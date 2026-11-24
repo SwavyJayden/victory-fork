@@ -218,6 +218,10 @@ pub(crate) const fn d3d12_object<const N: usize>(mut f: [*const (); N]) -> [*con
 
 /// The object methods' name setter: names only reach our log.
 pub(crate) extern "system" fn set_name(this: This, name: *const u16) -> HRESULT {
+    // The name only reaches the log: titles name every object they make.
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return S_OK;
+    }
     let name = if name.is_null() {
         String::new()
     } else {
