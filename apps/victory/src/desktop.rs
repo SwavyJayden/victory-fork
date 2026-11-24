@@ -205,14 +205,6 @@ mod win {
 
     use super::resolve_game_exe;
 
-    const DEFAULT_PERF_ENV: &[(&str, &str)] = &[
-        ("VICTORY_LATE_WAIT", "3"),
-        ("VICTORY_WIDE_BACK", "1"),
-        ("VICTORY_CARD_BUFFERS_MIN_MB", "1"),
-        ("VICTORY_CARD_BUFFERS_MB", "1024"),
-        ("VICTORY_PIPELINE_WAIT_MS", "24"),
-    ];
-
     fn wide_nul(text: &str) -> Vec<u16> {
         text.encode_utf16().chain(std::iter::once(0)).collect()
     }
@@ -496,15 +488,6 @@ mod win {
         }
     }
 
-    fn apply_default_perf_env() {
-        for &(key, val) in DEFAULT_PERF_ENV {
-            if std::env::var_os(key).is_none() {
-                // SAFETY: Called on the single main thread before any worker threads or title code start.
-                unsafe { std::env::set_var(key, val) };
-            }
-        }
-    }
-
     fn load_last_or_configured_exe(cfg: &victory_core::Config) -> Option<PathBuf> {
         let last_file = cfg.data_dir.join("last-game.txt");
         if let Ok(saved) = std::fs::read_to_string(&last_file) {
@@ -549,7 +532,6 @@ mod win {
             );
         }
 
-        apply_default_perf_env();
         println!("victory run \"{}\" --execute", exe.display());
         let outcome: Result<()> = crate::run::run(
             &exe,
