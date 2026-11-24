@@ -145,27 +145,56 @@ fn resolve_from_manifest(manifest: &Path) -> Result<PathBuf> {
     find_largest_exe_in_dir(dir)
 }
 
+fn is_runner_executable(candidate: &Path) -> bool {
+    if let Ok(current) = std::env::current_exe()
+        && let (Ok(c_canon), Ok(e_canon)) = (
+            std::fs::canonicalize(candidate),
+            std::fs::canonicalize(current),
+        )
+        && c_canon == e_canon
+    {
+        return true;
+    }
+    candidate
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| {
+            n.eq_ignore_ascii_case("victory.exe")
+                || n.eq_ignore_ascii_case("gta6rt.exe")
+                || n.eq_ignore_ascii_case("xcl.exe")
+        })
+}
+
 /// Resolves a user-picked `.exe`, `MicrosoftGame.config`, or folder into the
 /// executable path to run.
 pub fn resolve_game_exe(target: &Path) -> Result<PathBuf> {
-    if target.is_file() {
+    let resolved = if target.is_file() {
         let is_manifest = target
             .file_name()
             .and_then(|n| n.to_str())
             .is_some_and(|n| n.eq_ignore_ascii_case("MicrosoftGame.config"));
         if is_manifest {
-            return resolve_from_manifest(target);
+            resolve_from_manifest(target)?
+        } else {
+            target.to_path_buf()
         }
-        return Ok(target.to_path_buf());
-    }
-    if target.is_dir() {
+    } else if target.is_dir() {
         let manifest = target.join("MicrosoftGame.config");
         if manifest.is_file() {
-            return resolve_from_manifest(&manifest);
+            resolve_from_manifest(&manifest)?
+        } else {
+            find_largest_exe_in_dir(target)?
         }
-        return find_largest_exe_in_dir(target);
+    } else {
+        anyhow::bail!("target does not exist: {}", target.display())
+    };
+    if is_runner_executable(&resolved) {
+        anyhow::bail!(
+            "{} is a compatibility runner, not a game executable. Pick your unpacked Xbox Series game's .exe or MicrosoftGame.config instead.",
+            resolved.display()
+        );
     }
-    anyhow::bail!("target does not exist: {}", target.display())
+    Ok(resolved)
 }
 
 #[cfg(windows)]
@@ -648,5 +677,14 @@ mod tests {
         assert!(!should_treat_as_drop_target(OsStr::new("--help")));
         assert!(!should_treat_as_drop_target(OsStr::new("-V")));
         assert!(should_treat_as_drop_target(tmp.path().as_os_str()));
+    }
+
+    #[test]
+    fn resolve_rejects_runner_executables() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runner = tmp.path().join("victory.exe");
+        std::fs::write(&runner, b"MZ").unwrap();
+        let err = resolve_game_exe(&runner).unwrap_err();
+        assert!(err.to_string().contains("compatibility runner"));
     }
 }
