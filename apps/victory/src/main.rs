@@ -4,6 +4,7 @@
 //! the user's cache directory (outside the repository).
 
 mod census;
+mod desktop;
 mod inspect;
 mod run;
 mod shader;
@@ -128,6 +129,16 @@ fn main() -> Result<()> {
     if victory_hle::modules::audio::capture::child() {
         return Ok(());
     }
+    #[cfg(windows)]
+    {
+        let raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+        if raw_args.len() == 1 {
+            std::process::exit(desktop::run_interactive());
+        }
+        if raw_args.len() == 2 && desktop::should_treat_as_drop_target(&raw_args[1]) {
+            std::process::exit(desktop::run_path_target(std::path::Path::new(&raw_args[1])));
+        }
+    }
     let cli = Cli::parse();
     match cli.command {
         Command::Inspect {
@@ -154,11 +165,17 @@ fn main() -> Result<()> {
             jobs,
         } => {
             // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
-            if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
+            if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
                 victory_shader::emit::set_view_heap_limit(n);
             }
             // `VICTORY_HOST_WAVE=32`: translate as for a GPU whose waves are at most 32 lanes
-            if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
+            if let Some(n) = std::env::var("VICTORY_HOST_WAVE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
                 victory_shader::emit::set_host_max_wave(n);
             }
             translate::run(paths, validate, pipelines, list, jobs)
