@@ -135,9 +135,10 @@ const SHADER_VISIBLE: u32 = 1;
 #[cfg(windows)]
 static SHADER_HEAPS: std::sync::RwLock<Vec<(u64, u64, usize)>> = std::sync::RwLock::new(Vec::new());
 
-/// One [`sync_heaps`] at a time, as when the list above was a mutex.
+/// One [`sync_heaps`] at a time, keeping reusable scratch buffers across passes.
 #[cfg(windows)]
-static SYNCING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static SYNCING: std::sync::Mutex<(Vec<u8>, Vec<(u32, u64)>)> =
+    std::sync::Mutex::new((Vec::new(), Vec::new()));
 
 /// Makes the host descriptor for what the title wrote at `handle`, if it
 /// is in a shader-visible heap. Keeps `SHADER_HEAPS` read-locked for the
@@ -157,6 +158,14 @@ fn mirror(handle: u64) {
     let Some(index) = heap.index(handle) else {
         return;
     };
+    // Fast path: once the host heap exists (published after replaying
+    // `pending` in `Heap::host`), avoid locking `pending` on every write.
+    if let Some(host) = heap.host.get() {
+        if let Some(host) = host {
+            host.mirror(index, handle, false);
+        }
+        return;
+    }
     let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
     match heap.host.get() {
         None => pending.push(index),
@@ -164,6 +173,63 @@ fn mirror(handle: u64) {
             drop(pending);
             if let Some(host) = host {
                 host.mirror(index, handle, false);
+            }
+        }
+    }
+}
+
+/// Batched [`mirror`] for `count` contiguous descriptor slots written by
+/// `CopyDescriptorsSimple`, avoiding repeated `SHADER_HEAPS` lock lookups.
+#[cfg(windows)]
+fn mirror_range(dst: u64, count: u32, step: u64) {
+    if count == 0 {
+        return;
+    }
+    if count == 1 {
+        mirror(dst);
+        return;
+    }
+    let Some(end_addr) = dst.checked_add(u64::from(count) * step) else {
+        return;
+    };
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let Some(&(start, end, at)) = heaps
+        .iter()
+        .find(|&&(start, end, _)| (start..end).contains(&dst))
+    else {
+        return;
+    };
+    if end_addr > end || dst < start {
+        drop(heaps);
+        for i in 0..u64::from(count) {
+            mirror(dst + i * step);
+        }
+        return;
+    }
+    // SAFETY: registered heaps stay alive until `Heap::drop`, which takes
+    // the `SHADER_HEAPS` lock we hold here.
+    let heap = unsafe { &*(at as *const Heap) };
+    let Some(first) = heap.index(dst) else {
+        return;
+    };
+    let limit = heap.desc.count.saturating_sub(first).min(count);
+    if let Some(host) = heap.host.get() {
+        if let Some(host) = host {
+            for i in 0..limit {
+                host.mirror(first + i, dst + u64::from(i) * step, false);
+            }
+        }
+        return;
+    }
+    let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
+    match heap.host.get() {
+        None => pending.extend(first..first + limit),
+        Some(host) => {
+            drop(pending);
+            if let Some(host) = host {
+                for i in 0..limit {
+                    host.mirror(first + i, dst + u64::from(i) * step, false);
+                }
             }
         }
     }
@@ -187,8 +253,8 @@ pub(crate) fn sync_heaps() {
     }
     let started = std::time::Instant::now();
     let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
-    let mut page_bytes: Vec<u8> = Vec::new();
-    let _one = SYNCING.lock().unwrap_or_else(|e| e.into_inner());
+    let mut scratch = SYNCING.lock().unwrap_or_else(|e| e.into_inner());
+    let (page_bytes, due) = &mut *scratch;
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for &(start, end, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
@@ -211,14 +277,14 @@ pub(crate) fn sync_heaps() {
                 // copy: a page the title unmaps meanwhile fails the read
                 // where 2,048 reads in place would fault.
                 page_bytes.resize(to - from, 0);
-                if crate::host::read_into(from as *const u8, &mut page_bytes) {
+                if crate::host::read_into(from as *const u8, page_bytes) {
                     pages += 1;
                     let slots = changed_slots(from, to, start as usize, step, mirrored_count);
                     // The page's records in one go, under one lock
                     // (`HostHeap::mirror_copied_page`); one by one below
                     // with `VICTORY_HEAP_SYNC_PAGE=0`.
                     let slots = if page_at_once() {
-                        let (seen, made) = host.mirror_copied_page(slots, (start, step), from, &page_bytes);
+                        let (seen, made) = host.mirror_copied_page(slots, (start, step), from, page_bytes, due);
                         looked += seen;
                         mirrored += made;
                         0..0
@@ -434,7 +500,7 @@ const DSV_TAG: u32 = u32::from_le_bytes(*b"vDSV");
 
 /// A shader view or sampler as the title described it (descriptions in the
 /// host's layout, kept as words), for the host to build its own from.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum View {
     /// Constant buffer: GPU address and size.
     Constant(u64, u32),
@@ -494,26 +560,28 @@ impl View {
 struct Views {
     /// Each entry's view and generation.
     list: Vec<(View, u32)>,
-    index: std::collections::BTreeMap<View, u32>,
+    index: std::collections::HashMap<View, u32>,
     /// Entries naming each resource.
-    by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
+    by_resource: std::collections::HashMap<usize, Vec<u32>>,
     free: Vec<u32>,
     /// The shapes of views of placed memory, and where each is.
     shapes: Vec<Shape>,
-    shape_index: std::collections::BTreeMap<Shape, u32>,
+    shape_index: std::collections::HashMap<Shape, u32>,
 }
 
 /// Read far more often than written: every slot a draw reads through a
 /// table is looked up here, on several recording threads at once in the
 /// world. Readers share it; only a view not seen before (a new table entry
 /// or shape) and a released resource take it alone.
-static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
-    list: Vec::new(),
-    index: std::collections::BTreeMap::new(),
-    by_resource: std::collections::BTreeMap::new(),
-    free: Vec::new(),
-    shapes: Vec::new(),
-    shape_index: std::collections::BTreeMap::new(),
+static VIEWS: std::sync::LazyLock<std::sync::RwLock<Views>> = std::sync::LazyLock::new(|| {
+    std::sync::RwLock::new(Views {
+        list: Vec::new(),
+        index: std::collections::HashMap::new(),
+        by_resource: std::collections::HashMap::new(),
+        free: Vec::new(),
+        shapes: Vec::new(),
+        shape_index: std::collections::HashMap::new(),
+    })
 });
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
@@ -1066,9 +1134,7 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
         // SAFETY: both ranges are descriptor slots the title owns.
         unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
         #[cfg(windows)]
-        for i in 0..u64::from(count) {
-            mirror(dst + i * step);
-        }
+        mirror_range(dst, count, step);
     }
 }
 
