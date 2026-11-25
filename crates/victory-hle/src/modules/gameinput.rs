@@ -1,8 +1,10 @@
 //! `gameinput.dll`: input devices from the host. Gamepads come from XInput
-//! (host slots 0-3); while none is connected, the keyboard drives one
-//! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
-//! too. A poll thread turns host state into readings (a new one per change)
-//! and runs device callbacks on connect and disconnect.
+//! and native Sony PlayStation HID controllers (DualSense, DualSense Edge,
+//! DualShock 4 over USB and Bluetooth) across host slots 0-3; while none is
+//! connected, the keyboard drives one stand-in gamepad (`FALLBACK_BUTTONS`).
+//! The keyboard is a device of its own too. A poll thread turns host state
+//! into readings (a new one per change) and runs device callbacks on connect
+//! and disconnect.
 #![allow(non_snake_case)]
 // Title code calls these through the objects, passing pointers the real API
 // would trust.
@@ -36,23 +38,23 @@ const STATUS_CONNECTED: u32 = 0x3;
 const ASYNC_ENUMERATION: u32 = 1;
 
 /// Gamepad buttons; the title maps each bit to one of its pad buttons.
-const MENU: u32 = 0x1;
-const VIEW: u32 = 0x2;
-const A: u32 = 0x4;
-const B: u32 = 0x8;
-const X: u32 = 0x10;
-const Y: u32 = 0x20;
-const UP: u32 = 0x40;
-const DOWN: u32 = 0x80;
-const LEFT: u32 = 0x100;
-const RIGHT: u32 = 0x200;
-const LEFT_SHOULDER: u32 = 0x400;
-const RIGHT_SHOULDER: u32 = 0x800;
-const LEFT_STICK: u32 = 0x1000;
-const RIGHT_STICK: u32 = 0x2000;
+pub(super) const MENU: u32 = 0x1;
+pub(super) const VIEW: u32 = 0x2;
+pub(super) const A: u32 = 0x4;
+pub(super) const B: u32 = 0x8;
+pub(super) const X: u32 = 0x10;
+pub(super) const Y: u32 = 0x20;
+pub(super) const UP: u32 = 0x40;
+pub(super) const DOWN: u32 = 0x80;
+pub(super) const LEFT: u32 = 0x100;
+pub(super) const RIGHT: u32 = 0x200;
+pub(super) const LEFT_SHOULDER: u32 = 0x400;
+pub(super) const RIGHT_SHOULDER: u32 = 0x800;
+pub(super) const LEFT_STICK: u32 = 0x1000;
+pub(super) const RIGHT_STICK: u32 = 0x2000;
 
 /// Devices: host pad slots, the keyboard's stand-in pad, the keyboard.
-const PADS: usize = 4;
+pub(super) const PADS: usize = 4;
 const FALLBACK: usize = PADS;
 const KEYBOARD: usize = PADS + 1;
 const DEVICES: usize = PADS + 2;
@@ -83,14 +85,14 @@ const FALLBACK_BUTTONS: [(u8, u32); 14] = [
 /// A gamepad reading: triggers 0 to 1, sticks -1 to 1 (up positive).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct PadState {
-    buttons: u32,
-    left_trigger: f32,
-    right_trigger: f32,
-    left_x: f32,
-    left_y: f32,
-    right_x: f32,
-    right_y: f32,
+pub(super) struct PadState {
+    pub(super) buttons: u32,
+    pub(super) left_trigger: f32,
+    pub(super) right_trigger: f32,
+    pub(super) left_x: f32,
+    pub(super) left_y: f32,
+    pub(super) right_x: f32,
+    pub(super) right_y: f32,
 }
 
 /// One key held down: scan code (0xE0xx when extended), character, key.
@@ -316,6 +318,54 @@ struct Slot {
     connected: bool,
     sequence: u64,
     history: VecDeque<Ref>,
+    /// Last raw button bitmask seen from the host, for rising-edge detection.
+    prev_buttons: u32,
+    /// Button rising edges seen since the title last called `GetCurrentReading`,
+    /// so brief taps between low-FPS frames are not dropped before being read.
+    latched_buttons: u32,
+}
+
+impl Slot {
+    fn push(&mut self, device: *const Device, timestamp: u64, value: Value) {
+        self.sequence += 1;
+        if self.history.len() == HISTORY {
+            self.history.pop_front();
+        }
+        self.history.push_back(Ref::new(Reading {
+            vtable: &READING,
+            refs: AtomicU32::new(1),
+            device,
+            sequence: self.sequence,
+            timestamp,
+            value,
+        }));
+    }
+
+    /// Materializes any button taps that were pressed and released before the
+    /// title polled `GetCurrentReading` so low-FPS frames never drop quick taps.
+    fn flush_latched(&mut self, device: *const Device) {
+        if !self.connected {
+            self.latched_buttons = 0;
+            return;
+        }
+        let latched = std::mem::take(&mut self.latched_buttons);
+        if latched == 0 {
+            return;
+        }
+        let Some(back) = self.history.back() else {
+            return;
+        };
+        let Value::Pad(mut pad) = back.value else {
+            return;
+        };
+        let missed = latched & !pad.buttons;
+        if missed == 0 {
+            return;
+        }
+        pad.buttons |= missed;
+        let ts = now().max(back.timestamp);
+        self.push(device, ts, Value::Pad(pad));
+    }
 }
 
 struct State {
@@ -477,21 +527,22 @@ impl State {
         let slot = &mut self.slots[index];
         let was = slot.connected;
         slot.connected = value.is_some();
+        match &value {
+            Some(Value::Pad(pad)) => {
+                let rising = pad.buttons & !slot.prev_buttons;
+                slot.latched_buttons |= rising;
+                slot.prev_buttons = pad.buttons;
+            }
+            None => {
+                slot.prev_buttons = 0;
+                slot.latched_buttons = 0;
+            }
+            Some(Value::Keys(_)) => {}
+        }
         if let Some(value) = value
             && (!was || slot.history.back().is_none_or(|r| r.value != value))
         {
-            slot.sequence += 1;
-            if slot.history.len() == HISTORY {
-                slot.history.pop_front();
-            }
-            slot.history.push_back(Ref::new(Reading {
-                vtable: &READING,
-                refs: AtomicU32::new(1),
-                device: &devices[index],
-                sequence: slot.sequence,
-                timestamp: now,
-                value,
-            }));
+            slot.push(&devices[index], now, value);
         }
         if was != slot.connected {
             tracing::info!(device = index, connected = !was, "input device");
@@ -593,24 +644,40 @@ extern "system" fn current_reading(
     out: Out,
 ) -> HRESULT {
     let hub = hub(this);
-    let state = hub.state();
+    let mut state = hub.state();
+    let target = if device.is_null() {
+        if kind & GAMEPAD_KIND != 0 {
+            for i in 0..DEVICES {
+                if self::kind(i) & GAMEPAD_KIND != 0 {
+                    state.slots[i].flush_latched(&hub.devices[i]);
+                }
+            }
+        }
+        None
+    } else {
+        match hub.index(device) {
+            None => return fail(out, E_INVALIDARG),
+            Some(i) if !state.slots[i].connected => return fail(out, DEVICE_DISCONNECTED),
+            Some(i) => {
+                if kind & GAMEPAD_KIND != 0 {
+                    state.slots[i].flush_latched(&hub.devices[i]);
+                }
+                Some(i)
+            }
+        }
+    };
     let newest = |i: usize| {
         state.slots[i]
             .history
             .back()
             .filter(|r| r.kind() & kind != 0)
     };
-    let found = if device.is_null() {
-        (0..DEVICES)
+    let found = match target {
+        None => (0..DEVICES)
             .filter(|&i| state.slots[i].connected)
             .filter_map(newest)
-            .max_by_key(|r| r.timestamp)
-    } else {
-        match hub.index(device) {
-            None => return fail(out, E_INVALIDARG),
-            Some(i) if !state.slots[i].connected => return fail(out, DEVICE_DISCONNECTED),
-            Some(i) => newest(i),
-        }
+            .max_by_key(|r| r.timestamp),
+        Some(i) => newest(i),
     };
     tracing::trace!(
         kind = format_args!("{kind:#x}"),
@@ -1130,10 +1197,12 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        xinput_connected: [bool; PADS],
+        hid: crate::modules::gameinput_hid::HidManager,
     }
 
-    impl Source for Host {
-        fn pad(&mut self, slot: usize) -> Option<PadState> {
+    impl Host {
+        fn xinput_pad(&mut self, slot: usize) -> Option<PadState> {
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
                 return None;
             }
@@ -1144,8 +1213,23 @@ mod host {
                 return None;
             }
             self.empty_until[slot] = None;
+            Some(convert(&state.Gamepad))
+        }
+    }
+
+    impl Source for Host {
+        fn pad(&mut self, slot: usize) -> Option<PadState> {
+            let mut pad = self.xinput_pad(slot);
+            if pad.is_some() {
+                self.xinput_connected[slot] = true;
+                self.hid.vacate_slot(slot, &self.xinput_connected);
+            } else {
+                self.xinput_connected[slot] = false;
+                self.hid.poll(&self.xinput_connected, EMPTY_SLOT_RECHECK);
+                pad = self.hid.pad(slot);
+            }
             #[allow(unused_mut)]
-            let mut pad = convert(&state.Gamepad);
+            let mut pad = pad?;
             // The scripted keys (`VICTORY_KEYS`) also press the first
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
@@ -1189,12 +1273,16 @@ mod host {
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
-            let speeds = XINPUT_VIBRATION {
-                wLeftMotorSpeed: low,
-                wRightMotorSpeed: high,
-            };
-            // SAFETY: a valid vibration; an empty slot just fails.
-            unsafe { XInputSetState(slot as u32, &speeds) };
+            if self.xinput_connected[slot] {
+                let speeds = XINPUT_VIBRATION {
+                    wLeftMotorSpeed: low,
+                    wRightMotorSpeed: high,
+                };
+                // SAFETY: a valid vibration; an empty slot just fails.
+                unsafe { XInputSetState(slot as u32, &speeds) };
+            } else {
+                self.hid.rumble(slot, low, high);
+            }
         }
     }
 
@@ -1625,5 +1713,61 @@ mod tests {
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
         assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+    }
+
+    #[test]
+    fn quick_button_tap_between_reads_is_latched_for_low_fps_frames() {
+        let (hub, host) = fake();
+        host.lock().unwrap().pads[0] = Some(PadState::default());
+        hub.poll();
+
+        // Frame 1 reads neutral pad state.
+        let r0 = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(pad(r0).buttons, 0);
+        release(r0);
+
+        // User quickly presses and releases A before Frame 2 calls GetCurrentReading.
+        host.lock().unwrap().pads[0] = Some(PadState {
+            buttons: A,
+            ..Default::default()
+        });
+        hub.poll();
+        host.lock().unwrap().pads[0] = Some(PadState::default());
+        hub.poll();
+
+        // Frame 2 still observes the tapped A button (and a clean rising edge from previous).
+        let r1 = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(pad(r1).buttons, A);
+        let prev = walk(hub, 0x30, r1).unwrap();
+        assert_eq!(pad(prev).buttons, 0);
+        release(prev);
+
+        // Calling GetCurrentReading again in the same frame returns the same reading.
+        let r1_again = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(r1_again, r1);
+        release(r1_again);
+        release(r1);
+
+        // Next host poll restores the true released state for Frame 3 (no stuck button).
+        hub.poll();
+        let r2 = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(pad(r2).buttons, 0);
+        release(r2);
+
+        // Holding a button during one frame and releasing before the next must NOT ghost-latch.
+        host.lock().unwrap().pads[0] = Some(PadState {
+            buttons: B,
+            ..Default::default()
+        });
+        hub.poll();
+        let r3 = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(pad(r3).buttons, B);
+        release(r3);
+
+        host.lock().unwrap().pads[0] = Some(PadState::default());
+        hub.poll();
+        let r4 = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(pad(r4).buttons, 0);
+        release(r4);
     }
 }
