@@ -187,6 +187,8 @@ fn build(
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        written_root_uavs: Vec::new(),
+        writes_guest_memory: false,
         root_indexed_views: res.root_indexed_views.clone(),
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -686,5 +688,76 @@ fn a_structure_that_returns_triangle_ids_is_refused_by_name() {
             assert_eq!(what, "a ray-tracing structure that returns triangle ids");
         }
         other => panic!("{:?}", other.map(|_| ())),
+    }
+}
+
+#[test]
+fn bvh_no_hit_returns_immediate_miss_for_boxes_and_triangles() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let (shader, _) = super::with_bvh_no_hit_for_test(true, || {
+        build(true, WHOLE).expect("lowers with VICTORY_BVH_NO_HIT=1")
+    });
+    assert!(!shader.root_srvs.contains(&super::SLOT_MEMORY));
+    assert!(!shader.root_uavs.contains(&super::SLOT_FAULTS));
+    let ray = Ray::new([0.0; 3], [1.0, 0.0, 0.0], 100.0);
+    let cases: Vec<Case> = vec![
+        Some((0, 4, ray)),
+        Some((0, 5, ray)),
+        Some((0, 0, ray)),
+        Some((0, 2, ray)),
+        Some((0, 6, ray)),
+        None,
+    ];
+    let scene = Scene {
+        words: vec![0; 32],
+        starts: vec![0],
+    };
+    let mut input = vec![0u32; (NODES as usize) / 4];
+    for (t, case) in cases.iter().enumerate() {
+        let at = t * 16;
+        if let Some((n, kind, r)) = case {
+            let ptr = ((u64::from(NODES) + (scene.starts[*n] as u64) * 4) >> 3) | u64::from(*kind);
+            input[at] = ptr as u32;
+            input[at + 1] = (ptr >> 32) as u32;
+            input[at + 2] = r.extent.to_bits();
+            for a in 0..3 {
+                input[at + 3 + a] = r.origin[a].to_bits();
+                input[at + 6 + a] = r.direction[a].to_bits();
+                input[at + 9 + a] = r.inverse[a].to_bits();
+            }
+            input[at + 12] = 1;
+        }
+    }
+    let Some(host) = Host::new(true).ok() else {
+        return;
+    };
+    let (root, pso) = host.compute_pipeline(&shader).unwrap();
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(vec![0; 5]))],
+                views: &[
+                    View::Buffer {
+                        data: &input,
+                        stride: Stride::Raw,
+                    },
+                    View::RawUav(THREADS * 4),
+                ],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap();
+    for (t, case) in cases.iter().enumerate() {
+        let got: [u32; 4] = out[0][4 * t..4 * t + 4].try_into().unwrap();
+        let expected = match case {
+            Some((_, kind, _)) => bvh::no_hit(*kind),
+            None => BEFORE,
+        };
+        assert_eq!(got, expected, "thread {t}");
     }
 }
