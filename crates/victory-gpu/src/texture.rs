@@ -458,6 +458,72 @@ pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sy
 /// These say for what.
 pub(crate) static REFRESH_WAITS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Since the frame line last took them, of texture refreshes on every
+/// thread, how each ended: refreshes; passed over as the write watch saw
+/// no write; read as the write watch saw one; passed over as guarded and
+/// unwritten; partly mapped and passed over (read at most every 30 frames),
+/// of them found so before waiting for title memory to hold still
+/// ([`partial_early`]); partly mapped and read; read in place and found the
+/// same; read in place and detiled; waits for title memory to hold still of
+/// a millisecond or more; the longest such wait, in microseconds; and the
+/// microseconds of detiling (all refreshes).
+#[allow(dead_code)]
+pub(crate) static REFRESH_ENDS: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic::AtomicU64::new(0) }; 12];
+
+/// Places in [`REFRESH_ENDS`].
+#[allow(dead_code)]
+pub(crate) mod ends {
+    pub(crate) const ALL: usize = 0;
+    pub(crate) const UNWRITTEN: usize = 1;
+    pub(crate) const WATCHED: usize = 2;
+    pub(crate) const GUARDED: usize = 3;
+    pub(crate) const PARTIAL_SKIPPED: usize = 4;
+    pub(crate) const PARTIAL_EARLY: usize = 5;
+    pub(crate) const PARTIAL_READ: usize = 6;
+    pub(crate) const SAME: usize = 7;
+    pub(crate) const DETILED: usize = 8;
+    pub(crate) const LONG_WAITS: usize = 9;
+    pub(crate) const LONGEST_WAIT: usize = 10;
+    pub(crate) const DETILE_US: usize = 11;
+}
+
+fn ended(place: usize) {
+    REFRESH_ENDS[place].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether a partly mapped texture that is not due for a read (read in the
+/// last 30 frames) is passed over before the refresh waits for title
+/// memory to hold still (`VICTORY_PARTIAL_EARLY=0` waits first, as before;
+/// on by default).
+///
+/// Such a texture is passed over either way: under the lock the refresh
+/// asks whether all of it is mapped and, told no, returns. The question
+/// needs no lock (it reads nothing in place: `QueryWorkingSetEx` and reads
+/// through the kernel), so it is put before the wait as well; told yes, the
+/// refresh waits and asks again under the lock as before. A texture whose
+/// last pages arrive while the runtime is mapping them may then be read at
+/// its next refresh instead of after the wait.
+fn partial_early() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PARTIAL_EARLY").is_none_or(|v| v != "0"))
+}
+
+/// [`crate::watch::title_memory_reading`], its wait counted in
+/// [`REFRESH_WAITS`] and, when long, in [`REFRESH_ENDS`].
+fn wait_for_title_memory() -> crate::watch::Reading {
+    use std::sync::atomic::Ordering::Relaxed;
+    let started = std::time::Instant::now();
+    let reading = crate::watch::title_memory_reading();
+    let us = started.elapsed().as_micros() as u64;
+    REFRESH_WAITS[2].fetch_add(us, Relaxed);
+    crate::framelog::add(crate::framelog::T::RefreshStillUs, us);
+    if us >= 1000 {
+        ended(ends::LONG_WAITS);
+        REFRESH_ENDS[ends::LONGEST_WAIT].fetch_max(us, Relaxed);
+    }
+    reading
+}
+
 /// `f`'s result, its time added to [`REFRESH_WAITS`]' place `slot`.
 fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
     let started = std::time::Instant::now();
@@ -1070,14 +1136,17 @@ impl Staging {
     }
 
     fn refresh_timed(&self) -> usize {
+        ended(ends::ALL);
         let size = self.layout.size as usize;
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
         if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+                ended(ends::UNWRITTEN);
                 return 0;
             }
+            ended(ends::WATCHED);
             last.asked = now;
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
@@ -1114,8 +1183,20 @@ impl Staging {
             let frame = crate::frame::current();
             let turn = frame.wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY) || last.hash_due(frame);
             if unwritten && !turn {
+                ended(ends::GUARDED);
                 return 0;
             }
+        }
+        // A partly mapped texture not due for a read is passed over below,
+        // once title memory holds still; told so without the wait
+        // (`partial_early`).
+        if partial_early()
+            && last.partial.is_some_and(|at| crate::frame::current() < at + 30)
+            && !committed(self.memory, size)
+        {
+            ended(ends::PARTIAL_SKIPPED);
+            ended(ends::PARTIAL_EARLY);
+            return 0;
         }
         // From here on the texture's memory may be read in place. Held until
         // that read is done: the runtime changes what title memory shows
@@ -1132,7 +1213,7 @@ impl Staging {
             };
             mapped
         } else {
-            waited(2, crate::watch::title_memory_reading)
+            wait_for_title_memory()
         };
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages
@@ -1144,8 +1225,10 @@ impl Staging {
             // arrive): a mip that streams in shows up to 30 frames late.
             let frame = crate::frame::current();
             if last.partial.is_some_and(|at| frame < at + 30) {
+                ended(ends::PARTIAL_SKIPPED);
                 return 0;
             }
+            ended(ends::PARTIAL_READ);
             last.partial = Some(frame);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
@@ -1175,9 +1258,11 @@ impl Staging {
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if last.hash == Some(hash) {
+                    ended(ends::SAME);
                     last.unchanged();
                     return size;
                 }
+                ended(ends::DETILED);
                 if last.hash.is_some() {
                     last.changed(crate::frame::current());
                 }
@@ -1195,9 +1280,11 @@ impl Staging {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
+            ended(ends::SAME);
             last.unchanged();
             return size;
         }
+        ended(ends::DETILED);
         if last.hash.is_some() {
             last.changed(crate::frame::current());
         }
@@ -1239,6 +1326,12 @@ impl Staging {
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
+        let started = std::time::Instant::now();
+        self.detile_timed(tiled);
+        REFRESH_ENDS[ends::DETILE_US].fetch_add(started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn detile_timed(&self, tiled: &[u8]) {
         use std::sync::atomic::Ordering::Relaxed;
         let fence = self.last_upload.swap(0, Relaxed);
         if fence != 0 {
@@ -1342,23 +1435,27 @@ pub(crate) fn unstage(resource: This) {
     }
 }
 
-/// Where a staged title texture's memory is: address and bytes.
+/// Where a staged title texture's memory is: address and own bytes
+/// (stopping before the next placed texture's start).
 pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
     let map = STAGING.read().unwrap_or_else(|e| e.into_inner());
     let (at, len) = map.as_ref()?.get(&(resource as usize))?.memory();
-    Some((at as u64, len as u64))
+    let at = at as u64;
+    Some((at, crate::descriptor::host::texture_own_bytes(at, len as u64)))
 }
 
-/// A fingerprint of the title memory `[at, at + len)`, never 0: of all of
-/// it up to 48 KiB, else of 16 KiB at its start, its middle and its end
-/// (a texture streams in whole mips; the small ones lie first). Read
-/// through the kernel, so pages not there count as zeros.
+/// A fingerprint of the texture's own title memory within `[at, at + len)`
+/// (stopping before the next placed texture's start so neighbours packed in
+/// its large levels do not trigger false re-uploads), never 0: of all of it
+/// up to 48 KiB, else of 16 KiB at its start, its middle and its end (a
+/// texture streams in whole mips; the small ones lie first). Read through
+/// the kernel, so pages not there count as zeros.
 pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
     const WINDOW: usize = 16 << 10;
     thread_local! {
         static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     }
-    let len = len as usize;
+    let len = crate::descriptor::host::texture_own_bytes(at, len) as usize;
     let mut hasher = blake3::Hasher::new();
     READ.with(|read| {
         let mut read = read.borrow_mut();
@@ -1640,6 +1737,60 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     // footprint queries, D3D12 resource creation, and buffer zeroing outside
     // the global STAGING lock so other recording threads never stall on them.
     let on_demand = crate::resource::host_tiled(resource).is_some();
+    let s = new_staging(resource, texture, on_demand)?;
+    let mut map = STAGING.write().unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(HashMap::new);
+    Some(map.entry(resource as usize).or_insert(s).clone())
+}
+
+/// A staging buffer for `resource` (host copy `texture`) made and detiled
+/// off the submitting thread (`VICTORY_ASYNC_TEXTURES`): not in the table
+/// yet, so that the pass over the heap's textures still tells a texture
+/// draws read through a table (it has a staging buffer) from one it
+/// uploads itself; [`adopt`] puts it there when the pass records the
+/// upload.
+///
+/// Read from title memory now, as the submission's check would: the same
+/// write-watch asking (or hash, or guard) is noted in it, so the check that
+/// still runs at the submission that uploads it (`HostList::defer_texture`)
+/// reads again only what the title wrote since, as for any staging buffer.
+#[allow(dead_code)]
+pub(crate) fn prepare(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
+    let on_demand = crate::resource::host_tiled(resource).is_some();
+    let s = new_staging(resource, texture, on_demand)?;
+    s.refresh_now();
+    Some(s)
+}
+
+/// Puts a staging buffer made by [`prepare`] in the table, for the upload
+/// the caller records next to find. False if the texture has one already
+/// (a draw staged it meanwhile): that one is used, and `staging` let go.
+#[allow(dead_code)]
+pub(crate) fn adopt(resource: This, staging: Arc<Staging>) -> bool {
+    let mut map = STAGING.write().unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(HashMap::new);
+    if map.contains_key(&(resource as usize)) {
+        return false;
+    }
+    staging
+        .used
+        .store(crate::host::moment(), std::sync::atomic::Ordering::Relaxed);
+    map.insert(resource as usize, staging);
+    true
+}
+
+impl Staging {
+    /// The bytes of its upload buffer's staging layout.
+    #[allow(dead_code)]
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+/// A title texture's staging state, made and not put in the table.
+/// `on_demand`: the host texture's levels are made on demand
+/// (`crate::resource::host_tiled`), asked before the table is locked.
+fn new_staging(resource: This, texture: &ID3D12Resource, on_demand: bool) -> Option<Arc<Staging>> {
     let (memory, desc) = crate::resource::texture_memory(resource)?;
     let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
     else {
@@ -1711,9 +1862,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         waiting: std::sync::atomic::AtomicU64::new(0),
         pooled,
     });
-    let mut map = STAGING.write().unwrap_or_else(|e| e.into_inner());
-    let map = map.get_or_insert_with(HashMap::new);
-    Some(map.entry(resource as usize).or_insert(s).clone())
+    Some(s)
 }
 
 #[cfg(test)]
@@ -1914,6 +2063,39 @@ mod title_memory_tests {
             assert_eq!(mapped_bytes(unaligned_start, unaligned_len), (1024 + 4096) as u64);
             assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
         }
+    }
+
+    #[test]
+    fn fingerprint_stops_at_next_placed_texture() {
+        let mut backing = vec![0x11u8; 700_416];
+        let base = backing.as_ptr() as u64;
+        // Build a view heap with a placed texture at `base` and a neighbour at `base + 0x4000`.
+        let Some(heap) = crate::descriptor::host::HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let mut title = [0u64; 32];
+        let heap_ptr = title.as_mut_ptr() as u64;
+        let resource: [u32; 14] = [3, 0, 0, 0, 512, 0, 512, 0x8_0001, 98, 1, 0, 0x105, 0, 0];
+        let placed_at = |addr: u64, slot: u32| {
+            let mut desc = [0u32; 16];
+            desc[0] = 98;
+            desc[1] = 4;
+            desc[5] = 8;
+            (desc[10], desc[11]) = (addr as u32, (addr >> 32) as u32);
+            crate::descriptor::create_placed_srv(std::ptr::null(), &resource, &desc, heap_ptr + u64::from(slot) * 32);
+            heap.mirror(slot, heap_ptr + u64::from(slot) * 32, false);
+        };
+        placed_at(base, 1);
+        placed_at(base + 0x4000, 2);
+        let before = super::fingerprint(base, backing.len() as u64);
+        // Modifying bytes inside the neighbour (>= 0x4000) must not change the fingerprint.
+        backing[0x4000..0x8000].fill(0x99);
+        let tail = backing.len() - 4096;
+        backing[tail..].fill(0xaa);
+        assert_eq!(super::fingerprint(base, backing.len() as u64), before);
+        // Modifying bytes inside this texture's own bytes (< 0x4000) must change it.
+        backing[0x100] = 0x22;
+        assert_ne!(super::fingerprint(base, backing.len() as u64), before);
     }
 }
 
