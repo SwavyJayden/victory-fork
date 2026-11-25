@@ -88,6 +88,7 @@ mod diff_tests;
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+mod lean;
 mod lower;
 mod own_bits;
 mod rect;
@@ -168,6 +169,50 @@ pub fn group_sync() -> u8 {
     })
 }
 
+/// `VICTORY_WAVE_LOCAL_FIRST=1` (default off): a console wave64 compute program on a host of
+/// 32-lane waves whose wave operations are the allocation idiom (`lower::wave_local`) is
+/// taken with each host wave as a wave of its own (exact, no group barrier) before the forms
+/// "without early-outs" and "without skips", whose two host waves exchange each wave-wide value
+/// through LDS at two group barriers. Without it those forms win whenever they translate, and
+/// the idiom's exact form is only tried after them.
+pub(crate) fn local_first() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_LOCAL_FIRST.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_LOCAL_FIRST").is_some_and(|v| v == "1"))
+}
+
+/// `VICTORY_LEAN_MATH` (default 0): cheaper DXIL for the console's math that DXIL lacks.
+/// `1`: only forms equal to the default ones for every input (`lower.rs`: `legacy_mul`,
+/// `max_min`, the cube-face instructions, and a scalar buffer load from a raw view read as one
+/// load of up to four dwords instead of one per dword). `2`: also DXIL's own FMax/FMin for the
+/// console's maximum and minimum of two variables, which is exact only on a host whose FMax and
+/// FMin order -0 below +0 (measured on the card: `valu_tests`,
+/// `host_max_and_min_order_signed_zeros`).
+pub(crate) fn lean_math() -> u8 {
+    #[cfg(test)]
+    if let Some(level) = TEST_LEAN_MATH.get() {
+        return level;
+    }
+    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        std::env::var("VICTORY_LEAN_MATH")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`lean_math`], for its thread only.
+    pub(crate) static TEST_LEAN_MATH: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+    /// A test's choice for [`local_first`], for its thread only.
+    pub(crate) static TEST_LOCAL_FIRST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// The clean-up passes that run over a translated program before it is
 /// written (`bitcode::opt`): a set of that module's pass bits. Every pass
 /// is exact, so the switch is for telling a translator fault from a
@@ -244,6 +289,10 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.push(group_sync());
     out.extend_from_slice(&shader_opt().to_le_bytes());
     out.push(u8::from(bvh_no_hit()));
+    out.push(lean_math());
+    out.push(lean::wave_uniform());
+    out.push(u8::from(lean::class_ranges_on()));
+    out.push(u8::from(local_first()));
     out
 }
 
@@ -545,10 +594,24 @@ pub fn emit(
         // The program in two other forms: without its early-outs, and
         // without any branch that only skips code no lane is left for.
         let form = |p: Option<ir::Program>| {
+            if why && p.is_none() {
+                eprintln!("WAVE64-FORM nothing to leave out");
+            }
             p.and_then(|p| {
-                let st = structure::structure(&p).ok()?;
-                let io = io::raise(&p, native).ok()?;
-                let res = resource::track(&p, &native.layout, native.stage, Some(&st)).ok()?;
+                let failed = |stage: &str, e: ShaderError| {
+                    if why {
+                        eprintln!("WAVE64-FORM {stage}: {e}");
+                    }
+                };
+                let st = structure::structure(&p)
+                    .map_err(|e| failed("structure", e))
+                    .ok()?;
+                let io = io::raise(&p, native)
+                    .map_err(|e| failed("io", e))
+                    .ok()?;
+                let res = resource::track(&p, &native.layout, native.stage, Some(&st))
+                    .map_err(|e| failed("resources", e))
+                    .ok()?;
                 Some((p, st, io, res))
             })
         };
@@ -556,6 +619,29 @@ pub fn emit(
             ("without early-outs", form(ir::without_early_outs(p))),
             ("without skips", form(ir::without_skips(p, false))),
         ];
+        // `VICTORY_WAVE_LOCAL_FIRST=1`: the exact form with no group barrier (each host wave
+        // its own wave, where the wave operations are the allocation idiom) before the forms
+        // whose two host waves exchange through LDS at two group barriers per value.
+        if local_first() && local_on && !exact_only {
+            for (name, f) in &forms {
+                if let Some((p, st, io, res)) = f
+                    && idiom(p, st)
+                {
+                    let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
+                    report(&format!("local waves (idiom, first), {name}"), &local);
+                    if done(&local) {
+                        return local.map(|(shader, _)| shader);
+                    }
+                }
+            }
+            if idiom(p, st) {
+                let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
+                report("local waves (idiom, first)", &local);
+                if done(&local) {
+                    return local.map(|(shader, _)| shader);
+                }
+            }
+        }
         for (name, f) in &forms {
             if let Some((p, st, io, res)) = f {
                 let again = emit_program(c, native, p, st, io, res);
@@ -565,12 +651,19 @@ pub fn emit(
                 }
             }
         }
-        // Off unless asked for (`VICTORY_WAVE_WIDE=1`), for a console wave run as two host
-        // waves: this form puts group barriers inside branches and loops, and runs 121-124
-        // lost the card in a submission of two programs that had just moved to it
-        // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
-        // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        // For a console wave run as two host waves this form puts group barriers inside the
+        // branches it takes wave-wide, and runs 121-124 lost the card in a submission of two
+        // programs that had just moved to it (`ptfx_CS_lightAtlas_Sprite` and `_Trail`, whose
+        // wave-wide branches are loop exits). So by default only where no branch taken
+        // wave-wide lies in a loop ([`Wide::Acyclic`]): its barriers then stand in code each
+        // thread runs at most once per pass of the loops around it, as the barriers of the
+        // other forms do (uniform loops only). `VICTORY_WAVE_WIDE=1` takes any wave-wide form,
+        // `=0` none. The 32-lane programs' form below, which has no barrier, stays on.
+        let wide = match std::env::var("VICTORY_WAVE_WIDE").as_deref() {
+            Ok("1") => Some(Wide::Any),
+            Ok("0") => None,
+            _ => Some(Wide::Acyclic),
+        };
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -592,16 +685,19 @@ pub fn emit(
                 // Still stopped where not every lane runs: the per-lane branches around
                 // those places taken as the console takes them, by the whole wave at once
                 // ([`widen`]), at two group barriers per such branch.
-                if wide_on {
+                if let Some(mode) = wide {
                     let bases = [
-                        deep.as_ref().map(|f| &f.0),
-                        forms[1].1.as_ref().map(|f| &f.0),
-                        forms[0].1.as_ref().map(|f| &f.0),
-                        Some(p),
+                        ("", deep.as_ref().map(|f| &f.0)),
+                        (", without skips", forms[1].1.as_ref().map(|f| &f.0)),
+                        (", without early-outs", forms[0].1.as_ref().map(|f| &f.0)),
+                        ("", Some(p)),
                     ];
-                    if let Some(base) = bases.into_iter().flatten().next() {
-                        let again = widen(c, native, base, std::collections::HashSet::new(), why);
-                        report("wave-wide branches", &again);
+                    // (each base where only the loop-free form is taken: another base may
+                    // need no branch in a loop taken wave-wide)
+                    let tries = if mode == Wide::Any { 1 } else { bases.len() };
+                    for (name, base) in bases.into_iter().filter_map(|(n, b)| Some((n, b?))).take(tries) {
+                        let again = widen(c, native, base, std::collections::HashSet::new(), why, mode);
+                        report(&format!("wave-wide branches{name}"), &again);
                         if done(&again) {
                             return again.map(|(shader, _)| shader);
                         }
@@ -683,6 +779,7 @@ pub fn emit(
                     p,
                     seed,
                     std::env::var_os("VICTORY_WAVE_WHY").is_some(),
+                    Wide::Any,
                 );
                 match again {
                     Ok(_) => again,
@@ -722,6 +819,7 @@ fn widen(
     p: &ir::Program,
     mut wide: std::collections::HashSet<usize>,
     why: bool,
+    mode: Wide,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
     const NOT: ShaderError = ShaderError::Unsupported {
         offset: 0,
@@ -753,8 +851,27 @@ fn widen(
                 if lower::needs_every_lane(what) || *what == lower::LANE_MASK && !needs.is_empty())
             || matches!(&r, Ok((_, Some(64)))) && !needs.is_empty();
         if !stuck {
+            let cyc = in_cycles(p);
             if why {
                 eprintln!("WAVE64-WIDE {} branches taken wave-wide", wide.len());
+                let mut list: Vec<_> = wide.iter().copied().collect();
+                list.sort_unstable();
+                for &b in &list {
+                    let off = p.blocks[b]
+                        .insts
+                        .last()
+                        .map_or(p.blocks[b].offset, |i| i.machine.offset);
+                    eprintln!(
+                        "WAVE64-WIDE   branch at {off:#x}{}",
+                        if cyc[b] { " (in a loop)" } else { "" }
+                    );
+                }
+            }
+            if mode == Wide::Acyclic && r.is_ok() && wide.iter().any(|&b| cyc[b]) {
+                return Err(ShaderError::Unsupported {
+                    offset: 0,
+                    what: IN_LOOP,
+                });
             }
             return r;
         }
@@ -773,6 +890,39 @@ fn widen(
         last = r;
     }
     last
+}
+
+/// Which forms [`widen`] may give.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wide {
+    /// Any.
+    Any,
+    /// Only those where no branch taken wave-wide lies in a loop.
+    Acyclic,
+}
+
+/// What [`widen`] gives in [`Wide::Acyclic`] for a form with a branch taken wave-wide in a loop.
+const IN_LOOP: &str = "a wave-wide branch in a loop (VICTORY_WAVE_WIDE=1 takes it)";
+
+/// Per block of `p`: whether it lies on a cycle of the control flow (a loop body or header).
+fn in_cycles(p: &ir::Program) -> Vec<bool> {
+    let n = p.blocks.len();
+    (0..n)
+        .map(|b| {
+            let mut seen = vec![false; n];
+            let mut stack = p.blocks[b].exit.successors();
+            while let Some(x) = stack.pop() {
+                if x == b {
+                    return true;
+                }
+                if x < n && !seen[x] {
+                    seen[x] = true;
+                    stack.extend(p.blocks[x].exit.successors());
+                }
+            }
+            false
+        })
+        .collect()
 }
 
 /// The translated program, and the wave size it requires of the host.
@@ -1188,6 +1338,26 @@ mod tests {
         let off = with_bvh_no_hit_for_test(false, translation_fingerprint);
         let on = with_bvh_no_hit_for_test(true, translation_fingerprint);
         assert_ne!(off, on);
+
+        let base = translation_fingerprint();
+        let prev_lean = TEST_LEAN_MATH.replace(Some(1));
+        let lean1 = translation_fingerprint();
+        TEST_LEAN_MATH.set(Some(2));
+        let lean2 = translation_fingerprint();
+        TEST_LEAN_MATH.set(prev_lean);
+        assert_ne!(base, lean1);
+        assert_ne!(lean1, lean2);
+
+        let prev_uniform = lean::TEST_WAVE_UNIFORM.replace(Some(1));
+        let uni1 = translation_fingerprint();
+        lean::TEST_WAVE_UNIFORM.set(Some(2));
+        let uni2 = translation_fingerprint();
+        lean::TEST_WAVE_UNIFORM.set(Some(3));
+        let uni3 = translation_fingerprint();
+        lean::TEST_WAVE_UNIFORM.set(prev_uniform);
+        assert_ne!(base, uni1);
+        assert_ne!(uni1, uni2);
+        assert_ne!(uni2, uni3);
     }
 
     /// A wave64 compute program that writes only EXEC's high dword
