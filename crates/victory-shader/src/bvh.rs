@@ -218,6 +218,15 @@ pub fn boxes(children: &[u32; 4], boxes: &[[f32; 6]; 4], ray: &Ray, sort: bool) 
 /// What a triangle the ray misses returns.
 pub const MISS: [f32; 4] = [f32::INFINITY, 1.0, 0.0, 0.0];
 
+/// What an immediate no-hit returns for a node of `kind`: [`NONE`] for box
+/// nodes (kinds 4 and 5) and [`MISS`] for triangles or other nodes.
+pub fn no_hit(kind: u32) -> [u32; 4] {
+    match kind & 7 {
+        4 | 5 => [NONE; 4],
+        _ => MISS.map(f32::to_bits),
+    }
+}
+
 /// The triangle test: the hit distance's numerator, the denominator, and
 /// the numerators of the weights of vertices 1 and 2; [`MISS`] otherwise.
 /// Watertight: the vertices are sheared so the ray runs along its largest
@@ -707,6 +716,15 @@ pub(crate) mod tests {
                 assert!((h.1 - base.1).abs() < 1e-5 && (h.2 - base.2).abs() < 1e-5);
                 assert_eq!(h.3, base.3, "facing, axis {axis} flip {flip}");
             }
+        }
+    }
+
+    #[test]
+    fn no_hit_returns_none_for_boxes_and_miss_for_triangles() {
+        assert_eq!(no_hit(4), [NONE; 4]);
+        assert_eq!(no_hit(5), [NONE; 4]);
+        for k in [0, 1, 2, 3, 6, 7] {
+            assert_eq!(no_hit(k), MISS.map(f32::to_bits), "kind {k}");
         }
     }
 }

@@ -8,7 +8,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_FAILED, WAIT_OBJECT_0, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -5554,6 +5554,28 @@ impl Host {
         land();
     }
 
+    /// Waits for a direct queue fence with the shared event, under the submission lock.
+    fn wait_for_submission(&self, target: u64, started: std::time::Instant, context: &str) {
+        // SAFETY: the fence and event are ours, and the submission lock
+        // prevents another wait from using this event.
+        unsafe {
+            if let Err(e) = self.fence.SetEventOnCompletion(target, self.event) {
+                fail(format_args!("could not register a direct fence wait for {context} ({e})"));
+            }
+            working(false);
+            match WaitForSingleObject(self.event, INFINITE) {
+                WAIT_OBJECT_0 => {}
+                WAIT_FAILED => {
+                    let error = windows::core::Error::from_thread();
+                    fail(format_args!("could not wait for {context} ({error})"));
+                }
+                status => fail(format_args!("unexpected direct fence wait result for {context} ({:#x})", status.0)),
+            }
+            stood(started);
+            working(true);
+        }
+    }
+
     /// Sends `list`, a closed list of ours (the present's copy), as a
     /// flight ([`late_free_present`]): not waited for, settled with the
     /// others. The caller keeps the list and does not reset it before the
@@ -5638,19 +5660,7 @@ impl Host {
             if flights > 0 {
                 submitting(2, flights);
                 let waiting = std::time::Instant::now();
-                // SAFETY: the fence and event are ours, under the
-                // submission lock; `submitted` is the last value signalled.
-                unsafe {
-                    match self.fence.SetEventOnCompletion(*submitted, self.event) {
-                        Ok(()) => {
-                            working(false);
-                            WaitForSingleObject(self.event, INFINITE);
-                            stood(waiting);
-                            working(true);
-                        }
-                        Err(e) => tracing::warn!(error = %e, "submissions sent ahead not waited for"),
-                    }
-                }
+                self.wait_for_submission(*submitted, waiting, "submissions sent ahead");
                 let gpu = waiting.elapsed();
                 LATE_STATS[12].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 LATE_WAITED[why.min(10)].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
@@ -5955,24 +5965,15 @@ impl Host {
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
-            // SAFETY: closed lists; the fence and event are ours.
+            // SAFETY: closed lists; the fence is ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
                 self.card_sent();
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
-                    Ok(()) => {
-                        working(false);
-                        WaitForSingleObject(self.event, INFINITE);
-                        stood(started);
-                        working(true);
-                    }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                if let Err(e) = self.queue.Signal(&self.fence, *submitted) {
+                    fail(format_args!("could not signal a synchronous host submission ({e})"));
                 }
             }
+            self.wait_for_submission(*submitted, started, "a synchronous host submission");
             // With timing on each group is one of `runs` (and the compare
             // of copies in the card's memory, with the last): every
             // command's time on the card goes to the sums by pipeline.
@@ -7918,7 +7919,7 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
         // destination.
         unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
     };
-    if len == 0 || write(dst as usize, len) {
+    if len == 0 || crate::plaincopy::write(dst, src, len) || write(dst as usize, len) {
         return;
     }
     for_pieces(dst as usize, len, 64 << 10, |at, n| {

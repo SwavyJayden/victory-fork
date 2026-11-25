@@ -340,8 +340,8 @@ fn submit_cut(this: This, lists: &[This]) {
                 held.extend(waits.into_iter().map(Held::Value));
                 held.push_back(Held::Run(taken, order));
             }
+            add_waiting(this as usize);
         }
-        add_waiting(this as usize);
     }
     // What ran may be what another queue waits for, and what was just
     // given to the queue may be free to run already.
@@ -419,8 +419,11 @@ fn submit_split(this: This, lists: &[This]) {
             pieces.push(Held::Run(taken, order));
             from = to;
         }
-        lock(&queue(this).held).extend(pieces);
-        add_waiting(this as usize);
+        {
+            let mut held = lock(&queue(this).held);
+            held.extend(pieces);
+            add_waiting(this as usize);
+        }
     }
     // What ran may be what another queue waits for, and what was just held
     // may be free to run already.
@@ -796,9 +799,16 @@ fn release_held_now(all: bool) {
                         }
                     }
                     Some(Held::Value(wait)) if !all && !value_met(wait) => break,
-                    // The frame is shown behind the parts taken: they are
-                    // sent first.
-                    Some(Held::Present(..)) if !joined.is_empty() => break,
+                    // The frame is shown behind the parts taken: flush them at
+                    // once so `Present` is not delayed behind work on other
+                    // queues or another pass.
+                    Some(Held::Present(..)) if !joined.is_empty() => {
+                        drop(held);
+                        send_joined(&mut joined);
+                        held = lock(line);
+                        moved = true;
+                        continue;
+                    }
                     Some(_) => {}
                 }
                 let Some(next) = held.remove(base) else {
@@ -846,7 +856,7 @@ fn release_held_now(all: bool) {
                             // Taken, to go with the parts that follow it.
                             // The line stays open behind our mark.
                             if !joined.marked.contains(&q) {
-                                held.insert(0, Held::Running);
+                                held.push_front(Held::Running);
                                 joined.marked.push(q);
                             }
                             joined.add(lists, order);
@@ -1082,7 +1092,8 @@ fn execute_now(this: This, count: u32, lists: *const This) {
                 if SEEN.fetch_add(1, Ordering::Relaxed) < 8 {
                     tracing::info!(kind = queue(this).kind, ?unmet, "a submission is held for a memory value");
                 }
-                lock(&queue(this).held).extend(unmet.into_iter().map(Held::Value));
+                let mut held = lock(&queue(this).held);
+                held.extend(unmet.into_iter().map(Held::Value));
                 add_waiting(this as usize);
             }
         }
@@ -1199,6 +1210,7 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
             let behind = !held.is_empty() || now < value;
             if behind && waits() {
                 held.push_back(Held::Wait(fence as usize, value));
+                add_waiting(this as usize);
             }
             behind
         };
@@ -1215,7 +1227,6 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
             }
         }
         if behind && waits() {
-            add_waiting(this as usize);
             // The fence may have got there meanwhile.
             release_held(false);
         }
@@ -1345,7 +1356,7 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     // shortcut: what a queue still holds at a present runs now, whatever
     // its fence: a wait is not kept across frames.
     #[cfg(windows)]
-    if !sent_behind {
+    if !sent_behind && (forces() || !crate::host::late()) {
         release_held(forces());
     }
     #[cfg(windows)]
@@ -1725,7 +1736,113 @@ mod tests {
             .expect("queue::release finished");
         assert_eq!(left, 0);
         assert!(!lock(&WAITING).contains(&q_addr));
+        assert_eq!(WAITING_COUNT.load(Ordering::Acquire), lock(&WAITING).len());
         releaser.join().unwrap();
         assert_eq!(slot::<extern "system" fn(This) -> u32>(fence, 0x10)(fence), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn waiting_count_stays_in_sync_across_wait_signal_and_release() {
+        let null = std::ptr::null();
+        let desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let (mut q1, mut q2, mut f1, mut f2) = (null, null, null, null);
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q1), S_OK);
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q2), S_OK);
+        assert_eq!(crate::fence::create(null, 0, 0, &crate::fence::FENCE_IIDS[0], &mut f1), S_OK);
+        assert_eq!(crate::fence::create(null, 0, 0, &crate::fence::FENCE_IIDS[0], &mut f2), S_OK);
+
+        let before = lock(&WAITING).len();
+        assert_eq!(WAITING_COUNT.load(Ordering::Acquire), before);
+
+        assert_eq!(wait(q1, f1, 1), S_OK);
+        assert_eq!(lock(&WAITING).len(), before + 1);
+        assert_eq!(WAITING_COUNT.load(Ordering::Acquire), before + 1);
+
+        // Waiting again on the same queue must not duplicate `WAITING` or bump `WAITING_COUNT`.
+        assert_eq!(wait(q1, f1, 2), S_OK);
+        assert_eq!(lock(&WAITING).len(), before + 1);
+        assert_eq!(WAITING_COUNT.load(Ordering::Acquire), before + 1);
+
+        assert_eq!(wait(q2, f2, 1), S_OK);
+        assert_eq!(lock(&WAITING).len(), before + 2);
+        assert_eq!(WAITING_COUNT.load(Ordering::Acquire), before + 2);
+
+        assert_eq!(crate::fence::signal(f1, 2), S_OK);
+        release_held_now(false);
+        assert!(!lock(&WAITING).contains(&(q1 as usize)));
+        assert!(lock(&WAITING).contains(&(q2 as usize)));
+        assert_eq!(lock(&WAITING).len(), before + 1);
+        assert_eq!(WAITING_COUNT.load(Ordering::Acquire), before + 1);
+
+        // Releasing a waiting queue removes it and updates `WAITING_COUNT`.
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(q2, 0x10)(q2), 0);
+        assert!(!lock(&WAITING).contains(&(q2 as usize)));
+        assert_eq!(lock(&WAITING).len(), before);
+        assert_eq!(WAITING_COUNT.load(Ordering::Acquire), before);
+
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(q1, 0x10)(q1), 0);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(f1, 0x10)(f1), 0);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(f2, 0x10)(f2), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn send_joined_pops_running_marker_and_updates_waiting_count() {
+        let null = std::ptr::null();
+        let desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let (mut q1, mut q2, mut f1) = (null, null, null);
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q1), S_OK);
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q2), S_OK);
+        assert_eq!(crate::fence::create(null, 0, 0, &crate::fence::FENCE_IIDS[0], &mut f1), S_OK);
+
+        let before = lock(&WAITING).len();
+        {
+            let mut h1 = lock(&queue(q1).held);
+            h1.push_front(Held::Running);
+            add_waiting(q1 as usize);
+        }
+        {
+            let mut h2 = lock(&queue(q2).held);
+            h2.push_front(Held::Running);
+            h2.push_back(Held::Wait(f1 as usize, 1));
+            add_waiting(q2 as usize);
+        }
+        assert_eq!(WAITING_COUNT.load(Ordering::Acquire), before + 2);
+
+        let mut joined = Joined {
+            marked: vec![q1 as usize, q2 as usize],
+            signals: vec![(f1 as usize, 1)],
+            ..Default::default()
+        };
+        send_joined(&mut joined);
+
+        assert!(joined.marked.is_empty());
+        assert!(joined.signals.is_empty());
+        assert!(lock(&queue(q1).held).is_empty());
+        assert!(!lock(&WAITING).contains(&(q1 as usize)));
+        assert!(matches!(lock(&queue(q2).held).front(), Some(Held::Wait(_, 1))));
+        assert!(lock(&WAITING).contains(&(q2 as usize)));
+        assert_eq!(WAITING_COUNT.load(Ordering::Acquire), lock(&WAITING).len());
+
+        // The signal delivered behind `send_joined` lets `release_held_now` drain `q2`.
+        release_held_now(false);
+        assert!(!lock(&WAITING).contains(&(q2 as usize)));
+        assert_eq!(lock(&WAITING).len(), before);
+        assert_eq!(WAITING_COUNT.load(Ordering::Acquire), before);
+
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(q1, 0x10)(q1), 0);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(q2, 0x10)(q2), 0);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(f1, 0x10)(f1), 0);
     }
 }

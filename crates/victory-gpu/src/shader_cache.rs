@@ -73,6 +73,7 @@ fn build() -> [u8; 32] {
         h.update(exe);
     }
     h.update(&victory_shader::emit::translation_fingerprint());
+    h.update(&[u8::from(victory_shader::emit::bvh_no_hit())]);
     h.update(include_bytes!("shader_cache.rs"));
     *h.finalize().as_bytes()
 }
@@ -173,7 +174,7 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
+const MAGIC: &[u8; 4] = b"VSH3";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -248,10 +249,16 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, v);
         }
     }
-    for slots in [&s.root_cbvs, &s.root_srvs, &s.root_uavs] {
+    for slots in [
+        &s.root_cbvs,
+        &s.root_srvs,
+        &s.root_uavs,
+        &s.written_root_uavs,
+    ] {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
+    word(&mut out, u32::from(s.writes_guest_memory));
     word(&mut out, s.root_indexed_views.len() as u32);
     for view in &s.root_indexed_views {
         for value in [
@@ -321,6 +328,12 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
     let root_uavs = r.list()?;
+    let written_root_uavs = r.list()?;
+    let writes_guest_memory = match r.word()? {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
     let n = r.word()? as usize;
     let mut root_indexed_views = Vec::with_capacity(n.min(256));
     for _ in 0..n {
@@ -341,6 +354,8 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_cbvs,
         root_srvs,
         root_uavs,
+        written_root_uavs,
+        writes_guest_memory,
         root_indexed_views,
     })
 }
@@ -368,7 +383,9 @@ mod tests {
             ])],
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
-            root_uavs: vec![1],
+            root_uavs: vec![1, 2],
+            written_root_uavs: vec![2],
+            writes_guest_memory: true,
             root_indexed_views: vec![RootIndexedView {
                 table_slot: 1,
                 constant_slot: 2,
@@ -400,7 +417,7 @@ mod tests {
 
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
-            std::fs::write(e, b"VSH1 broken").unwrap();
+            std::fs::write(e, b"VSH3 broken").unwrap();
         }
         assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);
@@ -428,8 +445,24 @@ mod tests {
     fn entries_round_trip_and_reject_damage() {
         let bytes = encode(&shader());
         assert_eq!(decode(&bytes), Some(shader()));
+        let mut read_only = shader();
+        read_only.writes_guest_memory = false;
+        assert_eq!(decode(&encode(&read_only)), Some(read_only));
+        let mut stale = bytes.clone();
+        stale[..4].copy_from_slice(b"VSH1");
+        assert_eq!(decode(&stale), None);
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
+    }
+
+    #[test]
+    fn bvh_no_hit_changes_cache_key() {
+        let default_key = build();
+        let flipped = victory_shader::emit::with_bvh_no_hit_for_test(
+            !victory_shader::emit::bvh_no_hit(),
+            build,
+        );
+        assert_ne!(default_key, flipped);
     }
 }

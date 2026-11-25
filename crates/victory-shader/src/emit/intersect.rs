@@ -39,6 +39,12 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+thread_local! {
+    /// Override for [`super::super::bvh_no_hit`], scoped to the current thread.
+    pub(in crate::emit) static TEST_BVH_NO_HIT: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// Where the instruction's node is.
 #[derive(Clone, Copy)]
 enum NodeAt {
@@ -123,12 +129,21 @@ impl<'a> Lower<'a> {
             return Err("a ray-tracing structure that returns triangle ids");
         }
         let guard = self.guard(b, i)?;
+        let v = inst.read(Reg::V(regs[0])).ok_or("an unread operand")?;
+        let pointer = self.i32_of(v)?;
+        if super::super::bvh_no_hit() {
+            let miss = self.bvh_no_hit_result(pointer);
+            for (k, &r) in miss.iter().enumerate() {
+                self.write(inst, Reg::V(dst + k as u8), r, guard);
+            }
+            return Ok(());
+        }
         let mut x = Vec::with_capacity(regs.len());
-        for &r in &regs {
+        x.push(pointer);
+        for &r in &regs[1..] {
             let v = inst.read(Reg::V(r)).ok_or("an unread operand")?;
             x.push(self.i32_of(v)?);
         }
-        let pointer = x[0];
         let pointer_high = wide.then(|| x[1]);
         let f: Vec<V> = x[1 + usize::from(wide)..]
             .iter()
@@ -604,5 +619,17 @@ impl<'a> Lower<'a> {
             let f = self.s.m.select(c, hit, out[n], miss[n]);
             self.as_int(f)
         })
+    }
+
+    /// Immediate no-hit result when `VICTORY_BVH_NO_HIT=1`: [`bvh::NONE`] for
+    /// box nodes (kinds 4 and 5) and [`bvh::MISS`] for triangles or others.
+    fn bvh_no_hit_result(&mut self, pointer: V) -> [V; 4] {
+        let c = self.cur;
+        let (k4, k6) = (self.s.m.i32(4), self.s.m.i32(6));
+        let pair = self.s.m.bin(c, Bin::And, pointer, k6);
+        let is_box = self.s.m.cmp(c, pred::EQ, pair, k4);
+        let none = self.s.m.i32(bvh::NONE);
+        let miss = bvh::MISS.map(|f| self.s.m.i32(f.to_bits()));
+        std::array::from_fn(|k| self.s.m.select(c, is_box, none, miss[k]))
     }
 }
