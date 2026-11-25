@@ -463,6 +463,7 @@ pub fn emit(
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
     let original = emit_program(c, native, p, st, io, res);
+    let init_needs = lower::take_needs();
     // A console wave64 compute program on a host of 32-lane waves that
     // still needs 64 lanes, or whose cross-lane code sits where not every
     // lane runs: once more with its early-outs left out
@@ -563,7 +564,7 @@ pub fn emit(
                         Some(p),
                     ];
                     if let Some(base) = bases.into_iter().flatten().next() {
-                        let again = widen(c, native, base, why);
+                        let again = widen(c, native, base, std::collections::HashSet::new(), why);
                         report("wave-wide branches", &again);
                         if done(&again) {
                             return again.map(|(shader, _)| shader);
@@ -616,19 +617,41 @@ pub fn emit(
             }
         }
     }
-    // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
-    // trace programs): right once the wave takes that skip together ([`widen`]; the
-    // lowering has named the skipped blocks).
+    // Cross-lane code on a single host wave (no split-wave barriers) that needs
+    // every lane where it stands (SCC of a mask operation, a complement mask read
+    // as data, a lane read, a first-lane read): right once the wave takes the
+    // per-lane branches around it together ([`widen`]; the lowering has named the
+    // skipped blocks). Split wave64-on-wave32 programs stay gated behind
+    // `VICTORY_WAVE_WIDE=1` above because their widened branches carry group barriers.
+    let single_wave = !(native.wave64 && lower::host_max_wave() == 32);
     let original = match original {
         Err(ShaderError::Unsupported { what, .. })
             if native.stage == HwStage::Cs
-                && what == lower::LANE_MASK
+                && (what == lower::LANE_MASK || single_wave && lower::needs_every_lane(what))
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
-            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some());
-            match again {
-                Ok(_) => again,
-                Err(_) => emit_program(c, native, p, st, io, res),
+            let seed: std::collections::HashSet<usize> = if init_needs.is_empty() {
+                std::collections::HashSet::new()
+            } else {
+                lower::branches_around(st, &init_needs)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect()
+            };
+            if !init_needs.is_empty() && seed.is_empty() {
+                original
+            } else {
+                let again = widen(
+                    c,
+                    native,
+                    p,
+                    seed,
+                    std::env::var_os("VICTORY_WAVE_WHY").is_some(),
+                );
+                match again {
+                    Ok(_) => again,
+                    Err(_) => original,
+                }
             }
         }
         other => other,
@@ -661,6 +684,7 @@ fn widen(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,
+    mut wide: std::collections::HashSet<usize>,
     why: bool,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
     const NOT: ShaderError = ShaderError::Unsupported {
@@ -679,8 +703,8 @@ fn widen(
         }
         _ => return Err(NOT),
     }
-    let mut wide = std::collections::HashSet::new();
-    loop {
+    let mut last = Err(NOT);
+    for _ in 0..32 {
         let st = structure::structure_wide(p, &wide)?;
         let io = io::raise(p, native)?;
         let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
@@ -710,7 +734,9 @@ fn widen(
             return r;
         }
         wide.extend(more);
+        last = r;
     }
+    last
 }
 
 /// The translated program, and the wave size it requires of the host.

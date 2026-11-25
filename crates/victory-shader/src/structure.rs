@@ -63,6 +63,7 @@ pub struct Bools {
     /// Reverse-postorder index of the block that defines each atom.
     born: Vec<usize>,
     ids: Map<Atom, u32>,
+    cap: usize,
     overflow: bool,
 }
 
@@ -124,6 +125,7 @@ impl Bools {
             atoms: Vec::new(),
             born: Vec::new(),
             ids: Map::default(),
+            cap: MAX_NODES,
             overflow: false,
         }
     }
@@ -143,14 +145,15 @@ impl Bools {
     }
 
     fn vars(&self, b: Bool) -> Vec<u32> {
-        let (mut seen, mut vars, mut stack) = (Vec::new(), Vec::new(), vec![b]);
+        let mut seen: HashSet<Bool, BuildHasherDefault<Fx>> = HashSet::default();
+        let mut var_seen: HashSet<u32, BuildHasherDefault<Fx>> = HashSet::default();
+        let (mut vars, mut stack) = (Vec::new(), vec![b]);
         while let Some(b) = stack.pop() {
             let (v, lo, hi) = self.nodes[b.0 as usize];
-            if v == TERMINAL || seen.contains(&b) {
+            if v == TERMINAL || !seen.insert(b) {
                 continue;
             }
-            seen.push(b);
-            if !vars.contains(&v) {
+            if var_seen.insert(v) {
                 vars.push(v);
             }
             stack.extend([lo, hi]);
@@ -174,7 +177,7 @@ impl Bools {
         if let Some(&b) = self.unique.get(&(v, lo, hi)) {
             return b;
         }
-        if self.nodes.len() >= MAX_NODES {
+        if self.nodes.len() >= self.cap {
             // The caller fails once it sees `overflow`.
             self.overflow = true;
             return Bool::FALSE;
@@ -353,6 +356,27 @@ impl Bools {
             self.or(lo, hi)
         } else {
             self.mk(v, lo, hi)
+        };
+        memo.insert(b, r);
+        r
+    }
+
+    /// `b` with every non-uniform atom existentially quantified: what holds
+    /// of the wave's uniform state whenever any lane satisfies `b`.
+    fn uniform_only(&mut self, b: Bool, memo: &mut Map<Bool, Bool>) -> Bool {
+        let (v, lo, hi) = self.nodes[b.0 as usize];
+        if v == TERMINAL {
+            return b;
+        }
+        if let Some(&r) = memo.get(&b) {
+            return r;
+        }
+        let lo = self.uniform_only(lo, memo);
+        let hi = self.uniform_only(hi, memo);
+        let r = if matches!(self.atoms[v as usize], Atom::Uniform(_)) {
+            self.mk(v, lo, hi)
+        } else {
+            self.or(lo, hi)
         };
         memo.insert(b, r);
         r
@@ -537,6 +561,9 @@ struct Lanes<'a> {
     scc_every: HashSet<Value>,
     /// See [`Structured::wave_any`].
     wave_any: Vec<Option<bool>>,
+    /// When set, `join` never collapses phis to `TRUE`/`FALSE`, keeping every
+    /// join symbolic as `Atom::Phi` for exact wave-wide active/branch checks.
+    no_const_joins: bool,
 }
 
 /// A mask join taken as `value` in every lane that reaches `block`: each
@@ -617,6 +644,7 @@ impl<'a> Lanes<'a> {
             wide: HashSet::new(),
             scc_every: HashSet::new(),
             wave_any: vec![None; blocks.len()],
+            no_const_joins: false,
         })
     }
 
@@ -650,15 +678,22 @@ impl<'a> Lanes<'a> {
             self.masks.insert((lo, hi), Bool::TRUE);
             self.active.insert(lo);
         }
+        let loop_exits = self.single_exit_loops();
         let mut execs: Vec<Vec<Option<Bool>>> =
             p.blocks.iter().map(|b| vec![None; b.insts.len()]).collect();
         for n in 0..self.order.len() {
+            if self.b.overflow {
+                break;
+            }
             let b = self.order[n];
             let mut c = if n == 0 { Bool::TRUE } else { Bool::FALSE };
             for k in 0..self.incoming[b].len() {
                 let (q, taken) = self.incoming[b][k];
                 if self.index[q] < n {
-                    let e = self.edge(self.first[q], q, taken);
+                    let mut e = self.edge(self.first[q], q, taken);
+                    if let Some(&h_idx) = loop_exits.get(&(q, b)) {
+                        e = self.b.forget(e, h_idx, &mut Map::default());
+                    }
                     c = self.b.or(c, e);
                 }
             }
@@ -772,7 +807,10 @@ impl<'a> Lanes<'a> {
     ) -> Result<Structured, ShaderError> {
         let phi_joins = std::mem::take(&mut self.phi_joins);
         let mut phi_masks = HashMap::with_capacity(phi_joins.len());
+        let mut phi_raw: Vec<(Value, usize, Vec<(usize, bool, Bool)>)> =
+            Vec::with_capacity(phi_joins.len());
         for pj in phi_joins {
+            let mut raw = Vec::with_capacity(pj.args.len());
             let incoming: Vec<Bool> = pj
                 .args
                 .into_iter()
@@ -781,9 +819,11 @@ impl<'a> Lanes<'a> {
                     let (q, taken) = self.incoming[pj.block][n];
                     let e = self.edge(cond[q], q, taken);
                     let m = self.mask(a).0;
+                    raw.push((q, taken, m));
                     self.b.given(m, e)
                 })
                 .collect();
+            phi_raw.push((pj.id, pj.block, raw));
             phi_masks.insert(pj.id, incoming);
         }
         let blocks = &self.p.blocks;
@@ -838,23 +878,188 @@ impl<'a> Lanes<'a> {
         }
         self.masks.retain(|k, _| !split.contains(&k.0));
         self.active.retain(|lo| !split.contains(lo));
+        let export_masks: HashMap<Value, Bool> =
+            self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect();
+        let export_highs: HashMap<Value, Value> = self
+            .masks
+            .keys()
+            .filter(|(lo, hi)| lo != hi)
+            .map(|&(lo, hi)| (hi, lo))
+            .collect();
+        let export_paired = if self.p.wave64 {
+            self.masks.clone()
+        } else {
+            Map::default()
+        };
         // `active` promises that every lane outside `cond[b]` has bit 0 in the mask,
         // so `waveActiveBallot` in block `b` equals the console's mask. Even if EXEC
         // was temporarily widened inside `b` (e.g. `s_or_saveexec -1`), lanes not
-        // reaching `b` do not participate in `b`'s ballot.
-        let mut active_outside = HashSet::new();
-        for (&(lo, _), &m) in &self.masks {
-            if self.active.contains(&lo)
-                && let Some(&(b, _)) = self.defs.get(&lo)
-                && !self.b.implies(m, cond[b])
+        // reaching `b` do not participate in `b`'s ballot. Uniform conditions that
+        // hold for every lane reaching `b` hold for the whole wave when `b` runs.
+        let mut u_memo = Map::default();
+        let u_cond: Vec<Bool> = cond
+            .iter()
+            .map(|&c| self.b.uniform_only(c, &mut u_memo))
+            .collect();
+        let orig_when = self.when.clone();
+        let edge_uniform = |b: &mut Bools,
+                            q: usize,
+                            taken: bool,
+                            wide: &HashSet<usize>,
+                            when: &[Option<Bool>],
+                            u_memo: &mut Map<Bool, Bool>|
+         -> Bool {
+            let e = if wide.contains(&q) {
+                cond[q]
+            } else {
+                match when[q] {
+                    Some(w) if taken => b.and(cond[q], w),
+                    Some(w) => {
+                        let nw = b.not(w);
+                        b.and(cond[q], nw)
+                    }
+                    None => cond[q],
+                }
+            };
+            b.uniform_only(e, u_memo)
+        };
+        let implies_with_phis = |b: &mut Bools,
+                                 m: Bool,
+                                 u: Bool,
+                                 target: Bool,
+                                 bounded: &HashSet<Value>,
+                                 phi_imp: &Map<Value, Bool>|
+         -> bool {
+            let mut lhs = b.and(m, u);
+            if b.implies(lhs, target) {
+                return true;
+            }
+            let cap = (b.nodes.len() + 16_384).min(MAX_NODES / 4);
+            if bounded.is_empty() || b.nodes.len() >= cap {
+                return false;
+            }
+            let mut applied = HashSet::new();
+            loop {
+                if b.nodes.len() >= cap || applied.len() >= 8 {
+                    break;
+                }
+                let next: Vec<Value> = b
+                    .support(lhs)
+                    .into_iter()
+                    .filter_map(|a| match a {
+                        Atom::Phi(id)
+                            if bounded.contains(&id)
+                                && !applied.contains(&id)
+                                && phi_imp.contains_key(&id) =>
+                        {
+                            Some(id)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if next.is_empty() {
+                    break;
+                }
+                for id in next {
+                    if b.nodes.len() >= cap || applied.len() >= 8 {
+                        break;
+                    }
+                    applied.insert(id);
+                    lhs = b.and(lhs, phi_imp[&id]);
+                }
+                if b.implies(lhs, target) {
+                    return true;
+                }
+            }
+            false
+        };
+        let solve_bounded = |b: &mut Bools,
+                             raw: Vec<(Value, usize, Vec<(usize, bool, Bool)>)>,
+                             wide: &HashSet<usize>,
+                             when: &[Option<Bool>],
+                             index: &[usize],
+                             u_memo: &mut Map<Bool, Bool>|
+         -> (Map<Value, Bool>, HashSet<Value>) {
+            let mut phi_imp: Map<Value, Bool> = Map::default();
+            for &(id, blk, _) in &raw {
+                if b.nodes.len() >= MAX_NODES / 4 {
+                    break;
+                }
+                let atom = b.atom(Atom::Phi(id), index[blk]);
+                let not_atom = b.not(atom);
+                phi_imp.insert(id, b.or(not_atom, cond[blk]));
+            }
+            let mut bounded: HashSet<Value> = phi_imp.keys().copied().collect();
+            let mut pending: Vec<(Value, usize, Vec<(Bool, Bool)>)> = Vec::new();
+            for (id, blk, edges) in raw {
+                if !bounded.contains(&id) {
+                    continue;
+                }
+                let mut rest = Vec::new();
+                let mut dead = false;
+                for (q, taken, m) in edges {
+                    let ue = edge_uniform(b, q, taken, wide, when, u_memo);
+                    let lhs = b.and(m, ue);
+                    if b.implies(lhs, cond[blk]) {
+                        continue;
+                    }
+                    let has_phi = b
+                        .support(lhs)
+                        .iter()
+                        .any(|a| matches!(a, Atom::Phi(p) if bounded.contains(p)));
+                    if !has_phi {
+                        dead = true;
+                        break;
+                    }
+                    rest.push((m, ue));
+                }
+                if dead {
+                    bounded.remove(&id);
+                } else if !rest.is_empty() {
+                    pending.push((id, blk, rest));
+                }
+            }
+            while !bounded.is_empty() && !b.overflow {
+                let mut dropped = false;
+                for (id, blk, edges) in &pending {
+                    if !bounded.contains(id) {
+                        continue;
+                    }
+                    let ok = edges
+                        .iter()
+                        .all(|&(m, ue)| implies_with_phis(b, m, ue, cond[*blk], &bounded, &phi_imp));
+                    if !ok {
+                        bounded.remove(id);
+                        dropped = true;
+                    }
+                }
+                if !dropped {
+                    break;
+                }
+            }
+            (phi_imp, bounded)
+        };
+        let (phi_imp, bounded_phis) = solve_bounded(
+            &mut self.b,
+            phi_raw,
+            &self.wide,
+            &orig_when,
+            &self.index,
+            &mut u_memo,
+        );
+        let mut active_outside = Vec::new();
+        for (&k, &m) in &self.masks {
+            if self.active.contains(&k.0)
+                && let Some(&(b, _)) = self.defs.get(&k.0)
+                && !implies_with_phis(&mut self.b, m, u_cond[b], cond[b], &bounded_phis, &phi_imp)
             {
-                active_outside.insert(lo);
+                active_outside.push((k, b));
             }
         }
-        self.active.retain(|lo| !active_outside.contains(lo));
         // `wave_any[b]` promises that a wave-wide `waveAnyTrue`/`waveAllTrue` over
         // the lanes reaching `b` (`cond[b]`) matches the console's wave-wide branch.
         // Drop it if a lane outside `cond[b]` can decide the branch.
+        let mut wave_any_rejected = Vec::new();
         for (b, slot) in self.wave_any.iter_mut().enumerate() {
             let Some(any) = *slot else { continue };
             if cond[b] == Bool::FALSE {
@@ -870,39 +1075,155 @@ impl<'a> Lanes<'a> {
                 continue;
             }
             let set_bit = if any { w } else { self.b.not(w) };
-            if !self.b.implies(set_bit, cond[b]) {
+            if !implies_with_phis(
+                &mut self.b,
+                set_bit,
+                u_cond[b],
+                cond[b],
+                &bounded_phis,
+                &phi_imp,
+            ) {
                 *slot = None;
+                wave_any_rejected.push((b, any));
             }
         }
         // `scc_some` is lowered via `waveAnyTrue` in the defining block `b`, so
         // only masks guaranteed 0 outside `cond[b]` (or uniform across all lanes)
         // match hardware SCC.
-        let scc_some = self
-            .scc_lane
-            .iter()
-            .filter(|&(&scc, &m)| {
-                !self.scc_every.contains(&scc)
-                    && (self
-                        .defs
-                        .get(&scc)
-                        .is_none_or(|&(b, _)| self.b.implies(m, cond[b]))
-                        || self
-                            .b
-                            .support(m)
-                            .iter()
-                            .all(|a| matches!(a, Atom::Uniform(_))))
-            })
-            .map(|(&scc, &m)| (scc, m))
-            .collect();
+        let mut scc_some = HashMap::new();
+        let mut scc_rejected = Vec::new();
+        for (&scc, &m) in &self.scc_lane {
+            if self.scc_every.contains(&scc) {
+                continue;
+            }
+            let ok = self.defs.get(&scc).is_none_or(|&(b, _)| {
+                implies_with_phis(&mut self.b, m, u_cond[b], cond[b], &bounded_phis, &phi_imp)
+            }) || self
+                .b
+                .support(m)
+                .iter()
+                .all(|a| matches!(a, Atom::Uniform(_)));
+            if ok {
+                scc_some.insert(scc, m);
+            } else if let Some(&(b, _)) = self.defs.get(&scc) {
+                scc_rejected.push((scc, m, b));
+            }
+        }
+        // Constant joins (`Lanes::join` collapsing a loop-carried EXEC/active mask
+        // to `TRUE`) are exact for lanes inside the loop, but erase the fact that
+        // lanes outside `cond[header]` have bit 0. When a wave-wide check failed
+        // and constant joins exist, re-walk masks with all joins kept symbolic as
+        // `Atom::Phi` (without altering the exported per-lane BDDs) and re-check.
+        let mut drop_active: HashSet<Value> = active_outside.iter().map(|&(k, _)| k.0).collect();
+        if !self.joins.is_empty()
+            && (!active_outside.is_empty()
+                || !wave_any_rejected.is_empty()
+                || !scc_rejected.is_empty())
+            && self.b.nodes.len() < MAX_NODES / 4
+            && !self.b.overflow
+        {
+            let orig_cap = self.b.cap;
+            self.b.cap = (self.b.nodes.len() + 65_536).min(MAX_NODES);
+            let saved_active = std::mem::take(&mut self.active);
+            let saved_wave_any = std::mem::take(&mut self.wave_any);
+            self.masks.clear();
+            self.other.clear();
+            self.seen.clear();
+            self.scc_lane.clear();
+            self.scc_every.clear();
+            self.joins.clear();
+            self.phi_joins.clear();
+            self.phi_join_ids.clear();
+            self.first.fill(Bool::FALSE);
+            self.when.fill(None);
+            self.wave_any = vec![None; self.p.blocks.len()];
+            self.no_const_joins = true;
+            let _ = self.masks_in_order();
+            let mut exact_raw = Vec::new();
+            let mut idx = 0;
+            while idx < self.phi_joins.len() && !self.b.overflow {
+                let (id, block, args) = (
+                    self.phi_joins[idx].id,
+                    self.phi_joins[idx].block,
+                    self.phi_joins[idx].args.clone(),
+                );
+                let mut edges = Vec::with_capacity(args.len());
+                for (n, a) in args.into_iter().enumerate() {
+                    let (q, taken) = self.incoming[block][n];
+                    let m = self.mask(a).0;
+                    edges.push((q, taken, m));
+                }
+                exact_raw.push((id, block, edges));
+                idx += 1;
+            }
+            self.active = saved_active;
+            self.wave_any = saved_wave_any;
+            if !self.b.overflow {
+                let (exact_imp, exact_bounded) = solve_bounded(
+                    &mut self.b,
+                    exact_raw,
+                    &self.wide,
+                    &orig_when,
+                    &self.index,
+                    &mut u_memo,
+                );
+                if !self.b.overflow {
+                    for (k, b) in active_outside {
+                        if let Some(&m) = self.masks.get(&k)
+                            && implies_with_phis(
+                                &mut self.b,
+                                m,
+                                u_cond[b],
+                                cond[b],
+                                &exact_bounded,
+                                &exact_imp,
+                            )
+                        {
+                            drop_active.remove(&k.0);
+                        }
+                    }
+                    for (b, any) in wave_any_rejected {
+                        if let Some(w) = self.when[b] {
+                            let set_bit = if any { w } else { self.b.not(w) };
+                            if implies_with_phis(
+                                &mut self.b,
+                                set_bit,
+                                u_cond[b],
+                                cond[b],
+                                &exact_bounded,
+                                &exact_imp,
+                            ) {
+                                self.wave_any[b] = Some(any);
+                            }
+                        }
+                    }
+                    for (scc, orig_m, b) in scc_rejected {
+                        if let Some(&em) = self.scc_lane.get(&scc)
+                            && implies_with_phis(
+                                &mut self.b,
+                                em,
+                                u_cond[b],
+                                cond[b],
+                                &exact_bounded,
+                                &exact_imp,
+                            )
+                        {
+                            scc_some.insert(scc, orig_m);
+                        }
+                    }
+                }
+            }
+            self.b.overflow = false;
+            self.b.cap = orig_cap;
+        }
+        self.active.retain(|lo| !drop_active.contains(lo));
+        if self.b.overflow {
+            return Err(TOO_LARGE);
+        }
         Ok(Structured {
-            masks: self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
-            highs: self
-                .masks
-                .keys()
-                .filter(|(lo, hi)| lo != hi)
-                .map(|&(lo, hi)| (hi, lo))
-                .collect(),
-            paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
+            masks: export_masks,
+            highs: export_highs,
+            paired_masks: export_paired,
             active: self.active,
             wide: self.wide,
             wave_any: self.wave_any,
@@ -948,6 +1269,19 @@ impl<'a> Lanes<'a> {
         if let Some(&m) = self.other.get(&k) {
             return (m, false);
         }
+        // A scalar pair can be parked in two VGPR lanes and restored one
+        // dword at a time. The spill pass turns these into scalar moves.
+        // Recover the original lane predicate only when the two words
+        // still come from the same known mask, in their original order.
+        if self.p.wave64 {
+            let source = (self.move_source(k.0), self.move_source(k.1));
+            if source != k
+                && let Some(&m) = self.masks.get(&source)
+            {
+                self.masks.insert(k, m);
+                return (m, true);
+            }
+        }
         let p = self.p;
         let (m, derived) = match self.join(k) {
             Some(join) => join,
@@ -990,6 +1324,20 @@ impl<'a> Lanes<'a> {
         (m, derived)
     }
 
+    fn move_source(&self, mut value: Value) -> Value {
+        while let Some(&(b, i)) = self.defs.get(&value) {
+            let inst = &self.p.blocks[b].insts[i];
+            let [(Reg::S(_), source)] = inst.reads.as_slice() else {
+                break;
+            };
+            if inst.name() != "s_mov_b32" {
+                break;
+            }
+            value = *source;
+        }
+        value
+    }
+
     /// A mask joined by phis at a block entry, and whether a mask coming in
     /// on a forward edge derives from EXEC or a VALU result. Where every
     /// lane arriving so far has the incoming mask set (or clear), the join
@@ -1030,7 +1378,10 @@ impl<'a> Lanes<'a> {
         {
             return Some((m, derived));
         }
-        if !self.unresolved.contains(&id) {
+        let is_loop_header = self.incoming[block]
+            .iter()
+            .any(|&(q, _)| self.index[q] >= self.index[block]);
+        if !(self.no_const_joins && is_loop_header) && !self.unresolved.contains(&id) {
             for value in [true, false] {
                 let b = &mut self.b;
                 let holds = forward.iter().all(|&(e, m)| {
@@ -1410,10 +1761,122 @@ impl<'a> Lanes<'a> {
         }
     }
 
+    /// Exit edges `(from, to)` of natural loops that have no `End`/`Indirect`
+    /// inside and leave to a single exit block `to`, mapped to the outermost
+    /// such loop header's reverse-postorder index. Every lane entering the
+    /// loop header reaches `to` on termination, so loop-internal exit atoms do
+    /// not narrow `cond[to]` (preventing downstream `active`/`wave_any` loss).
+    fn single_exit_loops(&self) -> Map<(usize, usize), usize> {
+        let n = self.p.blocks.len();
+        let mut out: Map<(usize, usize), usize> = Map::default();
+        for &h in &self.order {
+            let h_idx = self.index[h];
+            let mut work: Vec<usize> = self.p.blocks[h]
+                .preds
+                .iter()
+                .copied()
+                .filter(|&q| self.index[q] != usize::MAX && self.index[q] >= h_idx)
+                .collect();
+            if work.is_empty() {
+                continue;
+            }
+            let mut inside = vec![false; n];
+            inside[h] = true;
+            while let Some(b) = work.pop() {
+                if inside[b] {
+                    continue;
+                }
+                inside[b] = true;
+                for &q in &self.p.blocks[b].preds {
+                    if self.index[q] != usize::MAX && !inside[q] {
+                        work.push(q);
+                    }
+                }
+            }
+            let mut valid = true;
+            let mut exits = Vec::new();
+            let mut targets = Vec::new();
+            for u in (0..n).filter(|&u| inside[u]) {
+                match self.p.blocks[u].exit {
+                    Exit::End | Exit::Indirect => {
+                        valid = false;
+                        break;
+                    }
+                    ref ex => {
+                        for s in ex.successors() {
+                            if !inside[s] {
+                                exits.push((u, s));
+                                if !targets.contains(&s) {
+                                    targets.push(s);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !valid || targets.is_empty() {
+                continue;
+            }
+            // All loop exits reach a unique merge block `m` directly or through
+            // unconditional `Exit::Jump` landing pads dominated by the loop.
+            let chains: Vec<Vec<usize>> = targets
+                .iter()
+                .map(|&t| {
+                    let mut chain = vec![t];
+                    let mut cur = t;
+                    while let Exit::Jump(next) = self.p.blocks[cur].exit {
+                        if inside[next] || chain.contains(&next) {
+                            break;
+                        }
+                        chain.push(next);
+                        cur = next;
+                    }
+                    chain
+                })
+                .collect();
+            let Some(&merge) = chains[0]
+                .iter()
+                .find(|&&cand| chains[1..].iter().all(|c| c.contains(&cand)))
+            else {
+                continue;
+            };
+            if self.index[merge] <= h_idx {
+                continue;
+            }
+            let mut pad = HashSet::new();
+            for chain in &chains {
+                for &b in chain {
+                    if b == merge {
+                        break;
+                    }
+                    pad.insert(b);
+                }
+            }
+            let pad_dominated = pad.iter().all(|&x| {
+                self.p.blocks[x]
+                    .preds
+                    .iter()
+                    .all(|&q| self.index[q] == usize::MAX || inside[q] || pad.contains(&q))
+            });
+            if !pad_dominated {
+                continue;
+            }
+            for &(q, _) in &self.incoming[merge] {
+                if (inside[q] || pad.contains(&q)) && self.index[q] < self.index[merge] {
+                    out.entry((q, merge))
+                        .and_modify(|cur| *cur = (*cur).min(h_idx))
+                        .or_insert(h_idx);
+                }
+            }
+        }
+        out
+    }
+
     /// What a lane knows on entering each block, to a fixpoint. A loop
     /// header forgets what the back edge says about atoms the loop redefines.
     fn paths(&mut self) -> Result<Vec<Bool>, ShaderError> {
         let n = self.p.blocks.len();
+        let loop_exits = self.single_exit_loops();
         let mut cond = vec![Bool::FALSE; n];
         if let Some(&entry) = self.order.first() {
             cond[entry] = Bool::TRUE;
@@ -1428,6 +1891,8 @@ impl<'a> Lanes<'a> {
                     let mut e = self.edge(cond[q], q, taken);
                     if i <= self.index[q] {
                         e = self.b.forget(e, i, &mut Map::default());
+                    } else if let Some(&h_idx) = loop_exits.get(&(q, s)) {
+                        e = self.b.forget(e, h_idx, &mut Map::default());
                     }
                     c = self.b.or(c, e);
                 }
@@ -1962,5 +2427,89 @@ mod tests {
         let top_not = &top.blocks[0].insts[1];
         assert_eq!(top_not.name(), "s_not_b32");
         assert!(st_top.scc_some.contains_key(&top_not.write(Reg::Scc).unwrap()));
+    }
+
+    #[test]
+    fn uniform_branch_preserves_active_and_wave_any() {
+        // Inside a uniform scalar branch (`s_cmp_eq_u32 s0, 0; s_cbranch_scc1`),
+        // a per-lane compare and `s_and_saveexec_b32` + `s_cbranch_execz` must keep
+        // `active`, `scc_some`, and `wave_any`: every lane takes the uniform branch together.
+        let p = build(
+            &[
+                0xBF06_8000, // 0: s_cmp_eq_u32 s0, 0
+                0xBF85_0004, // 4: s_cbranch_scc1 -> 24
+                0x7D84_0080, // 8: v_cmp_eq_u32 vcc_lo, 0, v0
+                0xBE84_3C6A, // 12: s_and_saveexec_b32 s4, vcc_lo
+                0xBF88_0001, // 16: s_cbranch_execz -> 24
+                0x7E02_0281, // 20: v_mov_b32 v1, 1
+                S_ENDPGM,    // 24: s_endpgm
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        let b_in = p.blocks.iter().position(|b| b.offset == 8).unwrap();
+        let cmp = p.blocks[b_in].insts[0].write(Reg::S(VCC)).unwrap();
+        assert!(s.active.contains(&cmp));
+        assert_eq!(s.wave_any[b_in], Some(false));
+    }
+
+    #[test]
+    fn loop_header_active_mask_and_single_exit_loop_keep_wave_any() {
+        // Divergent region containing a single-exit per-lane loop with a loop-carried
+        // remaining-lanes mask `s2` initialized from `exec_lo`, followed by another
+        // divergent branch after the loop exit. Both the loop back-edge `s_cbranch_scc1`
+        // and the post-loop `s_cbranch_execz` must keep `wave_any`.
+        let p = build(
+            &[
+                0x7DAA_0080, // 0: v_cmpx_ne_u32 exec_lo, 0, v0
+                0xBF88_000B, // 4: s_cbranch_execz -> 52
+                0xBE83_037E, // 8: s_mov_b32 s3, exec_lo
+                0xBE82_037E, // 12: s_mov_b32 s2, exec_lo
+                0x7DA4_0280, // 16: (loop) v_cmpx_eq_u32 exec_lo, 0, v1
+                0x8A02_7E02, // 20: s_andn2_b32 s2, s2, exec_lo
+                0xBF85_0001, // 24: s_cbranch_scc1 -> 32
+                0xBF82_0002, // 28: s_branch -> 40
+                0x877E_0202, // 32: (latch) s_and_b32 exec_lo, s2, s2
+                0xBF82_FFFA, // 36: s_branch -> 16
+                0xBEFE_0303, // 40: (exit) s_mov_b32 exec_lo, s3
+                0x7DAA_0480, // 44: v_cmpx_ne_u32 exec_lo, 0, v2
+                0xBF88_0000, // 48: s_cbranch_execz -> 52
+                S_ENDPGM,    // 52: s_endpgm
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        let b_loop = p.blocks.iter().position(|b| b.offset == 16).unwrap();
+        let b_exit = p.blocks.iter().position(|b| b.offset == 40).unwrap();
+        assert_eq!(s.wave_any[b_loop], Some(true));
+        assert_eq!(s.wave_any[b_exit], Some(false));
+    }
+
+    #[test]
+    fn split_scalar_copies_recover_wave64_mask() {
+        // Wave64 mask in `s[2:3]` copied word-by-word via two `s_mov_b32` into `s[4:5]`
+        // and consumed by `s_and_saveexec_b64` must still resolve to the original compare mask.
+        let p = build(
+            &[
+                0xD4C2_0002,
+                0x0002_0080, // 0: v_cmp_eq_u32 s[2:3], 0, v0
+                0xBE84_0302, // 8: s_mov_b32 s4, s2
+                0xBE85_0303, // 12: s_mov_b32 s5, s3
+                0xBE86_2404, // 16: s_and_saveexec_b64 s[6:7], s[4:5]
+                0xBF88_0001, // 20: s_cbranch_execz -> 28
+                0x7E02_0281, // 24: v_mov_b32 v1, 1
+                S_ENDPGM,    // 28: s_endpgm
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        let cmp = p.blocks[0].insts[0].write(Reg::S(2)).unwrap();
+        let LaneExit::Branch { when, .. } = s.exits[0] else {
+            panic!("{:?}", s.exits);
+        };
+        assert_eq!(
+            s.bools.node(when),
+            Some((Atom::Lane(cmp), Bool::TRUE, Bool::FALSE))
+        );
     }
 }
