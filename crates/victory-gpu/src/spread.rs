@@ -33,13 +33,15 @@ use windows_sys::Win32::System::Threading::{
     THREAD_SET_INFORMATION,
 };
 
-/// 0 off, 1 on, 2 in turn.
+/// 0 off, 1 on, 2 in turn. Defaults to on for hosts with fewer than
+/// sixteen logical processors (the console count the title pins for).
 fn mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("VICTORY_SPREAD").as_deref() {
+        Ok("0") => 0,
         Ok("1") => 1,
         Ok("alt") => 2,
-        _ => 0,
+        _ => u8::from(std::thread::available_parallelism().is_ok_and(|n| n.get() < 16)),
     })
 }
 
@@ -54,6 +56,17 @@ struct Pinned {
 /// with `spare` added if they are more than its processors.
 fn widened(mask: usize, threads: usize, spare: usize) -> usize {
     if threads > mask.count_ones() as usize { mask | spare } else { mask }
+}
+
+/// Like [`widened`], but on hosts with fewer than the console's 16 logical
+/// processors, any console subset mask is widened to include `spare` so
+/// host-side threads never leave RAGE workers starved onto a subset of cores.
+fn wide_for(original: usize, threads: usize, all: usize, spare: usize) -> usize {
+    if all.count_ones() < 16 {
+        original | spare
+    } else {
+        widened(original, threads, spare)
+    }
 }
 
 /// Whether `mask` is a pinning of the title's: some of the console's
@@ -131,7 +144,7 @@ fn pass(pinned: &mut HashMap<u32, Pinned>, all: usize, spare: usize, wide: bool,
         *groups.entry(p.original).or_default() += 1;
     }
     for p in pinned.values_mut() {
-        p.wide = widened(p.original, groups[&p.original], spare);
+        p.wide = wide_for(p.original, groups[&p.original], all, spare);
     }
     for (id, handle, mask) in open {
         if let Some(p) = pinned.get(&id) {
@@ -152,7 +165,7 @@ fn pass(pinned: &mut HashMap<u32, Pinned>, all: usize, spare: usize, wide: bool,
     let text = table
         .iter()
         .map(|&(mask, threads)| {
-            let to = widened(mask, threads, spare);
+            let to = wide_for(mask, threads, all, spare);
             if to == mask {
                 format!("{threads} on {mask:#x} ({} processors)", mask.count_ones())
             } else {
@@ -161,7 +174,8 @@ fn pass(pinned: &mut HashMap<u32, Pinned>, all: usize, spare: usize, wide: bool,
         })
         .collect::<Vec<_>>()
         .join("; ");
-    if text != *said {
+    let changed = text != *said;
+    if changed {
         tracing::info!("spread: the title's pinned threads by its mask: {text}");
         *said = text;
     }
@@ -183,7 +197,10 @@ pub(crate) fn start() {
             }
             let spare = match std::env::var("VICTORY_SPREAD_SPARE").ok().and_then(|v| usize::from_str_radix(v.trim_start_matches("0x"), 16).ok()) {
                 Some(mask) => mask & all,
-                None => crate::framelog::slow_processors() & all,
+                None => {
+                    let slow = crate::framelog::slow_processors() & all;
+                    if slow == 0 && all.count_ones() < 16 { all } else { slow }
+                }
             };
             if spare == 0 {
                 tracing::info!("spread: no spare processors (all cores are alike and VICTORY_SPREAD_SPARE names none); nothing is widened");
@@ -205,10 +222,16 @@ pub(crate) fn start() {
                     );
                 }
                 last = Some(wide);
+                let prev_len = pinned.len();
                 pass(&mut pinned, all, spare, wide, &mut said);
-                // Often enough to catch threads the title starts and to turn with the
-                // twenty-second phases; a pass is a snapshot and a query a thread.
-                std::thread::sleep(std::time::Duration::from_millis(500));
+                // Steady state with fixed thread topology polls every 2 s in mode 1
+                // to minimize ToolHelp snapshot overhead; mode 2 stays at 500 ms.
+                let poll_ms = if mode() == 1 && pinned.len() == prev_len && !said.is_empty() {
+                    2000
+                } else {
+                    500
+                };
+                std::thread::sleep(std::time::Duration::from_millis(poll_ms));
             }
         });
         if let Err(error) = made {
@@ -256,5 +279,14 @@ mod tests {
         assert!(mask_of(handle).is_some_and(|m| m != 0));
         // SAFETY: the handle opened above.
         unsafe { CloseHandle(handle) };
+    }
+
+    #[test]
+    fn sub16_host_widens_console_subset_masks() {
+        let all_12 = 0x0FFF;
+        assert_eq!(wide_for(0x00FF, 4, all_12, all_12), 0x0FFF);
+        assert_eq!(wide_for(0x000F, 4, all_12, all_12), 0x0FFF);
+        // Hosts with >= 16 logical cores keep the strict crowded-group check.
+        assert_eq!(wide_for(0x3F00, 3, 0xFFFF_FFFF, 0x0FFF_0000), 0x3F00);
     }
 }

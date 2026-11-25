@@ -1408,13 +1408,35 @@ pub(crate) fn host_made<'a>(
     Some(unsafe { &*std::ptr::from_ref(&host.texture) })
 }
 
+fn texture_room_allows(
+    filled: u64,
+    limit: Option<u64>,
+    floor: u64,
+    without_budget: u64,
+    vram_has_room: Option<bool>,
+) -> bool {
+    if let Some(limit) = limit
+        && filled >= limit
+    {
+        return false;
+    }
+    if filled < floor {
+        return true;
+    }
+    match vram_has_room {
+        Some(has_room) => has_room,
+        None => filled < limit.unwrap_or(without_budget),
+    }
+}
+
 /// Whether more host copies of textures the title fills may be made for
 /// shaders that pick textures by index (`draw.rs` `heap_textures`): always
 /// up to `FLOOR` bytes of them, beyond that while the card's memory in use
 /// by this process is under nine tenths of the budget the system gives it
-/// ([`room_percent`] says another share; `VICTORY_TEXTURE_BUDGET_MB` sets a
-/// limit on those copies' bytes instead). Past the budget the system moves
-/// the card's memory into the PC's, which ended runs 20 and 24.
+/// ([`room_percent`] says another share; `VICTORY_TEXTURE_BUDGET_MB` sets an
+/// additional hard cap on those copies' bytes without bypassing the adapter's
+/// DXGI budget). Past the budget the system moves the card's memory into the
+/// PC's, which ended runs 20 and 24.
 #[cfg(windows)]
 pub(crate) fn room() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
@@ -1428,22 +1450,10 @@ pub(crate) fn room() -> bool {
     // (With the tiles of the copies made level by level, whose own bytes
     // count as none: `crate::tiles`.)
     let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
-    if let Some(limit) = limit {
-        return filled < limit;
-    }
-    if filled < FLOOR {
-        return true;
-    }
-    match crate::host::host().and_then(|h| h.video_memory()) {
-        // What is kept for card copies of title buffers not made yet
-        // (`crate::shadow::card_room_kept`) and for the render targets a
-        // world makes in its first frame ([`targets_room_kept`]) counts as
-        // used.
-        Some([budget, used, ..]) => {
-            used + crate::shadow::card_room_kept() + targets_room_kept() < budget / 100 * room_percent()
-        }
-        None => filled < WITHOUT_BUDGET,
-    }
+    let vram_has_room = crate::host::host().and_then(|h| h.video_memory()).map(|[budget, used, ..]| {
+        used + crate::shadow::card_room_kept() + targets_room_kept() < budget / 100 * room_percent()
+    });
+    texture_room_allows(filled, limit, FLOOR, WITHOUT_BUDGET, vram_has_room)
 }
 
 /// The bytes of the card's memory the texture queue leaves free for
@@ -4127,5 +4137,29 @@ float4 lit() : SV_Target { return 1.0; }
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[test]
+    fn texture_room_honours_ceiling_and_dxgi_budget() {
+        use super::texture_room_allows;
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const FLOOR: u64 = 2 * GIB;
+        const WITHOUT: u64 = 4 * GIB;
+        let cap = Some(10 * GIB);
+
+        // Hard limit blocks when filled meets or exceeds cap.
+        assert!(!texture_room_allows(10 * GIB, cap, FLOOR, WITHOUT, Some(true)));
+        assert!(!texture_room_allows(12 * GIB, cap, FLOOR, WITHOUT, None));
+
+        // Under floor and under limit stays allowed.
+        assert!(texture_room_allows(GIB, cap, FLOOR, WITHOUT, Some(false)));
+
+        // Over floor and under limit must still obey adapter DXGI VRAM headroom.
+        assert!(!texture_room_allows(8 * GIB, cap, FLOOR, WITHOUT, Some(false)));
+        assert!(texture_room_allows(8 * GIB, cap, FLOOR, WITHOUT, Some(true)));
+
+        // Missing DXGI budget falls back to limit or default 4 GiB ceiling.
+        assert!(texture_room_allows(8 * GIB, cap, FLOOR, WITHOUT, None));
+        assert!(!texture_room_allows(5 * GIB, None, FLOOR, WITHOUT, None));
     }
 }

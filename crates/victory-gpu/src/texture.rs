@@ -89,20 +89,73 @@ unsafe impl Send for Spare {}
 /// Spare staging buffers by size (a power of two), and their bytes in all.
 static SPARE: Mutex<(std::collections::BTreeMap<u64, Vec<Spare>>, u64)> =
     Mutex::new((std::collections::BTreeMap::new(), 0));
+/// Last millisecond [`staging_buffer`] was called.
+static SPARE_USED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// The largest staging buffer that is pooled (16 MiB covers 4K BC7/BC1 mips).
 const SPARE_MAX_SINGLE: u64 = 16 << 20;
+/// Maximum pooled upload bytes retained after an idle period (`SPARE`).
+const SPARE_IDLE_KEEP: u64 = 64 << 20;
 
-/// The most bytes kept spare: 384 MiB on systems with >= 16 GiB free RAM,
-/// 256 MiB otherwise.
+/// The most bytes kept spare (`VICTORY_STAGING_POOL_MB`, else 192 MiB on
+/// systems with >= 16 GiB free RAM, 128 MiB otherwise).
 fn spare_budget() -> u64 {
+    static OVERRIDE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    if let Some(bytes) = *OVERRIDE.get_or_init(|| {
+        std::env::var("VICTORY_STAGING_POOL_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|mb| mb << 20)
+    }) {
+        return bytes;
+    }
     if crate::host::available_physical_ram().is_some_and(|avail| avail >= 16 << 30) {
-        384 << 20
+        192 << 20
     } else {
-        256 << 20
+        128 << 20
     }
 }
 /// Staging buffers taken from the spare ones, and made, since the start.
 pub(crate) static SPARE_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Frees pooled upload buffers above `SPARE_IDLE_KEEP` once the spare pool has
+/// sat idle for `idle_ms`, retiring popped D3D12 resources outside the lock.
+fn trim_spare_idle(idle_ms: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let last = SPARE_USED_MS.load(Relaxed);
+    if last == 0 || crate::host::now_ms().saturating_sub(last) < idle_ms {
+        return;
+    }
+    let keep = SPARE_IDLE_KEEP.min(spare_budget());
+    let mut retired = Vec::new();
+    {
+        let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        let (buckets, total) = &mut *all;
+        if *total <= keep {
+            return;
+        }
+        let sizes: Vec<u64> = buckets.keys().copied().rev().collect();
+        for size in sizes {
+            if *total <= keep {
+                break;
+            }
+            if let Some(bucket) = buckets.get_mut(&size) {
+                while *total > keep {
+                    let Some(Spare(buffer, _)) = bucket.pop() else {
+                        break;
+                    };
+                    *total -= size;
+                    retired.push(buffer);
+                }
+                if bucket.is_empty() {
+                    buckets.remove(&size);
+                }
+            }
+        }
+    }
+    for buffer in retired {
+        crate::host::retire(buffer);
+    }
+}
 
 /// A mapped upload buffer of `total` bytes for a texture's staging, all
 /// zeros, and its pool size (0: not pooled).
@@ -122,6 +175,7 @@ fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resourc
     if size > SPARE_MAX_SINGLE || !*ON.get_or_init(|| std::env::var_os("VICTORY_STAGING_POOL").is_none_or(|v| v != "0")) {
         return host.upload_buffer(total).map(|(buffer, data)| (buffer, data, 0));
     }
+    SPARE_USED_MS.store(crate::host::now_ms(), std::sync::atomic::Ordering::Relaxed);
     let spare = {
         let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         let taken = all.0.get_mut(&size).and_then(Vec::pop);
@@ -544,14 +598,22 @@ thread_local! {
 }
 
 /// Calls `f` with `size` bytes of this thread's read buffer (their
-/// contents are whatever the last texture left).
+/// contents are whatever the last texture left), shrinking oversized
+/// allocations back to 4 MiB after 4K uploads so worker threads do not pin
+/// tens of megabytes each.
 fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+    const READ_KEEP_MAX: usize = 4 << 20;
     READ.with(|read| {
         let mut read = read.borrow_mut();
         if read.len() < size {
             read.resize(size, 0);
         }
-        f(&mut read[..size])
+        let out = f(&mut read[..size]);
+        if read.capacity() > READ_KEEP_MAX {
+            read.truncate(READ_KEEP_MAX);
+            read.shrink_to_fit();
+        }
+        out
     })
 }
 
@@ -634,6 +696,8 @@ pub(crate) fn let_go() -> [u64; 2] {
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
+    let idle_ms = crate::host::effective_ram_idle_ms();
+    trim_spare_idle(idle_ms);
     let mut map = STAGING.write().unwrap_or_else(|e| e.into_inner());
     let Some(map) = map.as_mut() else {
         return;
@@ -641,7 +705,6 @@ pub(crate) fn let_go_idle() {
     if map.is_empty() {
         return;
     }
-    let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
     // A list that recorded an upload or a check holds the staging until it
     // is reset: one only the table holds is named by no list, recorded or
     // running.
@@ -2144,5 +2207,16 @@ mod hot_texture_tests {
         assert!(last.hash_due(4 + HOT_FRAMES - 1));
         last.unchanged();
         assert!(!last.hash_due(4 + HOT_FRAMES + 1));
+    }
+
+    #[test]
+    fn oversized_thread_read_buffer_shrinks_after_use() {
+        super::with_read(8 << 20, |buf| {
+            assert_eq!(buf.len(), 8 << 20);
+            buf[0] = 0x5a;
+        });
+        super::READ.with(|read| {
+            assert!(read.borrow().capacity() <= 4 << 20);
+        });
     }
 }

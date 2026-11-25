@@ -371,7 +371,7 @@ pub(crate) fn trim() {
     {
         return;
     }
-    let quiet_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    let quiet_ms = crate::host::effective_ram_idle_ms();
     if crate::host::now_ms() < LOADED_AT.load(Ordering::Relaxed) + quiet_ms
         || TRIMMED.swap(true, Ordering::Relaxed)
     {
@@ -578,15 +578,27 @@ pub(crate) fn pipeline(
     Ok(pso)
 }
 
+fn save_every() -> std::time::Duration {
+    static EVERY: OnceLock<std::time::Duration> = OnceLock::new();
+    *EVERY.get_or_init(|| {
+        let secs = std::env::var("VICTORY_LIBRARY_SAVE_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&s| s > 0)
+            .unwrap_or(60);
+        std::time::Duration::from_secs(secs)
+    })
+}
+
 /// Writes the library and the early list if pipelines were added since the
-/// last save and `SAVE_EVERY` has passed (or `now`).
+/// last save and [`save_every`] has passed (or `now`).
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-    const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+    let save_every = save_every();
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
+        if !now && last.is_some_and(|t| t.elapsed() < save_every) {
             return;
         }
         *last = Some(std::time::Instant::now());

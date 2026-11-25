@@ -345,36 +345,41 @@ pub(crate) fn frame_drew(drawn: u64) {
     }
 }
 
-/// Starts the workers (three-quarters of logical processors, 2 to 12,
-/// or `VICTORY_PIPELINE_WORKERS`) on first use.
+/// Starts the workers (a third of logical processors, 2 to 6, or
+/// `VICTORY_PIPELINE_WORKERS`) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
         let default_workers =
-            std::thread::available_parallelism().map_or(2, |n| (n.get() * 3 / 4).clamp(2, 12));
+            std::thread::available_parallelism().map_or(2, |n| (n.get() / 3).clamp(2, 6));
         let workers = std::env::var("VICTORY_PIPELINE_WORKERS")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|&n| n > 0)
             .unwrap_or(default_workers);
+        let world_quiet_workers = (workers / 2).max(2);
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
                 .spawn(move || {
-                    // Below the title's own threads (loading, recording).
+                    // Well below RAGE render/recording threads and `victory-submit`
+                    // so background JIT compilation never starves frame pacing.
                     // SAFETY: a plain call on our own thread.
                     unsafe {
                         use windows::Win32::System::Threading::*;
-                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
                     }
                     loop {
-                        // Throttle to `MENU_WORKERS` only while idle in light menus;
-                        // wake all workers once the world draws OR >= 16 pipelines queue up
-                        // so heavy cutscenes never starve behind 2 threads.
-                        while i >= MENU_WORKERS
+                        // Outside world gameplay, throttle to `MENU_WORKERS` until 16+ queue up.
+                        // Inside world gameplay, keep only half of workers active on tail compiles
+                        // unless a large burst (>= 128) is queued.
+                        while (i >= MENU_WORKERS
                             && !WORLD.load(Ordering::Relaxed)
-                            && WAITING.load(Ordering::Relaxed) < 16
+                            && WAITING.load(Ordering::Relaxed) < 16)
+                            || (i >= world_quiet_workers
+                                && WORLD.load(Ordering::Relaxed)
+                                && WAITING.load(Ordering::Relaxed) < 128)
                         {
                             std::thread::sleep(Duration::from_millis(50));
                         }

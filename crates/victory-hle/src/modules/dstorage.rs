@@ -425,12 +425,28 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let default_workers =
+            std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).clamp(2, 8));
+        let workers = std::env::var("VICTORY_DSTORAGE_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(default_workers);
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
                     .name(format!("dstorage {i}"))
-                    .spawn(|| work(scheduler))
+                    .spawn(|| {
+                        #[cfg(windows)]
+                        // SAFETY: plain call setting priority of our own worker thread.
+                        unsafe {
+                            use windows_sys::Win32::System::Threading::{
+                                GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+                            };
+                            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                        }
+                        work(scheduler);
+                    })
                     .is_ok()
             })
             .count();
