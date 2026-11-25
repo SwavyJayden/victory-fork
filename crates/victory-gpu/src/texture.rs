@@ -630,6 +630,19 @@ fn partial_early() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PARTIAL_EARLY").is_none_or(|v| v != "0"))
 }
 
+fn parse_partial_cooldown(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(6)
+}
+
+/// Frames to wait before re-reading a partly-mapped streamed texture
+/// (`VICTORY_PARTIAL_FRAMES`, default 6).
+fn partial_cooldown() -> u64 {
+    static FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FRAMES.get_or_init(|| parse_partial_cooldown(std::env::var("VICTORY_PARTIAL_FRAMES").ok().as_deref()))
+}
+
 /// [`crate::watch::title_memory_reading`], its wait counted in
 /// [`REFRESH_WAITS`] and, when long, in [`REFRESH_ENDS`].
 fn wait_for_title_memory() -> crate::watch::Reading {
@@ -1410,7 +1423,7 @@ impl Staging {
         // once title memory holds still; told so without the wait
         // (`partial_early`).
         if partial_early()
-            && last.partial.is_some_and(|at| crate::frame::current() < at + 30)
+            && last.partial.is_some_and(|at| crate::frame::current() < at + partial_cooldown())
             && !committed(self.memory, size)
         {
             ended(ends::PARTIAL_SKIPPED);
@@ -1439,11 +1452,11 @@ impl Staging {
             // there, the usual state while it streams in. Read through the
             // copy, which stands unmapped pages (zeros), and upload what
             // is there; nothing at all mapped changes nothing.
-            // shortcut: read again at most every 30 frames (reading around
-            // unmapped pages is slow, and nothing tells us when pages
-            // arrive): a mip that streams in shows up to 30 frames late.
+            // Re-check every `partial_cooldown()` frames (`VICTORY_PARTIAL_FRAMES`,
+            // default 6) so streamed cutscene mips pop in promptly without
+            // hashing on every frame.
             let frame = crate::frame::current();
-            if last.partial.is_some_and(|at| frame < at + 30) {
+            if last.partial.is_some_and(|at| frame < at + partial_cooldown()) {
                 ended(ends::PARTIAL_SKIPPED);
                 return 0;
             }
@@ -2483,5 +2496,14 @@ mod hot_texture_tests {
         super::READ.with(|read| {
             assert!(read.borrow().capacity() <= 4 << 20);
         });
+    }
+
+    #[test]
+    fn partial_cooldown_defaults_to_six_and_honors_env() {
+        assert_eq!(super::parse_partial_cooldown(None), 6);
+        assert_eq!(super::parse_partial_cooldown(Some("0")), 6);
+        assert_eq!(super::parse_partial_cooldown(Some("bad")), 6);
+        assert_eq!(super::parse_partial_cooldown(Some(" 4 ")), 4);
+        assert_eq!(super::parse_partial_cooldown(Some("30")), 30);
     }
 }

@@ -8800,7 +8800,15 @@ impl Meter {
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        let shader_note = match crate::pipeline::loading_status() {
+            Some((done, total, _)) if total > 0 => {
+                let pct = ((done.saturating_mul(100)) / total).min(99);
+                let left = total.saturating_sub(done);
+                format!(" | Shaders {pct}% ({left} left)")
+            }
+            _ => String::new(),
+        };
+        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame{shader_note}");
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,

@@ -117,6 +117,103 @@ pub(crate) fn waiting() -> u64 {
     WAITING.load(Ordering::Relaxed)
 }
 
+/// Whether the game's first loading screen seamlessly paces and boosts worker
+/// threads until early/loading shaders finish compiling (`VICTORY_LOADING_WARM=0` disables).
+fn loading_warm() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LOADING_WARM").is_none_or(|v| v != "0"))
+}
+
+fn parse_env_u64(raw: Option<&str>, default: u64, min: u64, max: u64) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(default, |v| v.clamp(min, max))
+}
+
+fn loading_warm_secs() -> u64 {
+    static SECS: OnceLock<u64> = OnceLock::new();
+    *SECS.get_or_init(|| {
+        parse_env_u64(
+            std::env::var("VICTORY_LOADING_WARM_SECS").ok().as_deref(),
+            120,
+            0,
+            600,
+        )
+    })
+}
+
+fn loading_slice_ms() -> u64 {
+    static MS: OnceLock<u64> = OnceLock::new();
+    *MS.get_or_init(|| {
+        parse_env_u64(
+            std::env::var("VICTORY_LOADING_SLICE_MS").ok().as_deref(),
+            250,
+            10,
+            2000,
+        )
+    })
+}
+
+fn world_entry_wait_ms() -> u64 {
+    static MS: OnceLock<u64> = OnceLock::new();
+    *MS.get_or_init(|| {
+        parse_env_u64(
+            std::env::var("VICTORY_WORLD_ENTRY_WAIT_MS").ok().as_deref(),
+            8000,
+            0,
+            15_000,
+        )
+    })
+}
+
+static WARM_START: OnceLock<Instant> = OnceLock::new();
+static SAVED_AFTER_WARM: AtomicBool = AtomicBool::new(false);
+
+/// Live shader/pipeline warmup progress `(done, total, pre_world)` while any
+/// pipelines are queued; `None` once the queue is empty.
+pub(crate) fn loading_status() -> Option<(u64, u64, bool)> {
+    let w = WAITING.load(Ordering::Relaxed);
+    if w == 0 {
+        return None;
+    }
+    let completed = super::library::LOADED
+        .load(Ordering::Relaxed)
+        .saturating_add(super::library::MADE.load(Ordering::Relaxed));
+    let early = super::library::EARLY.load(Ordering::Relaxed);
+    let total = completed.saturating_add(w).max(early).max(w);
+    let done = total.saturating_sub(w);
+    Some((done, total, !WORLD.load(Ordering::Relaxed)))
+}
+
+fn wait_until_drained(slice: Duration) {
+    if slice.is_zero() || WAITING.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let started = Instant::now();
+    let (lock, done) = &DONE;
+    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while WAITING.load(Ordering::Relaxed) > 0 {
+        let rest = slice.saturating_sub(started.elapsed());
+        if rest.is_zero() {
+            break;
+        }
+        held = done
+            .wait_timeout(held, rest)
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
+    }
+}
+
+fn flush_warm_cache_async() {
+    if SAVED_AFTER_WARM.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("victory-pipeline-flush".into())
+        .spawn(|| {
+            super::library::save(true);
+        });
+}
+
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
@@ -143,7 +240,10 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
     if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
-        super::library::EARLY.fetch_add(1, Ordering::Relaxed);
+        let n = super::library::EARLY.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 16 && loading_warm() {
+            let _ = WARM_START.get_or_init(Instant::now);
+        }
         start(p, EARLY);
     }
 }
@@ -337,10 +437,35 @@ const MENU_WORKERS: usize = 2;
 static WORLD: AtomicBool = AtomicBool::new(false);
 
 /// At every present, with the draws run on the host so far: a frame of many
-/// draws is the world's (menus run about ten).
+/// draws is the world's (menus run about ten). While still on the loading
+/// screen (`!WORLD`) and shaders are compiling, yields a watchdog-safe slice
+/// per loading frame (and a longer one on the first world-entry transition) so
+/// the title's own loading screen stays up seamlessly until cached/early PSOs
+/// finish warming.
 pub(crate) fn frame_drew(drawn: u64) {
     static LAST: AtomicU64 = AtomicU64::new(0);
-    if drawn.saturating_sub(LAST.swap(drawn, Ordering::Relaxed)) >= 60 {
+    let delta = drawn.saturating_sub(LAST.swap(drawn, Ordering::Relaxed));
+    let world = WORLD.load(Ordering::Relaxed);
+    let entering_world = !world && delta >= 60;
+    if !world && loading_warm() && WAITING.load(Ordering::Relaxed) > 0 {
+        let start = *WARM_START.get_or_init(Instant::now);
+        let max_total = Duration::from_secs(loading_warm_secs());
+        if let Some(rem_total) = max_total.checked_sub(start.elapsed())
+            && !rem_total.is_zero()
+        {
+            let slice = if entering_world {
+                Duration::from_millis(world_entry_wait_ms())
+            } else {
+                Duration::from_millis(loading_slice_ms())
+            }
+            .min(rem_total);
+            wait_until_drained(slice);
+            if WAITING.load(Ordering::Relaxed) == 0 {
+                flush_warm_cache_async();
+            }
+        }
+    }
+    if entering_world {
         WORLD.store(true, Ordering::Relaxed);
     }
 }
@@ -364,23 +489,41 @@ fn workers() -> bool {
                 .name(format!("victory-pipelines-{i}"))
                 .spawn(move || {
                     // Well below RAGE render/recording threads and `victory-submit`
-                    // so background JIT compilation never starves frame pacing.
-                    // SAFETY: a plain call on our own thread.
-                    unsafe {
+                    // during gameplay; elevated to BELOW_NORMAL while pre-world
+                    // loading shaders warm so the loading screen finishes fast.
+                    let set_priority = |boost: bool| unsafe {
                         use windows::Win32::System::Threading::*;
-                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
-                    }
+                        let prio = if boost {
+                            THREAD_PRIORITY_BELOW_NORMAL
+                        } else {
+                            THREAD_PRIORITY_LOWEST
+                        };
+                        let _ = SetThreadPriority(GetCurrentThread(), prio);
+                    };
+                    let mut boosted = false;
+                    set_priority(false);
                     loop {
-                        // Outside world gameplay, throttle to `MENU_WORKERS` until 16+ queue up.
-                        // Inside world gameplay, keep only half of workers active on tail compiles
-                        // unless a large burst (>= 128) is queued.
-                        while (i >= MENU_WORKERS
-                            && !WORLD.load(Ordering::Relaxed)
-                            && WAITING.load(Ordering::Relaxed) < 16)
-                            || (i >= world_quiet_workers
-                                && WORLD.load(Ordering::Relaxed)
-                                && WAITING.load(Ordering::Relaxed) < 128)
-                        {
+                        // Outside world gameplay, run all workers at full speed while
+                        // `loading_warm()` has queued pipelines; otherwise throttle to
+                        // `MENU_WORKERS` until 16+ queue up. Inside world gameplay, keep
+                        // only half of workers active on tail compiles unless >= 128 queue.
+                        loop {
+                            let world = WORLD.load(Ordering::Relaxed);
+                            let waiting = WAITING.load(Ordering::Relaxed);
+                            let warm_active = !world && loading_warm() && waiting > 0;
+                            let sleep_menu = !world && !warm_active && i >= MENU_WORKERS && waiting < 16;
+                            let sleep_world = world && i >= world_quiet_workers && waiting < 128;
+                            if !sleep_menu && !sleep_world {
+                                if warm_active != boosted {
+                                    set_priority(warm_active);
+                                    boosted = warm_active;
+                                }
+                                break;
+                            }
+                            if boosted {
+                                set_priority(false);
+                                boosted = false;
+                            }
                             std::thread::sleep(Duration::from_millis(50));
                         }
                         next().make();
@@ -405,10 +548,11 @@ fn workers() -> bool {
 static PEAK: AtomicU64 = AtomicU64::new(0);
 
 /// The workers ran out of work: logged after a batch of 10 or more, and
-/// the cache saved (at most every 20 s).
+/// the cache saved (immediately on first pre-world warmup drain, else at most every 60 s).
 fn drained() {
     use super::library::{EARLY, LOADED, MADE};
-    if PEAK.swap(0, Ordering::Relaxed) >= 10 {
+    let peak = PEAK.swap(0, Ordering::Relaxed);
+    if peak >= 10 {
         tracing::info!(
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
@@ -416,7 +560,11 @@ fn drained() {
             "host pipelines all made"
         );
     }
-    super::library::save(false);
+    if !WORLD.load(Ordering::Relaxed) && loading_warm() && peak >= 16 {
+        flush_warm_cache_async();
+    } else {
+        super::library::save(false);
+    }
 }
 
 #[cfg(test)]
@@ -469,5 +617,20 @@ mod tests {
         assert_eq!(queue.push(&promoted, REQUESTED), None);
         assert!(Arc::ptr_eq(&queue.pop().unwrap(), &earlier));
         assert!(queue.pop().is_none());
+    }
+
+    #[test]
+    fn loading_warm_env_parsing_and_idle_drain_wait() {
+        assert_eq!(parse_env_u64(None, 120, 0, 600), 120);
+        assert_eq!(parse_env_u64(Some(" 45 "), 120, 0, 600), 45);
+        assert_eq!(parse_env_u64(Some("9999"), 120, 0, 600), 600);
+        assert_eq!(parse_env_u64(Some("bad"), 250, 10, 2000), 250);
+        // When nothing is queued, `wait_until_drained` returns immediately.
+        let started = Instant::now();
+        if WAITING.load(Ordering::Relaxed) == 0 {
+            wait_until_drained(Duration::from_secs(5));
+            assert!(started.elapsed() < Duration::from_millis(100));
+            assert!(loading_status().is_none());
+        }
     }
 }

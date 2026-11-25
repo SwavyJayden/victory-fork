@@ -693,6 +693,13 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
+/// Live shader/pipeline warmup progress `(done, total, pre_world)` while any
+/// pipelines are queued; `None` once drained.
+#[cfg(windows)]
+pub(crate) fn loading_status() -> Option<(u64, u64, bool)> {
+    make::loading_status()
+}
+
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
 /// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
