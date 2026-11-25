@@ -2,7 +2,8 @@
 //! so fence signals complete at once.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
@@ -37,7 +38,7 @@ struct Queue {
     /// What the queue was given after a wait for a fence that had not been
     /// reached, in order; it runs when the fence gets there.
     #[cfg(windows)]
-    held: std::sync::Mutex<Vec<Held>>,
+    held: std::sync::Mutex<VecDeque<Held>>,
 }
 const _: () = assert!(std::mem::offset_of!(Queue, kind) == 0x10);
 
@@ -159,6 +160,29 @@ static PRESENTS_BEHIND: AtomicU64 = AtomicU64::new(0);
 /// The queues that hold something (their addresses).
 #[cfg(windows)]
 static WAITING: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+/// Length of `WAITING`, updated under `WAITING`'s lock so fast paths skip
+/// taking the mutex (and spurious worker wakeups) when no queue holds work.
+#[cfg(windows)]
+static WAITING_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(windows)]
+fn add_waiting(q: usize) {
+    let mut waiting = lock(&WAITING);
+    if !waiting.contains(&q) {
+        waiting.push(q);
+        WAITING_COUNT.store(waiting.len(), Ordering::Release);
+    }
+}
+
+#[cfg(windows)]
+fn remove_waiting(q: usize) {
+    let mut waiting = lock(&WAITING);
+    let before = waiting.len();
+    waiting.retain(|&w| w != q);
+    if waiting.len() != before {
+        WAITING_COUNT.store(waiting.len(), Ordering::Release);
+    }
+}
 
 #[cfg(windows)]
 fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -291,13 +315,10 @@ fn submit_cut(this: This, lists: &[This]) {
             let mut held = lock(&queue(this).held);
             for (waits, taken, order) in parts {
                 held.extend(waits.into_iter().map(Held::Value));
-                held.push(Held::Run(taken, order));
+                held.push_back(Held::Run(taken, order));
             }
         }
-        let mut waiting = lock(&WAITING);
-        if !waiting.contains(&(this as usize)) {
-            waiting.push(this as usize);
-        }
+        add_waiting(this as usize);
     }
     // What ran may be what another queue waits for, and what was just
     // given to the queue may be free to run already.
@@ -376,10 +397,7 @@ fn submit_split(this: This, lists: &[This]) {
             from = to;
         }
         lock(&queue(this).held).extend(pieces);
-        let mut waiting = lock(&WAITING);
-        if !waiting.contains(&(this as usize)) {
-            waiting.push(this as usize);
-        }
+        add_waiting(this as usize);
     }
     // What ran may be what another queue waits for, and what was just held
     // may be free to run already.
@@ -397,7 +415,7 @@ fn hold(this: This, what: impl FnOnce() -> Held) -> bool {
     if held.is_empty() {
         return false;
     }
-    held.push(what());
+    held.push_back(what());
     true
 }
 
@@ -415,6 +433,9 @@ static RELEASING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(windows)]
 pub(crate) fn release_held(all: bool) {
     if !all && behind() {
+        if WAITING_COUNT.load(Ordering::Acquire) == 0 {
+            return;
+        }
         // A thread of ours runs what is free to run ([`behind`]).
         wake();
         return;
@@ -484,19 +505,21 @@ fn worker() {
             }
             *work = false;
         }
-        let started = std::time::Instant::now();
-        let (user, kernel) = crate::framelog::thread_times();
-        if crate::framelog::on() {
+        let log = crate::framelog::on();
+        let timing = log.then(|| {
             crate::framelog::add(crate::framelog::T::WorkerLooks, 1);
             if crate::framelog::on_slow_core() {
                 crate::framelog::add(crate::framelog::T::WorkerSlow, 1);
             }
-        }
+            (std::time::Instant::now(), crate::framelog::thread_times())
+        });
         release_held_now(false);
-        let (user_now, kernel_now) = crate::framelog::thread_times();
-        crate::framelog::add(crate::framelog::T::WorkerUs, started.elapsed().as_micros() as u64);
-        crate::framelog::add(crate::framelog::T::WorkerUserUs, user_now.saturating_sub(user));
-        crate::framelog::add(crate::framelog::T::WorkerKernelUs, kernel_now.saturating_sub(kernel));
+        if let Some((started, (user, kernel))) = timing {
+            let (user_now, kernel_now) = crate::framelog::thread_times();
+            crate::framelog::add(crate::framelog::T::WorkerUs, started.elapsed().as_micros() as u64);
+            crate::framelog::add(crate::framelog::T::WorkerUserUs, user_now.saturating_sub(user));
+            crate::framelog::add(crate::framelog::T::WorkerKernelUs, kernel_now.saturating_sub(kernel));
+        }
     }
 }
 
@@ -518,7 +541,7 @@ pub(crate) fn before_sync() {
 
 #[cfg(windows)]
 fn release_held_now(all: bool) {
-    if lock(&WAITING).is_empty() {
+    if WAITING_COUNT.load(Ordering::Acquire) == 0 {
         return;
     }
     let _one = lock(&RELEASING);
@@ -530,15 +553,17 @@ fn release_held_now(all: bool) {
         }
     }
     let _leave = Leave(was_here);
+    let mut queues: Vec<usize> = Vec::new();
     loop {
-        let queues = lock(&WAITING).clone();
+        queues.clear();
+        queues.extend_from_slice(&lock(&WAITING));
         let mut moved = false;
-        for q in queues {
+        for &q in &queues {
             // SAFETY: a live queue: one released is taken off the list.
             let line = unsafe { &(*(q as *const Queue)).held };
             let mut held = lock(line);
             loop {
-                match held.first() {
+                match held.front() {
                     None | Some(Held::Running) => break,
                     Some(&Held::Wait(fence, value))
                         if !all && crate::fence::completed(fence as This) < value =>
@@ -548,7 +573,10 @@ fn release_held_now(all: bool) {
                     Some(Held::Value(wait)) if !all && !value_met(wait) => break,
                     Some(_) => {}
                 }
-                match held.remove(0) {
+                let Some(next) = held.pop_front() else {
+                    break;
+                };
+                match next {
                     Held::Wait(..) | Held::Running => {}
                     Held::Value(wait) => {
                         // Passed at a present without being met: what the
@@ -581,7 +609,7 @@ fn release_held_now(all: bool) {
                             let waits = held.iter().take_while(|h| matches!(h, Held::Value(_))).count();
                             if waits > 0
                                 && matches!(held.get(waits), Some(Held::Run(..)))
-                                && held[..waits].iter().all(|h| matches!(h, Held::Value(w) if w.met()))
+                                && held.iter().take(waits).all(|h| matches!(h, Held::Value(w) if w.met()))
                             {
                                 crate::copystat::add(crate::copystat::C::PartsTogether, 1);
                             }
@@ -595,12 +623,12 @@ fn release_held_now(all: bool) {
                                 // The line is open while this part is
                                 // prepared and sent: only this thread takes
                                 // from its head (one releaser at a time).
-                                held.insert(0, Held::Running);
+                                held.push_front(Held::Running);
                                 drop(held);
                                 host.execute_late(lists, order);
                                 held = lock(line);
-                                if matches!(held.first(), Some(Held::Running)) {
-                                    held.remove(0);
+                                if matches!(held.front(), Some(Held::Running)) {
+                                    held.pop_front();
                                 }
                             } else {
                                 host.execute_late(lists, order);
@@ -644,12 +672,12 @@ fn release_held_now(all: bool) {
                         } else {
                             // The line is open while the frame is shown,
                             // as it is while a submission is prepared.
-                            held.insert(0, Held::Running);
+                            held.push_front(Held::Running);
                             drop(held);
                             show();
                             held = lock(line);
-                            if matches!(held.first(), Some(Held::Running)) {
-                                held.remove(0);
+                            if matches!(held.front(), Some(Held::Running)) {
+                                held.pop_front();
                             }
                         }
                         PRESENTS_HELD.fetch_sub(1, Ordering::Relaxed);
@@ -665,7 +693,7 @@ fn release_held_now(all: bool) {
                 moved = true;
             }
             if held.is_empty() {
-                lock(&WAITING).retain(|&w| w != q);
+                remove_waiting(q);
             }
         }
         if !moved {
@@ -758,7 +786,7 @@ extern "system" fn release(this: This) -> u32 {
         #[cfg(windows)]
         {
             let _one = lock(&RELEASING);
-            lock(&WAITING).retain(|&q| q != this as usize);
+            remove_waiting(this as usize);
         }
     })
 }
@@ -767,10 +795,10 @@ extern "system" fn release(this: This) -> u32 {
 /// that waits for a fence keeps them until the fence is reached.
 extern "system" fn execute(this: This, count: u32, lists: *const This) {
     #[cfg(windows)]
-    let started = std::time::Instant::now();
+    let started = crate::framelog::on().then(std::time::Instant::now);
     execute_now(this, count, lists);
     #[cfg(windows)]
-    {
+    if let Some(started) = started {
         let us = started.elapsed().as_micros() as u64;
         crate::framelog::add(crate::framelog::T::ExecuteUs, us);
         crate::framelog::here(crate::framelog::H::ExecuteUs, us);
@@ -803,10 +831,7 @@ fn execute_now(this: This, count: u32, lists: *const This) {
                     tracing::info!(kind = queue(this).kind, ?unmet, "a submission is held for a memory value");
                 }
                 lock(&queue(this).held).extend(unmet.into_iter().map(Held::Value));
-                let mut waiting = lock(&WAITING);
-                if !waiting.contains(&(this as usize)) {
-                    waiting.push(this as usize);
-                }
+                add_waiting(this as usize);
             }
         }
         let kept = hold(this, || {
@@ -919,7 +944,7 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
             let mut held = lock(&queue(this).held);
             let behind = !held.is_empty() || now < value;
             if behind && waits() {
-                held.push(Held::Wait(fence as usize, value));
+                held.push_back(Held::Wait(fence as usize, value));
             }
             behind
         };
@@ -936,12 +961,7 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
             }
         }
         if behind && waits() {
-            {
-                let mut waiting = lock(&WAITING);
-                if !waiting.contains(&(this as usize)) {
-                    waiting.push(this as usize);
-                }
-            }
+            add_waiting(this as usize);
             // The fence may have got there meanwhile.
             release_held(false);
         }

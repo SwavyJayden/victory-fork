@@ -16,7 +16,7 @@
 //! (every mip and array slice), depth and stencil planes are not.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
@@ -89,8 +89,18 @@ unsafe impl Send for Spare {}
 /// Spare staging buffers by size (a power of two), and their bytes in all.
 static SPARE: Mutex<(std::collections::BTreeMap<u64, Vec<Spare>>, u64)> =
     Mutex::new((std::collections::BTreeMap::new(), 0));
-/// The most bytes kept spare, and the largest buffer that is pooled.
-const SPARE_MOST: (u64, u64) = (256 << 20, 8 << 20);
+/// The largest staging buffer that is pooled (16 MiB covers 4K BC7/BC1 mips).
+const SPARE_MAX_SINGLE: u64 = 16 << 20;
+
+/// The most bytes kept spare: 384 MiB on systems with >= 16 GiB free RAM,
+/// 256 MiB otherwise.
+fn spare_budget() -> u64 {
+    if crate::host::available_physical_ram().is_some_and(|avail| avail >= 16 << 30) {
+        384 << 20
+    } else {
+        256 << 20
+    }
+}
 /// Staging buffers taken from the spare ones, and made, since the start.
 pub(crate) static SPARE_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
@@ -103,13 +113,13 @@ pub(crate) static SPARE_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std:
 /// threads for some 100 uploads, most of it the graphics kernel waiting)
 /// and more to free on the thread that submits. A streaming burst is 200
 /// to 500 uploads in a frame (run 222), and those are the frames that
-/// dip. Buffers of up to 8 MiB are now kept by size and used again,
+/// dip. Buffers of up to 16 MiB are kept by size and used again,
 /// zeroed as a new one is (levels not there yet must read as zeros).
 /// `VICTORY_STAGING_POOL=0`: made and freed each time, as before.
 fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resource, *mut u8, u64)> {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let size = total.max(64 << 10).next_power_of_two();
-    if size > SPARE_MOST.1 || !*ON.get_or_init(|| std::env::var_os("VICTORY_STAGING_POOL").is_none_or(|v| v != "0")) {
+    if size > SPARE_MAX_SINGLE || !*ON.get_or_init(|| std::env::var_os("VICTORY_STAGING_POOL").is_none_or(|v| v != "0")) {
         return host.upload_buffer(total).map(|(buffer, data)| (buffer, data, 0));
     }
     let spare = {
@@ -185,7 +195,7 @@ unsafe impl Send for Staging {}
 // SAFETY: as above.
 unsafe impl Sync for Staging {}
 
-static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
+static STAGING: RwLock<Option<HashMap<usize, Arc<Staging>>>> = RwLock::new(None);
 
 /// The buffer a texture the host writes is copied through into the texture
 /// of a view the title placed in its memory in another format
@@ -515,8 +525,9 @@ impl Drop for Staging {
         // Nothing holds the staging any more (lists keep it until they are
         // reset, after their submission has run): its buffer is spare.
         if self.pooled != 0 {
+            let cap = spare_budget();
             let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-            if all.1 + self.pooled <= SPARE_MOST.0 {
+            if all.1 + self.pooled <= cap {
                 all.1 += self.pooled;
                 all.0.entry(self.pooled).or_default().push(Spare(self.buffer.clone(), self.data as usize));
             }
@@ -530,7 +541,7 @@ impl Drop for Staging {
 pub(crate) fn memory() -> [u64; 3] {
     use std::sync::atomic::Ordering::Relaxed;
     let kept = STAGING
-        .lock()
+        .read()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .map_or(0, |map| map.len() as u64);
@@ -557,7 +568,7 @@ pub(crate) fn let_go() -> [u64; 2] {
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = STAGING.write().unwrap_or_else(|e| e.into_inner());
     let Some(map) = map.as_mut() else {
         return;
     };
@@ -587,12 +598,20 @@ pub(crate) fn let_go_idle() {
 
 /// Textures the host GPU wrote by a copy or resolve: their contents are on
 /// the host, not in title memory, which stays as it was.
-static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+static HOST_WRITTEN: RwLock<Option<std::collections::HashSet<usize>>> = RwLock::new(None);
 
 /// A host copy or resolve writes `resource`.
 pub(crate) fn host_written(resource: This) {
+    if HOST_WRITTEN
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|set| set.contains(&(resource as usize)))
+    {
+        return;
+    }
     let new = {
-        let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        let mut set = HOST_WRITTEN.write().unwrap_or_else(|e| e.into_inner());
         set.get_or_insert_with(Default::default).insert(resource as usize)
     };
     // Diagnostics (run 177): where its title memory is, for placed views
@@ -657,7 +676,7 @@ pub(crate) fn placed_in_host_written(address: u64, desc: &[u32; 14]) {
 /// memory.
 pub(crate) fn host_wrote(resource: usize) -> bool {
     HOST_WRITTEN
-        .lock()
+        .read()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .is_some_and(|set| set.contains(&resource))
@@ -665,13 +684,17 @@ pub(crate) fn host_wrote(resource: usize) -> bool {
 
 /// The title released a resource.
 pub(crate) fn forget(resource: usize) {
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(map) = map.as_mut() {
-        map.remove(&resource);
+    {
+        let mut map = STAGING.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(map) = map.as_mut() {
+            map.remove(&resource);
+        }
     }
-    let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(set) = set.as_mut() {
-        set.remove(&resource);
+    {
+        let mut set = HOST_WRITTEN.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(set) = set.as_mut() {
+            set.remove(&resource);
+        }
     }
     // Its memory may be given to other textures now (run 177: most of the
     // "HERO LEAD" lines were views in memory a released texture had held).
@@ -696,7 +719,7 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
 /// destination state.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
     let host_written = HOST_WRITTEN
-        .lock()
+        .read()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .is_some_and(|set| set.contains(&(resource as usize)));
@@ -1133,7 +1156,7 @@ impl Staging {
                     return false;
                 }
                 last.hash = Some(hash);
-                if read.iter().all(|&b| b == 0) {
+                if all_zero(read) {
                     return false;
                 }
                 self.detile(read);
@@ -1236,7 +1259,7 @@ impl Staging {
             u32::MAX
         };
         #[cfg(feature = "diagnostics")]
-        if tiled.iter().all(|&b| b == 0) {
+        if all_zero(tiled) {
             tracing::debug!(
                 memory = ?self.memory,
                 desc = ?self.layout.desc,
@@ -1303,11 +1326,17 @@ fn subresource_bytes(
     exact.min(total.saturating_sub(offset)) as usize
 }
 
+/// Vectorizable all-zero check, 32 bytes at a time.
+fn all_zero(bytes: &[u8]) -> bool {
+    let (chunks, tail) = bytes.as_chunks::<32>();
+    chunks.iter().all(|c| *c == [0u8; 32]) && tail.iter().all(|&b| b == 0)
+}
+
 /// Lets go of a title texture's staging buffer (lists that recorded an
 /// upload from it hold it until they have run); the next upload makes one
 /// anew.
 pub(crate) fn unstage(resource: This) {
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = STAGING.write().unwrap_or_else(|e| e.into_inner());
     if let Some(map) = map.as_mut() {
         map.remove(&(resource as usize));
     }
@@ -1315,7 +1344,7 @@ pub(crate) fn unstage(resource: This) {
 
 /// Where a staged title texture's memory is: address and bytes.
 pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
-    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let map = STAGING.read().unwrap_or_else(|e| e.into_inner());
     let (at, len) = map.as_ref()?.get(&(resource as usize))?.memory();
     Some((at as u64, len as u64))
 }
@@ -1360,13 +1389,13 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn staged_state(resource: This) -> Option<(bool, bool)> {
     use std::sync::atomic::Ordering::Relaxed;
-    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let map = STAGING.read().unwrap_or_else(|e| e.into_inner());
     let staging = map.as_ref()?.get(&(resource as usize))?;
     Some((staging.uploaded.load(Relaxed), staging.dirty.load(Relaxed)))
 }
 
 pub(crate) fn is_staged(resource: This) -> bool {
-    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let map = STAGING.read().unwrap_or_else(|e| e.into_inner());
     map.as_ref().is_some_and(|map| map.contains_key(&(resource as usize)))
 }
 
@@ -1374,7 +1403,7 @@ pub(crate) fn is_staged(resource: This) -> bool {
 /// if the texture has been staged for upload.
 pub(crate) fn staged(resource: This) -> Option<(u64, bool)> {
     let s = {
-        let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        let map = STAGING.read().unwrap_or_else(|e| e.into_inner());
         map.as_ref()?.get(&(resource as usize))?.clone()
     };
     let size = s.layout.size as usize;
@@ -1416,22 +1445,64 @@ fn by_query() -> bool {
 /// trimmed), and a one-byte read through the kernel says.
 /// A page that is committed and may not be read counts as not there, which
 /// is what the callers ask for: they read or write the memory next.
+/// Queries up to 256 arbitrary 4 KiB page-aligned addresses in one
+/// `K32QueryWorkingSetEx` call, falling back to a one-byte kernel read
+/// only for pages not currently in the working set.
+fn query_pages(pages: &[usize], out: &mut [bool]) {
+    use std::mem::MaybeUninit;
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    debug_assert!(pages.len() <= 256 && pages.len() == out.len());
+    let n = pages.len();
+    if n == 0 {
+        return;
+    }
+    let mut info: [MaybeUninit<PSAPI_WORKING_SET_EX_INFORMATION>; 256] =
+        [const { MaybeUninit::uninit() }; 256];
+    for (entry, &page_addr) in info[..n].iter_mut().zip(pages) {
+        // SAFETY: plain zeroed POD struct with VirtualAddress populated.
+        let mut item: PSAPI_WORKING_SET_EX_INFORMATION = unsafe { std::mem::zeroed() };
+        item.VirtualAddress = page_addr as *mut _;
+        entry.write(item);
+    }
+    // SAFETY: `info[..n]` is initialized; our own process handle.
+    let asked = unsafe {
+        K32QueryWorkingSetEx(
+            GetCurrentProcess(),
+            info.as_mut_ptr().cast(),
+            (n * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32,
+        )
+    } != 0;
+    for i in 0..n {
+        // SAFETY: `info[i]` was initialized above and filled by the query.
+        let valid = asked && unsafe { info[i].assume_init_ref().VirtualAttributes.Flags } & 1 != 0;
+        let mut byte = [0u8];
+        out[i] = valid || crate::host::read_into(pages[i] as *const u8, &mut byte);
+    }
+}
+
 fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
+    use std::mem::MaybeUninit;
     use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     const KERNEL_PAGE: usize = 4096;
     let (first, last) = (at / KERNEL_PAGE, at.saturating_add(len - 1) / KERNEL_PAGE);
     let of = last - first + 1;
     let mut there = 0;
-    // SAFETY: plain data.
-    let mut info: [PSAPI_WORKING_SET_EX_INFORMATION; 256] = unsafe { std::mem::zeroed() };
+    let mut info: [MaybeUninit<PSAPI_WORKING_SET_EX_INFORMATION>; 256] =
+        [const { MaybeUninit::uninit() }; 256];
     let mut page = first;
     while page <= last {
         let n = (last - page + 1).min(info.len());
         for (i, entry) in info[..n].iter_mut().enumerate() {
-            entry.VirtualAddress = ((page + i) * KERNEL_PAGE) as *mut _;
+            // SAFETY: plain zeroed POD struct with VirtualAddress populated.
+            let mut item: PSAPI_WORKING_SET_EX_INFORMATION = unsafe { std::mem::zeroed() };
+            item.VirtualAddress = ((page + i) * KERNEL_PAGE) as *mut _;
+            entry.write(item);
         }
-        // SAFETY: `n` entries of the size given; our own process.
+        // SAFETY: `info[..n]` is initialized; our own process.
         let asked = unsafe {
             K32QueryWorkingSetEx(
                 GetCurrentProcess(),
@@ -1441,8 +1512,8 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
         } != 0;
         for (i, entry) in info[..n].iter().enumerate() {
             // Bit 0 of the answer: the page is in the working set.
-            // SAFETY: plain data the query filled in.
-            let valid = asked && unsafe { entry.VirtualAttributes.Flags } & 1 != 0;
+            // SAFETY: `entry` was initialized above and filled by the query.
+            let valid = asked && unsafe { entry.assume_init_ref().VirtualAttributes.Flags } & 1 != 0;
             let mut byte = [0u8];
             if valid || crate::host::read_into(((page + i) * KERNEL_PAGE) as *const u8, &mut byte) {
                 there += 1;
@@ -1485,35 +1556,55 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     }
     let start = at as usize;
     let end = start.saturating_add(len);
-    if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
-        return 0;
-    }
     if !by_query() {
+        const KERNEL_PAGE: usize = 4096;
+        let first_page = start & !(KERNEL_PAGE - 1);
+        let last_page = (end - 1) & !(KERNEL_PAGE - 1);
+        // Probe both endpoints in a single K32QueryWorkingSetEx syscall.
+        if first_page == last_page {
+            let mut ok = [false];
+            query_pages(&[first_page], &mut ok);
+            return if ok[0] { len as u64 } else { 0 };
+        }
+        let mut end_ok = [false; 2];
+        query_pages(&[first_page, last_page], &mut end_ok);
+        if !end_ok[0] && !end_ok[1] {
+            return 0;
+        }
         static BY_PAGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *BY_PAGE.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_PAGE").is_some_and(|v| v == "1")) {
             // By page, without the walk: whole pages, cut to the range.
             let (there, _) = readable(start, len, false);
             return (there as u64 * 4096).min(len as u64);
         }
-        // By 64 KiB block, one page asked of each: the title's memory is
-        // mapped in blocks of that size (the console's page), and the
-        // answer is a measure of how much of a texture has arrived, not a
-        // promise that every byte can be read (the upload reads through the
-        // kernel). By page, a texture half there cost a failed kernel read
-        // for each of its missing pages, every frame it stayed due: 1,663
-        // textures "uploaded in part" kept the pass over the heap's views at
-        // 90-160 ms a frame (run 81). `VICTORY_MAPPED_BY_PAGE=1`: by page.
+        // By 64 KiB block, one page asked of each, batched up to 256 blocks
+        // (16 MiB) per K32QueryWorkingSetEx call.
         const BLOCK: usize = 64 << 10;
         let mut there = 0u64;
         let mut block = start & !(BLOCK - 1);
+        let mut addrs = [0usize; 256];
+        let mut spans = [0u64; 256];
+        let mut ok = [false; 256];
         while block < end {
-            let (lo, hi) = (block.max(start), block.saturating_add(BLOCK).min(end));
-            if readable(lo, 1, true).0 == 1 {
-                there += (hi - lo) as u64;
+            let mut count = 0usize;
+            while block < end && count < 256 {
+                let (lo, hi) = (block.max(start), block.saturating_add(BLOCK).min(end));
+                addrs[count] = lo & !(KERNEL_PAGE - 1);
+                spans[count] = (hi - lo) as u64;
+                count += 1;
+                block = block.saturating_add(BLOCK);
             }
-            block = block.saturating_add(BLOCK);
+            query_pages(&addrs[..count], &mut ok[..count]);
+            for i in 0..count {
+                if ok[i] {
+                    there += spans[i];
+                }
+            }
         }
         return there;
+    }
+    if !committed_by_query(at, 1) && !committed_by_query((end - 1) as *const u8, 1) {
+        return 0;
     }
     let (mut p, mut there) = (start, 0u64);
     while p < end {
@@ -1535,14 +1626,20 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
 
 /// The staging state of a title texture, made on first use.
 fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
-    // Asked before the table is locked: the sweep lets go of a staging
-    // buffer with its texture's host side locked, in that order.
-    let on_demand = crate::resource::host_tiled(resource).is_some();
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let map = map.get_or_insert_with(HashMap::new);
-    if let Some(s) = map.get(&(resource as usize)) {
+    // Fast read path: avoid exclusive contention across recording threads.
+    if let Some(s) = STAGING
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|map| map.get(&(resource as usize)))
+    {
         return Some(s.clone());
     }
+    // Asked before the table is locked: the sweep lets go of a staging
+    // buffer with its texture's host side locked, in that order. Perform
+    // footprint queries, D3D12 resource creation, and buffer zeroing outside
+    // the global STAGING lock so other recording threads never stall on them.
+    let on_demand = crate::resource::host_tiled(resource).is_some();
     let (memory, desc) = crate::resource::texture_memory(resource)?;
     let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
     else {
@@ -1614,8 +1711,9 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         waiting: std::sync::atomic::AtomicU64::new(0),
         pooled,
     });
-    map.insert(resource as usize, s.clone());
-    Some(s)
+    let mut map = STAGING.write().unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(HashMap::new);
+    Some(map.entry(resource as usize).or_insert(s).clone())
 }
 
 #[cfg(test)]
@@ -1766,6 +1864,56 @@ mod title_memory_tests {
         layout
             .detile(&tiled, 0, 0, &mut buf[..span], 256, 256 * 4)
             .expect("exact unpadded staging slice suffices");
+    }
+
+    #[test]
+    fn all_zero_matches_naive_across_lengths() {
+        use super::all_zero;
+        for len in [0, 1, 7, 31, 32, 33, 63, 64, 65, 255, 256, 257] {
+            let mut buf = vec![0u8; len];
+            assert!(all_zero(&buf), "len {len}");
+            for pos in [0, len / 2, len.saturating_sub(1)] {
+                if pos < len {
+                    buf[pos] = 1;
+                    assert!(!all_zero(&buf), "len {len} pos {pos}");
+                    buf[pos] = 0;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn batched_mapped_bytes_handles_unmapped_partial_and_large_spans() {
+        use super::mapped_bytes;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const BLOCK: usize = 64 << 10;
+        // 260 blocks (> 256 batch size, 16.25 MiB) to exercise multi-batch querying.
+        const TOTAL: usize = 260 * BLOCK;
+        // SAFETY: reserve and commit selective blocks inside our own address space.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), TOTAL, MEM_RESERVE, PAGE_READWRITE).cast::<u8>();
+            assert!(!base.is_null());
+            // Entirely uncommitted: 0.
+            assert_eq!(mapped_bytes(base, TOTAL), 0);
+            assert_eq!(mapped_bytes(base, 4096), 0);
+            // Commit block 0, block 128, and block 259 (endpoints + interior across batch boundary).
+            for b in [0usize, 128, 259] {
+                let p = VirtualAlloc(base.add(b * BLOCK).cast(), BLOCK, MEM_COMMIT, PAGE_READWRITE);
+                assert!(!p.is_null());
+                base.add(b * BLOCK).write_volatile(0x5a);
+            }
+            // Single-page range inside committed block 0.
+            assert_eq!(mapped_bytes(base.add(100), 500), 500);
+            // Full 260-block span: exactly 3 committed blocks.
+            assert_eq!(mapped_bytes(base, TOTAL), (3 * BLOCK) as u64);
+            // Unaligned start/end spanning block 0 tail + uncommitted block 1 + block 128.
+            let unaligned_start = base.add(BLOCK - 1024);
+            let unaligned_len = 1024 + 127 * BLOCK + 4096;
+            assert_eq!(mapped_bytes(unaligned_start, unaligned_len), (1024 + 4096) as u64);
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
     }
 }
 

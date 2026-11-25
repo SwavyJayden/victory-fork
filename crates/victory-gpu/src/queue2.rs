@@ -103,12 +103,25 @@ struct Landing {
 /// Which landing buffer (its size, and the fence value it is held until)
 /// takes `bytes` when the host's fence has reached `completed`: the
 /// smallest free one that holds them.
+#[cfg(test)]
 fn pick_landing(landings: &[(u64, u64)], bytes: u64, completed: u64) -> Option<usize> {
+    pick_landing_by(landings, bytes, completed, |&(size, until)| (size, until))
+}
+
+fn pick_landing_by<T>(
+    landings: &[T],
+    bytes: u64,
+    completed: u64,
+    info: impl Fn(&T) -> (u64, u64),
+) -> Option<usize> {
     landings
         .iter()
         .enumerate()
-        .filter(|&(_, &(size, until))| until <= completed && size >= bytes)
-        .min_by_key(|&(_, &(size, _))| size)
+        .filter(|(_, item)| {
+            let (size, until) = info(item);
+            until <= completed && size >= bytes
+        })
+        .min_by_key(|(_, item)| info(item).0)
         .map(|(at, _)| at)
 }
 
@@ -383,8 +396,7 @@ impl Second {
     /// way.
     pub(crate) fn landing(&self, bytes: u64, completed: u64, until: u64) -> Option<ID3D12Resource> {
         let mut landings = lock(&self.landings);
-        let sizes: Vec<(u64, u64)> = landings.iter().map(|l| (l.size, l.until)).collect();
-        if let Some(at) = pick_landing(&sizes, bytes, completed) {
+        if let Some(at) = pick_landing_by(&landings, bytes, completed, |l| (l.size, l.until)) {
             landings[at].until = until;
             return Some(landings[at].buffer.clone());
         }
@@ -419,9 +431,9 @@ impl Second {
             };
             match (made, buffer) {
                 (Ok(()), Some(buffer)) => {
-                    let wide: Vec<u16> = "victory landing buffer (title bytes on their way up)".encode_utf16().chain([0]).collect();
-                    // SAFETY: a live buffer and a terminated string.
-                    let _ = unsafe { buffer.SetName(windows::core::PCWSTR(wide.as_ptr())) };
+                    crate::host::name(&buffer, || {
+                        "victory landing buffer (title bytes on their way up)".to_owned()
+                    });
                     landings.push(Landing {
                         buffer: buffer.clone(),
                         size,
