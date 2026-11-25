@@ -948,7 +948,17 @@ fn mesh_pipeline(
             bytes.add(at + size_of::<T>()).write_bytes(0, size_of::<Sub<T>>() - at - size_of::<T>());
         }
     }
-    let build = |depth: Sub<_>| {
+    #[allow(clippy::too_many_arguments)]
+    fn build<D>(
+        device: &ID3D12Device,
+        root: &ID3D12RootSignature,
+        ms: D3D12_SHADER_BYTECODE,
+        ps: D3D12_SHADER_BYTECODE,
+        g: &GraphicsState,
+        blend: D3D12_BLEND_DESC,
+        depth: Sub<D>,
+        name: &str,
+    ) -> windows::core::Result<ID3D12PipelineState> {
         let mut stream = Stream {
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
@@ -977,11 +987,29 @@ fn mesh_pipeline(
         zero_gaps(&mut stream.samples);
         zero_gaps(&mut stream.topology);
         stream_pipeline(device, &mut stream, name)
-    };
+    }
     if depth_bounds {
-        build(Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, g.depth1()))
+        build(
+            device,
+            root,
+            ms,
+            ps,
+            g,
+            blend,
+            Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, g.depth1()),
+            name,
+        )
     } else {
-        build(Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, depth))
+        build(
+            device,
+            root,
+            ms,
+            ps,
+            g,
+            blend,
+            Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, depth),
+            name,
+        )
     }
 }
 
