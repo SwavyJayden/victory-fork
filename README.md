@@ -60,10 +60,17 @@ Speed and memory:
 
 - Translated shaders get clean-up passes over the finished module (dead code, constant folding, reuse of values, branch facts); the pack's host instruction count falls by about 43 %, worth about 20 ms of GPU time per frame on the test machine (`VICTORY_SHADER_OPT=0` turns them off).
 
-Most of the newer speed changes sit behind environment switches that are off
+Many of the newer speed changes sit behind environment switches that are off
 by default (`VICTORY_LATE_WAIT`, `VICTORY_RELAY`, `VICTORY_WIDE_BACK`,
 `VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_INPLACE`, `VICTORY_BVH_BUILDER`, ...).
 Each is described in a comment where it is read.
+
+Texture refreshes no longer wait for the runtime to finish remapping title
+memory: they read through the kernel, or try again a frame later, instead. The
+wait was seconds a frame while the world streams in (issue #178); on an
+RX 6800 XT it was 3.1-4.5 s of a 4.4-5.6 s frame in the opening cutscene, and
+removing it brought "textures" down to 10-46 ms. `VICTORY_TEXTURE_NO_WAIT=0`
+restores the wait.
 
 ### Known problems
 

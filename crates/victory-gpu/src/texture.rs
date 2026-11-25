@@ -284,8 +284,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 }
 
 /// Whether a texture refresh that finds the runtime remapping title memory
-/// goes on without waiting for it (`VICTORY_TEXTURE_NO_WAIT=1`; off by
-/// default).
+/// goes on without waiting for it (on; `VICTORY_TEXTURE_NO_WAIT=0` waits).
 ///
 /// A texture whose memory is all mapped is read in place, under a lock
 /// the runtime takes alone while it changes a mapping
@@ -295,19 +294,29 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 /// have 4, 15 and 16 frame lines with over 300 ms of "textures", up to
 /// 3,708 ms, and on every one of them the wait for this lock is the whole
 /// of it (1,345 of 1,381 ms; 3,630 of 3,708; the write-watch askings 3-12
-/// ms, the texture's own lock 0).
+/// ms, the texture's own lock 0). On an RX 6800 XT the same wait was
+/// 3.1-4.5 s of a 4.4-5.6 s frame during the opening cutscene; with the
+/// wait gone, "textures" fell to 10-46 ms and the frame to 1.2-1.5 s
+/// (issue #178 has the same measurement on an RX 7900 XT).
 ///
-/// With the switch the refresh asks for the lock without waiting. If the
-/// runtime has it, the texture is read through the kernel instead, which
-/// needs no lock: it fails if a page is not there, and then the texture is
-/// left as it is and read at its next refresh, a frame later. A read
-/// through the kernel costs about 0.6 ms a megabyte against 0.3 in place.
+/// The refresh asks for the lock without waiting. If the runtime has it,
+/// the texture is read through the kernel instead, which needs no lock: it
+/// fails if a page is not there, and then the texture is left as it is and
+/// read at its next refresh, a frame later. A read through the kernel
+/// costs about 0.6 ms a megabyte against 0.3 in place, and only when a
+/// remap is under way; the in-place read is unchanged otherwise.
 ///
 /// What changes for the picture: a texture that arrives while the runtime
 /// is remapping may show a frame later. It never shows partly read.
 fn no_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| no_wait_from(std::env::var("VICTORY_TEXTURE_NO_WAIT").ok().as_deref()))
+}
+
+/// [`no_wait`] from the variable's value: on unless it is `0` (surrounding
+/// spaces ignored), so an unset variable means on.
+fn no_wait_from(value: Option<&str>) -> bool {
+    value.is_none_or(|value| value.trim() != "0")
 }
 
 /// Since the last frame-rate line, with [`no_wait`]: refreshes that read
@@ -1156,6 +1165,16 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 #[cfg(test)]
 mod title_memory_tests {
     use super::with_title;
+
+    #[test]
+    fn texture_refreshes_do_not_wait_unless_asked_to() {
+        use super::no_wait_from;
+        assert!(no_wait_from(None));
+        assert!(no_wait_from(Some("1")));
+        assert!(no_wait_from(Some("yes")));
+        assert!(!no_wait_from(Some("0")));
+        assert!(!no_wait_from(Some(" 0 ")));
+    }
 
     /// Title memory whose tail is reserved and not committed reads through
     /// the copy as its bytes and then zeros, without a fault; so does
