@@ -408,10 +408,6 @@ pub(crate) fn window_line(frames: f64) {
     );
 }
 
-/// Matches `victory_shader::emit::USER_DISPATCH_THREADS_X` (`0x104`): when non-zero,
-/// compute dispatches clamp active X threads to this count.
-const USER_DISPATCH_THREADS_X: u32 = 0x104;
-
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -1017,7 +1013,9 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{
+            USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+        };
         if kind == USER_DISPATCH_THREADS_X {
             return 0;
         }
@@ -1265,7 +1263,10 @@ impl State {
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
             // Title memory by address: what the shader finds it by.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
-                let Some(ready) = self.memory_ready(list, compute, writes) else {
+                // The shader can read the scene through guest addresses and
+                // write its result to a texture or a separate root UAV.
+                let raw_writes = writes && (t.host.writes_guest_memory || !write_skip());
+                let Some(ready) = self.memory_ready(list, compute, raw_writes) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };
@@ -1400,7 +1401,9 @@ impl State {
                         None
                     }
                 };
-                if !self.root_uav(list, address, param, compute, writes) {
+                let writes_slot =
+                    writes && (!write_skip() || t.host.written_root_uavs.contains(&slot));
+                if !self.root_uav(list, address, param, compute, writes_slot) {
                     return false;
                 }
             }
@@ -2408,7 +2411,7 @@ impl State {
             let stage = p.stages.first().filter(|_| p.compute)?;
             let (param, _) = stage.user_data?;
             let word = stage.translated().host.user_data.iter().find(|u| {
-                u.root == RootType::Other(USER_DISPATCH_THREADS_X)
+                u.root == RootType::Other(victory_shader::emit::USER_DISPATCH_THREADS_X)
             })?;
             Some((param, word.index))
         });
