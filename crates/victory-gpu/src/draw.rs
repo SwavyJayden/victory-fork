@@ -295,12 +295,12 @@ fn jump_windows() -> bool {
     }
 }
 
-/// Whether a single record that misses its window is gathered: given a
-/// slot that the list's prelude fills in one pass with the list's other
-/// such records, in place of a pass of ours in front of its draw
-/// (`crate::indirect::gather`; `VICTORY_INDIRECT_GATHER=1`; `alt`: twenty
-/// seconds with, twenty without, in turn, each change said in the log).
-/// Off by default. Needs [`windows`].
+/// Whether a single record that misses its window (or runs without
+/// windows) is gathered: given a slot that the list's prelude fills in one
+/// pass with the list's other such records, in place of a pass of ours in
+/// front of its draw (`crate::indirect::gather`; `VICTORY_INDIRECT_GATHER=1`;
+/// `alt`: twenty seconds with, twenty without, in turn, each change said in
+/// the log). Off by default. Works with or without [`windows`].
 fn gathers() -> bool {
     /// 0 off, 1 on, 2 in turn.
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
@@ -324,6 +324,21 @@ fn gathers() -> bool {
             on
         }
     }
+}
+
+/// Returns `(can_batch, windowed)` for an indirect command of `kind` with
+/// `max` records, optional count buffer (`has_count`), and shader buffer-store
+/// capability (`stores`). `can_batch` allows gathering (`VICTORY_INDIRECT_GATHER`)
+/// even when `windows_on` (`VICTORY_INDIRECT_WINDOW`) is disabled.
+fn indirect_batch_flags(
+    windows_on: bool,
+    kind: u32,
+    max: u32,
+    has_count: bool,
+    stores: bool,
+) -> (bool, bool) {
+    let can_batch = kind != 2 && max == 1 && !has_count && !stores;
+    (can_batch, windows_on && can_batch)
 }
 
 /// The records of a window opened at a remembered step ([`jump_windows`]):
@@ -392,6 +407,10 @@ pub(crate) fn window_line(frames: f64) {
         g[4],
     );
 }
+
+/// Matches `victory_shader::emit::USER_DISPATCH_THREADS_X` (`0x104`): when non-zero,
+/// compute dispatches clamp active X threads to this count.
+const USER_DISPATCH_THREADS_X: u32 = 0x104;
 
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
@@ -999,8 +1018,11 @@ impl State {
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
         use victory_shader::emit::{USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        if kind == USER_DISPATCH_THREADS_X {
+            return 0;
+        }
         if kind == USER_MEMORY_BASE {
-            return memory.map_or(0, |m| m.base);
+            return memory.map_or(0, |m| if dword == 0 { m.base } else { m.count });
         }
         if kind == USER_VIEW_BIAS {
             // The view begins on 16 bytes of the copy the address finds
@@ -1671,15 +1693,18 @@ impl State {
             let Some(view) = host.mirror(index, handle, true) else {
                 continue;
             };
-            // Every 64 views while the device lives (a cheap query).
+            // Every 256 views while the device lives (avoids excess COM calls
+            // in the 24,000-83,000 slot hot loop).
             if alive
-                && n % 64 == 63
+                && n % 256 == 255
                 && let Some(why) = crate::descriptor::host::device_removed()
             {
                 alive = false;
                 GONE.store(true, Ordering::Relaxed);
-                let last: Vec<String> = slots[n - 63..=n]
+                let last: Vec<String> = slots[n - 255..=n]
                     .iter()
+                    .rev()
+                    .take(64)
                     .filter_map(|&i| crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}")))
                     .map(|s| s.chars().take(200).collect())
                     .collect();
@@ -2312,7 +2337,14 @@ impl State {
     }
 
     /// Runs a dispatch on the host.
-    pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+    pub(crate) fn dispatch(
+        &mut self,
+        list: &HostList,
+        x: u32,
+        y: u32,
+        z: u32,
+        flags: Option<u32>,
+    ) {
         // It may write the arguments a window holds clamped.
         self.window = None;
         list.gather_close();
@@ -2364,10 +2396,34 @@ impl State {
             }
             return;
         }
+        let builder = crate::pipeline::is_builder(self.pipeline as This);
+        let thread_group = (builder && flags.unwrap_or(0) & 0x20 != 0)
+            .then(|| p.stages[0].translated().compute_threads)
+            .flatten();
+        let threads = [x, y, z];
+        let [x, y, z] = thread_group.map_or(threads, |size| {
+            std::array::from_fn(|i| threads[i].div_ceil(size[i]))
+        });
+        let tail = thread_group.and_then(|_| {
+            let stage = p.stages.first().filter(|_| p.compute)?;
+            let (param, _) = stage.user_data?;
+            let word = stage.translated().host.user_data.iter().find(|u| {
+                u.root == RootType::Other(USER_DISPATCH_THREADS_X)
+            })?;
+            Some((param, word.index))
+        });
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
-        // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        // SAFETY: an open list with everything set; `tail` names a declared root word.
+        unsafe {
+            if let Some((param, word)) = tail {
+                list.list.SetComputeRoot32BitConstant(param, threads[0], word);
+            }
+            list.list.Dispatch(x, y, z);
+            if let Some((param, word)) = tail {
+                list.list.SetComputeRoot32BitConstant(param, 0, word);
+            }
+        }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if self.ambient(list, p) {
             self.host_heaps = [0; 2];
@@ -2938,19 +2994,30 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size))
-                        if crate::host::fill_on_card()
+                        if address != 0
+                            && crate::descriptor::host::constant_view_bytes(size) > 0
+                            && crate::host::fill_on_card()
                             && crate::host::late()
-                            && crate::host::flights_write(address as usize, address as usize + size as usize)
-                            && let Some(shadow) = crate::shadow::find(address, u64::from(size))
+                            && {
+                                let clamped = crate::descriptor::host::constant_view_bytes(size);
+                                crate::host::flights_write(address as usize, address as usize + clamped as usize)
+                            }
+                            && let Some(shadow) = crate::shadow::find(
+                                address,
+                                u64::from(crate::descriptor::host::constant_view_bytes(size)),
+                            )
                             && let Some(gpu) = {
-                                shadow.refresh(list, address, u64::from(size));
-                                list.card_constants(&shadow, address, u64::from(size))
+                                let clamped = u64::from(crate::descriptor::host::constant_view_bytes(size));
+                                shadow.refresh(list, address, clamped);
+                                list.card_constants(&shadow, address, clamped)
                             } =>
                     {
+                        let size = crate::descriptor::host::constant_view_bytes(size);
                         host.constant_at(index, gpu, size);
                     }
                     Some(View::Constant(address, size)) => {
-                        if address == 0 || size == 0 {
+                        let size = crate::descriptor::host::constant_view_bytes(size);
+                        if size == 0 || address == 0 {
                             host.constant_at(index, 0, 0);
                             continue;
                         }
@@ -3308,26 +3375,24 @@ impl State {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
-        // A window of records clamped in one pass (`windows`): for single
+        // A window or gathered slot of records clamped in one pass: for single
         // records without a count buffer, drawn by shaders that store to no
-        // buffer. Anything else ends the window: it uses the scratch buffer
-        // or may write the arguments.
+        // buffer. Anything else ends the window and stops gathering: it uses
+        // the scratch buffer or may write the arguments.
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
-        let windowed = windows()
-            && kind != DISPATCH
-            && max == 1
-            && count.is_none()
-            && !p.stages.iter().any(|stage| stage.translated().stores);
+        let stores = p.stages.iter().any(|stage| stage.translated().stores);
+        let (can_batch, windowed) =
+            indirect_batch_flags(windows(), kind, max, count.is_some(), stores);
         // Another host list (a new one after a cut, or this one after its
         // reset) has another scratch buffer, or this one's with old bytes.
         let first_on_list = list.first_use(WINDOW_USE);
         if !windowed || first_on_list {
             self.window = None;
         }
-        if !windowed {
-            // A dispatch, or shaders that store to buffers: arguments may
-            // be written from here on.
+        if !can_batch {
+            // A dispatch, multi-record/count-buffered call, or shaders that
+            // store to buffers: arguments may be written from here on.
             list.gather_close();
         }
         // Diagnostics: why this command gets a pass of ours, if it does.
@@ -3361,9 +3426,9 @@ impl State {
             w.consumed |= 1u64 << slot;
             Some((w.scratch.clone(), at, w.step))
         });
-        // A record that misses its window: a slot the list's prelude fills,
-        // if the list still gathers ([`gathers`]).
-        let gathered = if hit.is_none() && windowed && gathers() {
+        // A single read-only record (when no window covers it): a slot the
+        // list's prelude fills, if the list still gathers ([`gathers`]).
+        let gathered = if hit.is_none() && can_batch && gathers() {
             let slot = crate::indirect::gather(list, (&args.buffer, args.id()), offset, (kind, stride));
             #[cfg(feature = "diagnostics")]
             WINDOW_WHY[if slot.is_some() { 12 } else { 13 }].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3371,7 +3436,7 @@ impl State {
         } else {
             None
         };
-        let (bounded, at) = match (hit, gathered) {
+        let (bounded, at, compacted_count) = match (hit, gathered) {
             (Some((scratch, at, step)), _) => {
                 // Diagnostics of windows: the record clamped again and
                 // compared (`crate::indirect::window_check`).
@@ -3395,7 +3460,7 @@ impl State {
                         self.walk_step = Some((w.copy, w.kind, w.stride, w.step));
                     }
                 }
-                (scratch, at)
+                (scratch, at, None)
             }
             (None, Some((scratch, at))) => {
                 // The record's bytes are up to date when the list is
@@ -3407,7 +3472,7 @@ impl State {
                     self.host_pipeline = 0;
                     self.host_roots[1] = 0;
                 }
-                (scratch, at)
+                (scratch, at, None)
             }
             (None, None) => {
                 // A window opened at the remembered step that no draw read
@@ -3453,16 +3518,31 @@ impl State {
                 // buffer at offset 0.
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 // More than the record asked for: a window clamped ahead,
-                // whose unfilled slots must not spend the list's budget.
-                let bounded = if windowed && records > 1 {
-                    crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
+                // whose unfilled slots must not spend the list's budget, and
+                // whose offsets must stay in-slot for later cached draws.
+                let (bounded, compacted_count) = if windowed && records > 1 {
+                    let Some(scratch) = crate::indirect::bound_ahead(
+                        list,
+                        (&args.buffer, offset),
+                        (kind, step, records),
+                    ) else {
+                        self.window = None;
+                        why("not bounded (no clamp, or arguments not 4-byte aligned)");
+                        return false;
+                    };
+                    (scratch, None)
                 } else {
-                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
-                };
-                let Some(bounded) = bounded else {
-                    self.window = None;
-                    why("not bounded (no clamp, or arguments not 4-byte aligned)");
-                    return false;
+                    let Some(bounded) = crate::indirect::bound(
+                        list,
+                        (&args.buffer, offset),
+                        count_arg,
+                        (kind, step, records),
+                    ) else {
+                        self.window = None;
+                        why("not bounded (no clamp, or arguments not 4-byte aligned)");
+                        return false;
+                    };
+                    (bounded.buffer, bounded.count)
                 };
                 #[cfg(feature = "diagnostics")]
                 if why_not < WINDOW_WHY.len() {
@@ -3501,7 +3581,7 @@ impl State {
                     consumed: 1,
                     scratch: bounded.clone(),
                 });
-                (bounded, 0)
+                (bounded, 0, compacted_count)
             }
         };
         #[cfg(feature = "diagnostics")]
@@ -3525,6 +3605,13 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
+        let (count_buffer, count_offset) = match compacted_count {
+            Some(offset) => (Some(&bounded), offset),
+            None => (
+                counter.as_ref().map(|(s, _)| &s.buffer),
+                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+            ),
+        };
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {
@@ -3533,8 +3620,8 @@ impl State {
                 max,
                 &bounded,
                 at,
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                count_buffer,
+                count_offset,
             )
         };
         if kind == MESH {
@@ -3948,5 +4035,20 @@ mod tests {
         assert_eq!(jump_window(remembered, (7, 0, 12), 1 << 20), None);
         assert_eq!(jump_window(remembered, (7, 10, 16), 1 << 20), None);
         assert_eq!(jump_window(None, (7, 10, 12), 1 << 20), None);
+    }
+
+    #[test]
+    fn indirect_gather_decoupled_from_windows() {
+        // With VICTORY_INDIRECT_WINDOW off, single read-only draws/mesh calls
+        // can still gather in the list prelude.
+        assert_eq!(indirect_batch_flags(false, 10, 1, false, false), (true, false));
+        assert_eq!(indirect_batch_flags(false, 0, 1, false, false), (true, false));
+        assert_eq!(indirect_batch_flags(true, 10, 1, false, false), (true, true));
+        // Dispatches, multi-record batches, count buffers, and store-capable
+        // shaders close gathering and disable windowing.
+        assert_eq!(indirect_batch_flags(true, 2, 1, false, false), (false, false));
+        assert_eq!(indirect_batch_flags(false, 10, 4, false, false), (false, false));
+        assert_eq!(indirect_batch_flags(false, 10, 1, true, false), (false, false));
+        assert_eq!(indirect_batch_flags(false, 10, 1, false, true), (false, false));
     }
 }
