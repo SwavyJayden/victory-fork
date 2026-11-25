@@ -164,6 +164,12 @@ pub(crate) extern "system" fn wait(
     let limit = Duration::from_millis(u64::from(timeout_ms));
     let (hr, tick, wait) = claim(kind, limit);
     let _ = (tick, wait); // read by the diagnostics below
+    #[cfg(windows)]
+    {
+        let us = wait.min(limit).as_micros() as u64;
+        crate::framelog::add(crate::framelog::T::PaceUs, us);
+        crate::framelog::here(crate::framelog::H::PaceUs, us);
+    }
     #[cfg(all(windows, feature = "diagnostics"))]
     {
         use crate::copystat::{C, add};
