@@ -177,6 +177,57 @@ fn parse_manifest(bytes: &[u8]) -> Option<Vec<String>> {
     (out.len() >= 2).then_some(out)
 }
 
+/// Removes a folder and all it holds; a missing one is no error.
+///
+/// Run from a packaged app (the Claude desktop app, say), the host merges
+/// the real `AppData\Local` with the package's private copy of it, and a
+/// folder can exist in both. `remove_dir_all` opens what is inside without
+/// following reparse points, which such a merged folder needs, and fails
+/// with ERROR_REPARSE_POINT_ENCOUNTERED (4395). Removing entry by entry,
+/// by path, works: each pass removes the upper copy, the lower one shows
+/// through, and the next pass removes that.
+fn remove_tree(dir: &Path) -> std::io::Result<()> {
+    let gone = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+    let mut last = None;
+    for _ in 0..4 {
+        match std::fs::remove_dir_all(dir).or_else(|_| remove_entries(dir)) {
+            Err(e) if gone(&e) => return Ok(()),
+            Err(e) => last = Some(e),
+            Ok(()) => {}
+        }
+        match std::fs::symlink_metadata(dir) {
+            Err(e) if gone(&e) => return Ok(()),
+            _ => {}
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("the folder is still there after removal")))
+}
+
+/// [`remove_tree`] by path, entry by entry; links are removed, never followed.
+fn remove_entries(dir: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            remove_entries(&path)?;
+        } else if kind.is_symlink() {
+            std::fs::remove_file(&path).or_else(|_| std::fs::remove_dir(&path))?;
+        } else {
+            std::fs::remove_file(&path)?;
+        }
+    }
+    std::fs::remove_dir(dir)
+}
+
+/// Removes a leftover (an unfinished or superseded version) if it can: one
+/// that stays is garbage, never read, and must not stop the container.
+fn discard(path: &Path) {
+    if let Err(e) = remove_tree(path) {
+        tracing::warn!(path = %path.display(), %e, "game save leftover not removed");
+    }
+}
+
 /// The container's newest committed version, if any. Removes what a crash
 /// left: unfinished versions and older ones.
 fn current(dir: &Path) -> std::io::Result<Option<Version>> {
@@ -185,7 +236,7 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
         let file = entry.file_name();
         let file = file.to_string_lossy();
         if file.ends_with(".new") {
-            std::fs::remove_dir_all(entry.path())?;
+            discard(&entry.path());
         } else if let Some(n) = file.strip_prefix('v').and_then(|n| n.parse::<u64>().ok()) {
             committed.push(n);
         }
@@ -195,7 +246,7 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
         return Ok(None);
     };
     for old in &committed[..committed.len() - 1] {
-        std::fs::remove_dir_all(dir.join(format!("v{old}")))?;
+        discard(&dir.join(format!("v{old}")));
     }
     let version = dir.join(format!("v{number}"));
     let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, "bad save manifest");
@@ -243,7 +294,7 @@ fn commit(
 ) -> std::io::Result<()> {
     let staged = dir.join(format!("v{number}.new"));
     if staged.exists() {
-        std::fs::remove_dir_all(&staged)?;
+        remove_tree(&staged)?;
     }
     std::fs::create_dir_all(&staged)?;
     let write = |path: PathBuf, data: &[u8]| -> std::io::Result<()> {
@@ -280,7 +331,7 @@ fn containers(root: &Path) -> Vec<(String, PathBuf)> {
             continue;
         }
         if file.ends_with(".gone") {
-            let _ = std::fs::remove_dir_all(&path);
+            discard(&path);
         } else if file.contains('~') {
             if let Ok(Some(v)) = current(&path) {
                 out.push((v.name, path));
@@ -318,7 +369,7 @@ fn migrate(root: &Path, name: &str, old: &Path) -> Option<PathBuf> {
             .collect();
         commit(&dir, 1, name, &display, &sources).ok()?;
     }
-    std::fs::remove_dir_all(old).ok()?;
+    remove_tree(old).ok()?;
     tracing::info!(container = name, "game save moved to the versioned layout");
     Some(dir)
 }
@@ -403,7 +454,7 @@ fn remaining(root: &Path) -> u64 {
 /// new version is written before the old one goes, so nothing it replaces
 /// counts there).
 fn no_room(written: u64, replaced: u64, used: u64, free: u64) -> Option<HRESULT> {
-    if written > QUOTA.saturating_sub(used) + replaced {
+    if written > QUOTA.saturating_sub(used).saturating_add(replaced) {
         Some(QUOTA_EXCEEDED)
     } else if written > free {
         Some(OUT_OF_LOCAL_STORAGE)
@@ -477,7 +528,7 @@ impl Update {
         }
         // The old version is garbage now; a crash here leaves it for later.
         if let Some(old) = &current {
-            let _ = std::fs::remove_dir_all(&old.dir);
+            discard(&old.dir);
             step();
         }
         S_OK
@@ -494,13 +545,25 @@ fn delete(root: &Path, name: &str) -> HRESULT {
         Err(e) => return io_error(&dir, &e),
     }
     let gone = dir.with_extension("gone");
-    let _ = std::fs::remove_dir_all(&gone);
+    let _ = remove_tree(&gone);
     step();
     if let Err(e) = std::fs::rename(&dir, &gone) {
         return io_error(&dir, &e);
     }
     step();
-    let _ = std::fs::remove_dir_all(&gone);
+    let _ = remove_tree(&gone);
+    // A folder the host merges from two copies (see `remove_tree`) moves
+    // one copy at a time: the lower one shows now and goes the same way.
+    for _ in 0..3 {
+        if !matches!(current_named(&dir, name), Ok(Some(_))) {
+            break;
+        }
+        let _ = remove_tree(&gone);
+        if std::fs::rename(&dir, &gone).is_err() {
+            break;
+        }
+        let _ = remove_tree(&gone);
+    }
     S_OK
 }
 
@@ -644,6 +707,13 @@ extern "system" fn close_provider(_: This, provider: *mut Provider) {
     take(provider);
 }
 
+extern "system" fn quota_sync(_: This, provider: *const Provider, out: *mut i64) -> HRESULT {
+    let Some(p) = get(provider) else {
+        return E_INVALIDARG;
+    };
+    put(out, p.remaining() as i64)
+}
+
 extern "system" fn quota_async(
     _: This,
     provider: *const Provider,
@@ -658,18 +728,21 @@ extern "system" fn quota_result(_: This, block: *mut AsyncBlock, out: *mut i64) 
     xasync::result(block, (&raw const QUOTA_CALL).cast(), out)
 }
 
+extern "system" fn delete_sync(_: This, provider: *const Provider, name: *const c_char) -> HRESULT {
+    match (get(provider), text(name)) {
+        (Some(p), Some(name)) if valid_container(&name) => delete(&p.root, &name),
+        (Some(_), Some(_)) => INVALID_CONTAINER_NAME,
+        _ => E_INVALIDARG,
+    }
+}
+
 extern "system" fn delete_async(
-    _: This,
+    this: This,
     provider: *const Provider,
     name: *const c_char,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    let hr = match (get(provider), text(name)) {
-        (Some(p), Some(name)) if valid_container(&name) => delete(&p.root, &name),
-        (Some(_), Some(_)) => INVALID_CONTAINER_NAME,
-        _ => E_INVALIDARG,
-    };
-    xasync::finished(block, (&raw const DELETE).cast(), hr)
+    xasync::finished(block, (&raw const DELETE).cast(), delete_sync(this, provider, name))
 }
 extern "system" fn delete_result(_: This, block: *mut AsyncBlock) -> HRESULT {
     let none = std::ptr::null_mut();
@@ -696,15 +769,26 @@ extern "system" fn container_info(
 }
 
 extern "system" fn enumerate_containers(
+    this: This,
+    provider: *const Provider,
+    context: *mut c_void,
+    callback: Option<ContainerCallback>,
+) -> HRESULT {
+    enumerate_containers_by_name(this, provider, std::ptr::null(), context, callback)
+}
+
+extern "system" fn enumerate_containers_by_name(
     _: This,
     provider: *const Provider,
+    prefix: *const c_char,
     context: *mut c_void,
     callback: Option<ContainerCallback>,
 ) -> HRESULT {
     let (Some(p), Some(callback)) = (get(provider), callback) else {
         return E_INVALIDARG;
     };
-    report(&p.root, |_| true, context, callback);
+    let prefix = text(prefix).unwrap_or_default();
+    report(&p.root, |n| n.starts_with(&prefix), context, callback);
     S_OK
 }
 
@@ -725,6 +809,15 @@ extern "system" fn create_container(
 }
 extern "system" fn close_container(_: This, container: *mut Container) {
     take(container);
+}
+
+extern "system" fn enumerate_all_blobs(
+    this: This,
+    container: *const Container,
+    context: *mut c_void,
+    callback: Option<BlobCallback>,
+) -> HRESULT {
+    enumerate_blobs(this, container, std::ptr::null(), context, callback)
 }
 
 extern "system" fn enumerate_blobs(
@@ -894,9 +987,12 @@ extern "system" fn delete_blob(_: This, update: *mut Update, name: *const c_char
     }
 }
 
-extern "system" fn submit_async(_: This, update: *const Update, block: *mut AsyncBlock) -> HRESULT {
-    let hr = get(update).map_or(E_INVALIDARG, Update::submit);
-    xasync::finished(block, (&raw const SUBMIT).cast(), hr)
+extern "system" fn submit_sync(_: This, update: *const Update) -> HRESULT {
+    get(update).map_or(E_INVALIDARG, Update::submit)
+}
+
+extern "system" fn submit_async(this: This, update: *const Update, block: *mut AsyncBlock) -> HRESULT {
+    xasync::finished(block, (&raw const SUBMIT).cast(), submit_sync(this, update))
 }
 extern "system" fn submit_result(_: This, block: *mut AsyncBlock) -> HRESULT {
     let none = std::ptr::null_mut();
@@ -907,33 +1003,33 @@ static VTABLE: Methods<30> = Methods([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
-    missing::<3> as *const (),         // 0x18 initialize (blocking)
-    initialize_async as *const (),     // 0x20
-    initialize_result as *const (),    // 0x28
-    close_provider as *const (),       // 0x30
-    missing::<7> as *const (),         // 0x38 remaining quota (blocking)
-    quota_async as *const (),          // 0x40
-    quota_result as *const (),         // 0x48
-    missing::<10> as *const (),        // 0x50 delete (blocking)
-    delete_async as *const (),         // 0x58
-    delete_result as *const (),        // 0x60
-    container_info as *const (),       // 0x68
-    enumerate_containers as *const (), // 0x70
-    missing::<15> as *const (),        // 0x78 by name prefix
-    create_container as *const (),     // 0x80
-    close_container as *const (),      // 0x88
-    missing::<18> as *const (),        // 0x90 all blob info
-    enumerate_blobs as *const (),      // 0x98 by name prefix
-    read_blobs as *const (),           // 0xa0
-    read_async as *const (),           // 0xa8
-    read_result as *const (),          // 0xb0
-    create_update as *const (),        // 0xb8
-    close_update as *const (),         // 0xc0
-    write_blob as *const (),           // 0xc8
-    delete_blob as *const (),          // 0xd0
-    missing::<27> as *const (),        // 0xd8 submit (blocking)
-    submit_async as *const (),         // 0xe0
-    submit_result as *const (),        // 0xe8
+    missing::<3> as *const (),                 // 0x18 initialize (blocking)
+    initialize_async as *const (),             // 0x20
+    initialize_result as *const (),            // 0x28
+    close_provider as *const (),               // 0x30
+    quota_sync as *const (),                   // 0x38 remaining quota (blocking)
+    quota_async as *const (),                  // 0x40
+    quota_result as *const (),                 // 0x48
+    delete_sync as *const (),                  // 0x50 delete (blocking)
+    delete_async as *const (),                 // 0x58
+    delete_result as *const (),                // 0x60
+    container_info as *const (),               // 0x68
+    enumerate_containers as *const (),         // 0x70
+    enumerate_containers_by_name as *const (), // 0x78 by name prefix
+    create_container as *const (),             // 0x80
+    close_container as *const (),              // 0x88
+    enumerate_all_blobs as *const (),          // 0x90 all blob info
+    enumerate_blobs as *const (),              // 0x98 by name prefix
+    read_blobs as *const (),                   // 0xa0
+    read_async as *const (),                   // 0xa8
+    read_result as *const (),                  // 0xb0
+    create_update as *const (),                // 0xb8
+    close_update as *const (),                 // 0xc0
+    write_blob as *const (),                   // 0xc8
+    delete_blob as *const (),                  // 0xd0
+    submit_sync as *const (),                  // 0xd8 submit (blocking)
+    submit_async as *const (),                 // 0xe0
+    submit_result as *const (),                // 0xe8
 ]);
 
 #[cfg(test)]
@@ -1068,6 +1164,71 @@ mod tests {
             }
             assert!(seen.0 > 0 && seen.1 > 1, "{op}: {seen:?}");
         }
+    }
+
+    /// A version that cannot be removed (here a file in it held open with
+    /// no sharing; on the user's machine a folder the host merged from two
+    /// copies, which `remove_dir_all` refuses with error 4395) is garbage:
+    /// the container still opens, reads, saves and lists, and the version
+    /// goes once it can.
+    #[cfg(windows)]
+    #[test]
+    fn an_old_version_that_stays_never_blocks_the_container() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        let saves = tempfile::tempdir().unwrap();
+        let p = Provider::open(saves.path(), Some("scid")).unwrap();
+        assert_eq!(update(&p.root, "one", &[("a", Some("old a")), ("b", Some("old b"))]), S_OK);
+        // A crash after committing v2, before removing v1.
+        let c = p.container("Slot");
+        let v1 = c.dir.join("v1");
+        let v2 = c.dir.join("v2");
+        copy_tree(&v1, &v2);
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(v1.join(MANIFEST))
+            .unwrap();
+        assert!(std::fs::remove_dir_all(&v1).is_err());
+
+        let p = Provider::open(saves.path(), Some("scid")).unwrap();
+        assert!(v1.exists());
+        assert_eq!(current_named(&c.dir, "Slot").unwrap().unwrap().number, 2);
+        assert_eq!(state(&p.root), old_state());
+        let _saves = saves_lock();
+        assert_eq!(containers(&p.root).len(), 1);
+        drop(_saves);
+        assert_eq!(update(&p.root, "two", &[("a", Some("new a"))]), S_OK);
+        let new = Some(("two".into(), vec![("a".into(), "new a".into()), ("b".into(), "old b".into())]));
+        assert_eq!(state(&p.root), new);
+        assert!(v1.exists() && !v2.exists());
+
+        drop(held);
+        assert_eq!(state(&p.root), new);
+        assert!(!v1.exists());
+        assert_eq!(current_named(&c.dir, "Slot").unwrap().unwrap().number, 3);
+    }
+
+    #[cfg(windows)]
+    fn copy_tree(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap().flatten() {
+            std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+        }
+    }
+
+    #[test]
+    fn remove_tree_removes_everything_or_nothing_is_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = dir.path().join("v1");
+        std::fs::create_dir_all(tree.join("a").join("b")).unwrap();
+        std::fs::write(tree.join("0"), b"x").unwrap();
+        std::fs::write(tree.join("a").join("b").join("1"), b"y").unwrap();
+        remove_entries(&tree.join("a")).unwrap();
+        assert!(!tree.join("a").exists() && tree.join("0").exists());
+        remove_tree(&tree).unwrap();
+        assert!(!tree.exists());
+        remove_tree(&tree).unwrap();
     }
 
     #[test]
@@ -1375,6 +1536,218 @@ mod tests {
         );
         assert!(found.is_empty());
         close_container(this, container);
+        close_provider(this, provider);
+    }
+
+    #[test]
+    fn sync_vtable_methods_work_end_to_end() {
+        let this: This = &OBJECT;
+        let saves = tempfile::tempdir().unwrap();
+        let provider = give(Provider::open(saves.path(), Some("scid")).unwrap());
+
+        let v_quota = method::<extern "system" fn(This, *const Provider, *mut i64) -> HRESULT>(&OBJECT, 0x38);
+        let v_delete = method::<extern "system" fn(This, *const Provider, *const c_char) -> HRESULT>(&OBJECT, 0x50);
+        let v_enum_containers = method::<
+            extern "system" fn(
+                This,
+                *const Provider,
+                *const c_char,
+                *mut c_void,
+                Option<ContainerCallback>,
+            ) -> HRESULT,
+        >(&OBJECT, 0x78);
+        let v_create_container = method::<
+            extern "system" fn(This, *const Provider, *const c_char, *mut *mut Container) -> HRESULT,
+        >(&OBJECT, 0x80);
+        let v_enum_all_blobs = method::<
+            extern "system" fn(This, *const Container, *mut c_void, Option<BlobCallback>) -> HRESULT,
+        >(&OBJECT, 0x90);
+        let v_create_update = method::<
+            extern "system" fn(This, *const Container, *const c_char, *mut *mut Update) -> HRESULT,
+        >(&OBJECT, 0xb8);
+        let v_write_blob = method::<
+            extern "system" fn(This, *mut Update, *const c_char, *const u8, usize) -> HRESULT,
+        >(&OBJECT, 0xc8);
+        let v_submit_sync = method::<extern "system" fn(This, *const Update) -> HRESULT>(&OBJECT, 0xd8);
+
+        let mut initial_quota = 0i64;
+        assert_eq!(v_quota(this, std::ptr::null(), &mut initial_quota), E_INVALIDARG);
+        assert_eq!(v_quota(this, provider, std::ptr::null_mut()), E_INVALIDARG);
+        assert_eq!(v_quota(this, provider, &mut initial_quota), S_OK);
+        assert!(initial_quota > 0);
+        assert_eq!(v_submit_sync(this, std::ptr::null()), E_INVALIDARG);
+
+        for (cname, dname, blobs) in [
+            ("Save/One", "First", [("alpha", b"12345".as_slice()), ("beta", b"67".as_slice())].as_slice()),
+            ("Save/Two", "Second", [("gamma", b"890".as_slice()), ("delta", b"ab".as_slice())].as_slice()),
+            ("Other", "Third", [("omega", b"xyz".as_slice())].as_slice()),
+        ] {
+            let cname_c = cstring(cname);
+            let dname_c = cstring(dname);
+            let mut container = std::ptr::null_mut();
+            assert_eq!(v_create_container(this, provider, cname_c.as_ptr(), &mut container), S_OK);
+            let mut upd = std::ptr::null_mut();
+            assert_eq!(v_create_update(this, container, dname_c.as_ptr(), &mut upd), S_OK);
+            for &(bname, data) in blobs {
+                let bname_c = cstring(bname);
+                assert_eq!(v_write_blob(this, upd, bname_c.as_ptr(), data.as_ptr(), data.len()), S_OK);
+            }
+            assert_eq!(v_submit_sync(this, upd), S_OK);
+            close_update(this, upd);
+            close_container(this, container);
+        }
+
+        // Enumerate containers by prefix (0x78).
+        extern "system" fn collect_containers(info: *const ContainerInfo, ctx: *mut c_void) -> bool {
+            // SAFETY: valid during callback; ctx is a Vec<String>.
+            let (info, out) = unsafe { (&*info, &mut *ctx.cast::<Vec<String>>()) };
+            out.push(text(info.name).unwrap());
+            true
+        }
+        let mut found_containers = Vec::<String>::new();
+        assert_eq!(
+            v_enum_containers(
+                this,
+                std::ptr::null(),
+                c"Save/".as_ptr(),
+                (&raw mut found_containers).cast(),
+                Some(collect_containers),
+            ),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            v_enum_containers(
+                this,
+                provider,
+                c"Save/".as_ptr(),
+                (&raw mut found_containers).cast(),
+                None,
+            ),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            v_enum_containers(
+                this,
+                provider,
+                c"Save/".as_ptr(),
+                (&raw mut found_containers).cast(),
+                Some(collect_containers),
+            ),
+            S_OK
+        );
+        assert_eq!(found_containers, ["Save/One", "Save/Two"]);
+
+        found_containers.clear();
+        assert_eq!(
+            v_enum_containers(
+                this,
+                provider,
+                std::ptr::null(),
+                (&raw mut found_containers).cast(),
+                Some(collect_containers),
+            ),
+            S_OK
+        );
+        assert_eq!(found_containers, ["Other", "Save/One", "Save/Two"]);
+
+        // Enumerate all blobs in a container (0x90).
+        extern "system" fn collect_blobs(info: *const BlobInfo, ctx: *mut c_void) -> bool {
+            // SAFETY: valid during callback; ctx is a Vec<(String, u32)>.
+            let (info, out) = unsafe { (&*info, &mut *ctx.cast::<Vec<(String, u32)>>()) };
+            out.push((text(info.name).unwrap(), info.size));
+            true
+        }
+        extern "system" fn stop_after_one(info: *const BlobInfo, ctx: *mut c_void) -> bool {
+            collect_blobs(info, ctx);
+            false
+        }
+        let mut container = std::ptr::null_mut();
+        assert_eq!(v_create_container(this, provider, c"Save/One".as_ptr(), &mut container), S_OK);
+        let mut found_blobs = Vec::<(String, u32)>::new();
+        assert_eq!(
+            v_enum_all_blobs(
+                this,
+                std::ptr::null(),
+                (&raw mut found_blobs).cast(),
+                Some(collect_blobs),
+            ),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            v_enum_all_blobs(this, container, (&raw mut found_blobs).cast(), None),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            v_enum_all_blobs(
+                this,
+                container,
+                (&raw mut found_blobs).cast(),
+                Some(collect_blobs),
+            ),
+            S_OK
+        );
+        assert_eq!(found_blobs, [("alpha".into(), 5), ("beta".into(), 2)]);
+        found_blobs.clear();
+        assert_eq!(
+            v_enum_all_blobs(
+                this,
+                container,
+                (&raw mut found_blobs).cast(),
+                Some(stop_after_one),
+            ),
+            S_OK
+        );
+        assert_eq!(found_blobs.len(), 1);
+        close_container(this, container);
+
+        // Uncommitted container enumerates zero blobs cleanly.
+        let mut empty_container = std::ptr::null_mut();
+        assert_eq!(
+            v_create_container(this, provider, c"Uncommitted".as_ptr(), &mut empty_container),
+            S_OK
+        );
+        found_blobs.clear();
+        assert_eq!(
+            v_enum_all_blobs(
+                this,
+                empty_container,
+                (&raw mut found_blobs).cast(),
+                Some(collect_blobs),
+            ),
+            S_OK
+        );
+        assert!(found_blobs.is_empty());
+        close_container(this, empty_container);
+
+        // Remaining quota (0x38) reflects written bytes (15 bytes total across 3 containers).
+        let mut after_writes = 0i64;
+        assert_eq!(v_quota(this, provider, &mut after_writes), S_OK);
+        assert_eq!(initial_quota - after_writes, 15);
+
+        // Blocking delete (0x50).
+        assert_eq!(v_delete(this, std::ptr::null(), c"Save/One".as_ptr()), E_INVALIDARG);
+        assert_eq!(v_delete(this, provider, std::ptr::null()), E_INVALIDARG);
+        assert_eq!(v_delete(this, provider, c"bad name".as_ptr()), INVALID_CONTAINER_NAME);
+        assert_eq!(v_delete(this, provider, c"Save/One".as_ptr()), S_OK);
+        assert_eq!(v_delete(this, provider, c"Missing".as_ptr()), S_OK);
+
+        found_containers.clear();
+        assert_eq!(
+            v_enum_containers(
+                this,
+                provider,
+                std::ptr::null(),
+                (&raw mut found_containers).cast(),
+                Some(collect_containers),
+            ),
+            S_OK
+        );
+        assert_eq!(found_containers, ["Other", "Save/Two"]);
+
+        let mut after_delete = 0i64;
+        assert_eq!(v_quota(this, provider, &mut after_delete), S_OK);
+        assert_eq!(after_delete - after_writes, 7);
+
         close_provider(this, provider);
     }
 }

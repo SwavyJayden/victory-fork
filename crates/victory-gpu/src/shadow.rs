@@ -77,6 +77,10 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// With [`gpu_upload_copies`]: `buffer` is in the card's memory, mapped
+    /// for the CPU (a GPU upload heap), not a shared buffer in the PC's;
+    /// its bytes.
+    bar: Option<u64>,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -317,6 +321,73 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
     }
     buffer
+}
+
+fn parse_gpu_upload_copies(level: Option<&str>, mb: Option<&str>) -> (u8, u64) {
+    let level = level.and_then(|v| v.trim().parse::<u8>().ok()).unwrap_or(0).min(2);
+    let most = mb.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(2048) << 20;
+    (level, most)
+}
+
+/// Whether host copies with no card side are made in the card's memory,
+/// mapped for the CPU (a GPU upload heap: resizable BAR), instead of a
+/// shared buffer in the PC's memory: `VICTORY_GPU_UPLOAD_COPIES` `1`
+/// windows outside buffers, `2` also title buffers and views' copies of
+/// their own bytes; 0 (unset) none. At most `VICTORY_GPU_UPLOAD_COPIES_MB`
+/// (2048 unless set) of them, and only while the card is under eight
+/// tenths of its budget, as windows' card sides are. Read when a copy is
+/// made, so it takes a fresh start; where the card has no such heap, nothing
+/// changes.
+///
+/// Such a copy is one buffer, as the shared buffer was: the CPU writes
+/// title memory into it at each refresh, through a write-combined mapping
+/// (64 MiB in 3 ms, measured on this PC), and shaders read it in the
+/// card's memory, not through the bus. No card side, no sends, no hashes:
+/// nothing of `Card` is involved.
+///
+/// What it costs: the copies' bytes come out of the card's budget (the
+/// texture queue's room); and reading such a copy on the CPU crosses the
+/// bus uncached, some 40 MB/s, so a copy whose ranges shaders write (its
+/// snapshot and compare read it) is slow: the memory line counts the bytes
+/// so declared, and the first is said.
+pub(crate) fn gpu_upload_copies() -> (u8, u64) {
+    static ON: std::sync::OnceLock<(u8, u64)> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        parse_gpu_upload_copies(
+            std::env::var("VICTORY_GPU_UPLOAD_COPIES").ok().as_deref(),
+            std::env::var("VICTORY_GPU_UPLOAD_COPIES_MB").ok().as_deref(),
+        )
+    })
+}
+
+/// [`gpu_upload_copies`]' copies alive and their bytes; and since the start,
+/// bytes of ranges shaders were declared to write in them.
+static BAR_COPIES: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// For the memory line: [`BAR_COPIES`].
+pub(crate) fn bar_copies() -> [u64; 3] {
+    BAR_COPIES.each_ref().map(|b| b.load(Ordering::Relaxed))
+}
+
+/// The buffer of a host copy of `size` bytes that has no card side (a
+/// `window` or not): in a GPU upload heap with [`gpu_upload_copies`], else
+/// a shared buffer in the PC's memory; and with the first, its bytes.
+fn pc_copy_buffer(size: u64, window: bool) -> Option<(ID3D12Resource, *mut u8, Option<u64>)> {
+    let (level, most) = gpu_upload_copies();
+    if level >= if window { 1 } else { 2 }
+        && let Some(host) = host()
+        && host.video_memory().is_none_or(|[budget, used, ..]| used + size <= budget / 10 * 8)
+    {
+        if BAR_COPIES[1].fetch_add(size, Ordering::Relaxed) + size <= most
+            && let Some((buffer, data)) = host.card_shared_buffer(size)
+        {
+            BAR_COPIES[0].fetch_add(1, Ordering::Relaxed);
+            return Some((buffer, data, Some(size)));
+        }
+        BAR_COPIES[1].fetch_sub(size, Ordering::Relaxed);
+    }
+    let (buffer, data) = host()?.shared_buffer(size)?;
+    Some((buffer, data, None))
 }
 
 /// The most bytes of windows outside buffers whose copies go to the card's
@@ -2314,6 +2385,10 @@ impl Drop for Shadow {
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
         LIVE[1].fetch_sub(self.len, Ordering::Relaxed);
+        if let Some(bytes) = self.bar {
+            BAR_COPIES[0].fetch_sub(1, Ordering::Relaxed);
+            BAR_COPIES[1].fetch_sub(bytes, Ordering::Relaxed);
+        }
         if self.kept.get_mut().unwrap_or_else(|e| e.into_inner()).1 {
             KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
@@ -2687,6 +2762,7 @@ impl Shadow {
             card: None,
             window: false,
             place: None,
+            bar: None,
         }
     }
 
@@ -2716,6 +2792,21 @@ impl Shadow {
             return;
         }
         let len = len.min(self.left(address));
+        if self.bar.is_some() {
+            // Their snapshot and compare read the copy back through the
+            // bus, uncached (`gpu_upload_copies`): counted, said once.
+            BAR_COPIES[2].fetch_add(len, Ordering::Relaxed);
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| {
+                tracing::warn!(
+                    start = format_args!("{:#x}", self.start),
+                    len = self.len,
+                    window = self.window,
+                    "shaders write a host copy in a GPU upload heap (VICTORY_GPU_UPLOAD_COPIES): its compare reads it back \
+                     through the bus at some 40 MB/s"
+                );
+            });
+        }
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
@@ -4047,12 +4138,15 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
-        let (buffer, data) = host()?.shared_buffer(size)?;
-        crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
-        // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
+        // memory, and the CPU's side is made beside it in PC memory.
+        let (buffer, data, card, bar) = match card_for(size) {
             Some(on_card) => {
+                let Some((staging, data)) = host().and_then(|h| h.shared_buffer(size)) else {
+                    CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+                    return None;
+                };
+                crate::host::name(&staging, || format!("title buffer {:#x}+{len:#x}", key.0));
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
                 tracing::info!(
                     start = format_args!("{:#x}", key.0),
@@ -4060,16 +4154,22 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     "a buffer's host copy is in the card's memory"
                 );
                 let card = Card {
-                    staging: buffer,
+                    staging,
                     before: Mutex::default(),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
                     side: std::sync::RwLock::new(()),
                     size,
                 };
-                (on_card, Some(card))
+                (on_card, data, Some(card), None)
             }
-            None => (buffer, None),
+            None => {
+                let (buffer, data, bar) = pc_copy_buffer(size, false)?;
+                crate::host::name(&buffer, || {
+                    format!("title buffer {:#x}+{len:#x}{}", key.0, if bar.is_some() { " (GPU upload heap)" } else { "" })
+                });
+                (buffer, data, None, bar)
+            }
         };
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -4088,6 +4188,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         }
         let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
         shadow.card = card;
+        shadow.bar = bar;
         let shadow = Arc::new(shadow);
         if shadow.card.is_some() {
             CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
@@ -4269,24 +4370,33 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
-    let (buffer, data) = host()?.shared_buffer(len)?;
-    crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // With room for windows on the card (`window_card_most`): shaders get a
-    // buffer there, and the one just made is the CPU's side.
-    let (buffer, card) = match window_card_for(len) {
+    // buffer there, and the CPU's side is made beside it in PC memory.
+    let (buffer, data, card, bar) = match window_card_for(len) {
         Some(on_card) => {
+            let Some((staging, data)) = host().and_then(|h| h.shared_buffer(len)) else {
+                WINDOW_CARD_BYTES.fetch_sub(len, Ordering::Relaxed);
+                return None;
+            };
+            crate::host::name(&staging, || format!("title memory {start:#x}+{len:#x}"));
             crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
             let card = Card {
-                staging: buffer,
+                staging,
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 side: std::sync::RwLock::new(()),
                 size: len,
             };
-            (on_card, Some(card))
+            (on_card, data, Some(card), None)
         }
-        None => (buffer, None),
+        None => {
+            let (buffer, data, bar) = pc_copy_buffer(len, true)?;
+            crate::host::name(&buffer, || {
+                format!("title memory {start:#x}+{len:#x}{}", if bar.is_some() { " (GPU upload heap)" } else { "" })
+            });
+            (buffer, data, None, bar)
+        }
     };
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -4298,6 +4408,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
     shadow.card = card;
+    shadow.bar = bar;
     let shadow = Arc::new(shadow);
     if shadow.card.is_some() {
         CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
@@ -4356,11 +4467,13 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
             Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
         });
     }
-    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
+    let (buffer, data, bar) = pc_copy_buffer(len.next_multiple_of(256), false)?;
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
+    let mut shadow = Shadow::new(buffer, data, gpu, address, len);
+    shadow.bar = bar;
+    let shadow = Arc::new(shadow);
     map.insert((address, len), (shadow.clone(), now));
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     Some(shadow)
@@ -4486,6 +4599,16 @@ mod window_tests {
             assert!(start <= address && start + len >= end);
             assert!(start % g == 0 && len % g == 0);
         }
+    }
+
+    #[test]
+    fn gpu_upload_copies_parsing_defaults_and_clamps() {
+        use super::parse_gpu_upload_copies;
+        assert_eq!(parse_gpu_upload_copies(None, None), (0, 2048 << 20));
+        assert_eq!(parse_gpu_upload_copies(Some("1"), None), (1, 2048 << 20));
+        assert_eq!(parse_gpu_upload_copies(Some("2"), Some("1024")), (2, 1024 << 20));
+        assert_eq!(parse_gpu_upload_copies(Some("9"), Some(" 512 ")), (2, 512 << 20));
+        assert_eq!(parse_gpu_upload_copies(Some("bad"), Some("bad")), (0, 2048 << 20));
     }
 }
 

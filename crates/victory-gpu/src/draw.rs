@@ -119,6 +119,86 @@ fn write_skip() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WRITE_SKIP").is_none_or(|v| v != "0"))
 }
 
+fn draw_probes_enabled(
+    probes: Option<&std::ffi::OsStr>,
+    pipelines: Option<&std::ffi::OsStr>,
+) -> bool {
+    probes.is_some_and(|v| v == "1") || pipelines.is_some_and(|v| !v.is_empty())
+}
+
+/// Whether the draw-time probes run: the `+R`/`+W`/`+S` tags, the check
+/// of every bound slot against its view's copy (a lock per view), and the
+/// views of the pipelines in `VICTORY_PROBE_PIPELINES`. Off unless
+/// `VICTORY_DRAW_PROBES=1` or `VICTORY_PROBE_PIPELINES` names pipelines:
+/// they cost draw time.
+// stitch: gate resident-era `touched`/`PROBE`/`HostHeap::shows` draw probes when resident.rs lands
+#[allow(dead_code)]
+pub(crate) fn draw_probes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        draw_probes_enabled(
+            std::env::var_os("VICTORY_DRAW_PROBES").as_deref(),
+            std::env::var_os("VICTORY_PROBE_PIPELINES").as_deref(),
+        )
+    })
+}
+
+fn table_on_card_mode(val: Option<&str>) -> u8 {
+    match val.map(str::trim) {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => 0,
+    }
+}
+
+/// Whether descriptor-table constant buffer views bind directly to a buffer's
+/// host copy (`VICTORY_TABLE_ON_CARD=1` card-resident only, `=2` any buffer
+/// copy; default `0` OFF) instead of filling upload memory on the CPU.
+fn table_on_card() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| table_on_card_mode(std::env::var("VICTORY_TABLE_ON_CARD").ok().as_deref()))
+}
+
+fn cbv_card_slot_fits(gpu: u64, left: u64, clamped_len: u64) -> bool {
+    gpu.is_multiple_of(256) && left >= clamped_len.next_multiple_of(256)
+}
+
+fn effective_texture_span(
+    stage_span: std::time::Duration,
+    cap_ms: u64,
+    spent_us: u64,
+) -> std::time::Duration {
+    if cap_ms == 0 {
+        return stage_span;
+    }
+    let remaining_us = cap_ms.saturating_mul(1000).saturating_sub(spent_us);
+    stage_span.min(std::time::Duration::from_micros(remaining_us))
+}
+
+/// With [`table_on_card`]: the host GPU address a table constant buffer view
+/// (`size` bytes of title memory at `address`) binds directly to in its host
+/// copy, avoiding a CPU-side upload fill and flight settle when the range is
+/// 256-byte aligned and fits in the copy.
+fn table_constant_on_card(list: &HostList, address: u64, size: u32) -> Option<u64> {
+    let mode = table_on_card();
+    let clamped = crate::descriptor::host::constant_view_bytes(size);
+    if mode == 0 || address == 0 || clamped == 0 {
+        return None;
+    }
+    let len = u64::from(clamped);
+    // stitch: switch to `crate::shadow::sole_buffer_copy` and call `list.note_table_on_card` once 3B/3C lands them
+    let shadow = crate::shadow::find(address, len)?;
+    if mode == 1 && !shadow.carded() {
+        return None;
+    }
+    let gpu = shadow.gpu(address);
+    if !cbv_card_slot_fits(gpu, shadow.left(address), len) {
+        return None;
+    }
+    shadow.refresh(list, address, len);
+    Some(gpu)
+}
+
 /// A run of indirect records clamped in one pass ([`windows`]): the host
 /// copy they came from (its number), their kind and stride, the offset of
 /// the first in that copy, how many, which slots have already been drawn
@@ -384,7 +464,7 @@ pub(crate) fn window_line(frames: f64) {
         "indirect commands per frame by their clamp: {:.0} read from a window (no pass of ours); a pass of ours for {:.0}: {:.0} dispatches, {:.0} of more than one record, {:.0} with a count \
          buffer, {:.0} whose shaders can store to buffers, {:.0} first on their list, {:.0} with no window on their argument buffer, {:.0} off the window's walk, {:.0} past the window's end; \
          {:.0} records clamped by those passes; {:.0} of the passes opened a window at a remembered step (VICTORY_WINDOW_JUMP=1), {:.0} of those windows were read by no draw; \
-         {:.0} read a record gathered for their list's prelude (VICTORY_INDIRECT_GATHER=1), {:.0} asked for one and got none          (no fit for the clamp {:.0}, the list had stopped gathering {:.0}, too many buffers {:.0}, the set full {:.0}, no buffer {:.0})",
+         {:.0} read a record gathered for their list's prelude (VICTORY_INDIRECT_GATHER=1), {:.0} asked for one and got none          (no fit for the clamp {:.0}, the list had stopped gathering {:.0}, too many buffers {:.0}, the set full {:.0}, no buffer {:.0}); {}",
         n[0],
         n[1..9].iter().sum::<f64>(),
         n[1],
@@ -405,6 +485,7 @@ pub(crate) fn window_line(frames: f64) {
         g[2],
         g[3],
         g[4],
+        crate::indirect::calls_line(frames),
     );
 }
 
@@ -441,6 +522,15 @@ pub(crate) struct State {
     /// The indirect records clamped last, if later draws may still read
     /// them ([`windows`]).
     window: Option<Window>,
+    /// The list's run buffer for batched indirect clamping
+    /// (`VICTORY_INDIRECT_BATCH`, `crate::indirect::batched`).
+    batch_args: crate::indirect::BatchArgs,
+    /// The run of indirect calls whose records one pass of ours clamps
+    /// (`VICTORY_INDIRECT_BATCH`, `crate::indirect::batched`).
+    batch: Option<crate::indirect::Run>,
+    /// A dispatch was recorded since the list last waited for every shader
+    /// write before an indirect call (`VICTORY_INDIRECT_BATCH=3`).
+    dispatched: bool,
     /// With [`jump_windows`]: the argument buffer (its copy's number), kind
     /// and stride of the last window of several records that a draw read
     /// from, and that window's step.
@@ -739,8 +829,34 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
 
 impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
+        let mut batch_args = std::mem::take(&mut self.batch_args);
+        batch_args.rewind();
         *self = State::default();
+        self.batch_args = batch_args;
         self.pipeline = pipeline as usize;
+    }
+
+    /// The run of indirect calls clamped together, if any, is over.
+    fn end_batch(&mut self, list: &HostList) {
+        crate::indirect::end_run(list, &mut self.batch_args, self.batch.take());
+    }
+
+    /// With runs ending at anything that may write (`VICTORY_INDIRECT_BATCH`
+    /// 1, 3): the bound pipeline's shaders can store to buffers, so the run ends.
+    fn end_batch_if_stores(&mut self, list: &HostList) {
+        if self.batch.is_some()
+            && crate::indirect::run_rules().stores
+            && self.pipeline_stores()
+        {
+            self.end_batch(list);
+        }
+    }
+
+    /// Whether the bound pipeline's shaders can store to buffer memory
+    /// (one without a host pipeline runs nothing, so writes nothing).
+    fn pipeline_stores(&self) -> bool {
+        crate::pipeline::host_pipeline(self.pipeline as This)
+            .is_some_and(|p| p.stages.iter().any(|stage| stage.translated().stores))
     }
 
     /// The title's topology; console-only ones become host lists (see
@@ -945,6 +1061,9 @@ impl State {
     /// the targets (a descriptor rewritten in between names another view).
     pub(crate) fn replay(&mut self, list: &HostList) {
         self.window = None;
+        self.batch = None;
+        self.batch_args.retire_to(list);
+        self.dispatched = false;
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
@@ -1964,18 +2083,23 @@ impl State {
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
             return;
         }
-        /// Bytes of texture memory staged per frame.
-        // `VICTORY_TEXTURE_STAGE_MB` raises it: a backlog of tens of thousands of
-        // textures (a scene's first minutes) then drains in fewer frames.
+        /// Bytes of texture memory staged per frame: 192 MB, or
+        /// `VICTORY_TEXTURE_STAGE_MB` (read once; `VICTORY_HEAP_TEXTURE_MB`
+        /// fallback).
         static PER_FRAME_MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let per_frame: u64 = *PER_FRAME_MB.get_or_init(|| {
-            std::env::var("VICTORY_TEXTURE_STAGE_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(192)
+            ["VICTORY_TEXTURE_STAGE_MB", "VICTORY_HEAP_TEXTURE_MB"]
+                .iter()
+                .find_map(|name| std::env::var(name).ok().and_then(|v| v.trim().parse().ok()))
+                .unwrap_or(192)
         }) << 20;
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static SPENT: AtomicU64 = AtomicU64::new(0);
+        static SPENT_US: AtomicU64 = AtomicU64::new(0);
         let frame = crate::frame::current();
         if FRAME.swap(frame, Ordering::Relaxed) != frame {
             SPENT.store(0, Ordering::Relaxed);
+            SPENT_US.store(0, Ordering::Relaxed);
         }
         // No more of them are made while the card has no room
         // (`resource::room`): by what is alive now, not by what was ever
@@ -2049,12 +2173,21 @@ impl State {
         let span = std::time::Duration::from_millis(*SPAN_MS.get_or_init(|| {
             std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(250)
         }));
+        // Per-frame elapsed budget (`VICTORY_HEAP_TEXTURE_MS`): default 0 =
+        // unlimited (matching existing behavior); when non-zero (e.g. 16),
+        // caps the `heap_textures` loop elapsed time per frame so world asset
+        // streaming does not spike single frames.
+        static HEAP_TEXTURE_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let cap_ms = *HEAP_TEXTURE_MS.get_or_init(|| {
+            std::env::var("VICTORY_HEAP_TEXTURE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+        });
         // A backlog (a scene's first minutes: 22,000 slots due, 2-3 minutes of black
         // surfaces at 192 MB a frame) gets three times the bytes and the time until it
         // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
         let (per_frame, span) = if catchup && due.len() >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
+        let span = effective_texture_span(span, cap_ms, SPENT_US.load(Ordering::Relaxed));
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
@@ -2292,6 +2425,7 @@ impl State {
                 None => host.texture_slot_done(index, write, again),
             }
         }
+        SPENT_US.fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
 
     /// For the frame listing, after a dropped dispatch's line: its group
@@ -2351,6 +2485,16 @@ impl State {
         // It may write the arguments a window holds clamped.
         self.window = None;
         list.gather_close();
+        // A dispatch that may write records ends the run (1: every one).
+        let rules = crate::indirect::run_rules();
+        if rules.on {
+            if rules.dispatch_ends(self.pipeline_stores()) {
+                self.end_batch(list);
+            } else if self.batch.is_some() {
+                crate::indirect::note_run_kept();
+            }
+            self.dispatched = true;
+        }
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2720,6 +2864,7 @@ impl State {
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         self.window = None;
+        self.end_batch_if_stores(list);
         if self.may_store() {
             list.gather_close();
         }
@@ -2997,6 +3142,13 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size))
+                        if table_on_card() > 0
+                            && let Some(gpu) = table_constant_on_card(list, address, size) =>
+                    {
+                        let size = crate::descriptor::host::constant_view_bytes(size);
+                        host.constant_at(index, gpu, size);
+                    }
+                    Some(View::Constant(address, size))
                         if address != 0
                             && crate::descriptor::host::constant_view_bytes(size) > 0
                             && crate::host::fill_on_card()
@@ -3141,6 +3293,7 @@ impl State {
         first_instance: u32,
     ) {
         self.window = None;
+        self.end_batch_if_stores(list);
         if self.may_store() {
             list.gather_close();
         }
@@ -3249,6 +3402,7 @@ impl State {
         first_instance: u32,
     ) {
         self.window = None;
+        self.end_batch_if_stores(list);
         if self.may_store() {
             list.gather_close();
         }
@@ -3385,8 +3539,13 @@ impl State {
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
         let stores = p.stages.iter().any(|stage| stage.translated().stores);
-        let (can_batch, windowed) =
-            indirect_batch_flags(windows(), kind, max, count.is_some(), stores);
+        let (can_batch, windowed) = indirect_batch_flags(
+            windows() && crate::indirect::batch_mode() == 0,
+            kind,
+            max,
+            count.is_some(),
+            stores,
+        );
         // Another host list (a new one after a cut, or this one after its
         // reset) has another scratch buffer, or this one's with old bytes.
         let first_on_list = list.first_use(WINDOW_USE);
@@ -3400,7 +3559,7 @@ impl State {
         }
         // Diagnostics: why this command gets a pass of ours, if it does.
         #[cfg(feature = "diagnostics")]
-        let why_not = if !windows() {
+        let why_not = if !windows() || crate::indirect::batch_mode() > 0 {
             usize::MAX
         } else if kind == DISPATCH {
             1
@@ -3439,8 +3598,51 @@ impl State {
         } else {
             None
         };
-        let (bounded, at, compacted_count) = match (hit, gathered) {
-            (Some((scratch, at, step)), _) => {
+        // A run of calls whose records one pass clamps
+        // (`crate::indirect::batch_mode`); one it cannot take is clamped
+        // alone below.
+        let in_run = if hit.is_none() && gathered.is_none() && crate::indirect::batch_mode() > 0 {
+            self.window = None;
+            args.refresh(list, arguments, len);
+            if let Some((s, at)) = &counter {
+                s.refresh(list, *at, 4);
+            }
+            let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+            let rules = crate::indirect::run_rules();
+            let last = rules.call_ends(kind, stores);
+            let joined = crate::indirect::batched(
+                list,
+                &mut self.batch_args,
+                &mut self.batch,
+                (&args.buffer, offset),
+                count_arg,
+                (kind, stride, max),
+                last,
+            )
+            .map(|(scratch, at, began)| {
+                if began {
+                    // Its pass bound a compute pipeline of ours.
+                    self.host_pipeline = 0;
+                    self.host_roots[1] = 0;
+                } else if rules.order && self.dispatched {
+                    // Where 1 would have begun a run (a dispatch since
+                    // the last wait), a wait without the pass.
+                    crate::indirect::wait_for_writes(list);
+                    crate::indirect::note_order_wait();
+                }
+                (scratch, at)
+            });
+            // Clamped in a run or (below) alone: either way the work before
+            // has been waited for.
+            self.dispatched = false;
+            joined
+        } else {
+            None
+        };
+        let batched = in_run.is_some();
+        let (bounded, at, compacted_count) = match (in_run, hit, gathered) {
+            (Some((scratch, at)), _, _) => (scratch, at, None),
+            (None, Some((scratch, at, step)), _) => {
                 // Diagnostics of windows: the record clamped again and
                 // compared (`crate::indirect::window_check`).
                 if crate::indirect::window_check()
@@ -3465,7 +3667,7 @@ impl State {
                 }
                 (scratch, at, None)
             }
-            (None, Some((scratch, at))) => {
+            (None, None, Some((scratch, at))) => {
                 // The record's bytes are up to date when the list is
                 // submitted, as for a record clamped in the list.
                 args.refresh(list, arguments, len);
@@ -3477,7 +3679,7 @@ impl State {
                 }
                 (scratch, at, None)
             }
-            (None, None) => {
+            (None, None, None) => {
                 // A window opened at the remembered step that no draw read
                 // from: the title does not walk here by that step.
                 if self.window_jumped && !self.window_read {
@@ -3598,6 +3800,10 @@ impl State {
             _ => false,
         };
         if !ran {
+            let rules = crate::indirect::run_rules();
+            if rules.call_ends(kind, stores) {
+                self.end_batch(list);
+            }
             why("prepare failed");
             return false;
         }
@@ -3632,7 +3838,18 @@ impl State {
         }
         // The scratch buffer stays readable as arguments: the next draw of
         // the window reads it with no barrier, and the next clamp moves it
-        // back (`crate::indirect`).
+        // back (`crate::indirect`). A run's buffer is left so too.
+        crate::indirect::note_call(kind, batched, count.is_some());
+        let rules = crate::indirect::run_rules();
+        if rules.call_ends(kind, stores) {
+            self.end_batch(list);
+        }
+        if kind == DISPATCH && rules.on {
+            self.dispatched = true;
+            if self.batch.is_some() {
+                crate::indirect::note_run_kept();
+            }
+        }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -4053,5 +4270,47 @@ mod tests {
         assert_eq!(indirect_batch_flags(false, 10, 4, false, false), (false, false));
         assert_eq!(indirect_batch_flags(false, 10, 1, true, false), (false, false));
         assert_eq!(indirect_batch_flags(false, 10, 1, false, true), (false, false));
+    }
+
+    #[test]
+    fn draw_probes_gate_respects_env_switches() {
+        use std::ffi::OsStr;
+        assert!(!draw_probes_enabled(None, None));
+        assert!(!draw_probes_enabled(Some(OsStr::new("0")), None));
+        assert!(!draw_probes_enabled(None, Some(OsStr::new(""))));
+        assert!(draw_probes_enabled(Some(OsStr::new("1")), None));
+        assert!(draw_probes_enabled(None, Some(OsStr::new("mesh_pass"))));
+        assert!(draw_probes_enabled(Some(OsStr::new("0")), Some(OsStr::new("ps_main"))));
+    }
+
+    #[test]
+    fn heap_texture_ms_budget_caps_span_only_when_nonzero() {
+        use std::time::Duration;
+        let stage = Duration::from_millis(750);
+        // Default 0 = unlimited by VICTORY_HEAP_TEXTURE_MS (keeps stage/catchup span).
+        assert_eq!(effective_texture_span(stage, 0, 0), stage);
+        assert_eq!(effective_texture_span(stage, 0, 50_000), stage);
+        // Non-zero caps per-frame elapsed budget, accounting for prior frame spend.
+        assert_eq!(effective_texture_span(stage, 16, 0), Duration::from_millis(16));
+        assert_eq!(effective_texture_span(stage, 16, 12_000), Duration::from_millis(4));
+        assert_eq!(effective_texture_span(stage, 16, 20_000), Duration::ZERO);
+        // Never extends a shorter stage span.
+        assert_eq!(
+            effective_texture_span(Duration::from_millis(5), 16, 0),
+            Duration::from_millis(5)
+        );
+    }
+
+    #[test]
+    fn table_on_card_mode_and_alignment_checks() {
+        assert_eq!(table_on_card_mode(None), 0);
+        assert_eq!(table_on_card_mode(Some("0")), 0);
+        assert_eq!(table_on_card_mode(Some("1")), 1);
+        assert_eq!(table_on_card_mode(Some(" 2 ")), 2);
+        assert!(cbv_card_slot_fits(0x1000, 256, 64));
+        assert!(!cbv_card_slot_fits(0x1010, 512, 64));
+        assert!(!cbv_card_slot_fits(0x1000, 128, 64));
+        assert!(cbv_card_slot_fits(0x1000, 512, 257));
+        assert!(!cbv_card_slot_fits(0x1000, 256, 257));
     }
 }

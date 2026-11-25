@@ -47,6 +47,7 @@ const TILE: u32 = 256;
 
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=8, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
+#define BATCH_RS "SRV(t0), SRV(t1), SRV(t2), UAV(u0), UAV(u1)"
 cbuffer Record : register(b0) {
     uint c0;
     uint c1;
@@ -64,6 +65,12 @@ cbuffer Record : register(b0) {
 };
 ByteAddressBuffer src_args : register(t0);
 ByteAddressBuffer count_buf : register(t1);
+// A run's jobs (`batch`): word 0 their number, then from byte 16 eight
+// words each: kind, stride, records, offset of the first in `src_args`,
+// flags (bit 0: bounded by the count at the next word's offset in
+// `count_buf`), that offset, the offset of the first clamped in
+// `dst_args`, nothing.
+ByteAddressBuffer jobs : register(t2);
 RWByteAddressBuffer dst_args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
@@ -277,6 +284,43 @@ void main(uint3 group_id : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         groups = uint3(0u, 0u, 0u);
     }
     store_record(c0, c1, dst_at, src_at, draw_counts, groups);
+}
+
+// A run's indirect calls (`Run`): a group each, its records clamped in
+// tiles of 64 using `clamp_header`, `charge_group`, and `store_record`.
+// Groups past the run's jobs do nothing.
+[RootSignature(BATCH_RS)]
+[numthreads(64, 1, 1)]
+void batch(uint3 group : SV_GroupID, uint lane : SV_GroupIndex) {
+    uint job = group.x;
+    if (job >= jobs.Load(0)) return;
+    uint4 a = jobs.Load4(16u + job * 32u);
+    uint4 b = jobs.Load4(32u + job * 32u);
+    uint kind = a.x;
+    uint stride = a.y;
+    uint eff_count = effective_count(a.z, b.x, b.y);
+    for (uint base = 0u; base < eff_count; base += 64u) {
+        uint r = base + lane;
+        bool active = r < eff_count;
+        uint src_at = a.w + r * stride;
+        uint dst_at = b.z + r * stride;
+        uint2 draw_counts = uint2(0u, 0u);
+        uint3 groups = uint3(0u, 0u, 0u);
+        uint cost = 0u;
+        uint asked = 0u;
+        if (active) {
+            clamp_header(kind, src_at, false, draw_counts, groups, cost, asked);
+        }
+        uint group_n = min(64u, eff_count - base);
+        bool fits = charge_group(lane, group_n, active, kind, cost, asked, true);
+        if (active) {
+            if (!fits) {
+                draw_counts = uint2(0u, 0u);
+                groups = uint3(0u, 0u, 0u);
+            }
+            store_record(kind, stride, dst_at, src_at, draw_counts, groups);
+        }
+    }
 }
 
 [RootSignature(RS)]
@@ -499,11 +543,46 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
     Ok(clamp)
 }
 
+/// The clamp of a run's records ([`Run`]), made once.
+fn batch_clamp() -> Option<&'static Clamp> {
+    static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+    CLAMP
+        .get_or_init(|| {
+            let made = host()
+                .ok_or_else(windows::core::Error::empty)
+                .and_then(|h| make_entry(&h.device, s!("batch")));
+            match made {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "no clamp of runs of indirect records: each is clamped alone"
+                    );
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+/// Compiles a single entry point (`"main"` or `"batch"`) from `SOURCE`.
+fn make_entry(device: &ID3D12Device, entry: PCSTR) -> windows::core::Result<Clamp> {
+    make_source_entry(device, SOURCE, entry)
+}
+
 /// The clamp compiled from `source` (ours, or in the benchmark the one it
 /// replaced). Single-entry sources (`CHECK_SOURCE`, `bench::OLD_SOURCE`) only
 /// expose `main`.
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
-    let code = compile_hlsl(source, s!("clamp"), s!("main"))?;
+    make_source_entry(device, source, s!("main"))
+}
+
+fn make_source_entry(
+    device: &ID3D12Device,
+    source: &str,
+    entry: PCSTR,
+) -> windows::core::Result<Clamp> {
+    let code = compile_hlsl(source, s!("clamp"), entry)?;
     // SAFETY: the blob's own bytes; the root signature is inside the shader.
     let root: ID3D12RootSignature = unsafe {
         let bytes =
@@ -979,6 +1058,441 @@ fn record_clamp_with(
     true
 }
 
+/// Runs of indirect calls clamped in one pass (`VICTORY_INDIRECT_BATCH`):
+/// `0` off (default: each call's records are clamped alone), `1` (every
+/// dispatch ends a run), or `3` (a run ends only at work whose shaders can
+/// store to buffers).
+fn batch_mode_from(val: Option<&str>) -> u8 {
+    match val.map(str::trim) {
+        Some("1") => 1,
+        Some("3") => 3,
+        _ => 0,
+    }
+}
+
+pub(crate) fn batch_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| batch_mode_from(std::env::var("VICTORY_INDIRECT_BATCH").ok().as_deref()))
+}
+
+/// Where the runs of a [`batch_mode`] end, and what orders their calls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RunRules {
+    /// Runs at all (0: each call clamped alone).
+    pub(crate) on: bool,
+    /// Every dispatch ends the run (1), not only one whose shaders store.
+    pub(crate) every_dispatch: bool,
+    /// A dispatch or draw whose shaders store to buffers ends the run.
+    pub(crate) stores: bool,
+    /// The title's barriers and pipeline syncs end the run (2).
+    pub(crate) title_barriers: bool,
+    /// A wait for every shader write before a call joins a run after a
+    /// dispatch was recorded since the run's pass or the last such wait (3).
+    pub(crate) order: bool,
+}
+
+impl RunRules {
+    pub(crate) const fn of(mode: u8) -> RunRules {
+        let on = mode > 0;
+        RunRules {
+            on,
+            every_dispatch: mode == 1,
+            stores: matches!(mode, 1 | 3 | 4),
+            title_barriers: mode == 2,
+            order: mode == 3,
+        }
+    }
+
+    /// A direct dispatch whose shaders store (`stores`) ends the run.
+    pub(crate) fn dispatch_ends(self, stores: bool) -> bool {
+        self.on && (self.every_dispatch || (self.stores && stores))
+    }
+
+    /// An indirect call of `kind` (PC numbering) whose shaders store
+    /// (`stores`) ends its run after its own call: it goes in a run only
+    /// if one is open to take it.
+    pub(crate) fn call_ends(self, kind: u32, stores: bool) -> bool {
+        const DISPATCH: u32 = 2;
+        self.on && ((self.every_dispatch && kind == DISPATCH) || (self.stores && stores))
+    }
+}
+
+/// [`RunRules`] of [`batch_mode`].
+pub(crate) fn run_rules() -> RunRules {
+    RunRules::of(batch_mode())
+}
+
+/// The most calls one run clamps (groups of its pass).
+pub(crate) const RUN_JOBS: u32 = 64;
+/// A job table's bytes: the count of jobs, then eight words a job.
+const JOBS_BYTES: u64 = 16 + RUN_JOBS as u64 * 32;
+/// The least room a run takes in the run buffer.
+const RUN_ROOM: u64 = 4096;
+/// The most bytes one call's records may take to go in a run.
+const JOB_MOST_BYTES: u64 = 64 << 10;
+/// The run buffer's first size, and its most.
+const RUN_BUFFER_FIRST: u64 = 64 << 10;
+const RUN_BUFFER_MOST: u64 = 64 << 20;
+
+/// A list's run buffer: device-local memory the runs of the list clamp
+/// their records into, a region each, given out from the start after
+/// every reset.
+#[derive(Default)]
+pub(crate) struct BatchArgs {
+    buffer: Option<ID3D12Resource>,
+    cap: u64,
+    used: u64,
+    /// A run was clamped into the buffer since the reset: it is in the
+    /// indirect-argument state (read-only buffers decay back to common when
+    /// the submission finishes).
+    clamped: bool,
+    /// Changed at every reset and cut: a run of another number is over.
+    epoch: u64,
+}
+
+static NEXT_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_epoch() -> u64 {
+    NEXT_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+impl BatchArgs {
+    /// The list was reset after its submission finished: reuse the buffer
+    /// from its start in `COMMON`.
+    pub(crate) fn rewind(&mut self) {
+        self.used = 0;
+        self.clamped = false;
+        self.epoch = next_epoch();
+    }
+
+    /// The list was cut onto a new `HostList`: keep the old buffer alive
+    /// through `list` and start fresh in `COMMON` so the new list never
+    /// collides with the old list's `INDIRECT_ARGUMENT` state.
+    pub(crate) fn retire_to(&mut self, list: &HostList) {
+        if let Some(old) = self.buffer.take() {
+            list.keep(&old);
+        }
+        self.cap = 0;
+        self.used = 0;
+        self.clamped = false;
+        self.epoch = next_epoch();
+    }
+
+    fn epoch(&mut self) -> u64 {
+        if self.epoch == 0 {
+            self.epoch = next_epoch();
+        }
+        self.epoch
+    }
+}
+
+/// A run of indirect calls whose records one pass clamped (or will: the
+/// pass reads the job table when the list runs) ([`batch_mode`]).
+pub(crate) struct Run {
+    list: usize,
+    epoch: u64,
+    src: u64,
+    count: u64,
+    jobs: usize,
+    n: u32,
+    scratch: ID3D12Resource,
+    base: u64,
+    room: u64,
+    used: u64,
+}
+
+/// Indirect calls since the last report line, by how they were clamped:
+/// alone (draws, dispatches, mesh draws, counted), in runs (draws,
+/// dispatches, mesh draws, passes, refused), order waits, and dispatches
+/// that left a run open.
+pub(crate) static CALLS: [std::sync::atomic::AtomicU64; 11] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 11];
+const ALONE: usize = 0;
+const IN_RUNS: usize = 4;
+const RUNS: usize = 7;
+const RUN_REFUSED: usize = 8;
+const ORDER_WAITS: usize = 9;
+const RUN_KEPT: usize = 10;
+
+/// A wait before a call that joined a run ([`RunRules::order`]).
+pub(crate) fn note_order_wait() {
+    CALLS[ORDER_WAITS].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A dispatch inside a run that does not end it (its shaders store to no
+/// buffer, [`RunRules::dispatch_ends`]).
+pub(crate) fn note_run_kept() {
+    CALLS[RUN_KEPT].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// An indirect call of `kind` (PC numbering) clamped alone or in a run.
+pub(crate) fn note_call(kind: u32, in_run: bool, counted: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let class = match kind {
+        0 | 1 => 0,
+        2 => 1,
+        _ => 2,
+    };
+    CALLS[if in_run { IN_RUNS } else { ALONE } + class].fetch_add(1, Relaxed);
+    if counted && !in_run {
+        CALLS[ALONE + 3].fetch_add(1, Relaxed);
+    }
+}
+
+/// The report line of [`CALLS`] per frame, taken.
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) fn calls_line(frames: f64) -> String {
+    let c = CALLS.each_ref().map(|c| {
+        c.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames.max(1.0)
+    });
+    format!(
+        "indirect calls per frame clamped alone: {:.1} draws, {:.1} dispatches, {:.1} mesh draws ({:.1} counted); in runs (VICTORY_INDIRECT_BATCH={}): {:.1} draws, {:.1} dispatches, {:.1} mesh draws in {:.1} passes, {:.1} refused; {:.1} non-storing dispatches kept run open, {:.1} order waits",
+        c[0], c[1], c[2], c[3], batch_mode(), c[4], c[5], c[6], c[7], c[8], c[10], c[9]
+    )
+}
+
+/// The records of an indirect call (`kind`, `stride` and up to `records`
+/// of them, PC numbering, from `src`, bounded by `count` if given)
+/// clamped in a run ([`batch_mode`]): `run` goes on if it can take the
+/// call, else a new run is begun in its place.
+pub(crate) fn batched(
+    list: &HostList,
+    batch_args: &mut BatchArgs,
+    run: &mut Option<Run>,
+    (src, src_offset): (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    (kind, stride, records): (u32, u32, u32),
+    last: bool,
+) -> Option<(ID3D12Resource, u64, bool)> {
+    let fits = || -> Option<(u64, u64, u64, u32, Option<u32>)> {
+        let bytes = validate_layout((kind, stride, records), src_offset, count.map(|(_, off)| off))?;
+        if bytes > JOB_MOST_BYTES || src_offset.checked_add(bytes)? > u64::from(u32::MAX) {
+            return None;
+        }
+        // SAFETY: live D3D12 buffer resources.
+        let (src_gpu, src_width, count_bounds) = unsafe {
+            (
+                src.GetGPUVirtualAddress(),
+                src.GetDesc().Width,
+                count.map(|(buf, off)| (off, buf.GetDesc().Width)),
+            )
+        };
+        if !fits_buffers(bytes, src_offset, src_width, JOB_MOST_BYTES, count_bounds) {
+            return None;
+        }
+        let (count_gpu, count_at) = match count {
+            Some((buf, off)) => {
+                if off.checked_add(4)? > u64::from(u32::MAX) {
+                    return None;
+                }
+                // SAFETY: as above.
+                (unsafe { buf.GetGPUVirtualAddress() }, Some(off as u32))
+            }
+            None => (0, None),
+        };
+        (src_gpu.is_multiple_of(4) && count_gpu.is_multiple_of(4))
+            .then_some((bytes, src_gpu, count_gpu, src_offset as u32, count_at))
+    };
+    let Some((bytes, src_gpu, count_gpu, args_at, count_at)) = fits() else {
+        end_run(list, batch_args, run.take());
+        CALLS[RUN_REFUSED].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return None;
+    };
+    let here = std::ptr::from_ref(list) as usize;
+    let epoch = batch_args.epoch();
+    let takes = run.as_ref().is_some_and(|r| {
+        r.list == here
+            && r.epoch == epoch
+            && r.src == src_gpu
+            && (count_at.is_none() || (r.count != 0 && r.count == count_gpu))
+            && r.n < RUN_JOBS
+            && r.used + bytes <= r.room
+    });
+    let began = !takes;
+    if began && last {
+        end_run(list, batch_args, run.take());
+        return None;
+    }
+    if began {
+        end_run(list, batch_args, run.take());
+        *run = begin_run(list, batch_args, src_gpu, count.map(|(b, _)| b), bytes);
+        if run.is_none() {
+            CALLS[RUN_REFUSED].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
+    }
+    let r = run.as_mut()?;
+    let at = r.used;
+    let job = [
+        kind,
+        stride,
+        records,
+        args_at,
+        u32::from(count_at.is_some()),
+        count_at.unwrap_or(0),
+        at as u32,
+        0,
+    ];
+    // SAFETY: the job table holds `RUN_JOBS` jobs and `r.n` is below that;
+    // the list is not submitted while it is recorded.
+    unsafe { write_job(r.jobs as *mut u8, r.n, job) };
+    r.n += 1;
+    r.used = (at + bytes).next_multiple_of(16);
+    Some((r.scratch.clone(), r.base + at, began))
+}
+
+/// `job` as job `n` of the table at `jobs`, and the table's count after it.
+///
+/// # Safety
+/// `jobs` is a mapped job table of [`JOBS_BYTES`], `n < RUN_JOBS`.
+unsafe fn write_job(jobs: *mut u8, n: u32, job: [u32; 8]) {
+    // SAFETY: inside the table, per the caller.
+    unsafe {
+        let words = jobs.cast::<u32>();
+        for (i, w) in job.into_iter().enumerate() {
+            words.add(4 + n as usize * 8 + i).write_volatile(w);
+        }
+        words.write_volatile(n + 1);
+    }
+}
+
+/// A run's start in `list`: its region of the run buffer (at least
+/// `bytes`), its job table (empty), and the wait, the clamp pass and the
+/// wait recorded.
+fn begin_run(
+    list: &HostList,
+    b: &mut BatchArgs,
+    src_gpu: u64,
+    count: Option<&ID3D12Resource>,
+    bytes: u64,
+) -> Option<Run> {
+    let c = batch_clamp()?;
+    let budget = list.budget()?;
+    let (jobs_gpu, jobs) = list.scratch(JOBS_BYTES)?;
+    let room = bytes.max(RUN_ROOM).next_multiple_of(256);
+    let mut old = None;
+    if b.buffer.is_none() || b.used + room > b.cap {
+        let cap = (b.cap * 2)
+            .max(RUN_BUFFER_FIRST)
+            .max(room)
+            .next_multiple_of(64 << 10);
+        if cap > RUN_BUFFER_MOST {
+            return None;
+        }
+        let buffer = host()?.uav_buffer(cap)?;
+        crate::host::name(&buffer, || format!("indirect runs {cap:#x}"));
+        old = b.buffer.replace(buffer);
+        (b.cap, b.used, b.clamped) = (cap, 0, false);
+    }
+    let base = b.used;
+    b.used += room;
+    let before = if b.clamped {
+        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT
+    } else {
+        D3D12_RESOURCE_STATE_COMMON
+    };
+    b.clamped = true;
+    let scratch = b.buffer.clone()?;
+    let epoch = b.epoch();
+    if let Some(old) = old {
+        // Earlier runs' calls still read it.
+        list.keep(&old);
+    }
+    // SAFETY: the list's own mapped scratch memory of `JOBS_BYTES`.
+    unsafe { jobs.cast::<u32>().write_volatile(0) };
+    // SAFETY: live buffers.
+    let (count_gpu, scratch_gpu) =
+        unsafe { (count.map_or(0, |c| c.GetGPUVirtualAddress()), scratch.GetGPUVirtualAddress()) };
+    let count_bound = if count.is_some() { count_gpu } else { src_gpu };
+    record_run(
+        c,
+        &list.list,
+        (&scratch, before, scratch_gpu + base),
+        (src_gpu, count_bound, jobs_gpu),
+        budget,
+    );
+    CALLS[RUNS].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Some(Run {
+        list: std::ptr::from_ref(list) as usize,
+        epoch,
+        src: src_gpu,
+        count: count_gpu,
+        jobs: jobs as usize,
+        n: 0,
+        scratch,
+        base,
+        room,
+        used: 0,
+    })
+}
+
+/// Records a run's pass in `l`.
+fn record_run(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    (scratch, before, region): (&ID3D12Resource, D3D12_RESOURCE_STATES, u64),
+    (src, count, jobs): (u64, u64, u64),
+    budget: u64,
+) {
+    #[cfg(feature = "diagnostics")]
+    let waits = crate::copystat::barrier_test() & 2 == 0;
+    #[cfg(not(feature = "diagnostics"))]
+    let waits = true;
+    let first = [
+        uav_barrier(),
+        transition(scratch, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+    ];
+    let second = [
+        uav_barrier(),
+        transition(
+            scratch,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+        ),
+    ];
+    let skip = usize::from(!waits);
+    // SAFETY: an open list; our root signature and pipeline; live buffers.
+    unsafe {
+        l.ResourceBarrier(&first[skip..]);
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        l.SetComputeRootShaderResourceView(0, src);
+        l.SetComputeRootShaderResourceView(1, count);
+        l.SetComputeRootShaderResourceView(2, jobs);
+        l.SetComputeRootUnorderedAccessView(3, region);
+        l.SetComputeRootUnorderedAccessView(4, budget);
+        l.Dispatch(RUN_JOBS, 1, 1);
+        l.ResourceBarrier(&second[skip..]);
+    }
+}
+
+/// `run` is over: the room it did not take goes back to the run buffer
+/// if nothing was given out after it.
+pub(crate) fn end_run(list: &HostList, b: &mut BatchArgs, run: Option<Run>) {
+    let Some(run) = run else {
+        return;
+    };
+    if run.list != std::ptr::from_ref(list) as usize {
+        return;
+    }
+    if b.epoch == run.epoch
+        && b.buffer.as_ref() == Some(&run.scratch)
+        && b.used == run.base + run.room
+    {
+        b.used = run.base + run.used.next_multiple_of(256);
+    }
+}
+
+/// A wait in `list` for every earlier shader write (`RunRules::order`).
+pub(crate) fn wait_for_writes(list: &HostList) {
+    #[cfg(feature = "diagnostics")]
+    if crate::copystat::barrier_test() & 2 != 0 {
+        return;
+    }
+    // SAFETY: an open list; UAV barrier orders subsequent reads after earlier writes.
+    unsafe { list.list.ResourceBarrier(&[uav_barrier()]) };
+}
+
 /// The most records of one argument buffer gathered for a list
 /// ([`gather`]): a multiple of the clamp's 64 threads a group, so that the
 /// threads past the last record read inside the table.
@@ -1441,6 +1955,325 @@ mod tests {
         assert_eq!(validate_layout((10, 12, 1), 0, Some(2)), None);
         assert_eq!(validate_layout((99, 16, 1), 0, None), None);
         assert_eq!(validate_layout((0, 16, u32::MAX), 0, None), None);
+    }
+
+    #[test]
+    fn run_rules_by_mode_and_default_off() {
+        assert_eq!(batch_mode_from(None), 0);
+        assert_eq!(batch_mode_from(Some("0")), 0);
+        assert_eq!(batch_mode_from(Some("2")), 0);
+        assert_eq!(batch_mode_from(Some("1")), 1);
+        assert_eq!(batch_mode_from(Some(" 3 ")), 3);
+
+        let none = RunRules::of(0);
+        assert!(!none.on && !none.dispatch_ends(true) && !none.call_ends(2, true));
+        let one = RunRules::of(1);
+        assert!(
+            one.dispatch_ends(false)
+                && one.call_ends(2, false)
+                && !one.call_ends(0, false)
+                && one.call_ends(10, true)
+        );
+        assert!(!one.title_barriers && !one.order);
+        let two = RunRules::of(2);
+        assert!(!two.dispatch_ends(true) && !two.call_ends(2, true) && two.title_barriers && !two.order);
+        for mode in [3, 4] {
+            let r = RunRules::of(mode);
+            assert!(
+                !r.dispatch_ends(false) && r.dispatch_ends(true),
+                "mode {mode}: only a dispatch that stores ends the run"
+            );
+            assert!(
+                !r.call_ends(2, false)
+                    && r.call_ends(2, true)
+                    && r.call_ends(0, true)
+                    && !r.call_ends(10, false)
+            );
+            assert!(!r.title_barriers);
+            assert_eq!(r.order, mode == 3, "mode {mode}: waits where 1 began a run");
+        }
+    }
+
+    /// A run's pass (`record_run`, the shader's `batch`) clamps each job's
+    /// records as the pass of one call (`main`) clamps them: the same
+    /// bytes at each job's place and the same budget words, with the jobs
+    /// written into the table after the pass was recorded and groups past
+    /// the jobs doing nothing.
+    #[test]
+    fn warp_run_clamps_each_job_as_alone() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let batch = make_entry(&warp.device, s!("batch"))
+            .expect("the run's clamp must compile on WARP");
+        const SRC: usize = 4096;
+        let mut src = vec![0u8; SRC];
+        let mut put = |at: usize, words: &[u32]| {
+            for (i, w) in words.iter().enumerate() {
+                src[at + i * 4..at + i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+            }
+        };
+        put(0, &[3, 2, 7, 9]);
+        put(64, &[70_000, 2, 1]);
+        put(
+            128,
+            &[5, 1, 1, 0xAB, u32::MAX, u32::MAX, u32::MAX, 0xAC, 519, 1, 1, 0xAD],
+        );
+        for i in 0..100u32 {
+            put(1024 + i as usize * 20, &[i + 1, 2, i, 0, 7]);
+        }
+        // (kind, stride, records, first record's offset, count's offset);
+        // the count at 8 is 70 of the 100.
+        let jobs: [(u32, u32, u32, u32, Option<u32>); 4] = [
+            (0, 16, 1, 0, None),
+            (2, 12, 1, 64, None),
+            (10, 16, 3, 128, None),
+            (1, 20, 100, 1024, Some(8)),
+        ];
+        let mut at = 0u64;
+        let places: Vec<u64> = jobs
+            .iter()
+            .map(|&(_, stride, records, _, _)| {
+                let here = at;
+                at = (at + u64::from(stride * records)).next_multiple_of(16);
+                here
+            })
+            .collect();
+        let (src_buf, src_ptr, src_gpu) = warp.shared_buffer(SRC as u64);
+        let (count_buf, count_ptr, count_gpu) = warp.shared_buffer(64);
+        let (_jobs_buf, jobs_ptr, jobs_gpu) = warp.shared_buffer(JOBS_BYTES);
+        let (_alone_budget, alone_budget_ptr, alone_budget_gpu) = warp.shared_buffer(256);
+        let (_run_budget, run_budget_ptr, run_budget_gpu) = warp.shared_buffer(256);
+        let run_dst = warp.default_uav(8192);
+        let (run_back, run_back_ptr, _) = warp.shared_buffer(8192);
+        let alone: Vec<_> = jobs
+            .iter()
+            .map(|_| (warp.default_uav(4096), warp.shared_buffer(4096)))
+            .collect();
+        // SAFETY: mapped buffers of these sizes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), src_ptr, SRC);
+            std::ptr::write_bytes(count_ptr, 0, 64);
+            count_ptr.add(8).cast::<u32>().write(70);
+            std::ptr::write_bytes(jobs_ptr, 0xCD, JOBS_BYTES as usize);
+            jobs_ptr.cast::<u32>().write(0);
+            std::ptr::write_bytes(alone_budget_ptr, 0, 256);
+            std::ptr::write_bytes(run_budget_ptr, 0, 256);
+        }
+        // Each call alone (in-slot, `ahead = false`, matching `batch`).
+        let no_compact = Clamp {
+            root: warp.clamp.root.clone(),
+            pso: warp.clamp.pso.clone(),
+            compact_single: None,
+            compact_pass1: None,
+            scan_tiles: None,
+            add_offsets: None,
+            compact_scatter: None,
+        };
+        for (&(kind, stride, records, first, count), (dst, _)) in jobs.iter().zip(&alone) {
+            assert!(record_clamp_as(
+                &no_compact,
+                &warp.list,
+                (dst, D3D12_RESOURCE_STATE_COMMON),
+                alone_budget_gpu,
+                (&src_buf, u64::from(first)),
+                count.map(|off| (&count_buf, u64::from(off))),
+                (kind, stride, records),
+                false,
+            ));
+            // SAFETY: an open list and live buffer in INDIRECT_ARGUMENT.
+            unsafe {
+                warp.list.ResourceBarrier(&[transition(
+                    dst,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )])
+            };
+        }
+        // The run: its pass first, its jobs written after.
+        // SAFETY: a live buffer.
+        let run_gpu = unsafe { run_dst.GetGPUVirtualAddress() };
+        record_run(
+            &batch,
+            &warp.list,
+            (&run_dst, D3D12_RESOURCE_STATE_COMMON, run_gpu),
+            (src_gpu, count_gpu, jobs_gpu),
+            run_budget_gpu,
+        );
+        for (n, (&(kind, stride, records, first, count), &place)) in
+            jobs.iter().zip(&places).enumerate()
+        {
+            let job = [
+                kind,
+                stride,
+                records,
+                first,
+                u32::from(count.is_some()),
+                count.unwrap_or(0),
+                place as u32,
+                0,
+            ];
+            // SAFETY: a mapped job table; the list is not submitted yet.
+            unsafe { write_job(jobs_ptr, n as u32, job) };
+        }
+        // SAFETY: an open list; the buffers are copied for the check.
+        unsafe {
+            warp.list.ResourceBarrier(&[transition(
+                &run_dst,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            warp.list.CopyBufferRegion(&run_back, 0, &run_dst, 0, 8192);
+            for (dst, (back, _, _)) in &alone {
+                warp.list.ResourceBarrier(&[transition(
+                    dst,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                warp.list.CopyBufferRegion(back, 0, dst, 0, 4096);
+            }
+        }
+        warp.submit_and_wait();
+        let words = |p: *mut u8, n: usize| -> Vec<u32> {
+            // SAFETY: the work is done; a mapped buffer of at least `n` words.
+            unsafe { std::slice::from_raw_parts(p.cast::<u32>().cast_const(), n).to_vec() }
+        };
+        let run_out = words(run_back_ptr, 2048);
+        for (i, (&(_, stride, records, _, count), (_, (_, back_ptr, _)))) in
+            jobs.iter().zip(&alone).enumerate()
+        {
+            let ran = if count.is_some() { records.min(70) } else { records };
+            let n = (stride * ran / 4) as usize;
+            let from = (places[i] / 4) as usize;
+            assert_eq!(
+                &run_out[from..from + n],
+                &words(*back_ptr, n)[..],
+                "job {i} clamped as alone"
+            );
+        }
+        assert_eq!(&run_out[0..4], &[3, 2, 7, 9], "the draw as asked");
+        assert_eq!(
+            &run_out[4..7],
+            &[65_535, 2, 1],
+            "the dispatch cut to 65,535 in x"
+        );
+        assert_eq!(
+            &run_out[12..16],
+            &[65_535, 1, 1, 0xAC],
+            "a slot of all ones clamped and charged, as alone"
+        );
+        assert_eq!(
+            words(run_budget_ptr, 5),
+            words(alone_budget_ptr, 5),
+            "the same budget and notes"
+        );
+        assert_eq!(
+            words(run_budget_ptr, 1)[0],
+            6 + 65_535 * 2 * 64 + (5 + 65_535 + 519) * 128 + 70 * 71
+        );
+        drop(src_buf);
+    }
+
+    /// Modes whose runs end at a storing dispatch (`1`, `3`, `4`) break the
+    /// run and start a new pass so the later indirect call sees the newly
+    /// written arguments; mode `2` leaves it stale.
+    #[test]
+    fn warp_storing_pass_inside_a_run_leaves_the_later_call_stale() {
+        const WRITER_CS: &str = r#"
+#define RS "UAV(u0)"
+RWByteAddressBuffer args : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    args.Store3(16, uint3(5, 1, 1));
+}
+"#;
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let batch = make_entry(&warp.device, s!("batch"))
+            .expect("the run's clamp must compile on WARP");
+        let writer = compile_cs(&warp.device, WRITER_CS).expect("writer shader must compile");
+        let sig = warp.signature(2, 12);
+        for mode in 1..=4u8 {
+            let rules = RunRules::of(mode);
+            let (src_buf, src_ptr, src_gpu) = warp.shared_buffer(256);
+            let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+            let (_hits, hits_ptr, hits_gpu) = warp.shared_buffer(256);
+            let (_first_jobs, first_ptr, first_gpu) = warp.shared_buffer(JOBS_BYTES);
+            let (_next_jobs, next_ptr, next_gpu) = warp.shared_buffer(JOBS_BYTES);
+            let run_dst = warp.default_uav(8192);
+            // SAFETY: a live buffer.
+            let run_gpu = unsafe { run_dst.GetGPUVirtualAddress() };
+            // SAFETY: mapped buffers of these sizes.
+            unsafe {
+                std::ptr::write_bytes(src_ptr, 0, 256);
+                src_ptr.cast::<[u32; 3]>().write([1, 1, 1]);
+                std::ptr::write_bytes(budget_ptr, 0, 256);
+                std::ptr::write_bytes(hits_ptr, 0, 256);
+                first_ptr.cast::<u32>().write(0);
+                next_ptr.cast::<u32>().write(0);
+            }
+            let worker = |warp: &WarpHarness, at: u64| {
+                // SAFETY: an open list; the worker's own root signature,
+                // pipeline and buffers.
+                unsafe {
+                    warp.list.SetComputeRootSignature(&warp.worker.root);
+                    warp.list.SetPipelineState(&warp.worker.pso);
+                    warp.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+                    warp.list.ExecuteIndirect(&sig, 1, &run_dst, at, None, 0);
+                }
+            };
+            record_run(
+                &batch,
+                &warp.list,
+                (&run_dst, D3D12_RESOURCE_STATE_COMMON, run_gpu),
+                (src_gpu, src_gpu, first_gpu),
+                budget_gpu,
+            );
+            // SAFETY: a mapped job table; the list is not submitted yet.
+            unsafe { write_job(first_ptr, 0, [2, 12, 1, 0, 0, 0, 0, 0]) };
+            worker(&warp, 0);
+            // SAFETY: an open list; the writer's root signature and pipeline.
+            unsafe {
+                warp.list.SetComputeRootSignature(&writer.root);
+                warp.list.SetPipelineState(&writer.pso);
+                warp.list.SetComputeRootUnorderedAccessView(0, src_gpu);
+                warp.list.Dispatch(1, 1, 1);
+            }
+            let at = if rules.dispatch_ends(true) {
+                record_run(
+                    &batch,
+                    &warp.list,
+                    (&run_dst, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, run_gpu + 4096),
+                    (src_gpu, src_gpu, next_gpu),
+                    budget_gpu,
+                );
+                // SAFETY: as above.
+                unsafe { write_job(next_ptr, 0, [2, 12, 1, 16, 0, 0, 0, 0]) };
+                4096
+            } else {
+                // SAFETY: as above.
+                unsafe { write_job(first_ptr, 1, [2, 12, 1, 16, 0, 0, 16, 0]) };
+                16
+            };
+            worker(&warp, at);
+            warp.submit_and_wait();
+            // SAFETY: the work is done; a mapped buffer.
+            let hits = unsafe { hits_ptr.cast::<u32>().read_volatile() };
+            if mode == 2 {
+                assert_eq!(
+                    hits, 1,
+                    "mode 2: the second call ran with the record clamped before the pass wrote it"
+                );
+            } else {
+                assert_eq!(
+                    hits, 6,
+                    "mode {mode}: the second call ran the five groups the pass asked for"
+                );
+            }
+            drop(src_buf);
+        }
     }
 
     const WORKER_CS: &str = r#"

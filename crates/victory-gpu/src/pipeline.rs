@@ -468,6 +468,15 @@ fn bvh_hold_matches(mode: &BvhHold, hash: &str, driver_tripped: bool) -> bool {
     }
 }
 
+#[cfg(windows)]
+fn should_hold_for_builder(mode: &BvhHold, builder_whole: bool, builder_off: bool, driver_tripped: bool) -> bool {
+    if matches!(mode, BvhHold::Off) {
+        return false;
+    }
+    let whole = builder_whole && !builder_off;
+    !(whole && !(driver_tripped && matches!(mode, BvhHold::Auto | BvhHold::Custom(_))))
+}
+
 /// Whether a dispatch with the title's pipeline `this` is held back
 /// because its program walks ray-tracing structures nothing has built
 /// (`VICTORY_BVH_HOLD`: default `auto`; `0`/`off` disables; `known` holds
@@ -515,7 +524,11 @@ pub(crate) fn walk_held(this: This) -> bool {
         return false;
     };
     // (Asked only for programs that match and walk: the lock is the builder's.)
-    if BUILDER.lock().unwrap_or_else(|e| e.into_inner()).whole {
+    let (builder_whole, builder_off) = {
+        let b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+        (b.whole, b.off)
+    };
+    if !should_hold_for_builder(mode, builder_whole, builder_off, tripped) {
         return false;
     }
     let escalated = tripped && !KNOWN_HANG_BVH_WALKS.iter().any(|&h| h.eq_ignore_ascii_case(&matched.hash));
@@ -552,6 +565,7 @@ pub(crate) fn is_builder(this: This) -> bool {
 #[cfg(windows)]
 pub(crate) fn builder_off(why: &'static str) {
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+    b.whole = false;
     if !b.off {
         b.off = true;
         tracing::warn!(why, "the ray-tracing structure builder is turned off for the rest of the run: its stages run all or none");
@@ -1245,5 +1259,13 @@ mod tests {
         assert!(bvh_hold_matches(&custom, "deadbeef00001111", false));
         assert!(!bvh_hold_matches(&custom, other, false));
         assert!(bvh_hold_matches(&custom, other, true));
+
+        // Builder interaction (`VICTORY_BVH_BUILDER=1` vs `builder_off` / driver trip).
+        assert!(should_hold_for_builder(&BvhHold::Auto, false, false, false));
+        assert!(!should_hold_for_builder(&BvhHold::Auto, true, false, false));
+        assert!(should_hold_for_builder(&BvhHold::Auto, true, true, false));
+        assert!(should_hold_for_builder(&BvhHold::Auto, true, false, true));
+        assert!(!should_hold_for_builder(&BvhHold::KnownOnly, true, false, true));
+        assert!(!should_hold_for_builder(&BvhHold::Off, false, true, true));
     }
 }

@@ -1504,7 +1504,7 @@ pub(crate) fn room_lately() -> bool {
 /// 1 MiB up take 449 MB more of the card than before (941 against 492),
 /// and 94 gives the textures about that much back.
 #[cfg(windows)]
-fn room_percent() -> u64 {
+pub(crate) fn room_percent() -> u64 {
     static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *PERCENT.get_or_init(|| {
         std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
@@ -2039,32 +2039,16 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     hosted(this, true).map(|made| made.0)
 }
 
-/// A host texture like the title's: same description, in GPU memory,
-/// without the console's layout and flags.
+/// The host's description of a host copy of a title texture of `desc`:
+/// the host layout (no console layout, alignment or flags but render
+/// target, depth, unordered access and no shader access), the host's
+/// format for it. `None` for buffers.
 #[cfg(windows)]
-fn host_texture(
-    desc: &ResourceDesc,
-    state: u32,
-    clear: *const c_void,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
-    host_texture_as(desc, state, clear, false)
-}
-
-/// [`host_texture`]; `reserved`: without memory of its own, to be given
-/// tiles level by level (`crate::tiles`).
-#[cfg(windows)]
-fn host_texture_as(
-    desc: &ResourceDesc,
-    state: u32,
-    clear: *const c_void,
-    reserved: bool,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
-    use windows::Win32::Graphics::Direct3D12::*;
+fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
         return None;
     }
-    let host = crate::host::host()?;
     let mut d = *desc;
     d.layout = 0;
     d.alignment = 0;
@@ -2097,6 +2081,34 @@ fn host_texture_as(
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
     }
+    Some(d)
+}
+
+/// A host texture like the title's: same description, in GPU memory,
+/// without the console's layout and flags.
+#[cfg(windows)]
+fn host_texture(
+    desc: &ResourceDesc,
+    state: u32,
+    clear: *const c_void,
+) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    host_texture_as(desc, state, clear, false)
+}
+
+/// [`host_texture`]; `reserved`: without memory of its own, to be given
+/// tiles level by level (`crate::tiles`).
+#[cfg(windows)]
+fn host_texture_as(
+    desc: &ResourceDesc,
+    state: u32,
+    clear: *const c_void,
+    reserved: bool,
+) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let host = crate::host::host()?;
+    let mut d = host_desc(desc)?;
+    const TARGET: u32 = 1;
+    const UNORDERED: u32 = 4;
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
     let clear_value = (!clear.is_null()).then(|| {
@@ -2563,12 +2575,34 @@ pub(crate) fn placed_filler_twins() -> u64 {
 /// and for a description without a size.
 #[cfg(windows)]
 pub(crate) fn placed_bytes(desc: &[u32; 14]) -> Option<u64> {
+    // Worked out once per description: the layout is made anew each time
+    // (mip offsets, planes), and the pass over textures picked by index
+    // asks for every slot it looks at, 1,500 a frame. A title has a few
+    // thousand descriptions; the table is emptied should it hold many more.
+    static SIZES: std::sync::Mutex<Option<std::collections::HashMap<[u32; 14], Option<u64>>>> =
+        std::sync::Mutex::new(None);
+    if let Some(&known) = SIZES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(desc))
+    {
+        return known;
+    }
     // SAFETY: 56 bytes in the description's layout.
     let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
-    if d.dimension == BUFFER {
-        return None;
+    let bytes = if d.dimension == BUFFER {
+        None
+    } else {
+        footprint(&d).map(|f| f.size)
+    };
+    let mut sizes = SIZES.lock().unwrap_or_else(|e| e.into_inner());
+    let sizes = sizes.get_or_insert_with(Default::default);
+    if sizes.len() >= 1 << 16 {
+        sizes.clear();
     }
-    footprint(&d).map(|f| f.size)
+    sizes.insert(*desc, bytes);
+    bytes
 }
 
 /// The resource [`texture_at`] made for a texture placed at `address` with

@@ -1741,7 +1741,8 @@ struct CardInflight {
     /// of that piece.
     table: (ID3D12Resource, usize, u64),
     /// PC memory, mapped (buffer, mapping, slots of [`INFLIGHT_SLOT`]
-    /// bytes): where the pieces come down.
+    /// bytes): where the pieces come down. With [`inflight_on_card`] the
+    /// card's own memory, no mapping (0): the landing copies slots down.
     fetched: (ID3D12Resource, usize, u32),
     /// Every ticket below it belongs to a landed flight: its slot may be
     /// written over. Raised by the thread that lands flights; read when a
@@ -1890,38 +1891,65 @@ fn hash_groups(pieces: u32) -> u32 {
 }
 
 /// Whether the pieces a flight's compare flags come down to the PC inside
-/// the flight itself (`VICTORY_CARD_FETCH_INFLIGHT=1`; off by default, and
+/// the flight itself (`VICTORY_CARD_FETCH_INFLIGHT=2`; off by default, and
 /// only with [`relay`]).
 ///
 /// With the relay the thread that lands flights fetched the flagged pieces
 /// with a list of its own on the host's queue, the one the submitting
 /// thread keeps filling: the fetch ran behind every flight sent meanwhile.
-/// Measured on an RTX 3070 Laptop: 140.9 ms a frame of that thread waiting
-/// for fetches, for 63 pieces (3.2 MB) in about five fetches, some 28 ms a
-/// fetch spent queued behind newer flights; and the submitting thread
-/// waited 81.7 ms a frame in "title memory read" settles for that thread.
 ///
-/// With the switch the compare's list does the fetch: right behind the
-/// compare, [`CARD_FETCH`] copies each piece it flagged into a slot of a
-/// buffer in the PC's memory ([`CardInflight`]), so when the flight's fence
-/// is reached its bytes are there, and the landing merges them
-/// (`Shadow::card_merge_relay`) with no list, signal or wait of its own.
-/// The merge's "fetched after" is the flight's own send number
-/// (`CardPlan::sent_as`): see [`Host::relay_card_back`] for why that is
-/// exact and when a landing falls back to the old fetch.
+/// With `VICTORY_CARD_FETCH_INFLIGHT=2` the compare's list copies each
+/// flagged piece into a slot in the card's own memory ([`CardInflight`]),
+/// and the landing thread copies the landed flight's slots down to the PC on
+/// a copy queue of its own (`inflight_copy_down`). Mode `1` (direct shader
+/// writes to PC memory) stalls ~600 ms/frame on RTX 5070 Ti / Blackwell and
+/// is refused with a warning.
 fn inflight_fetch() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_CARD_FETCH_INFLIGHT").is_some_and(|v| v == "1"))
+    inflight_mode() != 0
 }
 
-/// The bytes of the PC's memory pieces fetched inside flights go to
-/// ([`inflight_fetch`]; `VICTORY_CARD_FETCH_INFLIGHT_MB`, 64): 1,024 slots
-/// ([`inflight_slots`]). A flight whose flagged pieces find no free slot
-/// lands the old way.
+fn parse_inflight_mode(relay_on: bool, val: Option<&str>) -> u8 {
+    if !relay_on {
+        return 0;
+    }
+    match val.map(str::trim) {
+        Some("1") => {
+            tracing::warn!(
+                "VICTORY_CARD_FETCH_INFLIGHT=1 (direct shader writes to PC memory) stalls ~600 ms/frame on RTX 5070 Ti / \
+                 Blackwell and is refused; use VICTORY_CARD_FETCH_INFLIGHT=2 for VRAM-staged slots"
+            );
+            0
+        }
+        Some("2") => 2,
+        _ => 0,
+    }
+}
+
+/// [`inflight_fetch`]'s mode: 0 off, 2 slots in the card's memory
+/// ([`inflight_on_card`]). Mode 1 is refused.
+fn inflight_mode() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| parse_inflight_mode(relay(), std::env::var("VICTORY_CARD_FETCH_INFLIGHT").ok().as_deref()))
+}
+
+/// Whether the slots of the fetch inside flights are in the card's own
+/// memory (`VICTORY_CARD_FETCH_INFLIGHT=2`; off by default), the landing
+/// thread copying the landed flights' slots down to the PC on a copy queue
+/// of its own.
+fn inflight_on_card() -> bool {
+    inflight_mode() == 2
+}
+
+/// The bytes of memory pieces fetched inside flights go to
+/// ([`inflight_fetch`]; `VICTORY_CARD_FETCH_INFLIGHT_MB`; 256 with
+/// the slots in the card's memory): 4,096 slots ([`inflight_slots`]). A
+/// flight whose flagged pieces find no free slot lands the old way.
 fn inflight_fetch_bytes() -> u64 {
     static MOST: OnceLock<u64> = OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_CARD_FETCH_INFLIGHT_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(64).max(1) << 20
+        let default = if inflight_on_card() { 256 } else { 64 };
+        std::env::var("VICTORY_CARD_FETCH_INFLIGHT_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default).max(1)
+            << 20
     })
 }
 
@@ -1964,6 +1992,40 @@ pub(crate) fn inflight_piece_from(span: &crate::shadow::CardSpan, i: u32) -> usi
 /// share one. The arithmetic of the shader, for the tests.
 pub(crate) fn inflight_gets_slot(k: u32, floor: u32, slots: u32) -> bool {
     k.wrapping_sub(floor) < slots
+}
+
+/// A piece [`Host::relay_card_inflight`] merges: its copy, offsets, its
+/// place in the slots' buffer, and its "fetched after".
+type InflightPiece = (std::sync::Arc<crate::shadow::Shadow>, usize, usize, usize, u64);
+
+/// With [`inflight_on_card`]: the copies that bring pieces (their place in
+/// the slots' buffer, length) down one after the other: (from, to,
+/// length), a piece that starts where the one before ended in the slots
+/// joining its copy.
+pub(crate) fn slots_down(pieces: impl IntoIterator<Item = (u64, u64)>) -> Vec<(u64, u64, u64)> {
+    let mut copies: Vec<(u64, u64, u64)> = Vec::new();
+    let mut to = 0u64;
+    for (from, len) in pieces {
+        if len == 0 {
+            continue;
+        }
+        match copies.last_mut() {
+            Some(last) if last.0 + last.2 == from && last.1 + last.2 == to => last.2 += len,
+            _ => copies.push((from, to, len)),
+        }
+        to += len;
+    }
+    copies
+}
+
+/// Records [`slots_down`]'s `copies` from the slots' buffer `ring` into
+/// `down`, on an open list (the landing thread's copy queue's, or a
+/// test's).
+pub(crate) fn record_slots_down(list: &ID3D12GraphicsCommandList, down: &ID3D12Resource, ring: &ID3D12Resource, copies: &[(u64, u64, u64)]) {
+    for &(from, to, len) in copies {
+        // SAFETY: an open list; live buffers; the caller sized `down`.
+        unsafe { list.CopyBufferRegion(down, to, ring, from, len) };
+    }
 }
 
 /// The fetch inside a flight ([`inflight_fetch`]), run in the compare's list
@@ -2389,9 +2451,10 @@ static RELAY_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atom
 
 /// Since the last frame-rate line, with [`inflight_fetch`]: pieces merged
 /// from the slots their flights fetched them to, their bytes, landings that
-/// went the old way because a plan's pieces overflowed the slots, and
-/// landings that fetched the old way (for any reason, overflow too).
-static INFLIGHT_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// went the old way because a plan's pieces overflowed the slots, landings
+/// that fetched the old way (for any reason, overflow too), and with
+/// [`inflight_on_card`]: copy-downs, bytes, microseconds, and copies.
+static INFLIGHT_STATS: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
 
 /// After a fetch the old way taken with the queue's count at `after`, for
 /// plans whose highest send is `landed`: up to which send the notes of
@@ -2489,6 +2552,46 @@ fn flagged_pieces(flags: &[(usize, u32, bool)]) -> std::collections::HashSet<(us
     flags.iter().filter(|f| f.2).map(|f| (f.0, f.1)).collect()
 }
 
+/// Whether a landing tells the title about flights with nothing to copy
+/// back before the copy-back of the later flights it lands with
+/// (`VICTORY_EARLY_SIGNAL=1`; off by default; only with [`relay`]).
+///
+/// With memory in place (or flights with no shader writes), a flight has
+/// nothing for the relay to fetch, compare or merge ([`Flight::covered`]).
+/// But the relay lands every flight the card has run in one go, the
+/// copy-back of all of them first: a covered flight's fence signals, events
+/// and bottom-of-pipe writes waited for the copy-back of the flights after
+/// it. With the switch the flights ahead of the first one that still has
+/// copies to bring back, and what follows each, are told at once; the rest
+/// as before. The line's order is kept: nothing behind a flight with a
+/// copy-back is told before it.
+fn early_signal() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_EARLY_SIGNAL").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame-rate line: flights told before the copy-back of
+/// later ones ([`early_signal`]); title fence signals set by the relay,
+/// their microseconds from when it took their flights, and the longest.
+static EARLY: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// With [`early_signal`]: of the things a landing takes, in the line's
+/// order (a flight: whether it has nothing to copy back; a write or a
+/// signal behind one: `None`), how many from the front are told before
+/// the copy-back: everything ahead of the first flight that has one.
+fn told_ahead(line: &[Option<bool>]) -> usize {
+    line.iter().position(|f| *f == Some(false)).unwrap_or(line.len())
+}
+
+impl Flight {
+    /// Whether nothing of it is left to copy back once the card has run
+    /// it: no ranges of copies in the PC's memory, no pieces of copies in
+    /// the card's memory to fetch.
+    fn covered(&self) -> bool {
+        self.back.is_empty() && self.card.as_ref().is_none_or(|c| c.ranges.is_empty())
+    }
+}
+
 /// Whether pieces fetched on a copy queue beside later flights are fetched
 /// again when those flights land (`VICTORY_QUEUE2_REFETCH=0`: not, as
 /// before; on by default with `VICTORY_QUEUE2` bit 1).
@@ -2554,7 +2657,7 @@ fn note_beside(noted: &mut std::collections::HashMap<(usize, u32), u64>, fetched
 
 #[cfg(test)]
 mod relay_tests {
-    use super::{fetched_beside, flagged_pieces, landable, note_beside};
+    use super::{fetched_beside, first_landing, flagged_pieces, landable, note_beside, parse_inflight_mode, told_ahead};
 
     /// A piece fetched on the copy queue while a later flight was in the
     /// air is fetched again by that flight, and by no flight sent after
@@ -2598,9 +2701,52 @@ mod relay_tests {
         assert_eq!(landable(&[None, None], 0), 2);
         assert_eq!(landable(&[None, Some(9), None], 8), 1);
         assert_eq!(landable(&[], 3), 0);
+        // One flight a landing: the first flight with what follows it up
+        // to the next one (and what comes ahead of it).
+        assert_eq!(first_landing(&[Some(3), None, Some(4), None]), 2);
+        assert_eq!(first_landing(&[None, Some(3), Some(4)]), 2);
+        assert_eq!(first_landing(&[Some(3), None, None]), 3);
+        assert_eq!(first_landing(&[None, None]), 2);
         // After the first three landed, the rest when its turn comes.
         assert_eq!(landable(&line[3..], 5), 0);
         assert_eq!(landable(&line[3..], 6), 2);
+    }
+
+    /// With early signals: a flight with nothing to copy back is told as
+    /// soon as the card has run it, with what follows it; a flight that
+    /// still has a copy-back, and everything behind it (a covered flight
+    /// too), waits for that copy-back, so the line's order is kept.
+    #[test]
+    fn covered_flights_are_told_before_the_copy_back_of_later_ones() {
+        // Covered flight (fence 5), its write, a signal; a flight with a
+        // copy-back (fence 6), its signal; a covered flight (fence 7).
+        let fences = [Some(5), None, None, Some(6), None, Some(7)];
+        let covered = [Some(true), None, None, Some(false), None, Some(true)];
+        // The card has run the first only: it and what follows it go.
+        let n = landable(&fences, 5);
+        assert_eq!(n, 3);
+        assert_eq!(told_ahead(&covered[..n]), 3);
+        // It has run all three in one landing: the first at once, the
+        // second after its copy-back, and the third behind it.
+        let n = landable(&fences, 7);
+        assert_eq!(n, 6);
+        assert_eq!(told_ahead(&covered[..n]), 3);
+        // A landing that begins with a copy-back tells nothing ahead.
+        assert_eq!(told_ahead(&covered[3..]), 0);
+        // All covered: all at once; signals alone too.
+        assert_eq!(told_ahead(&[Some(true), None, Some(true), None]), 4);
+        assert_eq!(told_ahead(&[None, None]), 2);
+        assert_eq!(told_ahead(&[]), 0);
+    }
+
+    #[test]
+    fn inflight_mode_refuses_mode_1_and_accepts_mode_2() {
+        assert_eq!(parse_inflight_mode(false, Some("2")), 0);
+        assert_eq!(parse_inflight_mode(true, None), 0);
+        assert_eq!(parse_inflight_mode(true, Some("0")), 0);
+        assert_eq!(parse_inflight_mode(true, Some("1")), 0);
+        assert_eq!(parse_inflight_mode(true, Some("2")), 2);
+        assert_eq!(parse_inflight_mode(true, Some(" 2 ")), 2);
     }
 
     /// A piece flagged under one range of a plan is fetched under every
@@ -3526,6 +3672,34 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     submission_us(1, us);
 }
 
+/// Whether the landing thread lands one flight at a time (with what
+/// follows it in the line) rather than every flight the card has run
+/// (`VICTORY_RELAY_LAND_ONE`: on with the slots of the fetch inside
+/// flights in the card's memory, [`inflight_on_card`], unless `=0`; `=1`
+/// on in any case).
+fn land_one() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_RELAY_LAND_ONE").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => inflight_on_card(),
+    })
+}
+
+/// Of the first `fences.len()` things of the line, all landable
+/// ([`landable`]): how many make the first landing with [`land_one`],
+/// the first flight and what follows it up to the next flight.
+pub(crate) fn first_landing(fences: &[Option<u64>]) -> usize {
+    match fences.iter().position(Option::is_some) {
+        Some(first) => fences[first + 1..].iter().position(Option::is_some).map_or(fences.len(), |next| first + 1 + next),
+        None => fences.len(),
+    }
+}
+
+/// [`RelayFetch::copy`]: a copy queue, an allocator, and a command list for
+/// copying card slots down.
+type CopyFetch = (ID3D12CommandQueue, ID3D12CommandAllocator, ID3D12GraphicsCommandList);
+
 /// What the thread that lands flights fetches card copies' pieces with
 /// ([`relay`]): a list, a fence and an event of its own (the host's are
 /// behind the submission lock), and the memory the pieces come down to.
@@ -3537,6 +3711,9 @@ struct RelayFetch {
     sent: u64,
     /// Buffer, mapping, bytes.
     buffer: Option<(ID3D12Resource, usize, u64)>,
+    /// With [`inflight_on_card`]: the copy queue, its allocator and list,
+    /// made at the first fetch there (they signal `fence` too).
+    copy: Option<CopyFetch>,
 }
 
 /// The thread that lands flights ([`relay`]): as soon as the card has run
@@ -3576,6 +3753,7 @@ fn relay_worker() {
                     // The first thing is a flight the card has not run.
                     break Err(fences[0].unwrap_or(0));
                 }
+                let n = if land_one() { first_landing(&fences[..n]) } else { n };
                 line.settling = true;
                 let items: Vec<Late> = line.line.drain(..n).collect();
                 line.in_hand = items
@@ -3723,15 +3901,31 @@ fn late_line(frames: f64) {
         if inflight_fetch() {
             let i: Vec<f64> = INFLIGHT_STATS.iter().map(|i| i.swap(0, Ordering::Relaxed) as f64 / frames).collect();
             tracing::info!(
-                "card copies' pieces fetched inside their flights per frame (VICTORY_CARD_FETCH_INFLIGHT=1): {:.1} pieces \
+                "card copies' pieces fetched inside their flights per frame (VICTORY_CARD_FETCH_INFLIGHT={}): {:.1} pieces \
                  ({:.2} MB) merged with no fetch of their own; {:.1} landings fetched the old way (the wait above), {:.1} of \
-                 them because a flight's pieces overflowed the slots",
+                 them because a flight's pieces overflowed the slots; slots in the card's memory copied down on the landing \
+                 thread's copy queue: {:.1}x {:.2} MB in {:.0} copies, {:.1} ms",
+                inflight_mode(),
                 i[0],
                 i[1] / (1 << 20) as f64,
                 i[3],
                 i[2],
+                i[4],
+                i[5] / (1 << 20) as f64,
+                i[7],
+                i[6] / 1000.0,
             );
         }
+        let [ahead, signals, us, longest] = [0, 1, 2, 3].map(|i| EARLY[i].swap(0, Ordering::Relaxed) as f64);
+        tracing::info!(
+            "title fence signals set by the relay per frame: {:.1}, {:.2} ms on average after it took their flights from the card \
+             (the longest {:.1} ms); {:.1} flights told before the copy-back of later ones (VICTORY_EARLY_SIGNAL=1: now {})",
+            signals / frames,
+            if signals > 0.0 { us / signals / 1000.0 } else { 0.0 },
+            longest / 1000.0,
+            ahead / frames,
+            if early_signal() { "on" } else { "off" }
+        );
     }
     if late_exact() {
         let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
@@ -4346,7 +4540,11 @@ impl Host {
             let (table, table_data) = self.shared_buffer(4 + results).ok_or_else(windows::core::Error::empty)?;
             name(&table, || "card fetch in flight: tickets".into());
             let fetched_bytes = u64::from(slots) * INFLIGHT_SLOT;
-            let (fetched, fetched_data) = self.shared_buffer(fetched_bytes).ok_or_else(windows::core::Error::empty)?;
+            let (fetched, fetched_data) = if inflight_on_card() {
+                (self.uav_buffer(fetched_bytes).ok_or_else(windows::core::Error::empty)?, std::ptr::null_mut())
+            } else {
+                self.shared_buffer(fetched_bytes).ok_or_else(windows::core::Error::empty)?
+            };
             name(&fetched, || "card fetch in flight: pieces".into());
             // SAFETY: the mapping holds the counter; nothing of ours ran
             // on the card with it yet.
@@ -4378,12 +4576,23 @@ impl Host {
             Ok(inflight) => {
                 tracing::info!(
                     slots = inflight.fetched.2,
-                    "card copies' flagged pieces come down inside their flights (VICTORY_CARD_FETCH_INFLIGHT=1)"
+                    on_card = inflight_on_card(),
+                    "card copies' flagged pieces come down inside their flights (VICTORY_CARD_FETCH_INFLIGHT={}{})",
+                    inflight_mode(),
+                    if inflight_on_card() {
+                        ": slots in the card's memory, copied down at the landing on a copy queue"
+                    } else {
+                        ""
+                    }
                 );
                 Some(inflight)
             }
             Err(e) => {
-                tracing::warn!(error = %e, "no fetch inside flights (VICTORY_CARD_FETCH_INFLIGHT=1): pieces are fetched the old way");
+                tracing::warn!(
+                    error = %e,
+                    "no fetch inside flights (VICTORY_CARD_FETCH_INFLIGHT={}): pieces are fetched the old way",
+                    inflight_mode()
+                );
                 None
             }
         }
@@ -4789,6 +4998,7 @@ impl Host {
                 event,
                 sent: 0,
                 buffer: None,
+                copy: None,
             })
         }
     }
@@ -4823,7 +5033,7 @@ impl Host {
     fn relay_card_back(&self, plans: &[(u64, &CardPlan)], fetch: &mut Option<RelayFetch>, behind: u64, landed: u64) {
         if inflight_fetch() {
             let only: Vec<&CardPlan> = plans.iter().map(|p| p.1).collect();
-            let taken = self.relay_card_inflight(&only);
+            let taken = self.relay_card_inflight(&only, fetch, behind);
             inflight_tickets_landed(&only);
             if taken {
                 return;
@@ -5111,10 +5321,17 @@ impl Host {
     /// shortcut: all or nothing per landing, and a plan whose pieces overflow
     /// the slots lands the old way for all its pieces, not only the ones
     /// left out.
-    fn relay_card_inflight(&self, plans: &[&CardPlan]) -> bool {
+    ///
+    /// With [`inflight_on_card`] the slots are in the card's memory: the
+    /// pieces to merge are copied from them to a buffer in the PC's memory
+    /// on the landing thread's copy queue, behind `behind` (the host fence
+    /// value behind the last of these flights, reached already), and
+    /// waited for, before the merge and before the tickets are landed.
+    fn relay_card_inflight(&self, plans: &[&CardPlan], fetch: &mut Option<RelayFetch>, behind: u64) -> bool {
         use std::sync::Arc;
-        type Piece = (Arc<crate::shadow::Shadow>, usize, usize, usize, u64);
-        let mut pieces: Vec<Piece> = Vec::new();
+        // (copy, offsets, the piece's place in the slots' buffer, "fetched after").
+        let mut pieces: Vec<InflightPiece> = Vec::new();
+        let ring: (ID3D12Resource, usize);
         {
             let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
             let Some(work) = work.as_ref() else {
@@ -5135,6 +5352,7 @@ impl Host {
                 )
             };
             let slots = inflight.fetched.2;
+            ring = (inflight.fetched.0.clone(), inflight.fetched.1);
             for plan in plans {
                 if plan.ranges.is_empty() {
                     continue;
@@ -5185,7 +5403,7 @@ impl Host {
                         if lo < from || (hi - from) as u64 > INFLIGHT_SLOT {
                             return false;
                         }
-                        let slot = inflight.fetched.1 + (k % slots) as usize * INFLIGHT_SLOT as usize;
+                        let slot = (k % slots) as usize * INFLIGHT_SLOT as usize;
                         // Bytes a fetch the old way brought after this flight ran.
                         let newer: Vec<(usize, usize)> = inflight
                             .brought
@@ -5202,12 +5420,26 @@ impl Host {
         }
         // Outside the lock: no slot of these plans is written over before
         // their tickets are landed (`inflight_tickets_landed`, after this).
+        // With the slots in the card's memory they come down first, into
+        // `base` (mapped), one after the other; else `base` is the slots'
+        // own mapping.
+        let base = if inflight_on_card() {
+            match self.inflight_copy_down(&ring.0, &pieces, fetch, behind) {
+                Some(data) => data,
+                None => return false,
+            }
+        } else {
+            ring.1
+        };
         let mut title = Vec::new();
         let (mut written, mut bytes) = (0, 0u64);
         for (shadow, lo, hi, at, after) in &pieces {
-            // SAFETY: inside the mapping of the slots (checked above); the
-            // copy into it ran in the plan's flight, which the card has run.
-            let gpu = unsafe { std::slice::from_raw_parts(*at as *const u8, hi - lo) };
+            let at = if inflight_on_card() { base + bytes as usize } else { base + at };
+            // SAFETY: inside the mapping of the slots (checked above), or of
+            // the buffer they were copied down to (`inflight_copy_down`
+            // puts them one after the other, and has waited); the copy into
+            // the slot ran in the plan's flight, which the card has run.
+            let gpu = unsafe { std::slice::from_raw_parts(at as *const u8, hi - lo) };
             written += shadow.card_merge_relay(*lo, gpu, *after, &mut title);
             bytes += (hi - lo) as u64;
         }
@@ -5226,6 +5458,101 @@ impl Host {
         true
     }
 
+    /// [`Host::relay_card_inflight`] with [`inflight_on_card`]: `pieces`'
+    /// bytes, at their places in the slots' buffer `ring`, are copied one
+    /// after the other into the landing thread's buffer in the PC's memory
+    /// ([`RelayFetch::buffer`]) on its copy queue, which first waits on the
+    /// host fence for `behind`; and waited for. The mapping of the buffer,
+    /// or `None` (the landing then goes the old way) if the queue or the
+    /// memory cannot be had.
+    fn inflight_copy_down(
+        &self,
+        ring: &ID3D12Resource,
+        pieces: &[InflightPiece],
+        fetch: &mut Option<RelayFetch>,
+        behind: u64,
+    ) -> Option<usize> {
+        let started = std::time::Instant::now();
+        if fetch.is_none() {
+            *fetch = self.make_relay_fetch();
+        }
+        let f = fetch.as_mut()?;
+        let copies = slots_down(pieces.iter().map(|(_, lo, hi, at, _)| (*at as u64, (hi - lo) as u64)));
+        let total: u64 = copies.iter().map(|c| c.2).sum();
+        if total == 0 {
+            return Some(0);
+        }
+        if f.buffer.as_ref().is_none_or(|b| b.2 < total) {
+            let size = total.next_multiple_of(16 << 20);
+            f.buffer = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+        }
+        let (buffer, data, _) = f.buffer.clone()?;
+        let (queue, allocator, list) = self.relay_copy_lane(f)?;
+        f.sent += 1;
+        let (fence, event, sent) = (f.fence.clone(), f.event, f.sent);
+        // SAFETY: the list's last run was waited for by this thread; live
+        // buffers; the queue, fence and event are this thread's; the host
+        // fence is ours.
+        let ran = unsafe {
+            (|| -> windows::core::Result<()> {
+                allocator.Reset()?;
+                list.Reset(&allocator, None)?;
+                record_slots_down(&list, &buffer, ring, &copies);
+                list.Close()?;
+                queue.Wait(&self.fence, behind)?;
+                queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>()?)]);
+                queue.Signal(&fence, sent)?;
+                fence.SetEventOnCompletion(sent, event)?;
+                WaitForSingleObject(event, INFINITE);
+                Ok(())
+            })()
+        };
+        if let Err(e) = ran {
+            fail(format_args!("the slots of the fetch inside flights could not be copied down ({e}, VICTORY_CARD_FETCH_INFLIGHT=2)"));
+        }
+        let us = started.elapsed().as_micros() as u64;
+        INFLIGHT_STATS[4].fetch_add(1, Ordering::Relaxed);
+        INFLIGHT_STATS[5].fetch_add(total, Ordering::Relaxed);
+        INFLIGHT_STATS[6].fetch_add(us, Ordering::Relaxed);
+        INFLIGHT_STATS[7].fetch_add(copies.len() as u64, Ordering::Relaxed);
+        RELAY_STATS[3].fetch_add(us, Ordering::Relaxed);
+        Some(data)
+    }
+
+    /// The landing thread's copy queue ([`RelayFetch::copy`]), made the
+    /// first time.
+    fn relay_copy_lane(&self, f: &mut RelayFetch) -> Option<CopyFetch> {
+        if f.copy.is_none() {
+            // SAFETY: plain object creation on our device.
+            let made = unsafe {
+                (|| -> windows::core::Result<CopyFetch> {
+                    let queue: ID3D12CommandQueue = self.device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                        Type: D3D12_COMMAND_LIST_TYPE_COPY,
+                        ..Default::default()
+                    })?;
+                    let allocator: ID3D12CommandAllocator = self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)?;
+                    let list: ID3D12GraphicsCommandList =
+                        self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)?;
+                    list.Close()?;
+                    Ok((queue, allocator, list))
+                })()
+            };
+            match made {
+                Ok(made) => {
+                    name(&made.0, || "victory relay copy queue".into());
+                    tracing::info!(
+                        "the landing thread copies card pieces down on a copy queue of its own (VICTORY_CARD_FETCH_INFLIGHT=2)"
+                    );
+                    f.copy = Some(made);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "no copy queue for the landing thread");
+                }
+            }
+        }
+        f.copy.clone()
+    }
+
     /// [`relay`], on the thread that lands flights: `items` are the first
     /// things of the line, flights the card has run and what follows them.
     /// What their shaders wrote goes into title memory (copies in the
@@ -5234,8 +5561,60 @@ impl Host {
     /// then, in the line's order, each flight's read-backs, its
     /// bottom-of-pipe writes and the fence signals behind it. Title memory
     /// is complete before the title is told anything.
-    fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
+    ///
+    /// With [`early_signal`], the flights before the first one that has
+    /// something to copy back, and what follows each of them, are told
+    /// first, before that copy-back.
+    fn relay_land(&self, mut items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
         let landing = std::time::Instant::now();
+        let mut landed = Vec::new();
+        // SAFETY: a plain query (a removed device fails below, with what
+        // the flights ran).
+        if early_signal() && unsafe { self.device.GetDeviceRemovedReason() }.is_ok() {
+            let covered: Vec<Option<bool>> = items
+                .iter()
+                .map(|l| match l {
+                    Late::Run(flight) => Some(flight.covered()),
+                    _ => None,
+                })
+                .collect();
+            let rest = items.split_off(told_ahead(&covered));
+            let ahead = std::mem::replace(&mut items, rest);
+            let plans: Vec<(u64, &CardPlan)> = ahead
+                .iter()
+                .filter_map(|l| match l {
+                    Late::Run(flight) => flight.card.as_ref().map(|card| (flight.number, card)),
+                    _ => None,
+                })
+                .collect();
+            if !plans.is_empty() {
+                let behind = ahead
+                    .iter()
+                    .filter_map(|l| match l {
+                        Late::Run(flight) => Some(flight.fence),
+                        _ => None,
+                    })
+                    .max()
+                    .unwrap_or(0);
+                let landed_num = ahead
+                    .iter()
+                    .filter_map(|l| match l {
+                        Late::Run(flight) => Some(flight.number),
+                        _ => None,
+                    })
+                    .max()
+                    .unwrap_or(0);
+                // Nothing to fetch for these: their sends are noted as seen.
+                self.relay_card_back(&plans, fetch, behind, landed_num);
+            }
+            let flights = ahead.iter().filter(|l| matches!(l, Late::Run(_))).count() as u64;
+            EARLY[0].fetch_add(flights, Ordering::Relaxed);
+            RELAY_STATS[1].fetch_add(flights, Ordering::Relaxed);
+            if flights > 0 && !items.iter().any(|l| matches!(l, Late::Run(_))) {
+                RELAY_STATS[0].fetch_add(1, Ordering::Relaxed);
+            }
+            landed.extend(self.relay_tell(ahead, landing));
+        }
         {
             let flights: Vec<&Flight> = items
                 .iter()
@@ -5259,8 +5638,8 @@ impl Host {
                 fill_ahead::landing(flights.iter().map(|f| f.number).min().unwrap_or(0));
                 let plans: Vec<(u64, &CardPlan)> = flights.iter().filter_map(|f| f.card.as_ref().map(|card| (f.number, card))).collect();
                 let behind = flights.iter().map(|f| f.fence).max().unwrap_or(0);
-                let landed = flights.iter().map(|f| f.number).max().unwrap_or(0);
-                self.relay_card_back(&plans, fetch, behind, landed);
+                let landed_num = flights.iter().map(|f| f.number).max().unwrap_or(0);
+                self.relay_card_back(&plans, fetch, behind, landed_num);
                 let back = merge_declared(flights.iter().map(|f| f.back.as_slice()));
                 relay_hand_back(&back);
                 copy_back(0, landing.elapsed().as_micros() as u64);
@@ -5268,38 +5647,7 @@ impl Host {
                 RELAY_STATS[1].fetch_add(flights.len() as u64, Ordering::Relaxed);
             }
         }
-        // In the order given: what tells the title the card is done.
-        let mut last = 0;
-        let mut landed = Vec::new();
-        // Keep each flight's declared ranges (without deduplicating across
-        // flights so `Shadow::flights` refcounts decrement once per flight)
-        // and release `shadow.pending` only after all read-backs, writes, and
-        // signals complete, strictly before `LINE_LANDED.notify_all()`.
-        let mut back_done: Vec<Declared> = Vec::new();
-        for item in items {
-            match item {
-                Late::Run(flight) => {
-                    last = flight.number;
-                    for &i in &flight.order {
-                        read_backs(flight.lists[i].host());
-                    }
-                    if let Some(card) = flight.card {
-                        self.card_done(card);
-                    }
-                    back_done.extend(flight.back);
-                    landed.push((flight.lists, flight.order));
-                }
-                Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
-                Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
-            }
-        }
-        for (shadow, ranges) in &back_done {
-            shadow.copy_back_done(ranges);
-        }
-        if last > 0 {
-            FINISHED.store(last, Ordering::Release);
-            bury(last);
-        }
+        landed.extend(self.relay_tell(items, landing));
         self.log_messages();
         fill_ahead::landing(0);
         RELAY_STATS[4].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -5335,6 +5683,51 @@ impl Host {
         }
         LINE_MOVED.notify_all();
         LINE_LANDED.notify_all();
+    }
+
+    /// [`relay`], landing: what tells the title the card is done with
+    /// `items`, in the order given (each flight's read-backs, its
+    /// bottom-of-pipe writes, the fence signals behind it). `landing` is
+    /// when the relay took them. Returns the flights' host lists.
+    fn relay_tell(&self, items: Vec<Late>, landing: std::time::Instant) -> Vec<(Vec<crate::list::Detached>, Vec<usize>)> {
+        let mut last = 0;
+        let mut landed = Vec::new();
+        // Keep each flight's declared ranges (without deduplicating across
+        // flights so `Shadow::flights` refcounts decrement once per flight)
+        // and release `shadow.pending` only after all read-backs, writes, and
+        // signals complete, strictly before `LINE_LANDED.notify_all()`.
+        let mut back_done: Vec<Declared> = Vec::new();
+        for item in items {
+            match item {
+                Late::Run(flight) => {
+                    last = flight.number;
+                    for &i in &flight.order {
+                        read_backs(flight.lists[i].host());
+                    }
+                    if let Some(card) = flight.card {
+                        self.card_done(card);
+                    }
+                    back_done.extend(flight.back);
+                    landed.push((flight.lists, flight.order));
+                }
+                Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
+                Late::Signal(fence, value) => {
+                    crate::fence::set(fence as crate::object::This, value);
+                    let us = landing.elapsed().as_micros() as u64;
+                    EARLY[1].fetch_add(1, Ordering::Relaxed);
+                    EARLY[2].fetch_add(us, Ordering::Relaxed);
+                    EARLY[3].fetch_max(us, Ordering::Relaxed);
+                }
+            }
+        }
+        for (shadow, ranges) in &back_done {
+            shadow.copy_back_done(ranges);
+        }
+        if last > 0 {
+            FINISHED.store(last, Ordering::Release);
+            bury(last);
+        }
+        landed
     }
 
     /// After a submission ran, for copies in the card's memory: the pieces
@@ -8308,6 +8701,16 @@ impl Meter {
                     per_frame(6) / 1e3
                 );
             }
+            let bar = crate::shadow::bar_copies();
+            if crate::shadow::gpu_upload_copies().0 > 0 || bar[0] > 0 {
+                tracing::info!(
+                    "host copies in GPU upload heaps (VICTORY_GPU_UPLOAD_COPIES={}): {} copies {} MB ({} MB of declared shader writes read back over the bus)",
+                    crate::shadow::gpu_upload_copies().0,
+                    bar[0],
+                    bar[1] >> 20,
+                    bar[2] >> 20,
+                );
+            }
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
@@ -8697,6 +9100,94 @@ impl Host {
             shared[2] >> 20,
             shared[3] >> 20
         );
+    }
+
+    /// Whether the card and the runtime have GPU upload heaps (the card's
+    /// memory mapped for the CPU: resizable BAR), asked once and said.
+    fn gpu_upload_heap(&self) -> bool {
+        static HAS: OnceLock<bool> = OnceLock::new();
+        *HAS.get_or_init(|| {
+            let mut o16 = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+            // SAFETY: a structure of the size passed.
+            let asked = unsafe {
+                self.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS16,
+                    (&raw mut o16).cast(),
+                    size_of_val(&o16) as u32,
+                )
+            };
+            let has = asked.is_ok() && o16.GPUUploadHeapSupported.as_bool();
+            tracing::info!(
+                asked = asked.is_ok(),
+                has,
+                "GPU upload heaps (the card's memory mapped for the CPU; resizable BAR): {}",
+                if has {
+                    "supported (VICTORY_GPU_UPLOAD_COPIES can place copies there)"
+                } else {
+                    "not supported; falling back to PC shared buffers"
+                }
+            );
+            has
+        })
+    }
+
+    /// [`Self::shared_buffer`] in the card's own memory: a buffer in a GPU
+    /// upload heap (the card's memory mapped for the CPU through its window
+    /// on the bus, write-combined), shaders may write it, in the common
+    /// state. `None` where the card has no such heap
+    /// ([`Self::gpu_upload_heap`]) or it could not be made. The CPU writes
+    /// it as fast as upload memory; reading it back crosses the bus,
+    /// uncached (`crate::shadow::gpu_upload_copies`).
+    pub(crate) fn card_shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        if !self.gpu_upload_heap() {
+            return None;
+        }
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_GPU_UPLOAD,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: plain creation and mapping of a CPU-visible buffer.
+        let made = unsafe {
+            self.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut buffer,
+                )
+                .and_then(|()| {
+                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                    b.Map(0, None, Some(&mut data))
+                })
+        };
+        match made {
+            Ok(()) => Some((buffer?, data.cast())),
+            Err(e) => {
+                static WARNED: AtomicU32 = AtomicU32::new(0);
+                if WARNED.fetch_add(1, Ordering::Relaxed) < 8 {
+                    tracing::warn!(error = %e, size, "no shared buffer in a GPU upload heap: in the PC's memory instead");
+                }
+                None
+            }
+        }
     }
 
     /// A buffer in system memory that the CPU maps (write-back, so reading
@@ -9583,5 +10074,165 @@ void main() {
             }
         }
         drop((a, b, trial));
+    }
+
+    /// The fetch inside flights with its slots in the card's memory
+    /// (`VICTORY_CARD_FETCH_INFLIGHT=2`): flight A leaves a value in a
+    /// piece; flight B, sent behind it, writes the same piece through a
+    /// half-way value for seconds. A lands while B is half way: its pieces
+    /// come down from A's own slot on the landing thread's copy queue,
+    /// without waiting for B, and hold what A left, neither B's half-way
+    /// bytes (the tear of a copy-queue fetch of the copy itself) nor B's
+    /// last ones. Then B lands with its own.
+    #[test]
+    fn warp_slots_on_the_card_hold_their_flights_bytes_while_a_later_flight_writes() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+        let Some(host) = host() else {
+            return;
+        };
+        // SAFETY: a plain query.
+        let software = host
+            .adapter
+            .as_ref()
+            .and_then(|a| unsafe { a.GetDesc1() }.ok())
+            .is_some_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0);
+        if !software {
+            eprintln!("inflight_tests: skipped, the host device is not the software adapter (VICTORY_D3D12_WARP=1, diagnostics)");
+            return;
+        }
+        if !relay() || !inflight_on_card() {
+            eprintln!("inflight_tests: skipped, needs VICTORY_RELAY=1 VICTORY_CARD_FETCH_INFLIGHT=2");
+            return;
+        }
+        const PIECE: usize = 64 << 10;
+        const LEN: usize = 4 << 20;
+        // SAFETY: a plain allocation of our own.
+        let title = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as *mut u8;
+        assert!(!title.is_null());
+        let dword = |at: usize| unsafe { title.add(at).cast::<u32>() };
+        for i in 0..LEN / 4 {
+            // SAFETY: inside the allocation.
+            unsafe { dword(i * 4).write_volatile(0x5A00_0000 | i as u32) };
+        }
+        crate::shadow::register(0x52_5253, title as u64, LEN as u64);
+        let shadow = crate::shadow::find(title as u64, LEN as u64).expect("a host copy");
+        if !shadow.carded() {
+            eprintln!("inflight_tests: skipped, the copy is not in the card's memory (VICTORY_CARD_BUFFERS_MIN_MB=1)");
+            return;
+        }
+        let code = compile(TWICE, windows::core::s!("main"), windows::core::s!("cs_5_1")).expect("the test's shader");
+        // SAFETY: the shader's own root signature; plain creation.
+        let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code).expect("a root signature");
+            let pso = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.as_ptr().cast(),
+                        BytecodeLength: code.len(),
+                    },
+                    ..Default::default()
+                })
+                .expect("a pipeline");
+            (root, pso)
+        };
+        let record = |piece: usize, first: u32, last: u32, spin: u32| {
+            let list = host.new_list().expect("a host list");
+            shadow.refresh(&list, title as u64, LEN as u64);
+            shadow.gpu_writes(&list, (title as usize + piece * PIECE) as u64, PIECE as u64);
+            // SAFETY: an open list; the copy's buffer, with unordered
+            // access; the shader's own root signature.
+            unsafe {
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetPipelineState(&pso);
+                let constants = [(piece * PIECE + 256) as u32, first, last, spin];
+                list.list.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
+                list.list.SetComputeRootUnorderedAccessView(1, shadow.buffer.GetGPUVirtualAddress());
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.close();
+            list
+        };
+        // SAFETY: a plain query.
+        let completed = || unsafe { host.fence.GetCompletedValue() };
+        let wait_for = |value: u64| {
+            while completed() < value {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        };
+        const TRIAL: u32 = 1 << 20;
+        let trial = record(40, 1, 2, TRIAL);
+        let timing = std::time::Instant::now();
+        host.execute(&[&trial]);
+        let took = timing.elapsed().as_secs_f64().max(1e-4);
+        let spin = (f64::from(TRIAL) * 3.0 / took).clamp(f64::from(TRIAL), 2.0e9) as u32;
+        const AT: usize = 20 * PIECE + 256;
+        const A_LEFT: u32 = 0xA000_0001;
+        const B_HALF_WAY: u32 = 0xDEAD_0002;
+        const B_LEFT: u32 = 0xB000_0003;
+        let stats = || [3, 4].map(|i| INFLIGHT_STATS[i].load(Ordering::Relaxed));
+        let before = stats();
+        let a = record(20, A_LEFT, A_LEFT, 16);
+        let (submitted, mut sent_a) = host.submit(&[&a], true).expect("flight A sent ahead");
+        let fence_a = *submitted;
+        drop(submitted);
+        let b = record(20, B_HALF_WAY, B_LEFT, spin);
+        let (submitted, mut sent_b) = host.submit(&[&b], true).expect("flight B sent ahead");
+        let fence_b = *submitted;
+        drop(submitted);
+        wait_for(fence_a);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(completed() < fence_b, "flight B had run after 0.3 s ({spin} steps): nothing to show");
+        let mut fetch = None;
+        {
+            let plan = sent_a.card.as_ref().expect("flight A has a plan for the card's copies");
+            assert!(plan.inflight, "flight A's compare list has no fetch inside it");
+            host.relay_card_back(&[(sent_a.number, plan)], &mut fetch, fence_a, sent_a.number);
+        }
+        for (copy, ranges) in &sent_a.back {
+            copy.copy_back_done(ranges);
+        }
+        let b_ran = completed() >= fence_b;
+        // SAFETY: inside the allocation.
+        let seen = unsafe { dword(AT).read_volatile() };
+        eprintln!("inflight_tests: after A's landing title memory holds {seen:#x} (A left {A_LEFT:#x}); B had run: {b_ran}");
+        assert!(!b_ran, "A's landing waited for the later flight B");
+        assert_eq!(seen, A_LEFT, "A's landing did not bring A's own bytes (B's half way {B_HALF_WAY:#x}, B's last {B_LEFT:#x})");
+        let after_a = stats();
+        assert_eq!(after_a[0], before[0], "A landed the old way");
+        assert_eq!(after_a[1], before[1] + 1, "A's slot did not come down on the copy queue");
+        wait_for(fence_b);
+        {
+            let plan = sent_b.card.as_ref().expect("flight B has a plan for the card's copies");
+            host.relay_card_back(&[(sent_b.number, plan)], &mut fetch, fence_b, sent_b.number);
+        }
+        for (copy, ranges) in &sent_b.back {
+            copy.copy_back_done(ranges);
+        }
+        // SAFETY: inside the allocation.
+        let (left, beside) = unsafe { (dword(AT).read_volatile(), dword(AT + 4).read_volatile()) };
+        assert_eq!(left, B_LEFT, "B's landing did not bring B's bytes");
+        assert_eq!(beside, 0, "the dword beside it holds a half-way count");
+        assert_eq!(stats()[0], before[0], "B landed the old way");
+        for sent in [&mut sent_a, &mut sent_b] {
+            if let Some(plan) = sent.card.take() {
+                host.card_done(plan);
+            }
+        }
+        drop((a, b, trial));
+    }
+
+    /// The copies down of slots: pieces that follow each other in the slots
+    /// join one copy, the others start one of their own; empty ones none.
+    #[test]
+    fn slots_down_join_pieces_that_follow_each_other() {
+        use super::slots_down;
+        assert!(slots_down([]).is_empty());
+        assert_eq!(
+            slots_down([(100, 10), (110, 5), (0, 0), (500, 7), (507, 1), (0, 3)]),
+            vec![(100, 0, 15), (500, 15, 8), (0, 23, 3)]
+        );
     }
 }
