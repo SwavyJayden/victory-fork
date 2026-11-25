@@ -1357,6 +1357,22 @@ mod tests {
         assert!(probe.reserved_section_refused, "a reserved section is refused");
     }
 
+    /// Runs the full in-place probe directly on the real host GPU card (run with `--ignored --nocapture`).
+    #[test]
+    #[ignore = "probes the live host GPU card; run by name with --ignored --nocapture"]
+    fn card_probe_opens_title_like_memory_on_host_gpu() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("no host GPU available");
+            return;
+        };
+        let probe = probe(&host.device, &|| host.video_memory(), 64);
+        for line in &probe.lines {
+            eprintln!("CARD in place probe: {line}");
+        }
+        assert!(probe.part_reads, "host GPU reads private memory in place");
+        assert!(probe.part_writes, "host GPU writes land in private memory");
+    }
+
     /// Stage 1's own call on the software adapter: a title buffer that
     /// begins and ends off the 64 KiB lines is placed over its pages, the
     /// GPU reads the buffer's bytes at the offset the views use, and its

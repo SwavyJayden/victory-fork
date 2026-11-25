@@ -154,22 +154,29 @@ RWTexture2D<uint> light : register(u0);
 Texture2D<float> depth : register(t0);
 float3 seen(int2 p, float2 size) {
     float d = depth.Load(int3(clamp(p, int2(0, 0), int2(size) - 1), 0));
-    float z = near / max(d, 1e-7);
+    if (!isfinite(d) || d < 1e-7) d = 1e-7;
+    float z = near / d;
     float2 ndc = (float2(p) + 0.5) / size * 2.0 - 1.0;
     return float3(ndc.x * tan_y * size.x / size.y * z, -ndc.y * tan_y * z, z);
 }
 float open_to_light(int2 p, float2 size) {
     float3 c = seen(p, size);
-    if (c.z > 400.0) return 1.0;
+    if (!isfinite(c.z) || c.z > 400.0) return 1.0;
     float3 l = seen(p + int2(-1, 0), size), r = seen(p + int2(1, 0), size);
     float3 u = seen(p + int2(0, -1), size), d = seen(p + int2(0, 1), size);
     float3 dx = abs(l.z - c.z) < abs(r.z - c.z) ? c - l : r - c;
     float3 dy = abs(u.z - c.z) < abs(d.z - c.z) ? c - u : d - c;
-    float3 n = normalize(cross(dy, dx));
+    float3 raw_n = cross(dy, dx);
+    float n_len2 = dot(raw_n, raw_n);
+    if (!isfinite(n_len2) || !(n_len2 > 1e-12)) return 1.0;
+    float3 n = raw_n * rsqrt(n_len2);
     if (dot(n, c) > 0.0) n = -n;
-    float px = radius * size.y / (2.0 * tan_y * c.z);
-    if (px < 1.5) return 1.0;
+    float denom = 2.0 * tan_y * c.z;
+    if (!isfinite(denom) || !(denom > 1e-6)) return 1.0;
+    float px = radius * size.y / denom;
+    if (!isfinite(px) || px < 1.5) return 1.0;
     px = min(px, 128.0);
+    float inv_r2 = 1.0 / max(radius * radius, 1e-6);
     float noise = frac(52.9829189 * frac(dot(float2(p), float2(0.06711056, 0.00583715))));
     float sum = 0.0;
     const int N = 16;
@@ -178,12 +185,21 @@ float open_to_light(int2 p, float2 size) {
         float2 o = float2(cos(a), sin(a)) * (sqrt((i + 0.5) / N) * px);
         float3 v = seen(p + int2(round(o)), size) - c;
         float vv = dot(v, v);
+        if (!isfinite(vv)) continue;
         float over = dot(v, n) - 0.004 * c.z - 0.005;
-        sum += max(over, 0.0) / sqrt(vv + 1e-6) * saturate(1.0 - vv / (radius * radius));
+        if (over > 0.0 && isfinite(over)) {
+            sum += over * rsqrt(vv + 1e-6) * saturate(1.0 - vv * inv_r2);
+        }
     }
-    return saturate(1.0 - strength * 2.0 * sum / N);
+    float open = saturate(1.0 - strength * 2.0 * sum / N);
+    return isfinite(open) ? open : 1.0;
 }
 uint pack(float3 c) {
+    c = float3(
+        isfinite(c.r) ? c.r : 0.0,
+        isfinite(c.g) ? c.g : 0.0,
+        isfinite(c.b) ? c.b : 0.0
+    );
     c = clamp(c, 0.0, 65408.0);
     float most = max(c.r, max(c.g, c.b));
     int e = clamp(int(floor(log2(max(most, 1e-9)))) + 16, 0, 31);
@@ -199,6 +215,7 @@ void main(uint3 at : SV_DispatchThreadID) {
     light.GetDimensions(w, h);
     if (at.x >= w || at.y >= h) return;
     float open = strength > 0.0 ? open_to_light(int2(at.xy), float2(w, h)) : 1.0;
+    if (!isfinite(open)) open = 1.0;
     light[at.xy] = pack(tint * level * open);
 }
 "#;
