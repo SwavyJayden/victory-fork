@@ -19,6 +19,7 @@ pub mod dstorage;
 #[cfg(windows)]
 pub mod files;
 pub mod gameinput;
+mod gameinput_hid;
 pub mod kernel;
 #[cfg(windows)]
 pub mod lifecycle;
