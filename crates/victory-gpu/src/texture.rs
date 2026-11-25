@@ -30,21 +30,93 @@ macro_rules! once {
     }};
 }
 
+/// Mapped `D3D12_HEAP_TYPE_UPLOAD` staging buffer held by a [`Staging`] entry
+/// while needed for an upload and detached once the texture settles in VRAM.
+struct UploadBuf {
+    buffer: ID3D12Resource,
+    data: *mut u8,
+    /// Pool bucket size if taken from [`SPARE`], or 0 if unpooled.
+    pooled: u64,
+    /// Staging footprint size counted in [`STAGED`].
+    bytes: u64,
+}
+
+// SAFETY: a D3D12 upload buffer and its persistent mapping; mutated only under
+// `Staging::upload` (and `Staging::last`) while no GPU copy reads it.
+unsafe impl Send for UploadBuf {}
+
+impl UploadBuf {
+    fn new(host: &crate::host::Host, total: u64) -> Option<Self> {
+        let (buffer, data, pooled) = staging_buffer(host, total)?;
+        use std::sync::atomic::Ordering::Relaxed;
+        STAGED[0].fetch_add(1, Relaxed);
+        STAGED[1].fetch_add(total, Relaxed);
+        Some(Self {
+            buffer,
+            data,
+            pooled,
+            bytes: total,
+        })
+    }
+}
+
+impl Drop for UploadBuf {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        STAGED[0].fetch_sub(1, Relaxed);
+        STAGED[1].fetch_sub(self.bytes, Relaxed);
+        // Nothing holds the upload buffer any more (command lists keep the COM
+        // resource until reset, and sweeps retire after GPU completion).
+        if self.pooled != 0 {
+            let cap = spare_budget();
+            let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+            if all.1 + self.pooled <= cap {
+                all.1 += self.pooled;
+                all.0
+                    .entry(self.pooled)
+                    .or_default()
+                    .push(Spare(self.buffer.clone(), self.data as usize));
+            }
+        }
+    }
+}
+
+/// RAII hold preventing a [`Staging`] entry's upload buffer from being
+/// released while a command list holds a recorded `CopyTextureRegion`
+/// referencing it.
+pub(crate) struct UploadHold(Arc<Staging>);
+
+impl Drop for UploadHold {
+    fn drop(&mut self) {
+        self.0
+            .pending_uploads
+            .fetch_sub(1, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// A texture's upload state: the staging buffer laid out as the host
 /// texture's subresources, and what was last detiled.
+///
+/// Lock order DAG: `STAGING` -> `last` -> `upload` -> `SPARE`.
+/// NEVER acquire `last` or `STAGING` while holding `upload`.
 pub(crate) struct Staging {
-    buffer: ID3D12Resource,
+    upload: Mutex<Option<UploadBuf>>,
+    /// Fast-path mirror of `upload.is_some()` for lock-free sweep filtering.
+    has_upload: std::sync::atomic::AtomicBool,
+    /// Number of live [`UploadHold`] guards held by recorded command lists.
+    pending_uploads: std::sync::atomic::AtomicU32,
+    /// When a submission last noted an upload (`crate::host::moment`).
+    uploaded_at: std::sync::atomic::AtomicU64,
     /// Its bytes.
     #[cfg(feature = "diagnostics")]
     size: u64,
-    data: *mut u8,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     row_sizes: Vec<u64>,
     layout: victory_formats::texture::Layout,
     /// Mips per array slice.
     mips: u32,
-    /// The staging buffer's bytes (counted in `STAGED` while it lives).
+    /// The staging buffer's bytes (counted in `STAGED` while its [`UploadBuf`] lives).
     bytes: u64,
     memory: *const u8,
     last: Mutex<Last>,
@@ -73,10 +145,6 @@ pub(crate) struct Staging {
     /// recorded again about a second later if the card has room by then
     /// ([`upload`]).
     waiting: std::sync::atomic::AtomicU64,
-    /// The size of the buffer if it came from the pool of spare staging
-    /// buffers and goes back to it ([`staging_buffer`]); 0: a buffer of its
-    /// own, released when this is dropped.
-    pooled: u64,
 }
 
 /// A staging buffer nothing holds: the buffer and where it is mapped.
@@ -645,22 +713,16 @@ fn with_title<R>(memory: *const u8, size: usize, f: impl FnOnce(&[u8]) -> R) -> 
 /// bytes.
 static STAGED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
-impl Drop for Staging {
-    fn drop(&mut self) {
-        use std::sync::atomic::Ordering::Relaxed;
-        STAGED[0].fetch_sub(1, Relaxed);
-        STAGED[1].fetch_sub(self.bytes, Relaxed);
-        // Nothing holds the staging any more (lists keep it until they are
-        // reset, after their submission has run): its buffer is spare.
-        if self.pooled != 0 {
-            let cap = spare_budget();
-            let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-            if all.1 + self.pooled <= cap {
-                all.1 += self.pooled;
-                all.0.entry(self.pooled).or_default().push(Spare(self.buffer.clone(), self.data as usize));
-            }
-        }
-    }
+/// Whether active settled textures release their `D3D12_HEAP_TYPE_UPLOAD`
+/// staging buffers while retaining lightweight [`Staging`] metadata
+/// (`VICTORY_STAGING_RELEASE=0` disables; on by default).
+fn staging_release_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| staging_release_from(std::env::var("VICTORY_STAGING_RELEASE").ok().as_deref()))
+}
+
+fn staging_release_from(value: Option<&str>) -> bool {
+    value.is_none_or(|v| v.trim() != "0")
 }
 
 /// For the memory line: staging buffers alive, their bytes, and how many
@@ -687,39 +749,77 @@ pub(crate) fn let_go() -> [u64; 2] {
 }
 
 /// Lets go of the staging buffers no list recorded a use of for `IDLE_MS`
-/// and `IDLE_FRAMES` frames and no list holds: a staging buffer is system memory the size of its
-/// texture, kept so that an unchanged texture is not uploaded again, and
-/// those of textures no longer sampled were kept for the run (2,246 of
-/// them, 2.1 GB, at the end of run 24). The next list that samples such a
-/// texture makes a staging buffer anew, detiles and uploads once more.
+/// and `IDLE_FRAMES` frames and no list holds, and detaches the mapped
+/// `D3D12_HEAP_TYPE_UPLOAD` buffer from active settled textures once their
+/// last upload has completed on the GPU: a staging buffer is system memory
+/// the size of its texture, kept so that an unchanged texture is not uploaded
+/// again, and retaining upload buffers for active static textures pinned
+/// gigabytes of `PAGE_WRITECOMBINE` memory across the run. Active entries
+/// keep their lightweight [`Staging`] metadata (hash/watch state) and lazily
+/// reallocate an [`UploadBuf`] only if the texture's memory later changes.
 /// Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
-    use std::sync::atomic::Ordering::Relaxed;
+    use std::sync::atomic::Ordering::{Acquire, Relaxed};
     const IDLE_FRAMES: u64 = 4;
+    const RELEASE_IDLE_MS: u64 = 2_000;
+    const RELEASE_IDLE_FRAMES: u64 = 4;
     let idle_ms = crate::host::effective_ram_idle_ms();
     trim_spare_idle(idle_ms);
-    let mut map = STAGING.write().unwrap_or_else(|e| e.into_inner());
-    let Some(map) = map.as_mut() else {
-        return;
-    };
-    if map.is_empty() {
-        return;
-    }
-    // A list that recorded an upload or a check holds the staging until it
-    // is reset: one only the table holds is named by no list, recorded or
-    // running.
+    let release_on = staging_release_on();
+    let host = host();
     let (mut went, mut bytes) = (0u64, 0u64);
-    map.retain(|_, s| {
-        let keep = Arc::strong_count(s) > 1
-            || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES);
-        if !keep {
-            LET_GO[0].fetch_add(1, Relaxed);
-            LET_GO[1].fetch_add(s.bytes, Relaxed);
-            went += 1;
-            bytes += s.bytes;
+    let mut released: Vec<UploadBuf> = Vec::new();
+    {
+        let mut map = STAGING.write().unwrap_or_else(|e| e.into_inner());
+        let Some(map) = map.as_mut() else {
+            return;
+        };
+        if map.is_empty() {
+            return;
         }
-        keep
-    });
+        // A list that recorded an upload or a check holds the staging until it
+        // is reset: one only the table holds is named by no list, recorded or
+        // running.
+        map.retain(|_, s| {
+            let keep = Arc::strong_count(s) > 1
+                || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES);
+            if !keep {
+                if s.has_upload.load(Relaxed) {
+                    LET_GO[0].fetch_add(1, Relaxed);
+                    LET_GO[1].fetch_add(s.bytes, Relaxed);
+                    went += 1;
+                    bytes += s.bytes;
+                }
+            } else if release_on
+                && s.has_upload.load(Relaxed)
+                && s.pending_uploads.load(Acquire) == 0
+                && s.uploaded.load(Acquire)
+                && !s.dirty.load(Acquire)
+                && (!s.on_demand || s.waiting.load(Relaxed) == 0)
+                && crate::host::long_ago(s.uploaded_at.load(Relaxed), RELEASE_IDLE_MS, RELEASE_IDLE_FRAMES)
+                && host.is_none_or(|h| h.staging_completed(s.last_upload.load(Relaxed)))
+                && let Some(u) = s.release_upload()
+            {
+                released.push(u);
+            }
+            keep
+        });
+    }
+    if !released.is_empty() {
+        let rel_count = released.len() as u64;
+        let rel_bytes: u64 = released.iter().map(|u| u.bytes).sum();
+        for u in released {
+            crate::host::retire(u);
+        }
+        LET_GO[0].fetch_add(rel_count, Relaxed);
+        LET_GO[1].fetch_add(rel_bytes, Relaxed);
+        crate::host::trail(|| {
+            format!(
+                "sweep: {rel_count} settled texture upload buffers released ({} KiB)",
+                rel_bytes >> 10
+            )
+        });
+    }
     if went > 0 {
         crate::host::trail(|| format!("sweep: {went} staging buffers of textures let go ({} KiB), held by no list", bytes >> 10));
     }
@@ -860,7 +960,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     let Some(staging) = staging(resource, texture) else {
         return;
     };
-    use std::sync::atomic::Ordering::Relaxed;
+    use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
     staging.used.store(crate::host::moment(), Relaxed);
     // Levels on demand: a view of the texture now starts at another
     // level, or another texture now starts inside its span, with no byte
@@ -868,7 +968,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     // this list's submission, and uploaded by this list.
     if staging.on_demand && staging.judgement() != staging.judged() {
         staging.forget();
-        staging.dirty.store(true, Relaxed);
+        staging.dirty.store(true, Release);
     }
     // Levels on demand: the last upload left a held level without tiles
     // (the card had no room, or no heap could be had), and nothing else
@@ -880,8 +980,8 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         let since = staging.waiting.load(Relaxed);
         if since != 0 && crate::host::long_ago(since, 1000, 2) {
             if crate::resource::room_lately() {
-                staging.waiting.store(0, Relaxed);
-                staging.dirty.store(true, Relaxed);
+                staging.dirty.store(true, Release);
+                staging.waiting.store(0, Release);
                 crate::tiles::STATS[10].fetch_add(1, Relaxed);
             } else {
                 staging.waiting.store(crate::host::moment().max(1), Relaxed);
@@ -892,25 +992,51 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     // at submission is left, and what it finds changed the next list that
     // samples the texture uploads (a frame late where every list of the
     // frame was recorded before that check).
-    if staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
+    if staging.uploaded.load(Acquire) && !staging.dirty.load(Acquire) {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexSkipped, 1);
-        list.defer_texture(staging, false);
+        list.defer_texture(staging, None);
         return;
+    }
+    let hold = staging.acquire_upload_hold();
+    let (buf, reallocated) = {
+        let mut guard = staging.upload.lock().unwrap_or_else(|e| e.into_inner());
+        let mut reallocated = false;
+        if guard.is_none() {
+            let Some(host) = host() else {
+                return;
+            };
+            let Some(upload) = UploadBuf::new(host, staging.bytes) else {
+                return;
+            };
+            crate::host::name(&upload.buffer, || {
+                format!("staging reallocated of {resource:?} ({} B)", staging.bytes)
+            });
+            *guard = Some(upload);
+            staging.has_upload.store(true, Release);
+            reallocated = true;
+        }
+        (
+            guard.as_ref().expect("upload buffer ensured above").buffer.clone(),
+            reallocated,
+        )
+    };
+    if reallocated {
+        staging.forget();
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::TexUploads, 1);
     crate::framelog::add(crate::framelog::T::Uploads, 1);
     const COPY_DEST: u32 = 0x400;
     crate::list::ensure_state(list, resource, COPY_DEST);
-    // The staging buffer lives as long as `staging`, which the deferred
-    // refresh below holds until the list is reset.
+    // Keep the upload buffer COM reference alive until the list is reset.
+    list.keep(&buf);
     for (i, footprint) in staging.footprints.iter().enumerate() {
         #[cfg(feature = "diagnostics")]
         {
             let f = footprint.Footprint;
             // SAFETY: live resources.
-            let (gpu, d) = unsafe { (staging.buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
+            let (gpu, d) = unsafe { (buf.GetGPUVirtualAddress(), texture.GetDesc()) };
             let len = subresource_bytes(
                 footprint.Offset,
                 f.RowPitch,
@@ -949,8 +1075,8 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
             },
         };
         let from = D3D12_TEXTURE_COPY_LOCATION {
-            // SAFETY: as above.
-            pResource: unsafe { std::mem::transmute_copy(&staging.buffer) },
+            // SAFETY: as above; `list.keep(&buf)` keeps the resource alive until reset.
+            pResource: unsafe { std::mem::transmute_copy(&buf) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                 PlacedFootprint: *footprint,
@@ -968,10 +1094,10 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     let on_demand = if staging.on_demand { crate::resource::host_tiled(resource) } else { None };
     let Some(on_demand) = on_demand else {
         // Once per submission however many of its lists sample the texture.
-        list.defer_texture(staging, true);
+        list.defer_texture(staging, Some(hold));
         return;
     };
-    list.defer_texture(staging.clone(), true);
+    list.defer_texture(staging.clone(), Some(hold));
     list.defer_host(move || {
         let waiting = on_demand.uploaded(staging.detiled.load(Relaxed), staging.memory as u64);
         staging.waiting.store(if waiting { crate::host::moment().max(1) } else { 0 }, Relaxed);
@@ -1098,12 +1224,42 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
 }
 
 impl Staging {
+    /// Acquires an RAII hold preventing this entry's upload buffer from being
+    /// released until the recording list is reset or dropped.
+    fn acquire_upload_hold(self: &Arc<Self>) -> UploadHold {
+        self.pending_uploads
+            .fetch_add(1, std::sync::atomic::Ordering::Acquire);
+        UploadHold(Arc::clone(self))
+    }
+
+    /// Detaches the mapped upload buffer if no command list holds a pending
+    /// upload, the texture has been uploaded and is not dirty, and no
+    /// on-demand level is waiting for VRAM room.
+    fn release_upload(&self) -> Option<UploadBuf> {
+        use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+        let mut guard = self.upload.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            return None;
+        }
+        if self.pending_uploads.load(Acquire) != 0
+            || !self.uploaded.load(Acquire)
+            || self.dirty.load(Acquire)
+            || (self.on_demand && self.waiting.load(Relaxed) != 0)
+        {
+            return None;
+        }
+        let buf = guard.take();
+        self.has_upload.store(false, Release);
+        buf
+    }
+
     /// Note an upload before checking for changed contents. The check sets
     /// dirty again if the next list needs to upload newer contents.
     pub(crate) fn note_upload(&self) {
-        use std::sync::atomic::Ordering::Relaxed;
-        self.uploaded.store(true, Relaxed);
-        self.dirty.store(false, Relaxed);
+        use std::sync::atomic::Ordering::{Relaxed, Release};
+        self.uploaded_at.store(crate::host::moment(), Relaxed);
+        self.dirty.store(false, Release);
+        self.uploaded.store(true, Release);
     }
 
     pub(crate) fn note_upload_fence(&self, fence: u64) {
@@ -1395,12 +1551,24 @@ impl Staging {
     }
 
     fn detile_timed(&self, tiled: &[u8]) {
-        use std::sync::atomic::Ordering::Relaxed;
+        use std::sync::atomic::Ordering::{Relaxed, Release};
         let fence = self.last_upload.swap(0, Relaxed);
         if fence != 0 {
             host().expect("an upload has a host").wait_for_staging(fence);
         }
-        self.dirty.store(true, Relaxed);
+        let mut guard = self.upload.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            let Some(host) = host() else {
+                return;
+            };
+            let Some(upload) = UploadBuf::new(host, self.bytes) else {
+                return;
+            };
+            *guard = Some(upload);
+            self.has_upload.store(true, Release);
+        }
+        let data = guard.as_ref().expect("upload buffer ensured above").data;
+        self.dirty.store(true, Release);
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
         // that gives levels their memory goes by this answer.
@@ -1440,9 +1608,10 @@ impl Staging {
                 row_size,
                 self.bytes,
             );
-            // SAFETY: `footprint.Offset + len <= self.bytes`, inside the mapped staging buffer.
+            // SAFETY: `footprint.Offset + len <= self.bytes`, inside the mapped staging buffer,
+            // and `guard` holds `self.upload` for the duration of the write.
             let linear = unsafe {
-                std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
+                std::slice::from_raw_parts_mut(data.add(footprint.Offset as usize), len)
             };
             if mip < 32 && held & (1 << mip) == 0 {
                 // Not the title's: zeros, not what lies in that memory.
@@ -1893,21 +2062,21 @@ fn new_staging(resource: This, texture: &ID3D12Resource, on_demand: bool) -> Opt
             Some(&mut total),
         );
     }
-    let (buffer, data, pooled) = staging_buffer(host, total)?;
-    crate::host::name(&buffer, || {
+    let upload = UploadBuf::new(host, total)?;
+    crate::host::name(&upload.buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
             d.Width, d.Height, d.DepthOrArraySize, d.Format.0
         )
     });
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
-    STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
     let s = Arc::new(Staging {
-        buffer,
+        upload: Mutex::new(Some(upload)),
+        has_upload: std::sync::atomic::AtomicBool::new(true),
+        pending_uploads: std::sync::atomic::AtomicU32::new(0),
+        uploaded_at: std::sync::atomic::AtomicU64::new(0),
         #[cfg(feature = "diagnostics")]
         size: total,
-        data,
         footprints,
         rows,
         row_sizes,
@@ -1924,7 +2093,6 @@ fn new_staging(resource: This, texture: &ID3D12Resource, on_demand: bool) -> Opt
         detiled: std::sync::atomic::AtomicU32::new(0),
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
-        pooled,
     });
     Some(s)
 }
@@ -1932,6 +2100,103 @@ fn new_staging(resource: This, texture: &ID3D12Resource, on_demand: bool) -> Opt
 #[cfg(test)]
 mod title_memory_tests {
     use super::with_title;
+
+    #[test]
+    fn staging_release_toggle_defaults_on_and_zero_disables() {
+        use super::staging_release_from;
+        assert!(staging_release_from(None));
+        assert!(staging_release_from(Some("1")));
+        assert!(staging_release_from(Some("yes")));
+        assert!(!staging_release_from(Some("0")));
+        assert!(!staging_release_from(Some(" 0 ")));
+    }
+
+    #[test]
+    fn upload_hold_refcounts_and_release_upload_gating() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
+        use std::sync::{Arc, Mutex};
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+        assert!(host.staging_completed(0));
+        let words: [u32; 14] = [3, 0, 0, 0, 16, 0, 4, 65537, 10, 1, 0, 256, 3_145_728, 0];
+        // SAFETY: 14 words = 56-byte ResourceDesc.
+        let desc: crate::resource::ResourceDesc = unsafe { std::mem::transmute(words) };
+        let layout = crate::resource::texture_layout(&desc)
+            .expect("a console layout")
+            .planes[0]
+            .layout
+            .clone();
+        const BYTES: u64 = 4096;
+        let before_count = super::STAGED[0].load(Relaxed);
+        let before_bytes = super::STAGED[1].load(Relaxed);
+        let upload = super::UploadBuf::new(host, BYTES).expect("host upload buffer");
+        assert_eq!(super::STAGED[0].load(Relaxed), before_count + 1);
+        assert_eq!(super::STAGED[1].load(Relaxed), before_bytes + BYTES);
+        let staging = Arc::new(super::Staging {
+            upload: Mutex::new(Some(upload)),
+            has_upload: AtomicBool::new(true),
+            pending_uploads: AtomicU32::new(0),
+            uploaded_at: AtomicU64::new(0),
+            #[cfg(feature = "diagnostics")]
+            size: BYTES,
+            footprints: Vec::new(),
+            rows: Vec::new(),
+            row_sizes: Vec::new(),
+            layout,
+            mips: 1,
+            bytes: BYTES,
+            memory: std::ptr::null(),
+            last: Mutex::default(),
+            dirty: AtomicBool::new(true),
+            uploaded: AtomicBool::new(false),
+            last_upload: AtomicU64::new(0),
+            used: AtomicU64::new(0),
+            on_demand: false,
+            detiled: AtomicU32::new(0),
+            judged: [const { AtomicU64::new(0) }; 2],
+            waiting: AtomicU64::new(0),
+        });
+        // Not uploaded yet and dirty: must block release.
+        assert!(staging.release_upload().is_none());
+        assert!(staging.has_upload.load(Relaxed));
+
+        // Note upload: marks uploaded=true, dirty=false.
+        staging.note_upload();
+        assert!(staging.uploaded.load(Relaxed));
+        assert!(!staging.dirty.load(Relaxed));
+
+        // UploadHold RAII refcounting blocks release while pending_uploads > 0.
+        let hold1 = staging.acquire_upload_hold();
+        let hold2 = staging.acquire_upload_hold();
+        assert_eq!(staging.pending_uploads.load(Relaxed), 2);
+        assert!(staging.release_upload().is_none());
+        drop(hold1);
+        assert_eq!(staging.pending_uploads.load(Relaxed), 1);
+        assert!(staging.release_upload().is_none());
+        drop(hold2);
+        assert_eq!(staging.pending_uploads.load(Relaxed), 0);
+
+        // Dirty flag blocks release even when pending_uploads == 0 and uploaded == true.
+        staging.dirty.store(true, Relaxed);
+        assert!(staging.release_upload().is_none());
+        staging.dirty.store(false, Relaxed);
+
+        // Once pending_uploads == 0 && uploaded && !dirty, release succeeds cleanly.
+        let released = staging.release_upload();
+        assert!(released.is_some());
+        assert!(!staging.has_upload.load(Relaxed));
+        assert!(staging.release_upload().is_none());
+
+        // Dropping the released UploadBuf decrements STAGED once; dropping
+        // Staging afterward must not double-decrement.
+        drop(released);
+        assert_eq!(super::STAGED[0].load(Relaxed), before_count);
+        assert_eq!(super::STAGED[1].load(Relaxed), before_bytes);
+        drop(staging);
+        assert_eq!(super::STAGED[0].load(Relaxed), before_count);
+        assert_eq!(super::STAGED[1].load(Relaxed), before_bytes);
+    }
 
     #[test]
     fn texture_refreshes_do_not_wait_unless_asked_to() {

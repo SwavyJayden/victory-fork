@@ -2219,7 +2219,7 @@ enum Step {
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture {
         staging: std::sync::Arc<crate::texture::Staging>,
-        uploads: bool,
+        upload_hold: Option<crate::texture::UploadHold>,
     },
 }
 
@@ -6179,6 +6179,17 @@ impl Host {
         }
     }
 
+    /// Whether the host GPU has finished reading the staging buffer from
+    /// submission `target` (non-blocking fence poll).
+    pub(crate) fn staging_completed(&self, target: u64) -> bool {
+        if target == 0 {
+            return true;
+        }
+        // SAFETY: plain fence query on this host's fence.
+        let completed = unsafe { self.fence.GetCompletedValue() };
+        completed != u64::MAX && completed >= target
+    }
+
     /// [`Host::execute`], or with `late` the first half of
     /// [`Host::execute_late`]: the lists are prepared and sent, and what is
     /// to be done once they have run comes back with the submission lock
@@ -7798,8 +7809,12 @@ impl HostList {
 
     /// Brings a texture's staging buffer up to date when the list is
     /// submitted, keeping it alive until the list is reset.
-    pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>, uploads: bool) {
-        self.deferred().copies.push(Step::Texture { staging, uploads });
+    pub(crate) fn defer_texture(
+        &self,
+        staging: std::sync::Arc<crate::texture::Staging>,
+        upload_hold: Option<crate::texture::UploadHold>,
+    ) {
+        self.deferred().copies.push(Step::Texture { staging, upload_hold });
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
@@ -7878,8 +7893,8 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::Texture { staging, uploads } => {
-                    if *uploads {
+                Step::Texture { staging, upload_hold } => {
+                    if upload_hold.is_some() {
                         staging.note_upload();
                         batch.uploaded.push(staging.clone());
                     }
