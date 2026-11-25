@@ -586,13 +586,15 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                     .collect()
             }
             ("v_permlanex16_b32", Some(a))
-                if exec == all
-                    && v.opsel == 0
+                if (exec == all || v.opsel & 3 != 0)
                     && v.dpp.is_none()
                     && matches!(v.src.first(), Some(Operand::Vector { .. })) =>
             {
                 // Lanes of each row read the other row of their half; lane
                 // i's pick is nibble i of {src2, src1}.
+                // opsel bit 0 is fi:1 (fetch inactive), bit 1 is bound_ctrl:1.
+                let fi = v.opsel & 1 != 0;
+                let bc = v.opsel & 2 != 0;
                 let sel = |k: usize| match v.src.get(k) {
                     Some(&Operand::Const(c)) => crate::resource::inline(c),
                     Some(&Operand::Literal(x)) => Some(x),
@@ -605,7 +607,14 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                             .map(|l| {
                                 let other = (l & !31) | ((l & 16) ^ 16);
                                 let pick = (s >> (4 * (l & 15)) & 15) as u32;
-                                a[(other | pick) as usize]
+                                let src_lane = other | pick;
+                                if fi || exec >> src_lane & 1 != 0 {
+                                    a[src_lane as usize]
+                                } else if bc {
+                                    Sym::K(0)
+                                } else {
+                                    Sym::Unknown
+                                }
                             })
                             .collect()
                     }
@@ -1247,5 +1256,55 @@ mod tests {
             bad_ident[0] = red(None, v0, m0, 1, 1);
             assert_eq!(per_lane(&bad_ident, all), None);
         }
+    }
+
+    #[test]
+    fn permlanex16_fi_and_reserved_opsel_simulates_wave32_prefix_sum() {
+        // Wave32 exclusive prefix sum using `v_permlanex16_b32 v3, v2, -1, -1 fi:1`
+        // under `exec_lo = 0xffff0000` (encoding `0xD778_4803 0x0305_8302`, matching
+        // Xbox LLVM's `opsel = 9` where bit 0 is `fi:1` and bit 3 is reserved).
+        let w = [
+            0xBE81_3DC1, // s_or_saveexec_b32 s1, -1
+            0xD501_0001,
+            0x0006_0E80, // v_cndmask_b32 v1, 0, v7, s1
+            0x7E04_0301, // v_mov_b32 v2, v1
+            0x4A04_04FA,
+            0xFF09_1102, // v_add_nc_u32 v2, v2, v2 row_shr:1 bound_ctrl:1
+            0x4A04_04FA,
+            0xFF01_1202, // v_add_nc_u32 v2, v2, v2 row_shr:2
+            0x4A04_04FA,
+            0xFF01_1402, // v_add_nc_u32 v2, v2, v2 row_shr:4
+            0x4A04_04FA,
+            0xFF01_1802, // v_add_nc_u32 v2, v2, v2 row_shr:8
+            0xBEFE_03FF,
+            0xFFFF_0000, // s_mov_b32 exec_lo, lit(0xffff0000)
+            0xD778_4803,
+            0x0305_8302, // v_permlanex16_b32 v3, v2, -1, -1 fi:1
+            0x4A04_0503, // v_add_nc_u32 v2, v3, v2
+            0xBEFE_03C1, // s_mov_b32 exec_lo, -1
+            0x4C04_0302, // v_sub_nc_u32 v2, v2, v1
+            0xBEFE_0301, // s_mov_b32 exec_lo, s1
+            S_ENDPGM,
+        ];
+        let p = build(&w, false);
+        let sec = &sections(&p, 0)[&0];
+        let sub = p.blocks[0]
+            .insts
+            .iter()
+            .find(|i| i.name() == "v_sub_nc_u32")
+            .unwrap()
+            .write(Reg::V(2))
+            .unwrap();
+        let v7 = p
+            .inputs
+            .iter()
+            .find(|i| i.0 == Reg::V(7))
+            .unwrap()
+            .1;
+        let s1 = p.blocks[0].insts[0].write(Reg::S(1)).unwrap();
+        assert_eq!(
+            sec.shapes.get(&sub),
+            Some(&Shape::Prefix(Op::AddU, v7, s1, 0, false))
+        );
     }
 }

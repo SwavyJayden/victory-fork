@@ -479,16 +479,52 @@ fn unspill(
     moves
 }
 
+/// Spilled user-data entry values ([`crate::spill::user_data`]) live in
+/// `p.inputs` under `Reg::S(16+)` while instructions keep the rewritten
+/// `s_load_dword*`'s destination register in `inst.reads`. Preserve those
+/// entry bindings when a CFG transform re-runs SSA renaming.
+fn pinned_inputs(p: &Program) -> std::collections::HashMap<Value, Reg> {
+    let input_reg: std::collections::HashMap<Value, Reg> =
+        p.inputs.iter().map(|&(r, v)| (v, r)).collect();
+    let spilled = p.blocks.iter().any(|b| {
+        b.insts.iter().any(|inst| {
+            inst.reads
+                .iter()
+                .any(|&(r, v)| input_reg.get(&v).is_some_and(|&ir| ir != r))
+        })
+    });
+    if !spilled {
+        return Default::default();
+    }
+    p.inputs
+        .iter()
+        .filter_map(|&(r, v)| match r {
+            Reg::S(c) if c >= 16 => Some((v, r)),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Rename register reads and writes after changing edges in a reducible graph.
-fn rename(mut blocks: Vec<Block>, wave64: bool, vgprs: u16) -> Program {
+fn rename(blocks: Vec<Block>, wave64: bool, vgprs: u16) -> Program {
+    rename_pinned(blocks, wave64, vgprs, &Default::default())
+}
+
+fn rename_pinned(
+    mut blocks: Vec<Block>,
+    wave64: bool,
+    vgprs: u16,
+    pinned: &std::collections::HashMap<Value, Reg>,
+) -> Program {
     let order = reverse_postorder(&blocks);
-    let (live_in, live_out) = liveness(&blocks, &order);
+    let (live_in, live_out) = liveness(&blocks, &order, pinned);
     let mut values = 0u32;
     let mut new_value = || {
         values += 1;
         Value(values - 1)
     };
     let mut inputs = Vec::new();
+    let mut pinned_values: std::collections::HashMap<Reg, Value> = Default::default();
     let mut outs: Vec<Vec<(Reg, Value)>> = vec![Vec::new(); blocks.len()];
     let mut current = [NONE; REGS];
     for &b in &order {
@@ -516,6 +552,18 @@ fn rename(mut blocks: Vec<Block>, wave64: bool, vgprs: u16) -> Program {
         }
         for inst in &mut block.insts {
             for (reg, v) in &mut inst.reads {
+                if let Some(&in_reg) = pinned.get(v) {
+                    *v = *pinned_values.entry(in_reg).or_insert_with(|| {
+                        if let Some(&(_, existing)) = inputs.iter().find(|&&(r, _)| r == in_reg) {
+                            existing
+                        } else {
+                            let fresh = new_value();
+                            inputs.push((in_reg, fresh));
+                            fresh
+                        }
+                    });
+                    continue;
+                }
                 *v = current[index(*reg)];
                 debug_assert_ne!(*v, NONE, "{reg:?} read at {:#x}", inst.machine.offset);
             }
@@ -553,6 +601,7 @@ pub(crate) fn thread_edges(
     p: &Program,
     edges: &[(usize, usize, usize)],
 ) -> Result<Program, ShaderError> {
+    let pinned = pinned_inputs(p);
     let mut blocks = p.blocks.clone();
     for block in &mut blocks {
         block.phis.clear();
@@ -577,7 +626,7 @@ pub(crate) fn thread_edges(
     }
     link(&mut blocks);
     split_irreducible(&mut blocks)?;
-    Ok(rename(blocks, p.wave64, p.vgprs))
+    Ok(rename_pinned(blocks, p.wave64, p.vgprs, &pinned))
 }
 
 /// The program without its early-outs: an `s_cbranch_execz` to a block that
@@ -609,12 +658,13 @@ pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
     if !any {
         return None;
     }
+    let pinned = pinned_inputs(p);
     for block in &mut blocks {
         block.phis.clear();
     }
     link(&mut blocks);
     split_irreducible(&mut blocks).ok()?;
-    Some(rename(blocks, p.wave64, p.vgprs))
+    Some(rename_pinned(blocks, p.wave64, p.vgprs, &pinned))
 }
 
 /// As [`without_early_outs`], and also without the branches that only skip a
@@ -764,12 +814,13 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
     if !any {
         return None;
     }
+    let pinned = pinned_inputs(p);
     for block in &mut blocks {
         block.phis.clear();
     }
     link(&mut blocks);
     split_irreducible(&mut blocks).ok()?;
-    Some(rename(blocks, p.wave64, p.vgprs))
+    Some(rename_pinned(blocks, p.wave64, p.vgprs, &pinned))
 }
 
 /// Placeholder before renaming.
@@ -1060,13 +1111,20 @@ fn multi_entry_loop(blocks: &[Block], inside: &[bool]) -> Option<(Vec<bool>, Vec
 }
 
 /// Registers live into and out of each block.
-fn liveness(blocks: &[Block], order: &[usize]) -> (Vec<RegSet>, Vec<RegSet>) {
+fn liveness(
+    blocks: &[Block],
+    order: &[usize],
+    pinned: &std::collections::HashMap<Value, Reg>,
+) -> (Vec<RegSet>, Vec<RegSet>) {
     let empty = [0; REGS.div_ceil(64)];
     let mut uses = vec![empty; blocks.len()];
     let mut defs = vec![empty; blocks.len()];
     for (b, block) in blocks.iter().enumerate() {
         for inst in &block.insts {
-            for &(reg, _) in &inst.reads {
+            for &(reg, v) in &inst.reads {
+                if pinned.contains_key(&v) {
+                    continue;
+                }
                 if !contains(&defs[b], reg) {
                     insert(&mut uses[b], reg);
                 }
@@ -1797,5 +1855,36 @@ mod tests {
         assert_eq!(vgprs(&movrels.reads), [4, 5, 0]);
         assert_eq!(movrels.read(Reg::V(4)), movreld.write(Reg::V(4)));
         assert!(build(&code, false, 4).is_err(), "v4 is past 4 VGPRs");
+    }
+
+    #[test]
+    fn without_skips_preserves_pinned_spilled_user_data_inputs() {
+        // Simulate a program after `spill::build`: an instruction whose machine
+        // register is `s2` has its SSA read rewritten to a spilled entry input
+        // `Reg::S(20)` in `p.inputs`. `without_skips` must preserve the pinned
+        // `Reg::S(20)` input instead of re-renaming the read back to `Reg::S(2)`.
+        let mut p = skip(&[0x7E02_0202], &[]); // v_mov_b32 v1, s2 inside skip body
+        let spilled = Value(9999);
+        p.inputs.push((Reg::S(20), spilled));
+        let v_mov = p
+            .blocks
+            .iter_mut()
+            .flat_map(|b| &mut b.insts)
+            .find(|i| i.name() == "v_mov_b32")
+            .unwrap();
+        for (reg, val) in &mut v_mov.reads {
+            if *reg == Reg::S(2) {
+                *val = spilled;
+            }
+        }
+        let p2 = without_skips(&p, false).expect("skip removed");
+        let pinned = input(&p2, Reg::S(20));
+        let v_mov2 = p2
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find(|i| i.name() == "v_mov_b32")
+            .unwrap();
+        assert_eq!(v_mov2.read(Reg::S(2)), Some(pinned));
     }
 }

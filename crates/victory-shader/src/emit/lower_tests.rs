@@ -757,3 +757,49 @@ fn small_floats_widen_as_halves() {
     // A 16-bit float is a half already, sign included.
     assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
 }
+
+#[test]
+fn single_wave_compute_widens_complement_mask_and_validates() {
+    // A wave32 compute shader that reads a complement mask (`s_not_b32 s2, exec_lo`)
+    // as data inside a divergent branch: single-wave `widen()` widens the enclosing
+    // branch without group barriers and emits valid SM 6.6 DXIL.
+    let words = [
+        0x7DA4_0080, // v_cmpx_eq_u32 exec_lo, 0, v0
+        0xBF88_0005, // s_cbranch_execz -> end
+        0xBE82_077E, // s_not_b32 s2, exec_lo (complement mask: bits set outside cond)
+        0x7E04_0202, // v_mov_b32 v2, s2 (reads complement mask as data)
+        0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+        0xD834_0000,
+        0x0000_0204, // ds_write_b32 v4, v2
+        S_ENDPGM,
+    ];
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 1 << 15,
+            threads: [32, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, false, native.vgprs).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    let bytes = crate::emit::container::build(&[]);
+    let empty = crate::Container::parse(&bytes).unwrap();
+    let previous = super::TEST_HOST_WAVE.replace(Some(32));
+    let shader = super::super::emit(&empty, &native, &p, &st, &io, &res);
+    super::TEST_HOST_WAVE.set(previous);
+    let mut shader = shader.expect("single-wave complement mask must widen and emit");
+    assert_eq!(shader.stage, HwStage::Cs);
+    #[cfg(windows)]
+    if let Ok(mut v) = super::super::validator::Validator::load(
+        super::super::validator::Validator::default_path().as_deref(),
+    ) {
+        v.validate(&mut shader.dxil).unwrap();
+    }
+}
