@@ -26,6 +26,12 @@ use crate::watch::PAGE;
 
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
+    /// Title memory's pages of 4 KiB (from the one `start` lies in on), a bit
+    /// each, that what shaders wrote was put into since a refresh last looked
+    /// at them ([`Shadow::take_landed`]); empty until then.
+    landings: Mutex<Vec<u64>>,
+    /// Whether any is.
+    landing: std::sync::atomic::AtomicBool,
     pub(crate) buffer: ID3D12Resource,
     data: *mut u8,
     gpu: u64,
@@ -2065,6 +2071,21 @@ fn copy_changed() -> bool {
 /// bytes that went on, their stretches, and the refreshes.
 static COPY_CHANGED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
+/// The kernel's page size for landing-echo comparison.
+const KERNEL_PAGE: usize = 4096;
+
+/// Whether a refresh checks if a written 4 KiB page only holds what a shader
+/// landing wrote back to title memory, skipping redundant re-upload to the GPU
+/// (`VICTORY_LAND_ECHO=0`: always copy and upload as before).
+fn land_echo() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_ECHO").is_none_or(|v| v != "0"))
+}
+
+/// Since the start: bytes skipped as landing echo alone, and bytes where the
+/// title also wrote beside the landing.
+static ECHO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 /// The chunk a refresh by what differs compares at a time
 /// ([`changed_chunks`]): whole chunks go on, so that the compare is the
 /// machine's compare of two blocks and a refresh makes a few stretches,
@@ -2098,8 +2119,19 @@ fn changed_chunks(now: &[u8], was: &[u8], chunk: usize) -> Vec<(usize, usize)> {
 
 /// The runs of bytes where `now` differs from `was` (of one length), as
 /// (offset, bytes) in order: every differing byte is in a run and no equal
-/// byte is.
+/// byte is. Uses AVX2 (32 bytes per step) when available.
 fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    let n = now.len().min(was.len());
+    #[cfg(target_arch = "x86_64")]
+    if n >= 64 && std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 is detected and both slices have length >= `n`.
+        return unsafe { changed_runs_avx2(&now[..n], &was[..n]) };
+    }
+    changed_runs_scalar(&now[..n], &was[..n])
+}
+
+/// Scalar/SWAR fallback for [`changed_runs`].
+fn changed_runs_scalar(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     let n = now.len().min(was.len());
     let mut runs = Vec::new();
     let mut i = 0;
@@ -2123,6 +2155,57 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
             i += 1;
         }
         runs.push((first, i - first));
+    }
+    runs
+}
+
+/// # Safety
+/// Caller must verify AVX2 support and `now.len() == was.len()`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn changed_runs_avx2(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    use std::arch::x86_64::*;
+    let n = now.len();
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut push = |from: usize, len: usize| match runs.last_mut() {
+        Some((a, m)) if *a + *m == from => *m += len,
+        _ => runs.push((from, len)),
+    };
+    let mut i = 0;
+    while i + 64 <= n {
+        // SAFETY: `i + 64 <= n` for both slices.
+        let (m0, m1) = unsafe {
+            let a0 = _mm256_loadu_si256(now.as_ptr().add(i).cast());
+            let b0 = _mm256_loadu_si256(was.as_ptr().add(i).cast());
+            let a1 = _mm256_loadu_si256(now.as_ptr().add(i + 32).cast());
+            let b1 = _mm256_loadu_si256(was.as_ptr().add(i + 32).cast());
+            let eq0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(a0, b0)) as u32;
+            let eq1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(a1, b1)) as u32;
+            (!eq0, !eq1)
+        };
+        let mut differ = u64::from(m0) | (u64::from(m1) << 32);
+        while differ != 0 {
+            let first = differ.trailing_zeros();
+            let count = (differ >> first).trailing_ones();
+            push(i + first as usize, count as usize);
+            if first + count >= 64 {
+                break;
+            }
+            differ &= u64::MAX << (first + count);
+        }
+        i += 64;
+    }
+    while i < n {
+        if now[i] != was[i] {
+            let first = i;
+            i += 1;
+            while i < n && now[i] != was[i] {
+                i += 1;
+            }
+            push(first, i - first);
+        } else {
+            i += 1;
+        }
     }
     runs
 }
@@ -2264,6 +2347,35 @@ mod merge_tests {
             assert!(runs.windows(2).all(|w| w[0].0 + w[0].1 < w[1].0), "{changes:?}");
         }
         assert!(changed_runs(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn changed_runs_avx2_matches_scalar() {
+        let mut seed = 0x1234_5678u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed >> 8
+        };
+        for round in 0..200 {
+            let n = next() as usize % 600;
+            let was: Vec<u8> = (0..n).map(|_| next() as u8).collect();
+            let mut now = was.clone();
+            for _ in 0..next() % 120 {
+                if n == 0 {
+                    break;
+                }
+                let at = next() as usize % n;
+                let len = (next() as usize % 36).min(n - at);
+                for b in &mut now[at..at + len] {
+                    *b = next() as u8;
+                }
+            }
+            assert_eq!(
+                super::changed_runs(&now, &was),
+                super::changed_runs_scalar(&now, &was),
+                "round {round} len {n}"
+            );
+        }
     }
 
     #[test]
@@ -2741,6 +2853,8 @@ impl Shadow {
         LIVE[0].fetch_add(1, Ordering::Relaxed);
         LIVE[1].fetch_add(len, Ordering::Relaxed);
         Shadow {
+            landings: Mutex::default(),
+            landing: std::sync::atomic::AtomicBool::new(false),
             buffer,
             data,
             gpu,
@@ -3678,12 +3792,103 @@ impl Shadow {
         bytes
     }
 
+    /// What shaders wrote in `[from, to)` (offsets) was put into title memory.
+    fn note_landing(&self, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        let first = self.start as usize / KERNEL_PAGE;
+        let pages = (self.start as usize + from) / KERNEL_PAGE - first
+            ..(self.start as usize + to).div_ceil(KERNEL_PAGE) - first;
+        let mut bits = self.landings.lock().unwrap_or_else(|e| e.into_inner());
+        if bits.is_empty() {
+            let all = (self.start + self.len).div_ceil(KERNEL_PAGE as u64) as usize - first;
+            bits.resize(all.div_ceil(64), 0);
+        }
+        for page in pages {
+            if let Some(word) = bits.get_mut(page / 64) {
+                *word |= 1 << (page % 64);
+            }
+        }
+        self.landing.store(true, Ordering::Release);
+    }
+
+    /// [`Shadow::copy`] of `[from, to)` (inside the buffer): where a 4 KiB
+    /// page was written by a GPU landing, compare against the CPU side and
+    /// skip re-uploading identical pages ([`land_echo`]).
+    fn take_landed(&self, from: usize, to: usize) -> usize {
+        thread_local! {
+            static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let start = self.start as usize;
+        let first = start / KERNEL_PAGE;
+        let mut runs: Vec<(usize, usize, bool)> = Vec::new();
+        {
+            let mut bits = self.landings.lock().unwrap_or_else(|e| e.into_inner());
+            let mut at = from;
+            while at < to {
+                let next = ((at / KERNEL_PAGE + 1) * KERNEL_PAGE).min(to);
+                let page = at / KERNEL_PAGE - first;
+                let noted = bits
+                    .get(page / 64)
+                    .is_some_and(|word| (word >> (page % 64)) & 1 != 0);
+                // Only clear once a full 4 KiB page has been checked.
+                if noted && next - at == KERNEL_PAGE {
+                    bits[page / 64] &= !(1 << (page % 64));
+                }
+                match runs.last_mut() {
+                    Some(last) if last.2 == noted && next - last.0 <= PAGE => last.1 = next,
+                    _ => runs.push((at, next, noted)),
+                }
+                at = next;
+            }
+        }
+        TITLE.with_borrow_mut(|title| {
+            for (from, to, noted) in runs {
+                if !noted {
+                    // SAFETY: inside the mapping (`from` and `to` are within the buffer).
+                    let at = unsafe { self.data.add(from - start) };
+                    crate::host::copy_mapped(at, from as *const u8, to - from, false);
+                    self.changed(from - start, to - start);
+                    self.card_changed(from - start, to - start);
+                    continue;
+                }
+                title.resize(to - from, 0);
+                crate::host::copy_mapped(title.as_mut_ptr(), from as *const u8, to - from, false);
+                let mut at = from;
+                while at < to {
+                    let next = ((at / KERNEL_PAGE + 1) * KERNEL_PAGE).min(to);
+                    let slice = &title[at - from..next - from];
+                    // SAFETY: inside the CPU-side mapping; no shader range holds it.
+                    let held = unsafe {
+                        std::slice::from_raw_parts_mut(self.data.add(at - start), next - at)
+                    };
+                    if slice == held {
+                        ECHO[0].fetch_add((next - at) as u64, Ordering::Relaxed);
+                    } else {
+                        ECHO[1].fetch_add((next - at) as u64, Ordering::Relaxed);
+                        held.copy_from_slice(slice);
+                        self.changed(at - start, next - start);
+                        self.card_changed(at - start, next - start);
+                    }
+                    at = next;
+                }
+            }
+        });
+        to - from
+    }
+
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
-        if self.card.is_some() && from < to && copy_changed() && self.copy_changed(from, to) {
-            return to - from;
+        if self.card.is_some() && from < to {
+            if copy_changed() && self.copy_changed(from, to) {
+                return to - from;
+            }
+            if self.landing.load(Ordering::Acquire) && land_echo() {
+                return self.take_landed(from, to);
+            }
         }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
@@ -3909,6 +4114,7 @@ impl Shadow {
                 crate::watch::writing(start + at, n);
                 merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card");
                 crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                self.note_landing(at, at + n);
                 written = n;
             }
         } else {
@@ -3987,11 +4193,13 @@ impl Shadow {
         }
         crate::host::shaders_write(start + at, &title[..]);
         if self.put_back_own(start + at, &title[..]) {
+            self.note_landing(at, at + n);
             return n;
         }
         crate::watch::writing(start + at, n);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card relay");
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        self.note_landing(at, at + n);
         n
     }
 }

@@ -514,6 +514,10 @@ pub(crate) struct State {
     target_handles: Vec<u64>,
     depth_handle: u64,
     targets_set: bool,
+    /// The render target views and the depth view the host list has, once
+    /// it has any ([`State::set_targets`]): per view the host texture (0:
+    /// a null view) and what its descriptor says.
+    host_targets: Option<(Vec<TargetKey>, Option<TargetKey>)>,
     viewports: Vec<D3D12_VIEWPORT>,
     scissors: Vec<RECT>,
     blend: Option<[f32; 4]>,
@@ -543,6 +547,10 @@ pub(crate) struct State {
     /// command before this one on the list.
     #[cfg(feature = "diagnostics")]
     last_indirect: (u64, u64),
+    /// The tables the last bind made afresh for a program the stand-in for
+    /// the indirect light follows (`crate::ambient`): root parameter, bytes
+    /// into the view heap.
+    ambient_tables: Vec<(u8, u32)>,
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
     /// Graphics, compute.
@@ -790,6 +798,10 @@ pub(crate) fn dispatched() -> u64 {
 /// streams of a cutscene frame reach further, and what lay past the first
 /// megabyte was never brought up to date - meshes without bodies, exploded
 /// triangles. `VICTORY_ROOT_VIEW_MB` sets a limit again.)
+/// What a render target or depth view of the host is made from: the host
+/// texture, and [`crate::descriptor::RtvRecord::key`].
+type TargetKey = (usize, (usize, [u32; 7]));
+
 fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
@@ -807,9 +819,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         shadow.refresh(list, address, len);
         return Some(gpu);
     }
-    let (gpu, to) = list.scratch(len)?;
-    list.defer_fill(to, address as *const u8, len as usize);
-    Some(gpu)
+    list.fill_scratch(address as *const u8, len)
 }
 
 macro_rules! once {
@@ -954,7 +964,8 @@ impl State {
         self.index = view.copied().unwrap_or_default();
     }
 
-    /// Render targets and depth, set on the host list at once.
+    /// Render targets and depth, set on the host list at once, unless it has
+    /// the same ones already (`VICTORY_BIND_CACHE=0` sets them every time).
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
         let Some(host) = crate::host::host() else {
             return;
@@ -964,7 +975,8 @@ impl State {
         self.depth_handle = depth;
         self.targets_set = true;
         self.targets.clear();
-        let mut rtvs = Vec::new();
+        let mut views = Vec::with_capacity(handles.len());
+        let mut keys = Vec::with_capacity(handles.len());
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
@@ -984,14 +996,16 @@ impl State {
                     .desc()
                     .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
                 if let Some(desc) = null {
-                    rtvs.push(host.rtv(None, Some(&desc)));
+                    views.push((None, Some(desc)));
+                    keys.push((0, record.key()));
                 }
                 continue;
             };
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            rtvs.push(host.rtv(Some(texture), record.desc().as_ref()));
+            views.push((Some(texture), record.desc()));
+            keys.push((texture.as_raw() as usize, record.key()));
         }
         self.depth = 0;
         self.depth_state = DEPTH_WRITE;
@@ -1004,8 +1018,25 @@ impl State {
             }
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            Some(host.dsv(texture, record.depth_desc().as_ref()))
+            Some((texture, record))
         });
+        let now = (
+            keys,
+            dsv.as_ref()
+                .map(|(texture, record)| (texture.as_raw() as usize, record.key())),
+        );
+        static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *CACHE.get_or_init(|| std::env::var("VICTORY_BIND_CACHE").map_or(true, |v| v != "0"))
+            && self.host_targets.as_ref() == Some(&now)
+        {
+            return;
+        }
+        self.host_targets = Some(now);
+        let rtvs: Vec<_> = views
+            .iter()
+            .map(|(texture, desc)| host.rtv(*texture, desc.as_ref()))
+            .collect();
+        let dsv = dsv.map(|(texture, record)| host.dsv(texture, record.depth_desc().as_ref()));
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(
@@ -1082,6 +1113,7 @@ impl State {
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
+        self.host_targets = None;
         if self.targets_set {
             let handles = std::mem::take(&mut self.target_handles);
             self.set_targets(list, &handles, self.depth_handle);
@@ -1374,10 +1406,8 @@ impl State {
             // SAFETY: an open list and a live pipeline.
             unsafe { l.SetPipelineState(&p.pso) };
             self.host_pipeline = p.pso.as_raw() as usize;
-            list.used_pipeline(&p.name);
             // The title may release the pipeline before it submits the list.
-            list.keep(&p.pso);
-            list.keep(&p.root);
+            list.bind_pipeline(&p.name, &p.pso, &p.root);
         }
         for stage in &p.stages {
             let t = stage.translated();
@@ -1387,6 +1417,10 @@ impl State {
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
+            }
+            if stage.shader.ambient.is_some() {
+                self.ambient_tables.clear();
+                self.ambient_tables.extend(made.iter().copied());
             }
             // What the shader stores through root views and raw addresses is
             // copied back into title memory afterwards.
@@ -2355,17 +2389,36 @@ impl State {
                     break;
                 }
             }
-            let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
+            let late = crate::descriptor::host::show_after()
+                && heap
+                    .handle(index)
+                    .is_some_and(|handle| !host.texture_slot_made_from(index, handle));
+            let view = heap.handle(index).and_then(|handle| {
+                if late {
+                    crate::descriptor::view(handle)
+                } else {
+                    host.mirror(index, handle, true)
+                }
+            });
+            let at_once = || {
+                if late
+                    && let Some(handle) = heap.handle(index)
+                {
+                    let _ = host.mirror(index, handle, true);
+                }
+            };
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
             let resource = match placed.as_ref().or(view.as_ref()) {
                 Some(&View::Shader(resource, _)) => resource as This,
                 _ => {
+                    at_once();
                     host.texture_slot_done(index, write, None);
                     continue;
                 }
             };
             let title_fills = crate::resource::host_resource(resource).is_some_and(crate::texture::title_written);
             if !title_fills {
+                at_once();
                 // a render target, a depth or unordered access texture: the host's own
                 host.texture_slot_done(index, write, None);
                 continue;
@@ -2376,6 +2429,15 @@ impl State {
             let tabled = crate::texture::is_staged(resource);
             if let Some(view) = &view {
                 readable(list, sampled.kind, view);
+            }
+            if late {
+                if crate::resource::host_fresh(resource) {
+                    if let Some(handle) = heap.handle(index) {
+                        host.texture_slot_show_after(list, index, handle);
+                    }
+                } else {
+                    at_once();
+                }
             }
             // A texture view the host refuses removes the device: name it.
             static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2585,41 +2647,93 @@ impl State {
             }
         }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
-        if self.ambient(list, p) {
-            self.host_heaps = [0; 2];
+        if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
+            && crate::ambient::on()
+            && self.ambient(list, p, role)
+        {
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
         }
     }
 
-    /// After a dispatch of `p`: replaces the indirect diffuse light with a
-    /// depth-shaded ambient floor while ray tracing is off (`crate::ambient`).
-    fn ambient(&self, list: &HostList, p: &crate::pipeline::host::HostPipeline) -> bool {
-        let Some(stage) = p.stages.first().filter(|s| s.shader.resolves_light) else {
+    /// The stand-in for the indirect light after a dispatch of `p`
+    /// (`crate::ambient`). Whether it recorded anything.
+    fn ambient(
+        &self,
+        list: &HostList,
+        p: &crate::pipeline::host::HostPipeline,
+        role: crate::ambient::Role,
+    ) -> bool {
+        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, Role, Views};
+        let Some(t) = p.stages.first().map(|s| s.translated()) else {
             return false;
         };
-        let view = |kind: ResourceType, (slot, offset): (u8, u32)| {
-            let u = stage.translated().used.iter().find(|u| {
+        let Some(heap) = (self.heaps[0] != 0)
+            .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
+            .flatten()
+        else {
+            return false;
+        };
+        let entry = |kind: ResourceType, (slot, offset): (u8, u32)| {
+            t.used.iter().find(|u| {
                 u.kind == kind
                     && u.root == RootType::Table
                     && (u.slot, u.table_offset_dwords) == (slot, offset)
             })?;
-            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(u.slot)) else {
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
                 return None;
             };
-            crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
+            let resource = match crate::descriptor::view(table + u64::from(offset) * 4)? {
+                View::Shader(r, _) | View::Unordered(r, ..) => r,
+                _ => return None,
+            };
+            let start = match self.ambient_tables.iter().find(|m| m.0 == slot) {
+                Some(m) => m.1,
+                None => self.user_value(true, slot, RootType::Table, 0),
+            };
+            let host = crate::resource::host_resource(resource as This)?;
+            // SAFETY: a live resource.
+            let desc = unsafe { host.GetDesc() };
+            Some((desc, heap.gpu_handle((start + offset * 4) / 32)))
         };
-        let light = match view(ResourceType::Uav, crate::ambient::LIGHT) {
-            Some(View::Unordered(r, ..)) => r,
-            _ => 0,
+        let at = match role {
+            Role::Resolve => LIGHT,
+            Role::Radiance => RADIANCE,
+            Role::Air => AIR,
         };
-        if light == 0 {
-            once!("no ambient light: other tables");
+        let image = entry(ResourceType::Uav, at);
+        let depth = match role {
+            Role::Resolve => entry(ResourceType::Srv, DEPTH),
+            Role::Radiance | Role::Air => image,
+        };
+        let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
+            once!(?role, "no stand-in for the indirect light: other tables");
+            return false;
+        };
+        // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
+        let format = if role == Role::Resolve { 42 } else { 26 };
+        let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        if of.Format.0 != format
+            || (seen.Width, seen.Height) != (of.Width, of.Height)
+            || volume != (role == Role::Air)
+        {
+            once!(
+                ?role,
+                format = of.Format.0,
+                "no stand-in for the indirect light: another image"
+            );
             return false;
         }
-        let depth = match view(ResourceType::Srv, crate::ambient::DEPTH) {
-            Some(View::Shader(r, _)) => Some(r as This),
-            _ => None,
-        };
-        crate::ambient::raise(list, light as This, depth)
+        crate::ambient::after(
+            list,
+            role,
+            &Views {
+                image,
+                depth,
+                size: [of.Width as u32, of.Height],
+                slices: u32::from(of.DepthOrArraySize),
+            },
+        )
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -3214,7 +3328,7 @@ impl State {
                         {
                             host.texture_slot_tabled(title + k, kind.is_some());
                             if kind.is_some() {
-                                host.mirror(title + k, table + u64::from(k) * 32, true);
+                                host.mirror_after(list, title + k, table + u64::from(k) * 32);
                             }
                         }
                     }
@@ -4011,6 +4125,8 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
+            // Some compute-written textures are also read by the title CPU.
+            list.texture_written(*resource as This);
             // Unordered access to a depth texture is its colour twin's.
             if !list.twin_use(*resource as This, true, true) {
                 crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);

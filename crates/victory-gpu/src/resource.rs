@@ -1134,6 +1134,9 @@ pub(crate) struct HostTexture {
     /// levels have been given. Its `bytes` are 0: what it holds of the card
     /// is counted there.
     pub(crate) tiled: Option<crate::tiles::Tiled>,
+    /// Submission number when this host texture was created, for
+    /// `VICTORY_SHOW_AFTER=1` ([`host_fresh`]).
+    created: u64,
 }
 
 /// What a title texture has on the host: its host copy and, for a depth
@@ -1397,6 +1400,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
 /// The host copy of title texture `this` if it is made, without making it
 /// (for diagnostics and post-resolve passes, which must not count as a use).
 #[cfg(windows)]
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) fn host_made<'a>(
     this: This,
 ) -> Option<&'a windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
@@ -1968,6 +1972,7 @@ impl HostTexture {
             bytes,
             filled: false,
             tiled: None,
+            created: crate::host::submissions().0,
         }
     }
 
@@ -1985,8 +1990,23 @@ impl HostTexture {
             bytes: 0,
             filled: false,
             tiled: Some(tiled),
+            created: crate::host::submissions().0,
         }
     }
+}
+
+/// Whether the host texture of `this` was created during or after a submission
+/// that has not finished on the card yet (`VICTORY_SHOW_AFTER=1`).
+#[cfg(windows)]
+pub(crate) fn host_fresh(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let Some((host, _)) = hosted(this, false) else {
+        return false;
+    };
+    let (_, finished) = crate::host::submissions();
+    host.created >= finished
 }
 
 #[cfg(windows)]
@@ -2323,6 +2343,7 @@ fn hand_out_resource(
     if desc.dimension != BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         textures().insert(at);
+        crate::texback::replaced(resource.data() as usize);
         if !fills(&desc) {
             TARGETS_AT
                 .lock()
@@ -2347,7 +2368,9 @@ impl Drop for Resource {
         // Out of the table of textures first: the sweep looks at the ones
         // in it, under its lock.
         if self.desc.dimension != BUFFER {
-            textures().remove(&(std::ptr::from_ref::<Resource>(self) as usize));
+            let address = std::ptr::from_ref::<Resource>(self) as usize;
+            crate::texback::released(address);
+            textures().remove(&address);
             if !fills(&self.desc) {
                 let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
                 let at = self.data() as u64;
@@ -2578,6 +2601,38 @@ static PLACED_TWINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 #[allow(dead_code)]
 pub(crate) fn placed_filler_twins() -> u64 {
     PLACED_TWINS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Width, height and format of texture `this` (`None` for a buffer), for
+/// `crate::texback`'s kinds.
+#[cfg(windows)]
+pub(crate) fn texture_kind(this: This) -> Option<(u64, u32, u32)> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    const TEXTURE_2D: u32 = 3;
+    (r.desc.dimension == TEXTURE_2D && r.desc.sample_count <= 1)
+        .then_some((r.desc.width, r.desc.height, r.desc.format))
+}
+
+/// Texture `this`'s console layout (one plane), where it lies in title
+/// memory and the bytes that layout takes, for `crate::texback`; `None` for
+/// a buffer or a texture with planes.
+#[cfg(windows)]
+pub(crate) fn title_texture(this: This) -> Option<(victory_formats::texture::Layout, usize, usize)> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return None;
+    }
+    let t = texture_layout(&r.desc)?;
+    let [plane] = &t.planes[..] else {
+        return None;
+    };
+    Some((plane.layout.clone(), r.data() as usize, t.size as usize))
 }
 
 /// The bytes of title memory a texture with the resource description

@@ -161,6 +161,247 @@ impl DynamicBits {
     }
 }
 
+/// Whether a title slot shows a texture that is new to it only once the
+/// submission with its upload has finished (`VICTORY_SHOW_AFTER=1`; off by
+/// default). Prevents GPU page faults when in-flight command lists read a
+/// newly-created texture slot before its upload submission completes.
+pub(crate) fn show_after() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SHOW_AFTER").is_some_and(|v| v != "0"))
+}
+
+struct Flip {
+    after: u64,
+    heap: usize,
+    index: u32,
+    handle: u64,
+    key: u64,
+    since: u64,
+}
+
+static FLIPS: Mutex<Vec<Flip>> = Mutex::new(Vec::new());
+
+/// Slots shown late ([`show_after`]), frames waited, longest wait,
+/// neutral stand-ins placed meanwhile, and slots superseded before reveal.
+static LATE: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+fn record_key_at(handle: u64) -> u64 {
+    // SAFETY: the handle is a descriptor slot in title memory.
+    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    if tag == VIEW_TAG {
+        u64::from(generation) << 32 | u64::from(i)
+    } else {
+        0
+    }
+}
+
+/// A 1x1 neutral gray texture shown in a slot until a newly-created texture's
+/// upload submission finishes ([`show_after`]).
+fn neutral() -> Option<&'static ID3D12Resource> {
+    static TEXTURE: std::sync::OnceLock<Option<ID3D12Resource>> = std::sync::OnceLock::new();
+    TEXTURE
+        .get_or_init(|| {
+            let host = host()?;
+            let device = &host.device;
+            let (from, data) = host.upload_buffer(256)?;
+            // SAFETY: the buffer's mapping; plain creation and recording,
+            // waited for before returning.
+            unsafe {
+                std::ptr::write_bytes(data, 0x80, 256);
+                let mut made: Option<ID3D12Resource> = None;
+                device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_DEFAULT,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                            Width: 1,
+                            Height: 1,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                            SampleDesc: DXGI_SAMPLE_DESC {
+                                Count: 1,
+                                Quality: 0,
+                            },
+                            ..Default::default()
+                        },
+                        D3D12_RESOURCE_STATE_COMMON,
+                        None,
+                        &mut made,
+                    )
+                    .ok()?;
+                let made = made?;
+                let queue: ID3D12CommandQueue = device
+                    .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                        Type: D3D12_COMMAND_LIST_TYPE_COPY,
+                        ..Default::default()
+                    })
+                    .ok()?;
+                let allocator: ID3D12CommandAllocator =
+                    device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY).ok()?;
+                let list: ID3D12GraphicsCommandList = device
+                    .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)
+                    .ok()?;
+                let to = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&made),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        SubresourceIndex: 0,
+                    },
+                };
+                let footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: 0,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                        Width: 1,
+                        Height: 1,
+                        Depth: 1,
+                        RowPitch: 256,
+                    },
+                };
+                let source = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&from),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: footprint,
+                    },
+                };
+                list.CopyTextureRegion(&to, 0, 0, 0, &source, None);
+                list.Close().ok()?;
+                let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+                queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).ok()?)]);
+                queue.Signal(&fence, 1).ok()?;
+                fence
+                    .SetEventOnCompletion(1, windows::Win32::Foundation::HANDLE::default())
+                    .ok()?;
+                Some(made)
+            }
+        })
+        .as_ref()
+}
+
+/// Writes a 1x1 neutral SRV at `at` for 2D / 2D-array texture views, or a null
+/// view for other dimensions.
+fn neutral_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Resource> {
+    const TEXTURE2D: u32 = 4;
+    const TEXTURE2D_ARRAY: u32 = 5;
+    let dimension = match view {
+        View::Shader(_, Some(desc)) => desc[1],
+        View::Placed(false, resource, desc) if resource[0] != 1 => desc[1],
+        _ => 0,
+    };
+    let desc = match dimension {
+        TEXTURE2D => D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MipLevels: 1,
+                    ..Default::default()
+                },
+            },
+        },
+        TEXTURE2D_ARRAY => D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    ..Default::default()
+                },
+            },
+        },
+        _ => {
+            null_for(view, at);
+            return None;
+        }
+    };
+    let (Some(texture), Some(host)) = (neutral(), host()) else {
+        null_for(view, at);
+        return None;
+    };
+    // SAFETY: a slot of our heap and a live texture.
+    unsafe { host.device.CreateShaderResourceView(texture, Some(&desc), at) };
+    Some(texture.clone())
+}
+
+/// Reveals texture slots queued by [`HostHeap::texture_slot_show_after`] whose
+/// upload submission (`after <= finished`) has completed on the GPU.
+pub(crate) fn finish_flips(finished: u64) {
+    let mut flips = FLIPS.lock().unwrap_or_else(|e| e.into_inner());
+    if flips.is_empty() {
+        return;
+    }
+    let mut ready = Vec::new();
+    let mut keep = Vec::with_capacity(flips.len());
+    for f in flips.drain(..) {
+        if f.after <= finished {
+            ready.push(f);
+        } else {
+            keep.push(f);
+        }
+    }
+    *flips = keep;
+    // Keep `FLIPS` locked while updating slots so `Drop for HostHeap` cannot
+    // release a heap while we dereference it.
+    for f in ready {
+        // SAFETY: `Drop for HostHeap` purges entries under `FLIPS`.
+        let heap = unsafe { &*(f.heap as *const HostHeap) };
+        let _guard = heap.made_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(slot) = heap.made.get(f.index as usize) else {
+            continue;
+        };
+        if slot.load(Ordering::Relaxed) == f.key {
+            continue;
+        }
+        let view = view_at(f.key as u32, (f.key >> 32) as u32);
+        let (true, Some(view)) = (f.key != 0 && record_key_at(f.handle) == f.key, view) else {
+            LATE[4].fetch_add(1, Ordering::Relaxed);
+            continue;
+        };
+        if let View::Placed(_, resource, desc) = &view {
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            let len = crate::resource::placed_bytes(resource).unwrap_or(1);
+            if crate::texture::mapped_bytes(address as *const u8, len as usize) == 0 {
+                LATE[4].fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+        }
+        if let Some(kept) = make(&view, heap.cpu(f.index)) {
+            heap.set_null_cbv(f.index, false);
+            heap.keep(f.index, kept);
+            slot.store(f.key, Ordering::Release);
+            let frames = crate::frame::current().saturating_sub(f.since);
+            let n = LATE[0].fetch_add(1, Ordering::Relaxed) + 1;
+            let all = LATE[1].fetch_add(frames, Ordering::Relaxed) + frames;
+            let most = LATE[2].fetch_max(frames, Ordering::Relaxed).max(frames);
+            if n == 1 || n.is_multiple_of(5000) {
+                tracing::info!(
+                    "slots shown after their texture's upload (VICTORY_SHOW_AFTER=1), since the start: {n}, {:.2} frames after asked, longest {most}; neutral stand-in in {}; {} superseded",
+                    all as f64 / n as f64,
+                    LATE[3].load(Ordering::Relaxed),
+                    LATE[4].load(Ordering::Relaxed)
+                );
+            }
+        }
+    }
+}
+
+impl Drop for HostHeap {
+    fn drop(&mut self) {
+        let me = std::ptr::from_ref(self) as usize;
+        let mut flips = FLIPS.lock().unwrap_or_else(|e| e.into_inner());
+        flips.retain(|f| f.heap != me);
+    }
+}
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -1638,6 +1879,80 @@ impl HostHeap {
             .get(index as usize)
             .is_some_and(|m| m.load(Ordering::Acquire) == key)
             && self.has_kept(index)
+    }
+
+    /// Shows the texture at `handle` in slot `index` only after `list`'s
+    /// submission finishes on the card; until then the slot shows a neutral
+    /// 1x1 texture (or keeps an older view of the same placed texture).
+    pub(crate) fn texture_slot_show_after(
+        &self,
+        list: &crate::host::HostList,
+        index: u32,
+        handle: u64,
+    ) {
+        if index >= self.count {
+            return;
+        }
+        let key = record_key_at(handle);
+        let Some(view) = (key != 0)
+            .then(|| view_at(key as u32, (key >> 32) as u32))
+            .flatten()
+        else {
+            return;
+        };
+        {
+            let _guard = self.made_lock.lock().unwrap_or_else(|e| e.into_inner());
+            let shown = self.made[index as usize].load(Ordering::Relaxed);
+            if shown == key {
+                return;
+            }
+            for stale in self.note_buffer(index, Some(&view), true) {
+                if stale != index {
+                    self.unmake(stale);
+                }
+            }
+            let old = (shown != 0)
+                .then(|| view_at(shown as u32, (shown >> 32) as u32))
+                .flatten();
+            if shown == 0 || !old.is_some_and(|old| same_placed_texture(&old, &view)) {
+                self.made[index as usize].store(0, Ordering::Release);
+                let kept = neutral_for(&view, self.cpu(index));
+                self.set_null_cbv(index, false);
+                LATE[3].fetch_add(u64::from(kept.is_some()), Ordering::Relaxed);
+                self.keep(index, kept);
+            }
+        }
+        let heap = std::ptr::from_ref(self) as usize;
+        let since = crate::frame::current();
+        list.defer_host(move || {
+            let after = crate::host::submissions().0;
+            FLIPS.lock().unwrap_or_else(|e| e.into_inner()).push(Flip {
+                after,
+                heap,
+                index,
+                handle,
+                key,
+                since,
+            });
+        });
+    }
+
+    /// [`HostHeap::mirror`] of a slot whose table a draw read: when
+    /// `VICTORY_SHOW_AFTER=1` is enabled and the texture was just created,
+    /// reveal the slot only after `list`'s submission finishes.
+    pub(crate) fn mirror_after(&self, list: &crate::host::HostList, index: u32, handle: u64) {
+        if show_after()
+            && index < self.count
+            && !self.texture_slot_made_from(index, handle)
+            && let Some(view) = super::view(handle)
+            && let Some(View::Shader(resource, _)) = placed_texture(&view).or(Some(view))
+            && crate::resource::buffer_bytes(resource as crate::object::This).is_none()
+            && crate::resource::host_fresh(resource as crate::object::This)
+        {
+            self.texture_slot_show_after(list, index, handle);
+            return;
+        }
+        self.mirror(index, handle, true);
     }
 
     /// Levels on demand (`crate::tiles`): makes again the host slots of the
@@ -4943,5 +5258,35 @@ mod own_copy_tests {
         assert_eq!(own_bytes_if(true, 8, base, 2, 0, 32, 32, true), None);
         assert_eq!(own_bytes_if(true, 8, base, 2, 4, 0, 0, false), None);
         assert_eq!(own_bytes_if(false, 8, base, 2, 4, 32, 32, true), None);
+    }
+}
+
+#[cfg(test)]
+mod show_after_tests {
+    use super::*;
+
+    /// 2D textures and arrays get a neutral 1x1 stand-in; other dimensions get a null view.
+    #[test]
+    fn a_texture_not_there_yet_has_a_neutral_stand_in() {
+        let Some(host) = host() else { return };
+        // SAFETY: plain heap creation and queries.
+        unsafe {
+            let heap: ID3D12DescriptorHeap = host
+                .device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 1,
+                    ..Default::default()
+                })
+                .unwrap();
+            let at = heap.GetCPUDescriptorHandleForHeapStart();
+            let view =
+                |dimension| View::Shader(0, Some([98, dimension, 5768, 0, 0, 1, 0, 1, 0, 0]));
+            assert!(neutral_for(&view(4), at).is_some());
+            assert!(neutral_for(&view(5), at).is_some());
+            assert!(neutral_for(&view(9), at).is_none());
+            assert!(neutral_for(&view(8), at).is_none());
+            assert!(host.device.GetDeviceRemovedReason().is_ok());
+        }
     }
 }

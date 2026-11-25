@@ -950,44 +950,70 @@ fn uncommitted_end(block: usize) -> usize {
 
 /// Gives write access back to the guarded blocks of `[start, end)` and
 /// notes them written; true if any was guarded. The same physical pages at
-/// every other view of them are opened too: the write that faulted (or is
-/// ours, `crate::host::copy_mapped`) goes through one view, and every
-/// guard over the pages must copy them again.
+/// every other view of them are opened too: all views are removed from
+/// `protected`/`clean`/`aliased` together before any becomes writable, so no
+/// view can become writable while another view of the same page still looks
+/// clean.
 fn open(g: &mut Guards, start: usize, end: usize) -> bool {
-    let any = open_here(g, start, end);
-    if start >= end || g.aliased.is_empty() {
-        return any;
+    if start >= end {
+        return false;
     }
-    let aliased: Vec<usize> = g.aliased.range(start / BLOCK..end.div_ceil(BLOCK)).copied().collect();
-    for block in aliased {
-        g.aliased.remove(&block);
-        for alias in crate::inplace::pages_of(block * BLOCK) {
-            if alias / BLOCK != block && open_here(g, alias, alias.saturating_add(BLOCK)) {
-                #[cfg(feature = "diagnostics")]
-                ALIASES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            g.aliased.remove(&(alias / BLOCK));
-        }
-    }
-    any
-}
-
-/// [`open`] for one range, without the other views of its pages.
-fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    let blocks: Vec<usize> = g
+    let primary: Vec<usize> = g
         .protected
         .range(start / BLOCK..end.div_ceil(BLOCK))
         .copied()
         .collect();
-    for &block in &blocks {
-        g.protected.remove(&block);
-        g.clean.remove(block);
+    let mut blocks = primary;
+    let any = !blocks.is_empty();
+    if !g.aliased.is_empty() {
+        let aliased: Vec<usize> = g
+            .aliased
+            .range(start / BLOCK..end.div_ceil(BLOCK))
+            .copied()
+            .collect();
+        let mut alias_opened = 0u64;
+        for block in aliased {
+            g.aliased.remove(&block);
+            for alias in crate::inplace::pages_of(block * BLOCK) {
+                let ab = alias / BLOCK;
+                if ab != block && g.protected.contains(&ab) {
+                    blocks.push(ab);
+                    alias_opened += 1;
+                }
+                g.aliased.remove(&ab);
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        if alias_opened != 0 {
+            ALIASES[1].fetch_add(alias_opened, std::sync::atomic::Ordering::Relaxed);
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = alias_opened;
+    }
+    unguard_blocks(g, &blocks);
+    any
+}
+
+/// Removes all `blocks` from `protected` and `clean` before giving write
+/// access back to any of them, keeping multi-view state consistent under the
+/// guards lock.
+fn unguard_blocks(g: &mut Guards, blocks: &[usize]) {
+    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    if blocks.is_empty() {
+        return;
+    }
+    let mut unique: Vec<usize> = Vec::with_capacity(blocks.len());
+    for &block in blocks {
+        if g.protected.remove(&block) {
+            g.clean.remove(block);
+            unique.push(block);
+        }
+    }
+    for block in unique {
         let mut old = 0;
         // SAFETY: a block we made read-only.
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
     }
-    !blocks.is_empty()
 }
 
 /// Before our own write into title memory `[at, at + len)` through the
@@ -1090,13 +1116,20 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
     if ranges.is_empty() {
         return;
     }
+    // Collect and unguard every protected view of these physical pages
+    // together under one lock so none becomes writable while another stays
+    // marked clean.
     let mut g = guards();
-    for &(at, n) in &ranges {
-        if open_here(&mut g, at, at.saturating_add(n)) {
-            #[cfg(feature = "diagnostics")]
-            ALIASES[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
+    let blocks: Vec<usize> = ranges
+        .iter()
+        .flat_map(|&(at, n)| g.protected.range(at / BLOCK..at.saturating_add(n).div_ceil(BLOCK)).copied().collect::<Vec<_>>())
+        .collect();
+    if blocks.is_empty() {
+        return;
     }
+    #[cfg(feature = "diagnostics")]
+    ALIASES[2].fetch_add(blocks.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    unguard_blocks(&mut g, &blocks);
 }
 
 /// Held shared by a read of title memory in place, and alone by the runtime
@@ -1163,6 +1196,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    crate::texback::remapped(at, len);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
