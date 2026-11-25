@@ -1,17 +1,17 @@
-/// Frame pacing: the title sets a frame interval and waits for each frame
-/// to begin. Ours is a clock started by the first interval set, ticking
-/// once per interval; the token is the frame number. Each event kind
-/// (origin, vblank, flip) happens once per tick, so two waits for the same
-/// kind never end on the same tick: the title polls the origin
-/// with "token on time-out" (starting its next frame at once) and is paced
-/// by a blocking wait for the flip before each present.
-///
-/// `VICTORY_FPS_CAP=<n>` caps the wait interval at `1_000_000 / n` microseconds
-/// (e.g. `60` unlocks 60 fps instead of the title's 30 Hz default); `0` or
-/// `unlimited` sets a minimal 100 us interval (uncapped).
-///
-/// shortcut: event offsets are ignored (every event is at the tick); tie
-/// the clock to presentation if a title paces by them.
+//! Frame pacing: the title sets a frame interval and waits for each frame
+//! to begin. Ours is a clock started by the first interval set, ticking
+//! once per interval; the token is the frame number. Each event kind
+//! (origin, vblank, flip) happens once per tick, so two waits for the same
+//! kind never end on the same tick: the title polls the origin
+//! with "token on time-out" (starting its next frame at once) and is paced
+//! by a blocking wait for the flip before each present.
+//!
+//! `VICTORY_FPS_CAP=<n>` caps the wait interval at `1_000_000 / n` microseconds
+//! (e.g. `60` unlocks 60 fps instead of the title's 30 Hz default); `0` or
+//! `unlimited` sets a minimal 100 us interval (uncapped).
+//!
+//! shortcut: event offsets are ignored (every event is at the tick); tie
+//! the clock to presentation if a title paces by them.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::sync::Mutex;
