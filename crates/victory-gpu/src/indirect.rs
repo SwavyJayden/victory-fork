@@ -118,7 +118,11 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         }
         draw_counts = uint2(count, instances);
     } else if (active && kind == 2) {
-        uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
+        uint3 g = src_args.Load3(src_at);
+        if (ahead && (g.x > 65535u || g.y > 65535u || g.z > 65535u)) {
+            g = uint3(0, 0, 0);
+        }
+        g = min(g, uint3(65535u, 65535u, 65535u));
         // x * y fits 32 bits; the whole count may not.
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
             g = uint3(0, 0, 0);
@@ -128,10 +132,10 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     } else if (active) {
         // Mesh dispatches: the console's are one-dimensional.
         uint3 g = src_args.Load3(src_at);
-        // Ahead of its draw, a record over the most a dispatch runs is a
-        // slot the title has not filled (the title leaves all
+        // Ahead of its draw, a record over the most a dispatch runs in any
+        // dimension is a slot the title has not filled (the title leaves all
         // ones there): empty, and not counted below either.
-        if (ahead && g.x > 65535u) {
+        if (ahead && (g.x > 65535u || g.y > 65535u || g.z > 65535u)) {
             g = uint3(0, 0, 0);
         }
         asked = g.x;
@@ -327,6 +331,33 @@ fn validate_layout(
     (bytes <= u64::from(u32::MAX)).then_some(bytes)
 }
 
+/// Validates that the source, destination, and optional count buffer widths
+/// cover every byte the clamp compute shader accesses through its unbounded
+/// root SRVs/UAVs.
+fn fits_buffers(
+    bytes: u64,
+    src_offset: u64,
+    src_width: u64,
+    dst_width: u64,
+    count: Option<(u64, u64)>,
+) -> bool {
+    let Some(src_end) = src_offset.checked_add(bytes) else {
+        return false;
+    };
+    if src_end > src_width || bytes > dst_width {
+        return false;
+    }
+    if let Some((count_offset, count_width)) = count {
+        let Some(count_end) = count_offset.checked_add(4) else {
+            return false;
+        };
+        if count_end > count_width {
+            return false;
+        }
+    }
+    true
+}
+
 /// Records, in `list`, the non-destructive clamp of up to `records` records of
 /// `kind` (PC argument numbering) `stride` bytes apart from `src` (and bounded
 /// by the 32-bit count in `count` when given) into a device-local scratch
@@ -411,6 +442,31 @@ fn record_clamp_as(
     ) else {
         return false;
     };
+    // SAFETY: live D3D12 buffer resources.
+    let (src_width, dst_width, count_bounds) = unsafe {
+        (
+            src.GetDesc().Width,
+            dst.GetDesc().Width,
+            count.map(|(buf, off)| (off, buf.GetDesc().Width)),
+        )
+    };
+    if !fits_buffers(bytes, src_offset, src_width, dst_width, count_bounds) {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                kind,
+                stride,
+                records,
+                bytes,
+                src_offset,
+                src_width,
+                dst_width,
+                ?count_bounds,
+                "indirect argument clamp rejected: range exceeds host buffer width"
+            );
+        });
+        return false;
+    }
     // SAFETY: live D3D12 buffer resources.
     let (src_base, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
     if !src_base.is_multiple_of(4) || !dst_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
@@ -730,6 +786,36 @@ mod tests {
     use windows::Win32::Graphics::Dxgi::*;
     use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
     use windows::core::Interface;
+
+    #[test]
+    fn fits_buffers_rejects_out_of_bounds_ranges() {
+        // Exact fits pass for source, destination, and count buffers.
+        assert!(fits_buffers(64, 32, 96, 64, Some((12, 16))));
+        assert!(fits_buffers(0, 96, 96, 0, None));
+        // Source OOB (e.g., step=32 with only 16 bytes remaining) rejected.
+        assert!(!fits_buffers(32, 80, 96, 64, None));
+        // Destination scratch buffer too small rejected.
+        assert!(!fits_buffers(64, 0, 128, 32, None));
+        // Count buffer too small or overflowing offset rejected.
+        assert!(!fits_buffers(16, 0, 64, 64, Some((16, 16))));
+        assert!(!fits_buffers(16, 0, 64, 64, Some((u64::MAX - 2, u64::MAX))));
+        // Source offset overflow rejected.
+        assert!(!fits_buffers(16, u64::MAX - 8, u64::MAX, 64, None));
+    }
+
+    #[test]
+    fn validate_layout_rejects_unaligned_short_and_overflowing_specs() {
+        assert_eq!(validate_layout((0, 16, 4), 0, None), Some(64));
+        assert_eq!(validate_layout((1, 20, 2), 8, Some(4)), Some(40));
+        assert_eq!(validate_layout((2, 12, 1), 0, None), Some(12));
+        assert_eq!(validate_layout((10, 32, 16), 64, None), Some(512));
+        assert_eq!(validate_layout((0, 12, 1), 0, None), None);
+        assert_eq!(validate_layout((10, 14, 1), 0, None), None);
+        assert_eq!(validate_layout((10, 12, 1), 2, None), None);
+        assert_eq!(validate_layout((10, 12, 1), 0, Some(2)), None);
+        assert_eq!(validate_layout((99, 16, 1), 0, None), None);
+        assert_eq!(validate_layout((0, 16, u32::MAX), 0, None), None);
+    }
 
     const WORKER_CS: &str = r#"
 #define RS "UAV(u0)"

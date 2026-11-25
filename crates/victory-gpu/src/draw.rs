@@ -121,8 +121,9 @@ fn write_skip() -> bool {
 
 /// A run of indirect records clamped in one pass ([`windows`]): the host
 /// copy they came from (its number), their kind and stride, the offset of
-/// the first in that copy, how many, and the list's scratch buffer that
-/// holds them clamped, record `i` at `i * step`.
+/// the first in that copy, how many, which slots have already been drawn
+/// (one bit per slot, preventing budget bypass via repeated hits), and the
+/// list's scratch buffer that holds them clamped, record `i` at `i * step`.
 #[derive(Clone)]
 struct Window {
     copy: u64,
@@ -133,15 +134,70 @@ struct Window {
     step: u32,
     base: u64,
     records: u32,
+    /// Bitmask of slots already served from this window (`WINDOW_MOST <= 64`).
+    consumed: u64,
     scratch: ID3D12Resource,
 }
 
 /// The most records clamped in one pass ([`windows`]).
 const WINDOW_MOST: u64 = 64;
 
+/// Checks whether `offset` hits an unconsumed slot inside an active window,
+/// returning `(slot_index, scratch_offset)` when eligible. Each slot may be
+/// served at most once so repeated draws at the same offset cannot bypass
+/// the per-list indirect budget.
+fn window_hit(base: u64, step: u32, records: u32, consumed: u64, offset: u64) -> Option<(u32, u64)> {
+    let step = u64::from(step);
+    if step == 0 || offset < base {
+        return None;
+    }
+    let rel = offset - base;
+    if !rel.is_multiple_of(step) {
+        return None;
+    }
+    let slot = rel / step;
+    if slot >= u64::from(records) || slot >= WINDOW_MOST {
+        return None;
+    }
+    let slot = slot as u32;
+    if consumed & (1u64 << slot) != 0 {
+        return None;
+    }
+    Some((slot, rel))
+}
+
+/// Plans `(step, records)` for a fresh clamp after an active window misses.
+/// Opens or doubles a multi-record window only when at least 2 records of
+/// size `step` fit inside the remaining `left` bytes of the argument buffer;
+/// otherwise clamps a single record at `stride` so `step` can never read
+/// past the end of `args.buffer`.
+fn plan_window(
+    prev_base: u64,
+    prev_step: u32,
+    prev_records: u32,
+    stride: u32,
+    offset: u64,
+    left: u64,
+) -> (u32, u32) {
+    let last = prev_base.saturating_add(u64::from(prev_records.saturating_sub(1)) * u64::from(prev_step));
+    let step = offset.saturating_sub(last);
+    let walks = step >= u64::from(stride)
+        && step <= 256
+        && step.is_multiple_of(4)
+        && (prev_records == 1 || step == u64::from(prev_step));
+    if walks {
+        let fit = (left / step).min(WINDOW_MOST) as u32;
+        if fit >= 2 {
+            let want = if prev_records == 1 { 16 } else { prev_records.saturating_mul(2) };
+            return (step as u32, want.min(fit));
+        }
+    }
+    (stride, 1)
+}
+
 /// Whether indirect draws that read record after record of one argument
-/// buffer are clamped a window at a time (on by default;
-/// `VICTORY_INDIRECT_WINDOW=0` clamps each draw one at a time).
+/// buffer are clamped a window at a time (`VICTORY_INDIRECT_WINDOW=1`; off
+/// by default).
 ///
 /// The title issues its mesh draws one record per call, each from the next
 /// slot of the same argument buffer: 3,460 a frame in gameplay, and before
@@ -182,12 +238,13 @@ const WINDOW_MOST: u64 = 64;
 /// charged what it asks, a few thousand of 2^27. And arguments the title's CPU side changes are seen as
 /// before, at the next submission.
 ///
-/// Off for the rest of the run from the first error the card's driver
-/// reports to the system (`crate::drvwatch`): every loss of the card in a
-/// run with windows was announced that way seconds ahead.
+/// Off by default (windows have triggered NVIDIA `nvlddmkm` 153 / device
+/// removals), and forced off for the rest of the run from the first error
+/// the card's driver reports to the system (`crate::drvwatch`).
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_none_or(|v| v != "0")) && !crate::drvwatch::tripped()
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
+        && !crate::drvwatch::tripped()
 }
 
 /// What one title list has set, and what its host list was last given.
@@ -714,6 +771,7 @@ impl State {
     /// descriptors as they are now, not as they were when the title set
     /// the targets (a descriptor rewritten in between names another view).
     pub(crate) fn replay(&mut self, list: &HostList) {
+        self.window = None;
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
@@ -2099,7 +2157,7 @@ impl State {
         // A program that walks ray-tracing structures nothing has built.
         if crate::pipeline::walk_held(self.pipeline as This) {
             #[cfg(feature = "diagnostics")]
-            crate::pipeline::note_why("a walk of ray-tracing structures that are not built (VICTORY_BVH_HOLD=1)".to_owned());
+            crate::pipeline::note_why("a walk of ray-tracing structures that are not built (VICTORY_BVH_HOLD)".to_owned());
             return;
         }
         // The ray-tracing structure builder's stages run all or none.
@@ -2966,7 +3024,7 @@ impl State {
         // dropped before the argument clamp, like a skipped one.
         if crate::pipeline::walk_held(self.pipeline as This) {
             #[cfg(feature = "diagnostics")]
-            crate::pipeline::note_why("a walk of ray-tracing structures that are not built (VICTORY_BVH_HOLD=1)".to_owned());
+            crate::pipeline::note_why("a walk of ray-tracing structures that are not built (VICTORY_BVH_HOLD)".to_owned());
             return false;
         }
         const DRAW: u32 = 0;
@@ -3055,12 +3113,14 @@ impl State {
             self.window = None;
         }
         let same = |w: &Window| w.copy == args.id() && w.kind == kind && w.stride == stride;
-        let hit = self
-            .window
-            .as_ref()
-            .filter(|w| same(w) && offset >= w.base)
-            .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
-            .map(|w| (w.scratch.clone(), offset - w.base, w.step));
+        let hit = self.window.as_mut().and_then(|w| {
+            if !same(w) {
+                return None;
+            }
+            let (slot, at) = window_hit(w.base, w.step, w.records, w.consumed, offset)?;
+            w.consumed |= 1u64 << slot;
+            Some((w.scratch.clone(), at, w.step))
+        });
         let (bounded, at) = match hit {
             Some((scratch, at, step)) => {
                 // Diagnostics of windows: the record clamped again and
@@ -3086,18 +3146,7 @@ impl State {
                 // after it are clamped with it.
                 let (step, records) = match &self.window {
                     Some(w) if windowed && same(w) => {
-                        let last = w.base + u64::from(w.records - 1) * u64::from(w.step);
-                        let step = offset.saturating_sub(last);
-                        let walks = step >= u64::from(stride)
-                            && step <= 256
-                            && step % 4 == 0
-                            && (w.records == 1 || step == u64::from(w.step));
-                        if walks {
-                            let fit = (args.left(arguments) / step).min(WINDOW_MOST) as u32;
-                            (step as u32, (if w.records == 1 { 16 } else { w.records * 2 }).min(fit).max(1))
-                        } else {
-                            (stride, max)
-                        }
+                        plan_window(w.base, w.step, w.records, stride, offset, args.left(arguments))
                     }
                     _ => (stride, max),
                 };
@@ -3130,6 +3179,7 @@ impl State {
                     step,
                     base: offset,
                     records,
+                    consumed: 1,
                     scratch: bounded.clone(),
                 });
                 (bounded, 0)
@@ -3515,5 +3565,48 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     {
         // SAFETY: an open list on a device that supports depth bounds.
         unsafe { l1.OMSetDepthBounds(min, max) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_window_never_exceeds_remaining_buffer_bytes() {
+        // Regression: stride=12, step=32, only 16 bytes remain at the end of
+        // the buffer. Previously `fit == 0` became `.max(1)` with `step=32`,
+        // causing the clamp shader's root SRV to read 16 bytes past the buffer.
+        assert_eq!(plan_window(0, 12, 1, 12, 32, 16), (12, 1));
+        // Only 1 record of size `step` fits: no multi-record window opens, so
+        // clamp at exact `stride`.
+        assert_eq!(plan_window(0, 12, 1, 12, 32, 32), (12, 1));
+        // 2 records fit: opens a 2-record window at `step`.
+        assert_eq!(plan_window(0, 12, 1, 12, 32, 64), (32, 2));
+        // Plenty of room: grows 1 -> 16 -> 32 -> 64 (capped at WINDOW_MOST).
+        assert_eq!(plan_window(0, 12, 1, 12, 32, 4096), (32, 16));
+        assert_eq!(plan_window(32, 32, 16, 12, 32 + 16 * 32, 4096), (32, 32));
+        assert_eq!(plan_window(544, 32, 32, 12, 544 + 32 * 32, 4096), (32, 64));
+        assert_eq!(plan_window(1568, 32, 64, 12, 1568 + 64 * 32, 4096), (32, 64));
+        // Step mismatch or unaligned step falls back to single record at `stride`.
+        assert_eq!(plan_window(32, 32, 16, 12, 32 + 15 * 32 + 16, 4096), (12, 1));
+        assert_eq!(plan_window(0, 12, 1, 12, 14, 4096), (12, 1));
+    }
+
+    #[test]
+    fn window_hit_allows_each_slot_at_most_once() {
+        // Slot 0 was already consumed on window creation.
+        assert_eq!(window_hit(64, 32, 16, 1u64, 64), None);
+        // Unconsumed slot 1 hits at relative offset 32.
+        assert_eq!(window_hit(64, 32, 16, 1u64, 96), Some((1, 32)));
+        // Once slot 1 is marked consumed, repeating offset 96 misses (re-clamps & charges budget).
+        assert_eq!(window_hit(64, 32, 16, 0b11u64, 96), None);
+        // Unaligned, before base, or past records miss cleanly.
+        assert_eq!(window_hit(64, 32, 16, 1u64, 32), None);
+        assert_eq!(window_hit(64, 32, 16, 1u64, 80), None);
+        assert_eq!(window_hit(64, 32, 16, 1u64, 64 + 16 * 32), None);
+        // Highest valid slot (63) works when WINDOW_MOST == 64.
+        assert_eq!(window_hit(0, 32, 64, 1u64, 63 * 32), Some((63, 63 * 32)));
+        assert_eq!(window_hit(0, 32, 64, 1u64 | (1u64 << 63), 63 * 32), None);
     }
 }

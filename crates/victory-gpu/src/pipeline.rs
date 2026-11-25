@@ -366,9 +366,93 @@ fn code_walks(code: &[u8]) -> bool {
 #[cfg(windows)]
 pub(crate) static WALKS_HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Compute shaders known to walk unbuilt dynamic ray-tracing structures up to
+/// 65,535 iterations per wave and deterministically hang NVIDIA Wave32 cards
+/// (`DXGI_ERROR_DEVICE_HUNG` / `nvlddmkm` 153 -> `PF FLR`) when the structure
+/// builder has not run whole (upstream Marvisak#2311).
+#[cfg(windows)]
+const KNOWN_HANG_BVH_WALKS: &[&str] = &[
+    // CS_IrradianceCache_ShadowTrace_WithFar
+    "f607780aa8e502d0",
+];
+
+/// Policy for [`walk_held`] (`VICTORY_BVH_HOLD`).
+#[cfg(windows)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BvhHold {
+    /// `0` / `off` / `none`: never hold BVH-walking dispatches.
+    Off,
+    /// Unset / `auto` (default): hold [`KNOWN_HANG_BVH_WALKS`] while the
+    /// structure builder has not run whole, and automatically escalate to
+    /// holding every BVH-walking compute shader after the first display-driver
+    /// error (`crate::drvwatch::tripped()`).
+    Auto,
+    /// `known`: hold only [`KNOWN_HANG_BVH_WALKS`] (no driver-watch escalation).
+    KnownOnly,
+    /// `1` / `all`: hold every BVH-walking compute dispatch while the builder
+    /// has not run whole.
+    All,
+    /// Comma-separated 16-hex shader hashes to hold (plus escalate to all on
+    /// driver-watch trip).
+    Custom(Vec<String>),
+}
+
+#[cfg(windows)]
+fn parse_bvh_hold(value: Option<&str>) -> BvhHold {
+    let Some(raw) = value.map(str::trim).filter(|s| !s.is_empty()) else {
+        return BvhHold::Auto;
+    };
+    if raw.eq_ignore_ascii_case("0")
+        || raw.eq_ignore_ascii_case("off")
+        || raw.eq_ignore_ascii_case("none")
+        || raw.eq_ignore_ascii_case("false")
+    {
+        return BvhHold::Off;
+    }
+    if raw.eq_ignore_ascii_case("1")
+        || raw.eq_ignore_ascii_case("all")
+        || raw.eq_ignore_ascii_case("true")
+    {
+        return BvhHold::All;
+    }
+    if raw.eq_ignore_ascii_case("auto") {
+        return BvhHold::Auto;
+    }
+    if raw.eq_ignore_ascii_case("known") {
+        return BvhHold::KnownOnly;
+    }
+    let hashes: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    if hashes.is_empty() {
+        BvhHold::Auto
+    } else {
+        BvhHold::Custom(hashes)
+    }
+}
+
+#[cfg(windows)]
+fn bvh_hold_matches(mode: &BvhHold, hash: &str, driver_tripped: bool) -> bool {
+    match mode {
+        BvhHold::Off => false,
+        BvhHold::All => true,
+        BvhHold::KnownOnly => KNOWN_HANG_BVH_WALKS.iter().any(|&h| h.eq_ignore_ascii_case(hash)),
+        BvhHold::Auto => {
+            driver_tripped || KNOWN_HANG_BVH_WALKS.iter().any(|&h| h.eq_ignore_ascii_case(hash))
+        }
+        BvhHold::Custom(hashes) => {
+            driver_tripped || hashes.iter().any(|h| h.eq_ignore_ascii_case(hash))
+        }
+    }
+}
+
 /// Whether a dispatch with the title's pipeline `this` is held back
 /// because its program walks ray-tracing structures nothing has built
-/// (`VICTORY_BVH_HOLD=1`; off by default).
+/// (`VICTORY_BVH_HOLD`: default `auto`; `0`/`off` disables; `known` holds
+/// only known-hanging NVIDIA Wave32 shaders; `1`/`all` holds all 64).
 ///
 /// The structure builder does not run (see [`Builder`]: only with
 /// `VICTORY_BVH_BUILDER=1`, and then only whole, which a host of 32-lane
@@ -380,34 +464,59 @@ pub(crate) static WALKS_HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::
 /// title bounds at 65,535 steps a wave, whatever bytes lie where the
 /// structure would be: what it returns is not a picture of the scene, and
 /// how long it runs depends on those bytes. Upstream's pull request 2311
-/// measured a card hung in exactly that dispatch on an NVIDIA card, every
-/// run, and both card losses of ours since the draw windows' own fault was
-/// fixed (runs 208 and 224) came within a second of the first use of the
-/// programs that shade those rays' hits (`CS_RaytracingResolve`).
+/// measured a card hung in `f607780aa8e502d0` on an NVIDIA card every
+/// run, and both card losses since the draw windows' own fault was fixed
+/// (runs 208 and 224) came within a second of first RT walk/resolve use.
 ///
-/// With the switch such a dispatch is dropped until the builder has run
-/// whole. What the passes would have written stays as the title left it
-/// (their targets are not cleared by us): the picture has to be looked at.
+/// In the default `auto` mode, `f607780aa8e502d0` is held back while the
+/// builder has not run whole (preserving static pre-built BVH indirect
+/// light), and if the display driver reports any error
+/// (`crate::drvwatch::tripped()`), all remaining BVH-walking shaders are
+/// automatically held for the rest of the run before a repeat hang can
+/// escalate to `FECS` / `PF FLR`.
 #[cfg(windows)]
 pub(crate) fn walk_held(this: This) -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    if this.is_null() || !*ON.get_or_init(|| std::env::var_os("VICTORY_BVH_HOLD").is_some_and(|v| v == "1")) {
+    static MODE: OnceLock<BvhHold> = OnceLock::new();
+    if this.is_null() {
         return false;
     }
+    let mode = MODE.get_or_init(|| parse_bvh_hold(std::env::var("VICTORY_BVH_HOLD").ok().as_deref()));
+    if matches!(mode, BvhHold::Off) {
+        return false;
+    }
+    let tripped = crate::drvwatch::tripped();
     let p = pipeline(this);
-    if !p.shaders.iter().any(|s| s.stage == "compute" && s.walks()) {
+    // Check hash/policy match before decoding native bytecode so non-matching
+    // compute shaders pay only a cheap string compare until escalated.
+    let Some(matched) = p
+        .shaders
+        .iter()
+        .find(|s| s.stage == "compute" && bvh_hold_matches(mode, &s.hash, tripped) && s.walks())
+    else {
         return false;
-    }
-    // (Asked only for the few programs that walk: the lock is the builder's.)
+    };
+    // (Asked only for programs that match and walk: the lock is the builder's.)
     if BUILDER.lock().unwrap_or_else(|e| e.into_inner()).whole {
         return false;
     }
+    let escalated = tripped && !KNOWN_HANG_BVH_WALKS.iter().any(|&h| h.eq_ignore_ascii_case(&matched.hash));
     if WALKS_HELD.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
             tracing::info!(
                 shaders = ?p.shaders,
-                "a dispatch of a program that walks ray-tracing structures is held back: the structure builder has not                  built them (VICTORY_BVH_HOLD=1); the first one"
+                ?mode,
+                driver_tripped = tripped,
+                "a dispatch of a program that walks ray-tracing structures is held back: the structure builder has not built them (VICTORY_BVH_HOLD); the first one"
+            );
+        });
+    } else if escalated {
+        static ESCALATED: std::sync::Once = std::sync::Once::new();
+        ESCALATED.call_once(|| {
+            tracing::warn!(
+                shaders = ?p.shaders,
+                ?mode,
+                "driver watch tripped: escalating BVH walk hold to all ray-tracing traversal shaders for the rest of the run"
             );
         });
     }
@@ -1068,5 +1177,54 @@ mod tests {
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bvh_hold_policy_defaults_to_known_hang_and_escalates_on_driver_trip() {
+        assert_eq!(parse_bvh_hold(None), BvhHold::Auto);
+        assert_eq!(parse_bvh_hold(Some("")), BvhHold::Auto);
+        assert_eq!(parse_bvh_hold(Some(" auto ")), BvhHold::Auto);
+        assert_eq!(parse_bvh_hold(Some("0")), BvhHold::Off);
+        assert_eq!(parse_bvh_hold(Some("off")), BvhHold::Off);
+        assert_eq!(parse_bvh_hold(Some("1")), BvhHold::All);
+        assert_eq!(parse_bvh_hold(Some("all")), BvhHold::All);
+        assert_eq!(parse_bvh_hold(Some("known")), BvhHold::KnownOnly);
+        assert_eq!(
+            parse_bvh_hold(Some("F607780AA8E502D0, deadbeef00001111")),
+            BvhHold::Custom(vec![
+                "f607780aa8e502d0".to_owned(),
+                "deadbeef00001111".to_owned(),
+            ])
+        );
+
+        let hang = "f607780aa8e502d0";
+        let other = "0123456789abcdef";
+
+        // Default `Auto`: holds known NVIDIA Wave32 hang shader immediately,
+        // keeps other static-BVH lighting shaders running until a driver error,
+        // then escalates to hold all BVH walks.
+        assert!(bvh_hold_matches(&BvhHold::Auto, hang, false));
+        assert!(bvh_hold_matches(&BvhHold::Auto, "F607780AA8E502D0", false));
+        assert!(!bvh_hold_matches(&BvhHold::Auto, other, false));
+        assert!(bvh_hold_matches(&BvhHold::Auto, other, true));
+
+        // `KnownOnly`: never escalates to other shaders.
+        assert!(bvh_hold_matches(&BvhHold::KnownOnly, hang, false));
+        assert!(!bvh_hold_matches(&BvhHold::KnownOnly, other, true));
+
+        // `Off`: holds nothing even after driver trip.
+        assert!(!bvh_hold_matches(&BvhHold::Off, hang, true));
+        assert!(!bvh_hold_matches(&BvhHold::Off, other, true));
+
+        // `All`: holds every walking shader immediately.
+        assert!(bvh_hold_matches(&BvhHold::All, hang, false));
+        assert!(bvh_hold_matches(&BvhHold::All, other, false));
+
+        // `Custom`: holds listed hashes and escalates on driver trip.
+        let custom = parse_bvh_hold(Some("deadbeef00001111"));
+        assert!(bvh_hold_matches(&custom, "deadbeef00001111", false));
+        assert!(!bvh_hold_matches(&custom, other, false));
+        assert!(bvh_hold_matches(&custom, other, true));
     }
 }
