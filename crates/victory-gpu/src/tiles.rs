@@ -71,14 +71,47 @@ const HEAP_TILES: u32 = 1024;
 /// no heap could be had); uploads recorded again for such a level.
 pub(crate) static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 
+/// Whether environment switches ask for levels on demand without enabling
+/// incompatible mip-dropping (`VICTORY_TEXTURE_DROP_MIPS=1`, fxceless#814).
+fn wanted_from_env(levels_on_demand: Option<&str>, drop_mips: Option<&str>) -> bool {
+    levels_on_demand == Some("1") && drop_mips != Some("1")
+}
+
+/// Validates `GetResourceTiling` subresource counts against `total` tiles so
+/// `UpdateTileMappings` can never map past or short of a reserved texture.
+fn validate_tiling_totals(standard: &[u32], packed_tiles: u32, total: u32) -> bool {
+    if total == 0 {
+        return false;
+    }
+    let mut sum = 0u32;
+    for &tiles in standard {
+        let Some(next) = sum.checked_add(tiles) else {
+            return false;
+        };
+        sum = next;
+    }
+    sum.checked_add(packed_tiles) == Some(total)
+}
+
 /// Whether textures are made this way: the switch
 /// (`VICTORY_LEVELS_ON_DEMAND=1`; off by default), and a card that reads
 /// zeros from, and drops writes to, levels without memory (tiled resources
-/// tier 2).
+/// tier 2). Disabled if `VICTORY_TEXTURE_DROP_MIPS=1` is also set because
+/// dropping mips shifts subresource indices incompatibly with reserved
+/// tile mappings.
 pub(crate) fn wanted() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        if !std::env::var_os("VICTORY_LEVELS_ON_DEMAND").is_some_and(|v| v == "1") {
+        let on_demand = std::env::var("VICTORY_LEVELS_ON_DEMAND").ok();
+        let drop_mips = std::env::var("VICTORY_TEXTURE_DROP_MIPS").ok();
+        if on_demand.as_deref() == Some("1") && drop_mips.as_deref() == Some("1") {
+            tracing::warn!(
+                "VICTORY_LEVELS_ON_DEMAND=1 is incompatible with VICTORY_TEXTURE_DROP_MIPS=1; \
+                 disabling levels on demand to prevent mip-index / tile-mapping faults"
+            );
+            return false;
+        }
+        if !wanted_from_env(on_demand.as_deref(), drop_mips.as_deref()) {
             return false;
         }
         let Some(host) = host() else {
@@ -210,30 +243,53 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
 }
 
 /// Gives the runs `runs` of the pool's heap at `index` back; runs that
-/// touch become one. A heap with every tile free goes back to the card,
-/// unless it is the pool's only one. (Called when the texture that held
-/// the tiles is dropped: nothing on the card reads through its mappings
-/// any more, as for any host texture that is dropped.)
+/// touch become one. A heap with every tile free goes back to the card via
+/// `crate::host::retire` (never destroyed while any submission is in flight),
+/// unless it is the pool's only one.
 fn give_back(index: usize, runs: &[(u32, u32)]) {
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(Some(h)) = pool.get_mut(index) else {
-        return;
-    };
-    h.free.extend_from_slice(runs);
-    h.free.sort_unstable();
-    let mut joined: Vec<(u32, u32)> = Vec::with_capacity(h.free.len());
-    for &(from, tiles) in &h.free {
-        match joined.last_mut() {
-            Some(last) if last.0 + last.1 == from => last.1 += tiles,
-            _ => joined.push((from, tiles)),
+    let freed_heap = {
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(Some(h)) = pool.get_mut(index) else {
+            return;
+        };
+        h.free.extend_from_slice(runs);
+        h.free.sort_unstable();
+        let mut joined: Vec<(u32, u32)> = Vec::with_capacity(h.free.len());
+        for &(from, tiles) in &h.free {
+            match joined.last_mut() {
+                Some(last) if last.0 + last.1 == from => last.1 += tiles,
+                _ => joined.push((from, tiles)),
+            }
         }
+        h.free = joined;
+        let all_free = h.free_tiles() == HEAP_TILES;
+        if all_free && pool.iter().flatten().count() > 1 {
+            STATS[3].fetch_sub(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);
+            STATS[8].fetch_add(1, Ordering::Relaxed);
+            pool[index].take()
+        } else {
+            None
+        }
+    };
+    if let Some(heap) = freed_heap {
+        crate::host::retire(heap);
     }
-    h.free = joined;
-    let all_free = h.free_tiles() == HEAP_TILES;
-    if all_free && pool.iter().flatten().count() > 1 {
-        pool[index] = None;
-        STATS[3].fetch_sub(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);
-        STATS[8].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Defers returning tile runs to `POOL` until every GPU submission running
+/// when a [`Tiled`] dropped has finished (immediate when idle). Prevents a
+/// reserved texture dropped on a non-retire path (e.g. a submit-time
+/// deferred closure) from freeing or reallocating heap tiles while
+/// `UpdateTileMappings` or copies are still in flight on the GPU.
+struct RetiredRuns {
+    by_heap: std::collections::BTreeMap<usize, Vec<(u32, u32)>>,
+}
+
+impl Drop for RetiredRuns {
+    fn drop(&mut self) {
+        for (index, runs) in std::mem::take(&mut self.by_heap) {
+            give_back(index, &runs);
+        }
     }
 }
 
@@ -316,7 +372,10 @@ impl Tiled {
             standard.push(tiles);
         }
         let packed_tiles = if packed.NumPackedMips > 0 { packed.NumTilesForPackedMips } else { 0 };
-        if (packed.NumPackedMips > 0 && packed_tiles == 0) || packed_tiles > HEAP_TILES {
+        if (packed.NumPackedMips > 0 && packed_tiles == 0)
+            || packed_tiles > HEAP_TILES
+            || !validate_tiling_totals(&standard, packed_tiles, total)
+        {
             return None;
         }
         let full = u64::from(total) * TILE;
@@ -530,6 +589,10 @@ impl Tiled {
             wanted.push((first_packed, self.packed, None));
         }
         for (subresource, tiles, level) in wanted {
+            // SAFETY: querying device removal status on a live D3D12 device.
+            if unsafe { device.GetDeviceRemovedReason() }.is_err() {
+                break;
+            }
             let Some((heap, index, runs)) = take(device, tiles) else {
                 continue;
             };
@@ -636,8 +699,8 @@ impl Drop for Tiled {
             by_heap.entry(index).or_default().push((start, tiles));
             bytes += u64::from(tiles) * TILE;
         }
-        for (index, runs) in by_heap {
-            give_back(index, &runs);
+        if !by_heap.is_empty() {
+            crate::host::retire(RetiredRuns { by_heap });
         }
         STATS[0].fetch_sub(1, Ordering::Relaxed);
         STATS[1].fetch_sub(self.full, Ordering::Relaxed);
@@ -647,23 +710,25 @@ impl Drop for Tiled {
 
 /// Keeps a two-dimensional shader view (2D or 2D array) from the levels
 /// before `first` of a texture of `levels` levels: it starts at `first` if
-/// it started before it, shows as many levels fewer (clamped to the
-/// remaining levels), and reduces `ResourceMinLODClamp` by the same shift so
-/// the effective minimum LOD stays at the same resource level.
+/// it started before it, clamps `MostDetailedMip` and `MipLevels` inside
+/// `0..levels` (preventing invalid D3D12 SRV mip ranges), and adjusts
+/// `ResourceMinLODClamp` by the same shift (sanitizing negative/NaN values).
 pub(crate) fn show_from(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32, levels: u32) {
-    if first >= levels {
+    if levels == 0 || first >= levels {
         return;
     }
     let clamp = |most: &mut u32, mips: &mut u32, min_lod: &mut f32| {
-        if first <= *most {
-            return;
-        }
-        let fewer = first - *most;
-        *most = first;
+        let old_most = (*most).min(levels - 1);
+        let new_most = old_most.max(first);
+        let fewer = new_most - old_most;
+        *most = new_most;
+        let remaining = levels - new_most;
         if *mips != u32::MAX {
-            *mips = mips.saturating_sub(fewer).clamp(1, levels - first);
+            *mips = mips.saturating_sub(fewer).clamp(1, remaining);
         }
-        if *min_lod > 0.0 {
+        if !min_lod.is_finite() || *min_lod <= 0.0 {
+            *min_lod = 0.0;
+        } else {
             *min_lod = (*min_lod - fewer as f32).max(0.0);
         }
     };
@@ -1583,5 +1648,71 @@ void look() {
         assert!(!changed && waiting);
         assert!(!tiled.has_tiles(0));
         assert_eq!(tiled.given_bytes(), 0);
+    }
+
+    #[test]
+    fn wanted_rejects_drop_mips_combination() {
+        assert!(!wanted_from_env(None, None));
+        assert!(!wanted_from_env(Some("0"), None));
+        assert!(wanted_from_env(Some("1"), None));
+        assert!(wanted_from_env(Some("1"), Some("0")));
+        // Incompatible combination per fxceless#814.
+        assert!(!wanted_from_env(Some("1"), Some("1")));
+    }
+
+    #[test]
+    fn tiling_totals_must_match_driver_total() {
+        assert!(validate_tiling_totals(&[16, 4, 1], 1, 22));
+        assert!(validate_tiling_totals(&[], 1, 1));
+        assert!(!validate_tiling_totals(&[16, 4], 1, 22));
+        assert!(!validate_tiling_totals(&[16, 4], 0, 0));
+        assert!(!validate_tiling_totals(&[u32::MAX, 1], 0, u32::MAX));
+    }
+
+    #[test]
+    fn show_from_sanitizes_invalid_mip_ranges_and_non_finite_min_lod() {
+        // MostDetailedMip already >= first, but MipLevels overflows `levels` and MinLOD is NaN.
+        let mut srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: 5768,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: 5,
+                    MipLevels: 10,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: f32::NAN,
+                },
+            },
+        };
+        show_from(&mut srv, 2, 11);
+        // SAFETY: `ViewDimension` is `TEXTURE2D`.
+        let v = unsafe { srv.Anonymous.Texture2D };
+        assert_eq!(v.MostDetailedMip, 5);
+        assert_eq!(v.MipLevels, 6);
+        assert_eq!(v.ResourceMinLODClamp, 0.0);
+
+        // MostDetailedMip past `levels`, MipLevels == 0, negative MinLOD.
+        let mut bad = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+            Shader4ComponentMapping: 5768,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
+                    MostDetailedMip: 20,
+                    MipLevels: 0,
+                    FirstArraySlice: 0,
+                    ArraySize: 1,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: -3.0,
+                },
+            },
+        };
+        show_from(&mut bad, 2, 11);
+        // SAFETY: `ViewDimension` is `TEXTURE2DARRAY`.
+        let v = unsafe { bad.Anonymous.Texture2DArray };
+        assert_eq!(v.MostDetailedMip, 10);
+        assert_eq!(v.MipLevels, 1);
+        assert_eq!(v.ResourceMinLODClamp, 0.0);
     }
 }
