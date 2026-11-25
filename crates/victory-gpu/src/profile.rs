@@ -1194,10 +1194,8 @@ unsafe fn frame_fits(
     // part of, if the header says so.
     unsafe {
         let [begin, finish, mut data] = entry.read_unaligned();
-        let at = context
-            .Rip
-            .wrapping_sub(image)
-            .wrapping_sub(u64::from(begin));
+        let rva = context.Rip.wrapping_sub(image);
+        let at = rva.wrapping_sub(u64::from(begin));
         // The frame register the function itself names (its first part).
         let mut pointer = 0;
         // Bytes above the frame's base that unwinding may read: the
@@ -1222,29 +1220,40 @@ unsafe fn frame_fits(
             let codes = info.add(4);
             let count = usize::from(count);
             let slot = |i: usize| codes.add(2 * i).cast::<u16>().read_unaligned();
+            let reach_before = reach;
+            let mut saved = 0usize;
+            let mut epilog_len: Option<u32> = None;
+            let mut in_v2_epilog = false;
             let mut i = 0;
             let (mut found, mut set) = (false, false);
             while i < count {
                 let [offset, op] = codes.add(2 * i).cast::<[u8; 2]>().read();
-                let (op, op_info) = (op & 15, usize::from(op >> 4));
+                let op_raw_info = op >> 4;
+                let (op, op_info) = (op & 15, usize::from(op_raw_info));
                 i += match op {
                     // A register pushed.
                     0 => {
-                        reach += 8;
+                        reach = reach.saturating_add(8);
                         1
                     }
                     // A large allocation: its size in the next one or two slots.
                     1 if op_info == 0 => {
-                        reach += usize::from(slot(i + 1)) * 8;
+                        if i + 1 >= count {
+                            return false;
+                        }
+                        reach = reach.saturating_add(usize::from(slot(i + 1)) * 8);
                         2
                     }
                     1 => {
-                        reach += usize::from(slot(i + 1)) | usize::from(slot(i + 2)) << 16;
+                        if i + 2 >= count {
+                            return false;
+                        }
+                        reach = reach.saturating_add(usize::from(slot(i + 1)) | usize::from(slot(i + 2)) << 16);
                         3
                     }
                     // A small allocation.
                     2 => {
-                        reach += op_info * 8 + 8;
+                        reach = reach.saturating_add(op_info * 8 + 8);
                         1
                     }
                     // The frame pointer set: done already if the thread is
@@ -1256,19 +1265,76 @@ unsafe fn frame_fits(
                     }
                     // Registers saved in the frame (near, far), an epilogue
                     // note and a spare code, vector registers saved.
-                    4 | 8 => 2,
-                    5 | 9 => 3,
-                    6 => 1,
-                    7 => 2,
+                    4 => {
+                        if i + 1 >= count {
+                            return false;
+                        }
+                        saved = saved.max(usize::from(slot(i + 1)) * 8 + 8);
+                        2
+                    }
+                    8 => {
+                        if i + 1 >= count {
+                            return false;
+                        }
+                        saved = saved.max(usize::from(slot(i + 1)) * 16 + 16);
+                        2
+                    }
+                    5 => {
+                        if i + 2 >= count {
+                            return false;
+                        }
+                        saved = saved.max((usize::from(slot(i + 1)) | usize::from(slot(i + 2)) << 16).saturating_add(8));
+                        3
+                    }
+                    9 => {
+                        if i + 2 >= count {
+                            return false;
+                        }
+                        saved = saved.max((usize::from(slot(i + 1)) | usize::from(slot(i + 2)) << 16).saturating_add(16));
+                        3
+                    }
+                    6 => {
+                        if version & 7 == 2 {
+                            match epilog_len {
+                                None => {
+                                    let len = u32::from(offset);
+                                    epilog_len = Some(len);
+                                    if op_info & 1 != 0
+                                        && rva >= u64::from(finish.saturating_sub(len))
+                                        && rva < u64::from(finish)
+                                    {
+                                        in_v2_epilog = true;
+                                    }
+                                }
+                                Some(len) => {
+                                    let dist = (u32::from(op_raw_info) << 8) | u32::from(offset);
+                                    let end_rva = finish.saturating_sub(dist);
+                                    if rva >= u64::from(end_rva.saturating_sub(len))
+                                        && rva < u64::from(end_rva)
+                                    {
+                                        in_v2_epilog = true;
+                                    }
+                                }
+                            }
+                        }
+                        1
+                    }
+                    7 => {
+                        if i + 1 >= count {
+                            return false;
+                        }
+                        2
+                    }
                     // A machine frame.
                     10 => {
-                        reach += 48;
+                        reach = reach.saturating_add(48);
                         1
                     }
                     _ => return false,
                 };
             }
-            if frame & 15 != 0 && (set || !found || part > 0 || chained) {
+            reach = reach.max(reach_before.saturating_add(saved));
+            if frame & 15 != 0 && (set || in_v2_epilog || !found || part > 0 || chained) {
                 let register = gpr(context, frame & 15) as usize;
                 let back = usize::from(frame >> 4) * 16;
                 if register < start + back || register > end || based == bases.len() {
@@ -1283,8 +1349,8 @@ unsafe fn frame_fits(
                 return rsp >= start
                     && rsp < end
                     && reach <= SLACK
-                    && rsp + reach <= limit
-                    && bases[..based].iter().all(|base| base + reach <= limit)
+                    && rsp.saturating_add(reach) <= limit
+                    && bases[..based].iter().all(|base| base.saturating_add(reach) <= limit)
                     && epilogue_fits(context, code as usize, pointer, start, end);
             }
             let parent = codes
@@ -1334,19 +1400,28 @@ unsafe fn epilogue_fits(
     let moved = |from: u64, by: i32| (from as usize).wrapping_add(by as isize as usize);
     let mut rsp = context.Rsp as usize;
     let mut at = 0;
-    if byte(0) == 0x48 && byte(1) == 0x83 && byte(2) == 0xc4 {
+    if byte(0) & 0xf9 == 0x48 && byte(1) == 0x83 && byte(2) == 0xc4 {
         // add rsp, n (a byte).
         rsp = moved(context.Rsp, i32::from(byte(3) as i8));
         at = 4;
-    } else if byte(0) == 0x48 && byte(1) == 0x81 && byte(2) == 0xc4 {
+    } else if byte(0) & 0xf9 == 0x48 && byte(1) == 0x81 && byte(2) == 0xc4 {
         // add rsp, n.
         rsp = moved(context.Rsp, number(3));
         at = 7;
-    } else if byte(0) & 0xfe == 0x48 && byte(1) == 0x8d {
-        // lea rsp, [register + n]: taken only from the frame register.
+    } else if byte(0) & 0xfc == 0x48 && byte(1) == 0x8b && byte(2) & 0xf8 == 0xe0 {
+        // mov rsp, reg: taken only from the frame register.
         let register = (byte(0) & 1) << 3 | byte(2) & 7;
-        let (near, far) = (byte(2) & 0xf8 == 0x60, byte(2) & 0xf8 == 0xa0);
-        if register != 0 && register == pointer && (near || far) {
+        if register != 0 && register == pointer {
+            rsp = gpr(context, register) as usize;
+            at = 3;
+        } else {
+            return false;
+        }
+    } else if byte(0) & 0xfc == 0x48 && byte(1) == 0x8d && byte(2) & 0x38 == 0x20 {
+        // lea rsp, [register + n]: taken only from a non-SIB frame register with disp8/disp32.
+        let register = (byte(0) & 1) << 3 | byte(2) & 7;
+        let (near, far) = (byte(2) & 0xc0 == 0x40, byte(2) & 0xc0 == 0x80);
+        if register != 0 && register & 7 != 4 && register == pointer && (near || far) {
             let by = if near {
                 i32::from(byte(3) as i8)
             } else {
@@ -1354,6 +1429,8 @@ unsafe fn epilogue_fits(
             };
             rsp = moved(gpr(context, register), by);
             at = if near { 4 } else { 7 };
+        } else {
+            return false;
         }
     }
     // The `pop`s.
@@ -1370,10 +1447,11 @@ unsafe fn epilogue_fits(
     }
     // A return or a jump: only then are the instructions before it run.
     let leaves = matches!(byte(at), 0xc3 | 0xc2 | 0xeb | 0xe9)
-        || byte(at) == 0xf3 && byte(at + 1) == 0xc3
-        || byte(at) == 0xff && byte(at + 1) == 0x25
+        || matches!(byte(at), 0xf2 | 0xf3) && matches!(byte(at + 1), 0xc3 | 0xc2 | 0xeb | 0xe9)
+        || byte(at) & 0xf0 == 0x40 && matches!(byte(at + 1), 0xc3 | 0xc2 | 0xeb | 0xe9)
+        || byte(at) == 0xff && byte(at + 1) & 0x38 == 0x20
         || byte(at) & 0xf0 == 0x40 && byte(at + 1) == 0xff && byte(at + 2) & 0x38 == 0x20;
-    !leaves || (!pops_rsp && pops < 64 && rsp >= start && rsp + 8 * (pops + 1) <= end)
+    !leaves || (!pops_rsp && pops < 64 && rsp >= start && rsp.saturating_add(8 * (pops + 1)) <= end)
 }
 
 /// The class of a time in nanoseconds: four to a power of two (the

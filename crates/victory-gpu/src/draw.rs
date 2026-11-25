@@ -178,7 +178,7 @@ fn effective_texture_span(
 /// With [`table_on_card`]: the host GPU address a table constant buffer view
 /// (`size` bytes of title memory at `address`) binds directly to in its host
 /// copy, avoiding a CPU-side upload fill and flight settle when the range is
-/// 256-byte aligned and fits in the copy.
+/// sole-owned, 256-byte aligned, and fits in the copy.
 fn table_constant_on_card(list: &HostList, address: u64, size: u32) -> Option<u64> {
     let mode = table_on_card();
     let clamped = crate::descriptor::host::constant_view_bytes(size);
@@ -186,8 +186,7 @@ fn table_constant_on_card(list: &HostList, address: u64, size: u32) -> Option<u6
         return None;
     }
     let len = u64::from(clamped);
-    // stitch: switch to `crate::shadow::sole_buffer_copy` and call `list.note_table_on_card` once 3B/3C lands them
-    let shadow = crate::shadow::find(address, len)?;
+    let shadow = crate::shadow::sole_buffer_copy(address, len).ok()?;
     if mode == 1 && !shadow.carded() {
         return None;
     }
@@ -196,6 +195,7 @@ fn table_constant_on_card(list: &HostList, address: u64, size: u32) -> Option<u6
         return None;
     }
     shadow.refresh(list, address, len);
+    list.note_table_on_card(address as usize, clamped as usize);
     Some(gpu)
 }
 
@@ -837,8 +837,20 @@ impl State {
     }
 
     /// The run of indirect calls clamped together, if any, is over.
-    fn end_batch(&mut self, list: &HostList) {
+    pub(crate) fn end_batch(&mut self, list: &HostList) {
         crate::indirect::end_run(list, &mut self.batch_args, self.batch.take());
+    }
+
+    /// Ends an active batched indirect run or clears pending dispatch write
+    /// tracking across title barriers/syncs (`VICTORY_INDIRECT_BATCH`).
+    pub(crate) fn title_barrier(&mut self, list: &HostList, waits: bool) {
+        let rules = crate::indirect::run_rules();
+        if rules.title_barriers {
+            self.end_batch(list);
+        }
+        if rules.order && waits {
+            self.dispatched = false;
+        }
     }
 
     /// With runs ending at anything that may write (`VICTORY_INDIRECT_BATCH`

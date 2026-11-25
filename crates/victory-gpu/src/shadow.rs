@@ -4085,6 +4085,52 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     lookup(address, len, false)
 }
 
+/// Why [`sole_buffer_copy`] found no sole buffer copy for a range: either
+/// no registered title buffer covers it (`NoBuffer`), or another shadow
+/// copy (`BUFFERS` or `LOOSE`) overlaps `[address, address + len)` (`OtherCopy`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NotSole {
+    NoBuffer,
+    OtherCopy,
+}
+
+/// For bytes the host would otherwise copy out of title memory on the CPU
+/// (a constant view of a descriptor table, `crate::draw`): the copy of the
+/// innermost title buffer holding `[address, address + len)`, as [`find`]
+/// gives it, if no other copy holds any of those bytes (no other title
+/// buffer's copy over them, and no loose window outside buffers).
+pub(crate) fn sole_buffer_copy(address: u64, len: u64) -> Result<Arc<Shadow>, NotSole> {
+    let end = address.checked_add(len.max(1)).ok_or(NotSole::NoBuffer)?;
+    {
+        let map = buffers();
+        let key = map
+            .range(..=(address, usize::MAX))
+            .rev()
+            .take(64)
+            .find(|(_, e)| e.end >= end)
+            .map(|(k, _)| *k)
+            .ok_or(NotSole::NoBuffer)?;
+        if map
+            .range(..(end, 0))
+            .rev()
+            .take(256)
+            .any(|(k, e)| *k != key && e.end > address && e.shadow.is_some())
+        {
+            return Err(NotSole::OtherCopy);
+        }
+    }
+    {
+        let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        if map
+            .range((address.saturating_sub(64 << 20), 0)..(end, 0))
+            .any(|(k, _)| k.0 + k.1 > address)
+        {
+            return Err(NotSole::OtherCopy);
+        }
+    }
+    find(address, len).ok_or(NotSole::NoBuffer)
+}
+
 /// As [`find`], for an ask that is done with the copy when its list has
 /// run (a draw's vertex and index buffers, indirect arguments): outside
 /// buffer objects it takes a window that is there already and holds the
@@ -4707,6 +4753,79 @@ mod card_merge_tests {
         // older card byte is taken for a shader's write.
         let before = land(7);
         assert_eq!(before[title_byte], content[title_byte]);
+    }
+
+    #[test]
+    fn sole_buffer_copy_rejects_overlapping_buffers_and_loose_windows() {
+        let Some(buffer) = warp_buffer() else {
+            return;
+        };
+        let outer = 0x7FF0_1000_0000u64;
+        let inner = 0x7FF0_1001_0000u64;
+        let loose_addr = 0x7FF0_2000_0000u64;
+        let mut backing = vec![0u8; 64 << 10];
+        let shadow_outer = std::sync::Arc::new(Shadow::new(
+            buffer.clone(),
+            backing.as_mut_ptr(),
+            0,
+            outer,
+            256 << 10,
+        ));
+        let shadow_inner = std::sync::Arc::new(Shadow::new(
+            buffer,
+            backing.as_mut_ptr(),
+            0,
+            inner,
+            16 << 10,
+        ));
+        {
+            let mut map = super::buffers();
+            map.insert(
+                (outer, 0x9001),
+                super::Entry {
+                    end: outer + (256 << 10),
+                    shadow: Some(shadow_outer),
+                },
+            );
+        }
+        assert!(super::sole_buffer_copy(outer, 256).is_ok());
+
+        // Overlapping registered buffer shadow must return Err(NotSole::OtherCopy).
+        {
+            let mut map = super::buffers();
+            map.insert(
+                (inner, 0x9002),
+                super::Entry {
+                    end: inner + (16 << 10),
+                    shadow: Some(shadow_inner.clone()),
+                },
+            );
+        }
+        assert_eq!(
+            super::sole_buffer_copy(outer, 128 << 10).err().unwrap(),
+            super::NotSole::OtherCopy
+        );
+        {
+            let mut map = super::buffers();
+            map.remove(&(inner, 0x9002));
+        }
+        // Loose window overlapping the range must also be rejected.
+        {
+            let mut loose = super::LOOSE.lock().unwrap();
+            loose.insert((outer + 0x2_0000, 0x1_0000), shadow_inner);
+        }
+        assert_eq!(
+            super::sole_buffer_copy(outer + 0x2_0000, 256).err().unwrap(),
+            super::NotSole::OtherCopy
+        );
+        assert_eq!(
+            super::sole_buffer_copy(loose_addr, 256).err().unwrap(),
+            super::NotSole::NoBuffer
+        );
+        {
+            super::LOOSE.lock().unwrap().remove(&(outer + 0x2_0000, 0x1_0000));
+            super::buffers().remove(&(outer, 0x9001));
+        }
     }
 }
 

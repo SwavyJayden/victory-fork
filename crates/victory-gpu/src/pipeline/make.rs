@@ -94,17 +94,16 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
-/// Waiting allowed per title frame, over all threads: 5 ms, a fraction of
-/// a 30 fps frame, so a pipeline still being made does not hold the frame
-/// (a draw is dropped until it is ready; `VICTORY_PIPELINE_WAIT_MS` sets
-/// another budget).
+/// Waiting allowed per title frame, over all threads: 20 ms, allowing quick
+/// cutscene/composition PSOs to finish in-frame rather than dropping whole
+/// scenes to black (`VICTORY_PIPELINE_WAIT_MS` sets another budget).
 fn wait_budget() -> Duration {
     static BUDGET: OnceLock<Duration> = OnceLock::new();
     *BUDGET.get_or_init(|| {
         let millis = std::env::var("VICTORY_PIPELINE_WAIT_MS")
             .ok()
             .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or(5);
+            .unwrap_or(20);
         tracing::info!(millis, "host pipeline wait budget per frame");
         Duration::from_millis(millis)
     })
@@ -346,12 +345,19 @@ pub(crate) fn frame_drew(drawn: u64) {
     }
 }
 
-/// Starts the workers (half the logical processors, 2 to 8) on first use.
+/// Starts the workers (three-quarters of logical processors, 2 to 12,
+/// or `VICTORY_PIPELINE_WORKERS`) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let default_workers =
+            std::thread::available_parallelism().map_or(2, |n| (n.get() * 3 / 4).clamp(2, 12));
+        let workers = std::env::var("VICTORY_PIPELINE_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(default_workers);
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
@@ -363,9 +369,13 @@ fn workers() -> bool {
                         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
                     }
                     loop {
-                        // All of them during the intro and the menus starve
-                        // the title's threads: frames come unevenly.
-                        while i >= MENU_WORKERS && !WORLD.load(Ordering::Relaxed) {
+                        // Throttle to `MENU_WORKERS` only while idle in light menus;
+                        // wake all workers once the world draws OR >= 16 pipelines queue up
+                        // so heavy cutscenes never starve behind 2 threads.
+                        while i >= MENU_WORKERS
+                            && !WORLD.load(Ordering::Relaxed)
+                            && WAITING.load(Ordering::Relaxed) < 16
+                        {
                             std::thread::sleep(Duration::from_millis(50));
                         }
                         next().make();

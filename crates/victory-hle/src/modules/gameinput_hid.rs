@@ -73,18 +73,30 @@ pub(super) fn is_bluetooth_path(path: &str) -> bool {
     lower.contains("bthenum") || lower.contains("{00001124-0000-1000-8000-00805f9b34fb}")
 }
 
-/// Normalizes an unsigned 8-bit stick axis (`0..=255`, center `128`) to `-1.0..=1.0`.
+/// Normalizes an unsigned 8-bit stick axis (`0..=255`, center `128`) to `-1.0..=1.0`,
+/// absorbing tiny `+-2` raw-byte resting ADC chatter around center.
 fn stick_x(raw: u8) -> f32 {
+    if raw.abs_diff(128) <= 2 {
+        return 0.0;
+    }
     ((f32::from(raw) - 128.0) / 127.0).clamp(-1.0, 1.0)
 }
 
-/// Normalizes an unsigned 8-bit stick Y axis, inverted so `0 -> +1.0` (up) and `255 -> -1.0` (down).
+/// Normalizes an unsigned 8-bit stick Y axis, inverted so `0 -> +1.0` (up) and `255 -> -1.0` (down),
+/// absorbing tiny `+-2` raw-byte resting ADC chatter around center.
 fn stick_y(raw: u8) -> f32 {
+    if raw.abs_diff(128) <= 2 {
+        return 0.0;
+    }
     ((128.0 - f32::from(raw)) / 127.0).clamp(-1.0, 1.0)
 }
 
 fn trigger(raw: u8) -> f32 {
-    f32::from(raw) / 255.0
+    if raw <= 2 {
+        0.0
+    } else {
+        f32::from(raw) / 255.0
+    }
 }
 
 fn decode_dpad(hat: u8) -> u32 {

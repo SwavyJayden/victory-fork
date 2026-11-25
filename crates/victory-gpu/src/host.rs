@@ -2243,6 +2243,9 @@ struct Deferred {
     /// indirect arguments; 0 if none. It stays readable until the next
     /// clamp into it ([`HostList::indirect_state`]).
     indirect_readable: usize,
+    /// Table constant buffer ranges (`address`, `len`) bound directly in a
+    /// host buffer copy rather than filled into upload memory.
+    on_card: Vec<(usize, usize)>,
 }
 
 impl Deferred {
@@ -7343,7 +7346,8 @@ impl HostList {
                 && deferred.kept.is_empty()
                 && deferred.textures.is_empty()
                 && deferred.writes.is_empty()
-                && deferred.backs.is_empty())
+                && deferred.backs.is_empty()
+                && deferred.on_card.is_empty())
             {
                 return false;
             }
@@ -7442,6 +7446,12 @@ impl HostList {
             *readable = true;
             Some(buffer.GetGPUVirtualAddress() + at)
         }
+    }
+
+    /// Notes that a table constant view (`address`, `len` bytes) was bound
+    /// directly in a host buffer copy instead of filled into upload memory.
+    pub(crate) fn note_table_on_card(&self, address: usize, len: usize) {
+        self.deferred().on_card.push((address, len));
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload

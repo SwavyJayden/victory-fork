@@ -1647,7 +1647,9 @@ fn committed_by_query(at: *const u8, len: usize) -> bool {
 /// answer is none without a look at the pages between (two queries for the
 /// slots whose texture is away, which are asked again and again).
 pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
     if len == 0 {
         return 0;
     }
@@ -1665,6 +1667,8 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         }
         let mut end_ok = [false; 2];
         query_pages(&[first_page, last_page], &mut end_ok);
+        // Neither endpoint committed means the texture is absent: walking every
+        // 64 KiB block across uncommitted reservations stalls on RTX GPUs.
         if !end_ok[0] && !end_ok[1] {
             return 0;
         }
@@ -1700,9 +1704,6 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         }
         return there;
     }
-    if !committed_by_query(at, 1) && !committed_by_query((end - 1) as *const u8, 1) {
-        return 0;
-    }
     let (mut p, mut there) = (start, 0u64);
     while p < end {
         // SAFETY: plain data filled in by the query.
@@ -1713,7 +1714,7 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         if n == 0 || next <= p {
             break;
         }
-        if info.State == MEM_COMMIT {
+        if info.State == MEM_COMMIT && info.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 {
             there += (next - p) as u64;
         }
         p = next;
