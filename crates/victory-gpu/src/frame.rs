@@ -1,13 +1,17 @@
-//! Frame pacing: the title sets a frame interval and waits for each frame
-//! to begin. Ours is a clock started by the first interval set, ticking
-//! once per interval; the token is the frame number. Each event kind
-//! (origin, vblank, flip) happens once per tick, so two waits for the same
-//! kind never end on the same tick: the title polls the origin
-//! with "token on time-out" (starting its next frame at once) and is paced
-//! by a blocking wait for the flip before each present.
-//!
-//! shortcut: event offsets are ignored (every event is at the tick); tie
-//! the clock to presentation if a title paces by them.
+/// Frame pacing: the title sets a frame interval and waits for each frame
+/// to begin. Ours is a clock started by the first interval set, ticking
+/// once per interval; the token is the frame number. Each event kind
+/// (origin, vblank, flip) happens once per tick, so two waits for the same
+/// kind never end on the same tick: the title polls the origin
+/// with "token on time-out" (starting its next frame at once) and is paced
+/// by a blocking wait for the flip before each present.
+///
+/// `VICTORY_FPS_CAP=<n>` caps the wait interval at `1_000_000 / n` microseconds
+/// (e.g. `60` unlocks 60 fps instead of the title's 30 Hz default); `0` or
+/// `unlimited` sets a minimal 100 us interval (uncapped).
+///
+/// shortcut: event offsets are ignored (every event is at the tick); tie
+/// the clock to presentation if a title paces by them.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::sync::Mutex;
@@ -24,6 +28,29 @@ const ORIGIN: u32 = 0;
 /// frame early).
 const TOKEN_ON_TIMEOUT: u32 = 2;
 const SIXTIETH: Duration = Duration::from_micros(16_667);
+const UNCAPPED_INTERVAL: Duration = Duration::from_micros(100);
+
+/// Parses `VICTORY_FPS_CAP` (`0` / `unlimited` -> `UNCAPPED_INTERVAL`,
+/// positive `n` -> `1_000_000 / n` us), clamping `interval` to at most that cap.
+fn apply_fps_cap(interval: Duration, cap: Option<&str>) -> Duration {
+    let Some(raw) = cap.map(str::trim).filter(|s| !s.is_empty()) else {
+        return interval;
+    };
+    if raw.eq_ignore_ascii_case("unlimited") || raw == "0" {
+        return interval.min(UNCAPPED_INTERVAL);
+    }
+    if let Ok(fps) = raw.parse::<u64>()
+        && fps > 0
+    {
+        return interval.min(Duration::from_micros((1_000_000 / fps).max(100)));
+    }
+    interval
+}
+
+fn fps_cap() -> Option<String> {
+    static CAP: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CAP.get_or_init(|| std::env::var("VICTORY_FPS_CAP").ok()).clone()
+}
 
 struct Clock {
     start: Instant,
@@ -49,11 +76,12 @@ pub(crate) extern "system" fn set_interval(
     _period: u32,
     _flags: u32,
 ) -> HRESULT {
-    let interval = match length {
+    let base = match length {
         0 => SIXTIETH,
         us => Duration::from_micros(u64::from(us)),
     };
-    tracing::info!(?interval, "frame interval");
+    let interval = apply_fps_cap(base, fps_cap().as_deref());
+    tracing::info!(?interval, ?base, "frame interval");
     // A new interval starts from now, after the last tick handed out.
     let first = LAST
         .iter()
@@ -335,5 +363,19 @@ mod tests {
         // Even when a flip wait begins on the tick another just ended on.
         let (tick, _) = next_tick(FLIP);
         assert!(tick > flips[3]);
+    }
+
+    #[test]
+    fn fps_cap_unlocks_intervals_past_30_hz() {
+        let thirty = Duration::from_micros(33_333);
+        assert_eq!(apply_fps_cap(thirty, None), thirty);
+        assert_eq!(apply_fps_cap(thirty, Some("60")), Duration::from_micros(16_666));
+        assert_eq!(apply_fps_cap(thirty, Some("120")), Duration::from_micros(8_333));
+        assert_eq!(apply_fps_cap(thirty, Some("0")), UNCAPPED_INTERVAL);
+        assert_eq!(apply_fps_cap(thirty, Some("unlimited")), UNCAPPED_INTERVAL);
+        assert_eq!(
+            apply_fps_cap(Duration::from_micros(4_000), Some("60")),
+            Duration::from_micros(4_000)
+        );
     }
 }
