@@ -97,16 +97,27 @@ pub(crate) fn on() -> bool {
 /// Copies made in place, their bytes, the copies that met a page that was
 /// not there (and went to the kernel's copy), and the copies not tried in
 /// place because their source faulted lately ([`RECENT`]) or they were
-/// under [`LEAST`] bytes, since the last line.
+/// under [`least`] bytes, since the last line.
 static COUNT: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
-/// The fewest bytes copied in place. A read of a byte or a word is how the
-/// layer ASKS whether a page is there (a texture's first page, a record):
-/// it is expected to fail, and a failed kernel read costs a microsecond
-/// where a fault and its handler cost tens (run 230: 1,000 to 1,300 faults
-/// a frame, nearly all of them such askings, took back most of what the
-/// copies in place had won).
-const LEAST: usize = 256;
+/// Default fewest bytes copied in place (`VICTORY_COPY_PLAIN_MIN`, 32). A
+/// read of a byte or a word is how the layer ASKS whether a page is there
+/// (a texture's first page, a record): it is expected to fail, and a failed
+/// kernel read costs a microsecond where a fault and its handler cost tens.
+/// Live benchmarks showed thousands of 32-255 byte copies per frame falling
+/// back to `NtReadVirtualMemory` at 256 bytes, so the default threshold is
+/// 32 bytes.
+const DEFAULT_LEAST: usize = 32;
+
+fn parse_least(val: Option<&str>) -> usize {
+    val.and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(DEFAULT_LEAST)
+}
+
+/// Minimum byte length copied in place (`VICTORY_COPY_PLAIN_MIN`, default 32).
+fn least() -> usize {
+    static LEAST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LEAST.get_or_init(|| parse_least(std::env::var("VICTORY_COPY_PLAIN_MIN").ok().as_deref()))
+}
 
 /// The 64 KiB blocks of title memory a copy in place faulted in lately:
 /// their copies go straight to the kernel's, which reads round the hole.
@@ -261,7 +272,7 @@ pub(crate) fn copy(to: *mut u8, from: *const u8, len: usize) -> bool {
     if !on() {
         return false;
     }
-    if len < LEAST {
+    if len < least() {
         COUNT[4].fetch_add(1, Relaxed);
         return false;
     }
@@ -285,12 +296,13 @@ pub(crate) fn line(frames: f64) {
     if !on() {
         return;
     }
+    let min = least();
     let [copies, bytes, gone, lately, small] = [0, 1, 2, 3, 4].map(|i| COUNT[i].swap(0, Relaxed) as f64 / frames);
     let [writes, wbytes, wgone] = [0, 1, 2].map(|i| WRITE_COUNT[i].swap(0, Relaxed) as f64 / frames);
     tracing::info!(
         "copies of title memory made in place per frame (VICTORY_COPY_PLAIN=1): {copies:.0}, {:.1} MB; {gone:.1} met a page \
          that was not there and went through the kernel's copy; left to the kernel's copy untried: {lately:.0} whose source \
-         faulted in the last two seconds, {small:.0} of under {LEAST} bytes; writes back in place: {writes:.0}, {:.1} MB, \
+         faulted in the last two seconds, {small:.0} of under {min} bytes; writes back in place: {writes:.0}, {:.1} MB, \
          {wgone:.1} fell back",
         bytes / 1e6,
         wbytes / 1e6
@@ -413,5 +425,63 @@ mod tests {
         assert!(guarded_write(base, src.as_ptr(), PAGE));
         // SAFETY: the test's reservation.
         unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn copy_plain_min_parsing_defaults_to_32_and_honors_overrides() {
+        assert_eq!(parse_least(None), 32);
+        assert_eq!(parse_least(Some("")), 32);
+        assert_eq!(parse_least(Some("not-a-number")), 32);
+        assert_eq!(parse_least(Some("64")), 64);
+        assert_eq!(parse_least(Some(" 256 ")), 256);
+        assert_eq!(parse_least(Some("0")), 0);
+    }
+
+    #[test]
+    fn small_32_and_64_byte_guarded_copies_and_writes_work_and_handle_faults() {
+        use windows_sys::Win32::System::Memory::PAGE_READONLY;
+        for size in [32usize, 64usize] {
+            let src: Vec<u8> = (0..size).map(|i| (i * 13 + 5) as u8).collect();
+            let mut dst = vec![0u8; size];
+            assert!(guarded(dst.as_mut_ptr(), src.as_ptr(), size), "copy {size}B");
+            assert_eq!(dst, src);
+
+            // SAFETY: memory of the test's own (page 0 RW, page 1 uncommitted, page 2 RO).
+            let base = unsafe { VirtualAlloc(std::ptr::null(), 3 * PAGE, MEM_RESERVE, PAGE_NOACCESS) } as *mut u8;
+            assert!(!base.is_null());
+            assert!(!unsafe { VirtualAlloc(base.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+            assert!(!unsafe { VirtualAlloc(base.wrapping_add(2 * PAGE).cast(), PAGE, MEM_COMMIT, PAGE_READONLY) }.is_null());
+
+            // Valid 32B/64B write into page 0 and read back.
+            assert!(guarded_write(base, src.as_ptr(), size), "write {size}B");
+            dst.fill(0);
+            assert!(guarded(dst.as_mut_ptr(), base, size), "read back {size}B");
+            assert_eq!(dst, src);
+
+            // Read spanning page 0 -> uncommitted page 1 fails cleanly with partial prefix copied.
+            // SAFETY: page 0 is committed and writable.
+            unsafe { std::slice::from_raw_parts_mut(base, PAGE) }.fill(0xAB);
+            dst.fill(0);
+            assert!(!guarded(dst.as_mut_ptr(), base.wrapping_add(PAGE - size / 2), size));
+            assert!(dst[..size / 2].iter().all(|&b| b == 0xAB));
+            assert!(dst[size / 2..].iter().all(|&b| b == 0));
+
+            // Read from uncommitted page 1 fails cleanly.
+            assert!(!guarded(dst.as_mut_ptr(), base.wrapping_add(PAGE), size));
+
+            // Write spanning page 0 -> uncommitted page 1 fails cleanly.
+            assert!(!guarded_write(base.wrapping_add(PAGE - size / 2), src.as_ptr(), size));
+
+            // Write to read-only page 2 fails cleanly.
+            assert!(!guarded_write(base.wrapping_add(2 * PAGE), src.as_ptr(), size));
+
+            // Valid 32B/64B copy/write still work after faults.
+            assert!(guarded_write(base, src.as_ptr(), size));
+            assert!(guarded(dst.as_mut_ptr(), base, size));
+            assert_eq!(dst, src);
+
+            // SAFETY: the test's reservation.
+            unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
+        }
     }
 }
