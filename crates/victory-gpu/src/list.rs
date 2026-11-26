@@ -948,6 +948,105 @@ pub(crate) struct CopyLocation {
     footprint: crate::resource::PlacedFootprint,
 }
 
+/// What unwritten texels of a title-filled texture hold on the first GPU
+/// `CopyTextureRegion` into it (`VICTORY_COPY_OVER_TITLE`).
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CopyOverTitle {
+    /// Leave pool block bytes untouched (`VICTORY_COPY_OVER_TITLE=0`).
+    Off,
+    /// Upload current title memory first (`VICTORY_COPY_OVER_TITLE=title`).
+    Title,
+    /// Zero every subresource first (default: prevents stale pool bytes from
+    /// bleeding into unwritten regions of partially baked atlases).
+    Zeros,
+}
+
+#[cfg(any(windows, test))]
+fn copy_over_title_from(raw: Option<&str>) -> CopyOverTitle {
+    match raw.map(str::trim) {
+        Some("0") => CopyOverTitle::Off,
+        Some("title") => CopyOverTitle::Title,
+        _ => CopyOverTitle::Zeros,
+    }
+}
+
+#[cfg(windows)]
+fn copy_over_title() -> CopyOverTitle {
+    static MODE: std::sync::OnceLock<CopyOverTitle> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        copy_over_title_from(std::env::var("VICTORY_COPY_OVER_TITLE").ok().as_deref())
+    })
+}
+
+/// Records copies of zeros into every subresource of `texture`, which must
+/// already be in `COPY_DEST`.
+#[cfg(windows)]
+fn zero_texture_subresources(
+    list: &crate::host::HostList,
+    host: &crate::host::Host,
+    texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+) {
+    use windows::Win32::Graphics::Direct3D12::*;
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    if d.SampleDesc.Count > 1 {
+        return;
+    }
+    let layers = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+        1
+    } else {
+        u32::from(d.DepthOrArraySize)
+    };
+    let count = u32::from(d.MipLevels) * layers;
+    if count == 0 {
+        return;
+    }
+    let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
+    let mut bytes = 0u64;
+    // SAFETY: outputs for `count` subresources.
+    unsafe {
+        host.device.GetCopyableFootprints(
+            &d,
+            0,
+            count,
+            0,
+            Some(footprints.as_mut_ptr()),
+            None,
+            None,
+            Some(&mut bytes),
+        );
+    }
+    if bytes == 0 || bytes == u64::MAX {
+        return;
+    }
+    let Some((buffer, data)) = list.upload(host, bytes) else {
+        return;
+    };
+    // SAFETY: a mapped buffer of `bytes` bytes, just made.
+    unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
+    for (i, footprint) in footprints.iter().enumerate() {
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the location never releases.
+            pResource: unsafe { std::mem::transmute_copy(texture) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: i as u32,
+            },
+        };
+        let from = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: as above; the list holds the buffer until it is reset.
+            pResource: unsafe { std::mem::transmute_copy(&buffer) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: *footprint,
+            },
+        };
+        // SAFETY: an open list; both locations name live resources.
+        unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+    }
+}
+
 /// Texture to texture on the GPU; buffer to texture through an upload
 /// buffer filled at submission. Texture to buffer (read back) is not done
 /// yet.
@@ -1061,6 +1160,45 @@ extern "system" fn copy_texture_region(
         // A depth texture shaders also write: what they wrote, first (the
         // source above too).
         list.twin_use(dst.resource, false, true);
+        // The first copy into a texture of the title's: what it does not
+        // write is zeros, as in a texture that was an allocation of its own
+        // (`VICTORY_COPY_OVER_TITLE=title`: what title memory holds; `=0`:
+        // whatever the pool block held). A host copy cut from a pool block
+        // otherwise holds stale bytes from earlier textures, and no upload
+        // runs once a copy wrote it — partially baked atlases (e.g., 2048x2048
+        // BC3 character decoration bakes written in 256x256 regions) would
+        // composite stale bytes over unwritten areas.
+        let over = copy_over_title();
+        if over != CopyOverTitle::Off
+            && crate::texture::title_written(to)
+            && !crate::texture::host_wrote(dst.resource as usize)
+        {
+            // A texture a list uploaded or a draw sampled already holds the
+            // title's bytes; on-demand tiled textures have each freshly mapped
+            // level zeroed by `card_writes` immediately below.
+            let mut touched = false;
+            if over == CopyOverTitle::Zeros && !crate::texture::is_staged(dst.resource) {
+                if crate::resource::host_tiled(dst.resource).is_none()
+                    && let Some(host) = crate::host::host()
+                {
+                    if list.first_use(dst.resource as usize) {
+                        ensure_state(list, dst.resource, COPY_DEST);
+                        zero_texture_subresources(list, host, to);
+                    } else {
+                        crate::texture::upload(list, dst.resource, to);
+                    }
+                    touched = true;
+                }
+            } else {
+                crate::texture::upload(list, dst.resource, to);
+                touched = true;
+            }
+            // Done before the title's copy writes over it (forces a
+            // COPY_DEST -> COPY_SOURCE -> COPY_DEST barrier pair).
+            if touched {
+                ensure_state(list, dst.resource, COPY_SOURCE);
+            }
+        }
         // A destination made level by level gets the level's memory ahead
         // of this list (`crate::tiles`): the title's bake copies each level
         // of its result into a block-compressed texture of that kind, and
@@ -2327,6 +2465,69 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         for object in [buffer, list, allocator] {
             assert_eq!(release(object), 0);
+        }
+    }
+
+    #[test]
+    fn copy_over_title_defaults_to_zeros_and_parses_overrides() {
+        assert_eq!(copy_over_title_from(None), CopyOverTitle::Zeros);
+        assert_eq!(copy_over_title_from(Some("")), CopyOverTitle::Zeros);
+        assert_eq!(copy_over_title_from(Some("1")), CopyOverTitle::Zeros);
+        assert_eq!(copy_over_title_from(Some("zeros")), CopyOverTitle::Zeros);
+        assert_eq!(copy_over_title_from(Some("title")), CopyOverTitle::Title);
+        assert_eq!(copy_over_title_from(Some(" title ")), CopyOverTitle::Title);
+        assert_eq!(copy_over_title_from(Some("0")), CopyOverTitle::Off);
+        assert_eq!(copy_over_title_from(Some(" 0 ")), CopyOverTitle::Off);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn zero_texture_subresources_clears_texture_cleanly() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
+        };
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 16,
+            Height: 16,
+            DepthOrArraySize: 1,
+            MipLevels: 3,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            ..Default::default()
+        };
+        let mut tex: Option<ID3D12Resource> = None;
+        // SAFETY: plain default-heap 2D texture creation.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut tex,
+                )
+                .expect("create 2D texture");
+        }
+        let tex = tex.expect("texture created");
+        let list = host.new_list().expect("host list");
+        zero_texture_subresources(&list, host, &tex);
+        list.close();
+        host.execute(&[&list]);
+        if let Some(err) = host.log_messages() {
+            panic!("D3D12 debug layer error in zero_texture_subresources: {err}");
         }
     }
 }

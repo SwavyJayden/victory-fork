@@ -357,67 +357,67 @@ fn neutral_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Res
 }
 
 /// Reveals texture slots queued by [`HostHeap::texture_slot_show_after`] whose
-/// upload submission (`after <= finished`) has completed on the GPU, and drains
-/// deferred `levels_on_demand` view remakes whenever no submission is in flight.
+/// upload submission (`after <= finished`) has completed on the GPU.
 pub(crate) fn finish_flips(finished: u64) {
-    {
-        let mut flips = FLIPS.lock().unwrap_or_else(|e| e.into_inner());
-        if !flips.is_empty() {
-            let mut ready = Vec::new();
-            let mut keep = Vec::with_capacity(flips.len());
-            for f in flips.drain(..) {
-                if f.after <= finished {
-                    ready.push(f);
-                } else {
-                    keep.push(f);
-                }
+    // Keep `descriptor::drain_quiet_remade_views` referenced until post-merge
+    // cleanup removes it from `descriptor.rs` (owned by W12-C).
+    let _ = super::drain_quiet_remade_views as fn(u64);
+    let mut flips = FLIPS.lock().unwrap_or_else(|e| e.into_inner());
+    if flips.is_empty() {
+        return;
+    }
+    let mut ready = Vec::new();
+    let mut keep = Vec::with_capacity(flips.len());
+    for f in flips.drain(..) {
+        if f.after <= finished {
+            ready.push(f);
+        } else {
+            keep.push(f);
+        }
+    }
+    *flips = keep;
+    // Keep `FLIPS` locked while updating slots so `Drop for HostHeap` cannot
+    // release a heap while we dereference it.
+    for f in ready {
+        // SAFETY: `Drop for HostHeap` purges entries under `FLIPS`.
+        let heap = unsafe { &*(f.heap as *const HostHeap) };
+        let _guard = heap.made_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(slot) = heap.made.get(f.index as usize) else {
+            continue;
+        };
+        if slot.load(Ordering::Relaxed) == f.key {
+            continue;
+        }
+        let view = view_at(f.key as u32, (f.key >> 32) as u32);
+        let (true, Some(view)) = (f.key != 0 && record_key_at(f.handle) == f.key, view) else {
+            LATE[4].fetch_add(1, Ordering::Relaxed);
+            continue;
+        };
+        if let View::Placed(_, resource, desc) = &view {
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            let len = crate::resource::placed_bytes(resource).unwrap_or(1);
+            if crate::texture::mapped_bytes(address as *const u8, len as usize) == 0 {
+                LATE[4].fetch_add(1, Ordering::Relaxed);
+                continue;
             }
-            *flips = keep;
-            // Keep `FLIPS` locked while updating slots so `Drop for HostHeap` cannot
-            // release a heap while we dereference it.
-            for f in ready {
-                // SAFETY: `Drop for HostHeap` purges entries under `FLIPS`.
-                let heap = unsafe { &*(f.heap as *const HostHeap) };
-                let _guard = heap.made_lock.lock().unwrap_or_else(|e| e.into_inner());
-                let Some(slot) = heap.made.get(f.index as usize) else {
-                    continue;
-                };
-                if slot.load(Ordering::Relaxed) == f.key {
-                    continue;
-                }
-                let view = view_at(f.key as u32, (f.key >> 32) as u32);
-                let (true, Some(view)) = (f.key != 0 && record_key_at(f.handle) == f.key, view) else {
-                    LATE[4].fetch_add(1, Ordering::Relaxed);
-                    continue;
-                };
-                if let View::Placed(_, resource, desc) = &view {
-                    let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-                    let len = crate::resource::placed_bytes(resource).unwrap_or(1);
-                    if crate::texture::mapped_bytes(address as *const u8, len as usize) == 0 {
-                        LATE[4].fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                }
-                if let Some(kept) = make(&view, heap.cpu(f.index)) {
-                    heap.keep(f.index, kept);
-                    slot.store(f.key, Ordering::Release);
-                    let frames = crate::frame::current().saturating_sub(f.since);
-                    let n = LATE[0].fetch_add(1, Ordering::Relaxed) + 1;
-                    let all = LATE[1].fetch_add(frames, Ordering::Relaxed) + frames;
-                    let most = LATE[2].fetch_max(frames, Ordering::Relaxed).max(frames);
-                    if n == 1 || n.is_multiple_of(5000) {
-                        tracing::info!(
-                            "slots shown after their texture's upload (VICTORY_SHOW_AFTER=1), since the start: {n}, {:.2} frames after asked, longest {most}; neutral stand-in in {}; {} superseded",
-                            all as f64 / n as f64,
-                            LATE[3].load(Ordering::Relaxed),
-                            LATE[4].load(Ordering::Relaxed)
-                        );
-                    }
-                }
+        }
+        if let Some(kept) = make(&view, heap.cpu(f.index)) {
+            heap.keep(f.index, kept);
+            slot.store(f.key, Ordering::Release);
+            let frames = crate::frame::current().saturating_sub(f.since);
+            let n = LATE[0].fetch_add(1, Ordering::Relaxed) + 1;
+            let all = LATE[1].fetch_add(frames, Ordering::Relaxed) + frames;
+            let most = LATE[2].fetch_max(frames, Ordering::Relaxed).max(frames);
+            if n == 1 || n.is_multiple_of(5000) {
+                tracing::info!(
+                    "slots shown after their texture's upload (VICTORY_SHOW_AFTER=1), since the start: {n}, {:.2} frames after asked, longest {most}; neutral stand-in in {}; {} superseded",
+                    all as f64 / n as f64,
+                    LATE[3].load(Ordering::Relaxed),
+                    LATE[4].load(Ordering::Relaxed)
+                );
             }
         }
     }
-    super::drain_quiet_remade_views(finished);
 }
 
 impl Drop for HostHeap {
@@ -563,24 +563,15 @@ pub(crate) fn first_viewed(start: u64) -> Option<u32> {
         .min()
 }
 
-/// Levels on demand (`crate::tiles`): placed texture start address ->
-/// submission number whose `UpdateTileMappings` + `CopyTextureRegion`
-/// populated the newly shown level(s). Deduplicated by address so deferred
-/// passes never grow unboundedly, and held until `finished >= after` so no
-/// shader samples newly-mapped tiles before their upload completes.
-static RESHOWN: Mutex<std::collections::BTreeMap<u64, u64>> =
-    Mutex::new(std::collections::BTreeMap::new());
-/// Lock-free hint for `drain_quiet_remade_views`: true while `RESHOWN` may
-/// contain pending entries.
-static RESHOWN_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Levels on demand (`crate::tiles`): where the placed textures start
+/// whose first level with memory changed since a texture pass last took
+/// them ([`HostHeap::texture_views_remade`]).
+static RESHOWN: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
-/// Since the start, of `levels_on_demand` view remakes:
-/// `[0]` view slots made again;
-/// `[1]` those of them made while a submission was in flight;
-/// `[2]` passes put off because a submission was in flight (`VICTORY_VIEWS_REMADE_QUIET=1`);
-/// `[3]` slots made again cleanly at quiet submission completion (`finish_flips`);
-/// `[4]` passes that deferred entries whose own upload submission had not finished yet.
-static VIEWS_REMADE: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// Since the start, of [`HostHeap::texture_views_remade`]: view slots made
+/// again, those of them made while a submission was in flight, and passes
+/// put off because one was (`VICTORY_VIEWS_REMADE_QUIET=1`).
+static VIEWS_REMADE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 fn views_remade_quiet_from(val: Option<&std::ffi::OsStr>) -> bool {
     val.is_some_and(|v| v == "1")
@@ -588,12 +579,10 @@ fn views_remade_quiet_from(val: Option<&std::ffi::OsStr>) -> bool {
 
 /// Whether view slots of textures with levels on demand are made again
 /// only while no submission is in flight (`VICTORY_VIEWS_REMADE_QUIET=1`;
-/// off by default: at every texture pass once the texture's upload submission
-/// has finished, plus opportunistically at quiet submission completion).
-/// After fork pull request #1219, whose author lost the device with slots
-/// rewritten under lists already sent; draining in `finish_flips` at every
-/// quiet completion point prevents starvation under `VICTORY_LATE_WAIT=3` +
-/// `VICTORY_ASYNC_PRESENT=1` + `VICTORY_RELAY=2`.
+/// off by default: at every texture pass, as before). A texture then
+/// shows its new level a pass or more later. After fork pull request
+/// #1219, whose author lost the device with slots rewritten under lists
+/// already sent; whether that is behind the losses here is not known.
 fn views_remade_quiet() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -601,99 +590,23 @@ fn views_remade_quiet() -> bool {
     })
 }
 
-/// The first level with memory of the placed texture at `start` changed during
-/// the current submission (`crate::host::submissions().0`): its slots are made
-/// again once that submission has finished writing the newly-mapped tiles.
+/// The first level with memory of the placed texture at `start` changed:
+/// its slots are made again at the next texture pass.
 pub(crate) fn levels_changed(start: u64) {
-    let after = crate::host::submissions().0;
-    let mut pending = RESHOWN.lock().unwrap_or_else(|e| e.into_inner());
-    pending
-        .entry(start)
-        .and_modify(|prev| *prev = (*prev).max(after))
-        .or_insert(after);
-    RESHOWN_ANY.store(true, Ordering::Release);
+    RESHOWN.lock().unwrap_or_else(|e| e.into_inner()).push(start);
 }
 
-/// Lock-free check whether any `levels_on_demand` texture has a pending view remake.
+/// Compatibility no-op stubs while `descriptor::drain_quiet_remade_views`
+/// awaits post-merge removal from `descriptor.rs` (owned by W12-C).
 pub(super) fn has_reshown() -> bool {
-    RESHOWN_ANY.load(Ordering::Acquire)
+    false
 }
 
-/// Selects pending `RESHOWN` texture starts ready to remake given `finished`,
-/// `flying`, and `quiet`. Returns `(ready_starts, deferred_for_quiet, deferred_for_upload)`.
-/// Entries whose upload submission (`after > finished`) is still in flight—or
-/// all entries when `quiet && flying > 0`—stay in `pending` so no remake is lost.
-fn take_ready_reshown(
-    pending: &mut std::collections::BTreeMap<u64, u64>,
-    finished: u64,
-    flying: u64,
-    quiet: bool,
-) -> (Vec<u64>, bool, bool) {
-    if pending.is_empty() {
-        return (Vec::new(), false, false);
-    }
-    if quiet && flying > 0 {
-        return (Vec::new(), true, false);
-    }
-    let mut ready = Vec::new();
-    let mut deferred_upload = false;
-    pending.retain(|&start, &mut after| {
-        if after <= finished {
-            ready.push(start);
-            false
-        } else {
-            deferred_upload = true;
-            true
-        }
-    });
-    (ready, false, deferred_upload)
+pub(super) fn take_quiet_reshown(_finished: u64) -> Option<Vec<u64>> {
+    None
 }
 
-/// Takes ready `RESHOWN` entries at a quiet completion point (`flying == 0`)
-/// called from [`finish_flips`]. Returns `None` if a submission is still in
-/// flight or nothing is ready yet.
-pub(super) fn take_quiet_reshown(finished: u64) -> Option<Vec<u64>> {
-    let (started, fin) = crate::host::submissions();
-    let finished_now = fin.max(finished);
-    if started.saturating_sub(finished_now) > 0 {
-        return None;
-    }
-    let mut pending = RESHOWN.lock().unwrap_or_else(|e| e.into_inner());
-    let (ready, _, _) = take_ready_reshown(&mut pending, finished_now, 0, true);
-    if pending.is_empty() {
-        RESHOWN_ANY.store(false, Ordering::Release);
-    }
-    (!ready.is_empty()).then_some(ready)
-}
-
-/// Records `remade` remade slots and logs every 1,024 slots.
-pub(super) fn record_views_remade(remade: usize, flying: u64, from_quiet_finish: bool) {
-    use std::sync::atomic::Ordering::Relaxed;
-    if remade == 0 {
-        return;
-    }
-    let before = VIEWS_REMADE[0].fetch_add(remade as u64, Relaxed);
-    if flying > 0 {
-        VIEWS_REMADE[1].fetch_add(remade as u64, Relaxed);
-    }
-    if from_quiet_finish {
-        VIEWS_REMADE[3].fetch_add(remade as u64, Relaxed);
-    }
-    // Said at every 1,024 slots made again.
-    if (before + remade as u64) / 1024 != before / 1024 {
-        tracing::info!(
-            "view slots of textures with levels on demand made again, since the start: {}, {} of them while a submission was in flight \
-             (a list already sent may have been reading the slot), {} at quiet submission completion; {} passes put off for in-flight \
-             (VICTORY_VIEWS_REMADE_QUIET=1: {}), {} deferred awaiting upload completion",
-            before + remade as u64,
-            VIEWS_REMADE[1].load(Relaxed),
-            VIEWS_REMADE[3].load(Relaxed),
-            VIEWS_REMADE[2].load(Relaxed),
-            if views_remade_quiet() { "on" } else { "off" },
-            VIEWS_REMADE[4].load(Relaxed),
-        );
-    }
-}
+pub(super) fn record_views_remade(_remade: usize, _flying: u64, _from_quiet_finish: bool) {}
 
 /// Levels on demand (`crate::tiles`): where the placed textures start
 /// whose last upload left a held level without tiles (the card had no
@@ -2187,20 +2100,42 @@ impl HostHeap {
     /// gives nothing is a whole texture staged and copied for nothing.
     const WAITING_A_PASS: usize = 128;
 
-    /// Remakes all currently-made slots of this view heap that describe any
-    /// placed texture in `starts`.
-    pub(super) fn remake_starts(&self, starts: &[u64]) -> usize {
+    /// Compatibility no-op stub while `descriptor::drain_quiet_remade_views`
+    /// awaits post-merge removal from `descriptor.rs` (owned by W12-C).
+    pub(super) fn remake_starts(&self, _starts: &[u64]) -> usize {
+        0
+    }
+
+    pub(crate) fn texture_views_remade(&self) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
-        if self.sampler || starts.is_empty() {
+        if self.sampler {
             return 0;
         }
+        // The slots made again here are live slots of the heap the card
+        // reads, and the making is the layer's own, at a moment the title
+        // knows nothing of: a list already sent may be reading a slot while
+        // it is written (Direct3D 12 asks that a descriptor a submitted
+        // list reads is left alone until the list has run). Counted always;
+        // with `VICTORY_VIEWS_REMADE_QUIET=1` the pass is put off while a
+        // submission is in flight, and what is due stays due.
+        let (started, finished) = crate::host::submissions();
+        let flying = started.saturating_sub(finished);
+        if flying > 0 && views_remade_quiet() {
+            if !RESHOWN.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+                VIEWS_REMADE[2].fetch_add(1, Relaxed);
+            }
+            return 0;
+        }
+        let mut starts = std::mem::take(&mut *RESHOWN.lock().unwrap_or_else(|e| e.into_inner()));
+        if starts.is_empty() {
+            return 0;
+        }
+        starts.sort_unstable();
+        starts.dedup();
         let mut slots: Vec<u32> = {
             let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
             starts.iter().flat_map(|&start| placed.slots_at(start)).collect()
         };
-        if slots.is_empty() {
-            return 0;
-        }
         slots.sort_unstable();
         slots.dedup();
         let _guard = self.made_lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -2221,47 +2156,21 @@ impl HostHeap {
                 remade += 1;
             }
         }
-        remade
-    }
-
-    pub(crate) fn texture_views_remade(&self) -> usize {
-        use std::sync::atomic::Ordering::Relaxed;
-        if self.sampler || !has_reshown() {
-            return 0;
+        let before = VIEWS_REMADE[0].fetch_add(remade as u64, Relaxed);
+        if flying > 0 {
+            VIEWS_REMADE[1].fetch_add(remade as u64, Relaxed);
         }
-        // The slots made again here are live slots of the heap the card
-        // reads, and the making is the layer's own, at a moment the title
-        // knows nothing of: a list already sent may be reading a slot while
-        // it is written (Direct3D 12 asks that a descriptor a submitted
-        // list reads is left alone until the list has run). Entries whose
-        // own upload submission (`after > finished`) has not completed yet
-        // always stay due so shaders never sample newly-mapped tiles before
-        // `CopyTextureRegion` writes them. With `VICTORY_VIEWS_REMADE_QUIET=1`
-        // the pass is put off while any submission is in flight, and
-        // `finish_flips` drains it at the first quiet completion point so it
-        // never starves under `VICTORY_LATE_WAIT=3` + `VICTORY_ASYNC_PRESENT=1`.
-        let (started, finished) = crate::host::submissions();
-        let flying = started.saturating_sub(finished);
-        let (starts, deferred_quiet, deferred_upload) = {
-            let mut pending = RESHOWN.lock().unwrap_or_else(|e| e.into_inner());
-            let out = take_ready_reshown(&mut pending, finished, flying, views_remade_quiet());
-            if pending.is_empty() {
-                RESHOWN_ANY.store(false, Ordering::Release);
-            }
-            out
-        };
-        if deferred_quiet {
-            VIEWS_REMADE[2].fetch_add(1, Relaxed);
-            return 0;
+        // Said at every 1,024 slots made again.
+        if (before + remade as u64) / 1024 != before / 1024 {
+            tracing::info!(
+                "view slots of textures with levels on demand made again, since the start: {}, {} of them while a submission was in flight \
+                 (a list already sent may have been reading the slot); {} passes put off for that (VICTORY_VIEWS_REMADE_QUIET=1: {})",
+                before + remade as u64,
+                VIEWS_REMADE[1].load(Relaxed),
+                VIEWS_REMADE[2].load(Relaxed),
+                if views_remade_quiet() { "on" } else { "off" }
+            );
         }
-        if deferred_upload {
-            VIEWS_REMADE[4].fetch_add(1, Relaxed);
-        }
-        if starts.is_empty() {
-            return 0;
-        }
-        let remade = self.remake_starts(&starts);
-        record_views_remade(remade, flying, false);
         remade
     }
 
@@ -4744,50 +4653,6 @@ mod tests {
         assert!(make(&View::Constant(address, 1_087_744), heap.cpu(0)).is_some());
         assert!(make(&View::Constant(address, u32::MAX), heap.cpu(1)).is_some());
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
-    }
-
-    #[test]
-    fn reshown_defers_for_quiet_and_inflight_uploads_without_losing_remakes() {
-        let mut pending = std::collections::BTreeMap::new();
-        // Empty queue: nothing ready, nothing deferred.
-        assert_eq!(take_ready_reshown(&mut pending, 10, 1, true), (vec![], false, false));
-
-        // Texture A uploaded in submission 5, texture B in submission 7.
-        pending.insert(0x1000, 5);
-        pending.insert(0x2000, 7);
-
-        // Quiet mode while submissions are in flight: everything stays pending.
-        let (ready, dq, du) = take_ready_reshown(&mut pending, 6, 2, true);
-        assert!(ready.is_empty() && dq && !du);
-        assert_eq!(pending.len(), 2);
-
-        // Non-quiet mode at finished=6, flying=2: A (after=5 <= 6) is ready,
-        // B (after=7 > 6) stays pending so unwritten tiles are never exposed early.
-        let (ready, dq, du) = take_ready_reshown(&mut pending, 6, 2, false);
-        assert_eq!(ready, vec![0x1000]);
-        assert!(!dq && du);
-        assert_eq!(pending.get(&0x2000), Some(&7));
-
-        // Quiet mode once GPU goes idle at finished=7, flying=0: B drains completely.
-        let (ready, dq, du) = take_ready_reshown(&mut pending, 7, 0, true);
-        assert_eq!(ready, vec![0x2000]);
-        assert!(!dq && !du);
-        assert!(pending.is_empty());
-
-        // Deduplication + monotonic submission watermark on repeated `levels_changed`.
-        let mut dedup = std::collections::BTreeMap::new();
-        for after in [10u64, 12, 11] {
-            dedup
-                .entry(0x3000u64)
-                .and_modify(|prev: &mut u64| *prev = (*prev).max(after))
-                .or_insert(after);
-        }
-        assert_eq!(dedup.len(), 1);
-        assert_eq!(dedup.get(&0x3000), Some(&12));
-        // Still blocked at finished=11, ready at finished=12.
-        assert_eq!(take_ready_reshown(&mut dedup, 11, 1, false), (vec![], false, true));
-        assert_eq!(take_ready_reshown(&mut dedup, 12, 0, true), (vec![0x3000], false, false));
-        assert!(dedup.is_empty());
     }
 
     #[test]

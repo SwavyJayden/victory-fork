@@ -285,6 +285,31 @@ pub extern "system" fn TerminateProcess(process: *mut c_void, code: u32) -> i32 
     host::terminate_process(process, code)
 }
 
+/// The title's thread priorities, except the lowest two (`IDLE` and `LOWEST`),
+/// which are raised to `BELOW_NORMAL`. Six of the title's threads run at
+/// `IDLE`, including the streaming pager; on a PC where other programs and
+/// our own shader/pipeline workers keep all processors busy, `IDLE` threads
+/// starve for seconds and delay geometry/texture streaming.
+/// `VICTORY_TITLE_PRIORITIES=0`: preserve the title's requested priorities.
+fn title_priority(asked: i32) -> i32 {
+    const IDLE: i32 = -15;
+    const LOWEST: i32 = -2;
+    const BELOW_NORMAL: i32 = -1;
+    match asked {
+        IDLE..=LOWEST => BELOW_NORMAL,
+        other => other,
+    }
+}
+
+/// [`title_priority`].
+pub extern "system" fn SetThreadPriority(thread: *mut c_void, priority: i32) -> i32 {
+    static AS_SET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let as_set = *AS_SET
+        .get_or_init(|| std::env::var_os("VICTORY_TITLE_PRIORITIES").is_some_and(|v| v == "0"));
+    let priority = if as_set { priority } else { title_priority(priority) };
+    host::set_thread_priority(thread, priority)
+}
+
 /// The pseudo handle of one of our modules: its address, never a real image.
 fn handle(m: &HleModule) -> *mut c_void {
     m as *const HleModule as *mut c_void
@@ -382,6 +407,7 @@ pub(crate) fn module() -> HleModule {
             hle_export!(_invalid_parameter_noinfo_noreturn),
             hle_export!(TerminateProcess),
             hle_export!(SetUnhandledExceptionFilter),
+            hle_export!(SetThreadPriority),
         ],
     }
 }
@@ -402,7 +428,7 @@ mod host {
         DisableThreadLibraryCalls, GetModuleFileNameA, GetModuleFileNameW, GetModuleHandleA,
         GetModuleHandleW, GetProcAddress, LoadLibraryExA, LoadLibraryExW,
     };
-    use windows_sys::Win32::System::Threading::TerminateProcess;
+    use windows_sys::Win32::System::Threading::{SetThreadPriority, TerminateProcess};
 
     unsafe extern "C" {
         #[link_name = "exit"]
@@ -484,6 +510,11 @@ mod host {
     pub(super) fn terminate_process(process: *mut c_void, code: u32) -> i32 {
         // SAFETY: see above.
         unsafe { TerminateProcess(process, code) }
+    }
+
+    pub(super) fn set_thread_priority(thread: *mut c_void, priority: i32) -> i32 {
+        // SAFETY: the title passes a thread handle.
+        unsafe { SetThreadPriority(thread, priority) }
     }
 
     pub(super) fn set_unhandled_exception_filter(filter: extern "system" fn(*const c_void) -> i32) {
@@ -581,6 +612,10 @@ mod host {
         std::process::exit(code as i32)
     }
 
+    pub(super) fn set_thread_priority(_: *mut c_void, _: i32) -> i32 {
+        0
+    }
+
     pub(super) fn set_unhandled_exception_filter(_: extern "system" fn(*const c_void) -> i32) {}
 
     pub(super) fn report_unhandled(_: *const c_void) {}
@@ -595,6 +630,30 @@ mod host {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The title's idle and lowest threads run below normal; the others as
+    /// it sets them.
+    #[test]
+    fn no_title_thread_waits_for_idle_processors() {
+        let given: Vec<i32> = [-15, -2, -1, 0, 1, 2, 15]
+            .into_iter()
+            .map(title_priority)
+            .collect();
+        assert_eq!(given, [-1, -1, -1, 0, 1, 2, 15]);
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadPriority};
+            std::thread::spawn(|| {
+                // SAFETY: plain calls on this thread.
+                let thread = unsafe { GetCurrentThread() };
+                assert_eq!(SetThreadPriority(thread, -15), 1);
+                // SAFETY: as above.
+                assert_eq!(unsafe { GetThreadPriority(thread) }, -1);
+            })
+            .join()
+            .unwrap();
+        }
+    }
 
     #[test]
     fn title_images_report_their_original_path() {
