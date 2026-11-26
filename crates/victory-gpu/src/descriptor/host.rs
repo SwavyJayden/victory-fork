@@ -117,9 +117,14 @@ pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
     step: u32,
-    /// Slots mirroring the title's; view heaps have `dynamic` more.
+    /// Slots mirroring the title's; view heaps have `dynamic` more starting at
+    /// `dynamic_base`.
     count: u32,
-    /// Dynamic slots past `count`: [`DYNAMIC`] in view heaps, none in
+    /// First dynamic slot in the host heap: equals `count` on uncapped heaps,
+    /// or `PORTABLE_VIEWS - DYNAMIC` (`null + 1`) on 1M-capped NVIDIA heaps so
+    /// bindless `UMin(idx, null)` clamping never aliases live dynamic tables.
+    dynamic_base: u32,
+    /// Dynamic slots past `dynamic_base`: [`DYNAMIC`] in view heaps, none in
     /// sampler heaps. (Upstream falls back to 2^16 on a capped host heap;
     /// ours keeps 2^18 there: 2^16 and 2^17 both ran out in this title.)
     dynamic: u32,
@@ -1235,7 +1240,14 @@ fn off_elements(offset: u64, stride: u32, raw: bool, element: u64) -> bool {
     if raw {
         !offset.is_multiple_of(16)
     } else if stride > 0 {
-        !offset.is_multiple_of(16) && !offset.is_multiple_of(u64::from(stride))
+        // On NVIDIA (`raw_views() == 0`), translated shaders read 4B-multiple
+        // structured buffers via `rawBufferLoad`/`rawBufferStore`; a structured
+        // D3D12 view reads zeros on NVIDIA, so require 16-byte raw alignment.
+        if victory_shader::emit::raw_views() == 0 && stride.is_multiple_of(4) {
+            !offset.is_multiple_of(16)
+        } else {
+            !offset.is_multiple_of(16) && !offset.is_multiple_of(u64::from(stride))
+        }
     } else {
         element > 0 && !offset.is_multiple_of(element)
     }
@@ -1296,7 +1308,7 @@ pub(crate) fn describe_slots(words: &[u32]) -> Vec<(usize, u32, String)> {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn shown_bytes(at: u32, n: u32) -> Option<(u32, Vec<u8>, u32)> {
     super::with_view_heap(|host| {
-        let own = host.count + host.dynamic;
+        let own = host.dynamic_base + host.dynamic;
         let end = if host.raw == 0 { own } else { host.raw + own };
         let at = if at >= own && at < host.raw { host.raw } else { at };
         let stop = if at < own { own } else { end };
@@ -1318,9 +1330,12 @@ pub(crate) fn slot_story(slot: u32) -> String {
         let (index, twin) = if host.raw != 0 && slot >= host.raw { (slot - host.raw, true) } else { (slot, false) };
         let mut text = if index < host.count {
             format!("title slot {index}, made from {}", host.describe_slot(index).unwrap_or_default())
+        } else if index >= host.dynamic_base && index < host.dynamic_base + host.dynamic {
+            let dyn_i = index - host.dynamic_base;
+            let taken = host.next.lock().unwrap_or_else(|e| e.into_inner()).1.get(dyn_i as usize).copied();
+            format!("dynamic slot {dyn_i} (taken {taken:?})")
         } else {
-            let taken = host.next.lock().unwrap_or_else(|e| e.into_inner()).1.get((index - host.count) as usize).copied();
-            format!("dynamic slot {} (taken {taken:?})", index - host.count)
+            format!("permanent null slot {index}")
         };
         if twin {
             let made = host.twins.get(index as usize).map(|t| t.load(Relaxed));
@@ -1452,20 +1467,25 @@ pub(crate) fn probe_view_limit() {
         if twins {
             victory_shader::emit::set_raw_views(RAW_TWINS);
         }
-        // (The twins lie past the null slot.)
-        let views = if twins {
-            RAW_TWINS
+        // (The twins lie past the null slot. On 1M-capped hosts like NVIDIA,
+        // reserve the permanent null clamp slot BEFORE `DYNAMIC` so bindless
+        // `UMin(idx, limit)` never aliases live dynamic per-draw tables:
+        // `[0..fitted)` title <= `737_855`, `[737_855]` permanent null,
+        // `[737_856..1_000_000)` dynamic tables.)
+        let (views, limit) = if twins {
+            (RAW_TWINS, RAW_TWINS - 1)
         } else if fits(UNCAPPED_VIEWS) {
-            UNCAPPED_VIEWS
+            (UNCAPPED_VIEWS, UNCAPPED_VIEWS - 1)
         } else {
-            PORTABLE_VIEWS
+            (PORTABLE_VIEWS, PORTABLE_VIEWS - 1 - DYNAMIC)
         };
         tracing::info!(
             views,
+            limit,
             raw_twins = twins,
-            "host view heaps hold {views} views; view indices are clamped to the null slot at the end from the first shader on"
+            "host view heaps hold {views} views; bindless indices clamp to null slot {limit} from the first shader on"
         );
-        victory_shader::emit::set_view_heap_limit(views - 1);
+        victory_shader::emit::set_view_heap_limit(limit);
     });
 }
 
@@ -1535,11 +1555,29 @@ impl HostHeap {
         };
         let raw = if sampler { 0 } else { victory_shader::emit::raw_views() };
         let extra = if sampler { 0 } else { dynamic_slots(count, null) };
-        let (heap, count, size) = if null == 0 {
+        let (heap, count, dynamic_base, size) = if null == 0 {
             match make(count + extra) {
-                Ok(heap) => (heap, count, count + extra),
+                Ok(heap) => (heap, count, count, count + extra),
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                    return None;
+                }
+            }
+        } else if raw == 0 && null == PORTABLE_VIEWS - 1 - DYNAMIC {
+            // 1M-capped host (NVIDIA): `[0..fitted)` title slots, `[fitted..=null]`
+            // permanent null slots (bindless clamp target `null`), and
+            // `[null + 1..PORTABLE_VIEWS)` dynamic per-draw tables.
+            let size = PORTABLE_VIEWS;
+            let fitted = if count <= null {
+                count
+            } else {
+                tracing::warn!(count, null, size, "host view heap capped at {size}; views past {null} read the null slot");
+                null
+            };
+            match make(size) {
+                Ok(heap) => (heap, fitted, null + 1, size),
+                Err(e) => {
+                    tracing::warn!(error = %e, count, size, "no host view heap");
                     return None;
                 }
             }
@@ -1554,7 +1592,7 @@ impl HostHeap {
                 null - extra
             };
             match make(size) {
-                Ok(heap) => (heap, fitted, size),
+                Ok(heap) => (heap, fitted, fitted, size),
                 Err(e) => {
                     tracing::warn!(error = %e, count, size, "no host view heap");
                     return None;
@@ -1597,6 +1635,7 @@ impl HostHeap {
             cpu,
             step,
             count,
+            dynamic_base,
             dynamic: extra,
             sampler,
             raw,
@@ -1771,7 +1810,7 @@ impl HostHeap {
         taken[first..first + n].fill(true);
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
         *next = ((first + n) % end) as u32;
-        Some(self.count + first as u32)
+        Some(self.dynamic_base + first as u32)
     }
 
     /// The title slots this heap has host slots for; fewer than the title's
@@ -2778,7 +2817,7 @@ impl HostHeap {
     ///
     /// [`dynamic`]: HostHeap::dynamic
     pub(crate) fn release(&self, first: u32, n: u32) {
-        let Some(at) = first.checked_sub(self.count) else {
+        let Some(at) = first.checked_sub(self.dynamic_base) else {
             return;
         };
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
@@ -2908,9 +2947,23 @@ impl HostHeap {
         }
     }
 
+    /// Maps a heap slot index (either a title slot `[0..count)` or a dynamic
+    /// slot `[dynamic_base..dynamic_base+dynamic)`) into `self.kept`.
+    fn kept_slot(&self, index: u32) -> Option<usize> {
+        if index < self.count {
+            Some(index as usize)
+        } else if let Some(dyn_i) = index.checked_sub(self.dynamic_base)
+            && dyn_i < self.dynamic
+        {
+            Some((self.count + dyn_i) as usize)
+        } else {
+            None
+        }
+    }
+
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
-        let Some(slot) = self.kept.get(index as usize) else {
+        let Some(slot) = self.kept_slot(index).and_then(|i| self.kept.get(i)) else {
             return;
         };
         let old = {
@@ -2931,7 +2984,11 @@ impl HostHeap {
 
     /// What slot `index` views.
     fn kept_in(&self, index: u32) -> Option<ID3D12Resource> {
-        self.kept.get(index as usize)?.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.kept
+            .get(self.kept_slot(index)?)?
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view of `len` bytes
@@ -4385,17 +4442,27 @@ fn make_twinned(
 /// on (`crate::resource::held_only`). What it shows of larger ones, if any,
 /// is left out.
 fn from_base(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, base: u32) {
-    if desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D {
-        return;
+    let shift = |most: &mut u32, mips: &mut u32, clamp: &mut f32| {
+        let lost = base.saturating_sub(*most);
+        *most = most.saturating_sub(base);
+        if *mips != u32::MAX {
+            *mips = mips.saturating_sub(lost).max(1);
+        }
+        *clamp = (*clamp - base as f32).max(0.0);
+    };
+    match desc.ViewDimension {
+        D3D12_SRV_DIMENSION_TEXTURE2D => {
+            // SAFETY: the member its dimension says.
+            let t = unsafe { &mut desc.Anonymous.Texture2D };
+            shift(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+        }
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+            // SAFETY: the member its dimension says.
+            let t = unsafe { &mut desc.Anonymous.Texture2DArray };
+            shift(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+        }
+        _ => {}
     }
-    // SAFETY: the member its dimension says.
-    let t = unsafe { &mut desc.Anonymous.Texture2D };
-    let lost = base.saturating_sub(t.MostDetailedMip);
-    t.MostDetailedMip = t.MostDetailedMip.saturating_sub(base);
-    if t.MipLevels != u32::MAX {
-        t.MipLevels = t.MipLevels.saturating_sub(lost).max(1);
-    }
-    t.ResourceMinLODClamp = (t.ResourceMinLODClamp - base as f32).max(0.0);
 }
 
 /// Writes of a slot with another view of the placed texture it showed,
@@ -5227,8 +5294,11 @@ mod tests {
         assert!(off_elements(8, 0, true, 4));
         assert!(!off_elements(0, 0, true, 4));
         assert!(!off_elements(48, 0, true, 4));
-        // 456-byte elements: at one of them, on 16 bytes, at neither
-        assert!(!off_elements(456, 456, false, 0));
+        // 456-byte elements: on 16 bytes is always valid; at 456 (456 % 16 == 8),
+        // NVIDIA (`raw_views() == 0`) requires a 16B-aligned exact copy because
+        // shaders emit raw loads/stores on 4B-multiple structured buffers.
+        let need_raw = victory_shader::emit::raw_views() == 0;
+        assert_eq!(off_elements(456, 456, false, 0), need_raw);
         assert!(!off_elements(32, 456, false, 0));
         assert!(off_elements(100, 456, false, 0));
         // A typed view of 12-byte elements on 16 bytes and not on an element.
@@ -5668,14 +5738,23 @@ mod tests {
         let Some(heap) = HostHeap::new(false, 4) else {
             return; // no host GPU
         };
+        let base = heap.dynamic_base;
         let a = heap.dynamic(heap.dynamic - 100).unwrap();
         let b = heap.dynamic(60).unwrap();
-        assert_eq!((a, b), (4, 4 + heap.dynamic - 100));
+        assert_eq!((a, b), (base, base + heap.dynamic - 100));
         // 40 left at the end: 50 do not fit until something is given back.
         assert_eq!(heap.dynamic(50), None);
         heap.release(a, 50);
-        assert_eq!(heap.dynamic(50), Some(4));
-        assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+        assert_eq!(heap.dynamic(50), Some(base));
+        assert_eq!(heap.dynamic(40), Some(base + heap.dynamic - 40));
+        // On 1M-capped NVIDIA heaps, dynamic slots must sit strictly past the
+        // shader bindless clamp slot so OOB bindless indexing never aliases live tables.
+        let limit = victory_shader::emit::view_heap_limit();
+        if victory_shader::emit::raw_views() == 0 && limit == PORTABLE_VIEWS - 1 - DYNAMIC {
+            assert!(heap.count <= limit);
+            assert_eq!(heap.dynamic_base, limit + 1);
+            assert_eq!(heap.dynamic_base + heap.dynamic, PORTABLE_VIEWS);
+        }
     }
 
     #[test]
@@ -5684,11 +5763,12 @@ mod tests {
             eprintln!("no host descriptor heap; skipped");
             return;
         };
+        let base = heap.dynamic_base;
         let first = heap.dynamic(1).unwrap();
         let left = heap.dynamic(2).unwrap();
         let right = heap.dynamic(2).unwrap();
         let rest = heap.dynamic(heap.dynamic - 5).unwrap();
-        assert_eq!((first, left, right, rest), (4, 5, 7, 9));
+        assert_eq!((first, left, right, rest), (base, base + 1, base + 3, base + 5));
 
         // Reallocating the left half puts the cursor back in the middle.
         heap.release(left, 2);

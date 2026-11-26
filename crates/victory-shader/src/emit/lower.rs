@@ -1388,7 +1388,8 @@ impl<'a> Lower<'a> {
                         || reads_mask_as_data(x.st, i)
                 }) || lane_constant_masks(x.st)
                     || !x.st.wide.is_empty();
-                if !crosses && (s.lds_dwords == 0 || group <= 32) {
+                const MAX_TGSM_DWORDS: u32 = 8192;
+                if !crosses && (s.lds_dwords == 0 || group <= 32) && s.lds_dwords < MAX_TGSM_DWORDS {
                     wave = 32;
                 } else {
                     // (Groups of several console waves too: each console wave is two host
@@ -1421,7 +1422,8 @@ impl<'a> Lower<'a> {
                                 }
                             }
                         }
-                        if lds_ok {
+                        let extra_lds = if crosses { 2 * group.div_ceil(64) } else { 0 } + 1;
+                        if lds_ok && s.lds_dwords.saturating_add(extra_lds) <= MAX_TGSM_DWORDS {
                             wave = 32;
                             split_lds = s.lds_dwords > 0 && group > 32;
                             if crosses {
@@ -2143,7 +2145,7 @@ impl<'a> Lower<'a> {
             .op(c, "splitDouble.f64", Attr::ReadNone, split_ty, 102, &[sum]);
         let mut r_lo = self.s.m.extract(c, split, 0);
         let mut r_hi = self.s.m.extract(c, split, 1);
-        if self.exchange.is_some() {
+        if self.exchange.as_ref().is_some_and(|e| !e.1) && !self.local {
             if !self.all_lanes(self.cur_ir) {
                 need(self.cur_ir);
                 return Err("a wave reduction where not every lane runs");
@@ -4152,7 +4154,19 @@ impl<'a> Lower<'a> {
         let p0 = self.s.m.element(at, lds, pair);
         let p1 = self.s.m.element(at, lds, k1);
         let lo = self.s.m.load(at, p0);
-        let hi = self.s.m.load(at, p1);
+        let mut hi = self.s.m.load(at, p1);
+        // For groups with a partial trailing console wave of 1..=32 threads
+        // (e.g. 96 threads = 3 Wave32 host waves), the last console wave has
+        // no upper half, so nobody writes `lds[pair + 1]`: force `hi = 0`.
+        let group = self.s.threads.map_or(0, |t| t.iter().product::<u32>());
+        let rem = group % 64;
+        if rem > 0 && rem <= 32 {
+            let thread = self.console_thread();
+            let cutoff = self.s.m.i32(group - rem);
+            let no_upper = self.s.m.cmp(at, pred::IUGE, thread, cutoff);
+            let z = self.s.m.i32(0);
+            hi = self.s.m.select(at, no_upper, z, hi);
+        }
         // the slots are written again only after every thread read them
         self.group_sync(at);
         (lo, hi)
@@ -4944,8 +4958,16 @@ impl<'a> Lower<'a> {
             let at = self.s.m.bin(c, Bin::Add, at, o);
             let two = self.s.m.i32(2);
             let src = self.s.m.bin(c, Bin::LShr, at, two);
-            let last = self.s.m.i32(self.wave() - 1);
-            let src = self.s.m.bin(c, Bin::And, src, last);
+            let console_wave = if self.x.native.wave64 { 64 } else { self.wave() };
+            let last = self.s.m.i32(console_wave - 1);
+            let src_console = self.s.m.bin(c, Bin::And, src, last);
+            let host_wave = self.wave();
+            let src_host = if host_wave < console_wave {
+                let mask = self.s.m.i32(host_wave - 1);
+                self.s.m.bin(c, Bin::And, src_console, mask)
+            } else {
+                src_console
+            };
             let x = match guard {
                 Some(g) => {
                     let z = self.s.m.i32(0);
@@ -4953,7 +4975,15 @@ impl<'a> Lower<'a> {
                 }
                 None => x,
             };
-            let r = self.read_lane(x, src);
+            let r = self.read_lane(x, src_host);
+            let r = if host_wave < console_wave {
+                let lim = self.s.m.i32(host_wave);
+                let in_wave = self.s.m.cmp(c, pred::IULT, src_console, lim);
+                let z = self.s.m.i32(0);
+                self.s.m.select(c, in_wave, r, z)
+            } else {
+                r
+            };
             let reg = dst_reg.ok_or("a permute result")?;
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
@@ -9432,7 +9462,7 @@ impl<'a> Lower<'a> {
             let t = self.binary(35, a, lo);
             let t = self.binary(36, t, hi);
             let r = self.s.m.cast(c, Cast::FpToSi, t, i32t);
-            let nan = self.s.m.cmp(c, pred::UNO, a, a);
+            let nan = self.is_nan_f32(a);
             let z = self.s.m.i32(0);
             let r = self.s.m.select(c, nan, z, r);
             return self.write_half(inst, r, guard);

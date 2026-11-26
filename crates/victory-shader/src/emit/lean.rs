@@ -204,8 +204,8 @@ pub(super) fn lane_uniform(
             {
                 // without `offen` and `idxen` the address register is not read
                 let addressed = !(offen || idxen)
-                    || (reg..reg.saturating_add(dwords))
-                        .all(|r| inst.read(Reg::V(r)).is_some_and(|a| same.contains(&a)));
+                    || (u16::from(reg)..u16::from(reg) + u16::from(dwords))
+                        .all(|r| u8::try_from(r).ok().and_then(|r| inst.read(Reg::V(r))).is_some_and(|a| same.contains(&a)));
                 if addressed {
                     same.extend(
                         inst.writes
@@ -232,31 +232,50 @@ pub(super) fn lane_uniform(
             // of the other VGPRs the instruction reads, the old values of
             // those it writes (unguarded here) do not count.
             let own = own_registers
-                && !(name.contains("mac") || name.contains("dot") || name.contains("movrel"));
+                && !(name.contains("mac")
+                    || name.contains("dot")
+                    || name.contains("movrel")
+                    || name.starts_with("v_swap"));
             let alike = ops.iter().all(|op| match *op {
                 Operand::Vector { reg, dwords } => {
-                    let end = if own {
-                        reg.saturating_add(dwords.max(1))
+                    let end: u16 = if own {
+                        u16::from(reg) + u16::from(dwords.max(1))
                     } else {
-                        u8::MAX
+                        256
                     };
                     let read: Vec<Value> = inst
                         .reads
                         .iter()
-                        .filter(|r| matches!(r.0, Reg::V(x) if x >= reg && (x < end || !own)))
+                        .filter(|r| matches!(r.0, Reg::V(x) if x >= reg && (u16::from(x) < end || !own)))
                         .map(|r| r.1)
                         .collect();
                     !read.is_empty() && read.iter().all(|x| same.contains(x))
                 }
                 // a scalar is one value; a lane mask is not, unless a compare of such values made it
-                Operand::Scalar { code, .. } if code != NULL => inst
-                    .read(Reg::S(code))
-                    .is_none_or(|x| !is_mask(x) || same.contains(&x)),
+                Operand::Scalar { code, dwords } if code != NULL => (u16::from(code)
+                    ..u16::from(code) + u16::from(dwords.max(1)))
+                    .all(|c| {
+                        u8::try_from(c).is_ok_and(|c| {
+                            inst.read(Reg::S(c))
+                                .is_none_or(|x| !is_mask(x) || same.contains(&x))
+                        })
+                    }),
+                _ => true,
+            }) && inst.reads.iter().all(|r| match r.0 {
+                // Implicit scalar reads (e.g. `VCC` in `v_div_fmas_f32` / `v_add_co_ci_u32`):
+                // a lane mask read implicitly makes the result lane-dependent unless uniform.
+                Reg::S(c) if c != crate::ir::EXEC && c != crate::ir::EXEC + 1 => {
+                    !is_mask(r.1) || same.contains(&r.1)
+                }
                 _ => true,
             }) && (!own || {
                 let in_operand = |x: u8| {
                     ops.iter().any(|op| {
-                        matches!(*op, Operand::Vector { reg, dwords } if x >= reg && x < reg.saturating_add(dwords.max(1)))
+                        matches!(
+                            *op,
+                            Operand::Vector { reg, dwords }
+                                if x >= reg && u16::from(x) < u16::from(reg) + u16::from(dwords.max(1))
+                        )
                     })
                 };
                 let written = |x: u8| inst.writes.iter().any(|w| w.0 == Reg::V(x));
@@ -359,8 +378,8 @@ pub(super) fn class_test(m: &mut Module, c: usize, x: V, mask: u32, f16: bool) -
         };
         let signed = run.negative.map(|negative| {
             let s = *sign.get_or_insert_with(|| {
-                let sh = k(m, sign_shift);
-                let s = m.bin(c, Bin::LShr, x, sh);
+                let bit = k(m, 1u32 << sign_shift);
+                let s = m.bin(c, Bin::And, x, bit);
                 let z = k(m, 0);
                 m.cmp(c, pred::NE, s, z)
             });
@@ -396,7 +415,7 @@ mod tests {
         };
         let e = x >> exp_sh & exp_mask;
         let m = x & mant_mask;
-        let neg = x >> sign_sh != 0;
+        let neg = x & (1u32 << sign_sh) != 0;
         let t = if m == 0 { 6 } else { 7 };
         let t = if e == 0 { t } else { 8 };
         let t = if e == exp_mask { 9 } else { t };
@@ -415,7 +434,7 @@ mod tests {
             (0x7FFF_FFFF, 31)
         };
         let abs = x & top;
-        let neg = x >> sign_shift != 0;
+        let neg = x & (1u32 << sign_shift) != 0;
         runs.iter()
             .any(|r| abs >= r.lo && abs <= r.hi && r.negative.is_none_or(|n| n == neg))
     }
@@ -431,6 +450,9 @@ mod tests {
             for x in [0x1_0000u32, 0x1_3C00, 0xFFFF_7C00] {
                 let want = mask >> class_of(x, true) & 1 != 0;
                 assert_eq!(runs_say(&runs, x, true), want, "mask {mask:#x} x {x:#x}");
+                // Upper 16 bits in a VGPR holding an f16 must not alter sign classification.
+                let low = mask >> class_of(x & 0xFFFF, true) & 1 != 0;
+                assert_eq!(runs_say(&runs, x, true), low, "f16 upper bits flipped class: mask {mask:#x} x {x:#x}");
             }
         }
     }

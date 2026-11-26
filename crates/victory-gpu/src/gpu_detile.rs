@@ -388,6 +388,10 @@ pub(crate) fn eligible(
     if slices == 0 || slices > layout.slices {
         return false;
     }
+    let required_tiled = layout.bytes_from(first);
+    if required_tiled == 0 || (tiled_len as u64) < required_tiled {
+        return false;
+    }
     let total_aligned = total_linear.next_multiple_of(4);
     for (i, ((fp, &sub_rows), &row_size)) in footprints
         .iter()
@@ -481,11 +485,13 @@ pub(crate) fn take_vram_buf(host: &Host, total: u64) -> Option<(ID3D12Resource, 
         let reused = {
             let mut spare = VRAM_SPARE.lock().unwrap_or_else(|e| e.into_inner());
             let taken = spare.0.get_mut(&pooled).and_then(|q| {
-                if q.front().is_some_and(|s| s.until_fence <= completed) {
-                    q.pop_front()
-                } else {
-                    None
-                }
+                // Only reuse once the compute detile fence completed AND no
+                // Direct/Copy command list or `in_flight` batch still holds a
+                // COM reference (`references == 1` => sole owner in pool).
+                let idx = q.iter().position(|s| {
+                    s.until_fence <= completed && crate::host::references(&s.buffer) == 1
+                })?;
+                q.remove(idx)
             });
             if taken.is_some() {
                 spare.1 -= pooled;
@@ -529,10 +535,13 @@ fn evict_completed_spares(target_bytes: u64) {
                 break;
             }
             if let Some(bucket) = buckets.get_mut(&size) {
-                while freed < target_bytes
-                    && bucket.front().is_some_and(|s| s.until_fence <= completed)
-                {
-                    if let Some(VramSpare { buffer, .. }) = bucket.pop_front() {
+                while freed < target_bytes {
+                    let Some(idx) = bucket.iter().position(|s| {
+                        s.until_fence <= completed && crate::host::references(&s.buffer) == 1
+                    }) else {
+                        break;
+                    };
+                    if let Some(VramSpare { buffer, .. }) = bucket.remove(idx) {
                         *total -= size;
                         freed += size;
                         retired.push(buffer);
@@ -552,6 +561,7 @@ fn evict_completed_spares(target_bytes: u64) {
 pub(crate) fn release_vram_buf(buffer: ID3D12Resource, alloc_size: u64, pooled: u64) {
     ACTIVE_VRAM_BYTES.fetch_sub(alloc_size, Ordering::Relaxed);
     if pooled == 0 {
+        crate::host::retire(buffer);
         return;
     }
     let until_fence = COMPUTE_SAFE_FENCE.load(Ordering::Acquire);
@@ -563,6 +573,9 @@ pub(crate) fn release_vram_buf(buffer: ID3D12Resource, alloc_size: u64, pooled: 
             .entry(pooled)
             .or_default()
             .push_back(VramSpare { buffer, until_fence });
+    } else {
+        drop(spare);
+        crate::host::retire(buffer);
     }
 }
 
@@ -988,100 +1001,13 @@ fn engine(host: &Host) -> Option<&'static Mutex<DetileEngine>> {
         .as_ref()
 }
 
-fn ensure_pattern_lut(
-    host: &Host,
-    luts: &mut HashMap<(u32, u32), LutEntry>,
-    list: &ID3D12GraphicsCommandList,
-    keep_resources: &mut Vec<ID3D12Resource>,
-    layout: &Layout,
-) -> windows::core::Result<u64> {
-    let key = (
-        layout.desc.swizzle.0,
-        layout.desc.element_bytes.trailing_zeros(),
-    );
-    if let Some(entry) = luts.get(&key) {
-        return Ok(entry.gpu);
-    }
-    let pat = layout.pattern();
-    let mut table = [0u32; 512];
-    table[..pat[0].len()].copy_from_slice(&pat[0]);
-    table[256..256 + pat[1].len()].copy_from_slice(&pat[1]);
-
-    let (stage, stage_ptr) = host
-        .upload_buffer(2048)
-        .ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: `stage_ptr` is a valid 2048-byte mapped upload buffer.
-    unsafe {
-        std::ptr::copy_nonoverlapping(table.as_ptr().cast::<u8>(), stage_ptr, 2048);
-    }
-
-    let heap = D3D12_HEAP_PROPERTIES {
-        Type: D3D12_HEAP_TYPE_DEFAULT,
-        ..Default::default()
-    };
-    let desc = D3D12_RESOURCE_DESC {
-        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-        Width: 2048,
-        Height: 1,
-        DepthOrArraySize: 1,
-        MipLevels: 1,
-        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
-            Count: 1,
-            Quality: 0,
-        },
-        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-        Flags: D3D12_RESOURCE_FLAG_NONE,
-        ..Default::default()
-    };
-    let mut lut_buf: Option<ID3D12Resource> = None;
-    // SAFETY: plain default-heap buffer creation and upload recorded onto the
-    // open compute command list; `stage` is retained in `keep_resources`.
-    let gpu = unsafe {
-        host.device.CreateCommittedResource(
-            &heap,
-            D3D12_HEAP_FLAG_NONE,
-            &desc,
-            D3D12_RESOURCE_STATE_COMMON,
-            None,
-            &mut lut_buf,
-        )?;
-        let lut_buf = lut_buf.ok_or_else(windows::core::Error::empty)?;
-        crate::host::name(&lut_buf, || {
-            format!("gpu detile lut sw{} e{}", key.0, key.1)
-        });
-        list.ResourceBarrier(&[transition(
-            &lut_buf,
-            D3D12_RESOURCE_STATE_COMMON,
-            D3D12_RESOURCE_STATE_COPY_DEST,
-        )]);
-        list.CopyBufferRegion(&lut_buf, 0, &stage, 0, 2048);
-        list.ResourceBarrier(&[transition(
-            &lut_buf,
-            D3D12_RESOURCE_STATE_COPY_DEST,
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-        )]);
-        let gpu = lut_buf.GetGPUVirtualAddress();
-        keep_resources.push(stage);
-        luts.insert(
-            key,
-            LutEntry {
-                _buffer: lut_buf,
-                gpu,
-            },
-        );
-        gpu
-    };
-    Ok(gpu)
-}
-
 #[allow(clippy::too_many_arguments)]
 fn record_detile_op(
-    host: &Host,
     detile_root: &ID3D12RootSignature,
     detile_pso: &ID3D12PipelineState,
     zero_root: &ID3D12RootSignature,
     zero_pso: &ID3D12PipelineState,
-    luts: &mut HashMap<(u32, u32), LutEntry>,
+    pat_gpu: u64,
     batch: &mut OpenBatch,
     dst_buffer: &ID3D12Resource,
     dst_base: u64,
@@ -1097,17 +1023,6 @@ fn record_detile_op(
     has_held: bool,
     has_unheld: bool,
 ) -> windows::core::Result<()> {
-    let pat_gpu = if has_held {
-        ensure_pattern_lut(
-            host,
-            luts,
-            &batch.cmd.list,
-            &mut batch.keep_resources,
-            layout,
-        )?
-    } else {
-        0
-    };
 
     let mips_per_slice = mips - first;
     let elem_bytes = layout.desc.element_bytes;
@@ -1441,7 +1356,7 @@ impl DetileEngine {
             self.queue.Signal(&self.fence, self.fence_val)?;
         }
         let val = self.fence_val;
-        COMPUTE_SAFE_FENCE.store(val, Ordering::Release);
+        COMPUTE_SAFE_FENCE.fetch_max(val, Ordering::AcqRel);
 
         let mut keep = batch.keep_resources;
         keep.extend(batch.touched_dsts.into_values());
@@ -1543,6 +1458,108 @@ impl DetileEngine {
         Ok(())
     }
 
+    /// Ensures the 2 KiB swizzle pattern LUT for `layout` is resident on the
+    /// GPU before ANY open batch submits on `self.queue`. Uploading on an
+    /// immediate one-shot compute command list submitted to `self.queue`
+    /// guarantees FIFO ordering for every concurrent batch (`Host::submit`
+    /// and `texture::ahead` copy-queue workers) with zero CPU stalls.
+    fn ensure_pattern_lut(
+        &mut self,
+        host: &Host,
+        layout: &Layout,
+    ) -> windows::core::Result<u64> {
+        let key = (
+            layout.desc.swizzle.0,
+            layout.desc.element_bytes.trailing_zeros(),
+        );
+        if let Some(entry) = self.luts.get(&key) {
+            return Ok(entry.gpu);
+        }
+        let pat = layout.pattern();
+        let mut table = [0u32; 512];
+        table[..pat[0].len()].copy_from_slice(&pat[0]);
+        table[256..256 + pat[1].len()].copy_from_slice(&pat[1]);
+
+        let (stage, stage_ptr) = host
+            .upload_buffer(2048)
+            .ok_or_else(windows::core::Error::empty)?;
+        // SAFETY: `stage_ptr` is a valid 2048-byte mapped upload buffer.
+        unsafe {
+            std::ptr::copy_nonoverlapping(table.as_ptr().cast::<u8>(), stage_ptr, 2048);
+        }
+
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 2048,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_NONE,
+            ..Default::default()
+        };
+        let cmd = self.take_cmd_list()?;
+        let mut lut_buf: Option<ID3D12Resource> = None;
+        // SAFETY: plain default-heap buffer creation and immediate one-shot
+        // upload submitted on `self.queue` ahead of every open detile batch.
+        let (lut_buf, gpu) = unsafe {
+            host.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut lut_buf,
+            )?;
+            let lut_buf = lut_buf.ok_or_else(windows::core::Error::empty)?;
+            crate::host::name(&lut_buf, || {
+                format!("gpu detile lut sw{} e{}", key.0, key.1)
+            });
+            cmd.list.ResourceBarrier(&[transition(
+                &lut_buf,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            )]);
+            cmd.list.CopyBufferRegion(&lut_buf, 0, &stage, 0, 2048);
+            cmd.list.ResourceBarrier(&[transition(
+                &lut_buf,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            )]);
+            cmd.list.Close()?;
+            let cmd_list: ID3D12CommandList = cmd.list.cast()?;
+            self.queue.ExecuteCommandLists(&[Some(cmd_list)]);
+            self.fence_val += 1;
+            self.queue.Signal(&self.fence, self.fence_val)?;
+            let gpu = lut_buf.GetGPUVirtualAddress();
+            (lut_buf, gpu)
+        };
+        let val = self.fence_val;
+        COMPUTE_SAFE_FENCE.fetch_max(val, Ordering::AcqRel);
+        self.in_flight.push_back(InFlightBatch {
+            until_fence: val,
+            cmd,
+            _used_slabs: Vec::new(),
+            _keep_resources: vec![stage, lut_buf.clone()],
+        });
+        self.luts.insert(
+            key,
+            LutEntry {
+                _buffer: lut_buf,
+                gpu,
+            },
+        );
+        Ok(gpu)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run_detile(
         &mut self,
@@ -1562,6 +1579,11 @@ impl DetileEngine {
         has_unheld: bool,
     ) -> windows::core::Result<()> {
         self.reclaim_completed();
+        let pat_gpu = if has_held {
+            self.ensure_pattern_lut(host, layout)?
+        } else {
+            0
+        };
         let batch_id = active_batch_id();
         // SAFETY: live D3D12 buffer.
         let dst_res_va = unsafe { dst_buffer.GetGPUVirtualAddress() };
@@ -1575,12 +1597,11 @@ impl DetileEngine {
             let slot = self.batches.get_mut(&batch_id).expect("slot ensured above");
             let batch = slot.open.as_mut().expect("open_batch ensured above");
             record_detile_op(
-                host,
                 &self.detile_root,
                 &self.detile_pso,
                 &self.zero_root,
                 &self.zero_pso,
-                &mut self.luts,
+                pat_gpu,
                 batch,
                 dst_buffer,
                 dst_base,
@@ -1596,7 +1617,7 @@ impl DetileEngine {
                 has_held,
                 has_unheld,
             )?;
-            COMPUTE_SAFE_FENCE.store(self.fence_val + 1, Ordering::Release);
+            COMPUTE_SAFE_FENCE.fetch_max(self.fence_val + 1, Ordering::AcqRel);
             let overflow = batch.raw_bytes >= BATCH_MAX_RAW_BYTES || batch.ops >= BATCH_MAX_OPS;
             if overflow {
                 let full = self
@@ -1617,12 +1638,11 @@ impl DetileEngine {
         // Immediate synchronous fallback outside any active batch.
         let mut batch = OpenBatch::new(self.take_cmd_list()?);
         record_detile_op(
-            host,
             &self.detile_root,
             &self.detile_pso,
             &self.zero_root,
             &self.zero_pso,
-            &mut self.luts,
+            pat_gpu,
             &mut batch,
             dst_buffer,
             dst_base,
@@ -1677,7 +1697,7 @@ impl DetileEngine {
                 dst_base,
                 dst_total,
             );
-            COMPUTE_SAFE_FENCE.store(self.fence_val + 1, Ordering::Release);
+            COMPUTE_SAFE_FENCE.fetch_max(self.fence_val + 1, Ordering::AcqRel);
             let overflow = batch.ops >= BATCH_MAX_OPS;
             if overflow {
                 let full = self

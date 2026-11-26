@@ -209,9 +209,9 @@ pub(crate) struct Replay {
     #[arg(long)]
     retranslate: Option<PathBuf>,
     /// With --retranslate: the view heap's null slot, and where raw twins of
-    /// views start, as the capture's shaders have them (0: none).
-    #[arg(long, default_value_t = 0)]
-    view_limit: u32,
+    /// views start, as the capture's shaders have them (omit to probe host).
+    #[arg(long)]
+    view_limit: Option<u32>,
     #[arg(long, default_value_t = 0)]
     raw_views: u32,
     /// Use the D3D12 debug layer (slow).
@@ -434,7 +434,16 @@ pub(crate) fn run(r: Replay) -> Result<()> {
 }
 
 /// Translates the capture's shaders into `into`.
-fn retranslate(folder: &std::path::Path, into: &std::path::Path, view_limit: u32, raw_views: u32) -> Result<()> {
+fn retranslate(
+    folder: &std::path::Path,
+    into: &std::path::Path,
+    view_limit: Option<u32>,
+    raw_views: u32,
+) -> Result<()> {
+    anyhow::ensure!(
+        raw_views == 0 || raw_views.is_power_of_two(),
+        "--raw-views must be 0 or a power of two (got {raw_views})"
+    );
     use std::sync::atomic::{AtomicUsize, Ordering};
     let wanted = play::title_shaders(folder)?;
     let kept = play::find(folder)?.with_file_name("containers");
@@ -468,15 +477,23 @@ fn retranslate(folder: &std::path::Path, into: &std::path::Path, view_limit: u32
     let (detected_wave, detected_rdna) = victory_shader::emit::host::Host::new(false)
         .map(|h| h.wave_and_rdna())
         .unwrap_or((32, false));
-    let max_wave = std::env::var("VICTORY_HOST_WAVE")
+    let max_wave = std::env::var("VICTORY_HOST_MAX_WAVE")
         .ok()
+        .or_else(|| std::env::var("VICTORY_HOST_WAVE").ok())
         .and_then(|v| v.parse().ok())
         .unwrap_or(detected_wave);
     let rdna = std::env::var_os("VICTORY_HOST_RDNA")
         .map_or(detected_rdna, |v| v == "1");
     victory_shader::emit::set_host_max_wave(max_wave);
     victory_shader::emit::set_host_rdna(rdna);
-    victory_shader::emit::set_view_heap_limit(view_limit);
+    let limit = view_limit.unwrap_or_else(|| {
+        if raw_views > 0 {
+            raw_views - 1
+        } else {
+            1_000_000 - 1 - (1 << 18)
+        }
+    });
+    victory_shader::emit::set_view_heap_limit(limit);
     victory_shader::emit::set_raw_views(raw_views);
     let all: Vec<_> = wanted.iter().collect();
     let (next, done) = (AtomicUsize::new(0), AtomicUsize::new(0));

@@ -152,11 +152,39 @@ struct Checks {
     host: Option<(Host, emit::HostShader)>,
 }
 
+/// Probes the host GPU (Wave32 vs Wave64, RDNA float semantics) and applies
+/// any explicit environment overrides (`VICTORY_HOST_MAX_WAVE`,
+/// `VICTORY_HOST_WAVE`, `VICTORY_HOST_RDNA`) so offline translation and shader
+/// pre-warming match runtime DXIL emission on NVIDIA Blackwell and AMD alike.
+fn configure_host_target() {
+    let (detected_wave, detected_rdna) = Host::new(false)
+        .map(|h| h.wave_and_rdna())
+        .unwrap_or((32, false));
+    let max_wave = std::env::var("VICTORY_HOST_MAX_WAVE")
+        .ok()
+        .or_else(|| std::env::var("VICTORY_HOST_WAVE").ok())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(detected_wave);
+    let rdna = std::env::var_os("VICTORY_HOST_RDNA").map_or(detected_rdna, |v| v == "1");
+    victory_shader::emit::set_host_max_wave(max_wave);
+    victory_shader::emit::set_host_rdna(rdna);
+}
+
+/// Default worker count for shader warm-up / precompilation: physical-core
+/// friendly on 6C/12T Ryzen 5600X (`half threads`, clamped to `2..=6`).
+fn default_warm_threads(jobs: Option<usize>) -> usize {
+    jobs.unwrap_or_else(|| {
+        std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).clamp(2, 6))
+    })
+    .max(1)
+}
+
 /// `translate --warm <file>`: the containers whose hash the file names are
 /// translated into the run's shader cache, on `jobs` threads; nothing is
 /// made on the GPU. A run of the title then finds them there instead of
 /// translating each at its first use.
 pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()> {
+    configure_host_target();
     // `--warm all`: every container found, whatever its hash.
     let all = file.as_os_str() == "all";
     let mut wanted: HashSet<String> = HashSet::new();
@@ -177,7 +205,7 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
     let cfg = victory_core::Config::load()?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let paths = crate::default_paths(paths)?;
-    let threads = jobs.unwrap_or(4).max(1);
+    let threads = default_warm_threads(jobs);
     let began = std::time::Instant::now();
     let done = Mutex::new(HashSet::new());
     let counts = [const { AtomicUsize::new(0) }; 5];
@@ -245,13 +273,7 @@ pub fn run(
         victory_core::ensure_outside_repo(Path::new(&dir))?;
     }
     let paths = crate::default_paths(paths)?;
-    // `VICTORY_HOST_MAX_WAVE=32`: translate as for a host whose waves have
-    // at most 32 lanes (as the runtime does on such a card).
-    if let Some(n) = std::env::var("VICTORY_HOST_MAX_WAVE").ok().and_then(|v| v.parse().ok()) {
-        victory_shader::emit::set_host_max_wave(n);
-    }
-    // `VICTORY_HOST_RDNA=1`: as for an AMD RDNA card (`VICTORY_RDNA_FLOAT`).
-    victory_shader::emit::set_host_rdna(std::env::var_os("VICTORY_HOST_RDNA").is_some_and(|v| v == "1"));
+    configure_host_target();
     let dll = validate.then(Validator::default_path).flatten();
     if validate {
         Validator::load(dll.as_deref()).map_err(anyhow::Error::msg)?;
@@ -395,11 +417,11 @@ pub fn run(
 
 /// Every shader found into the cache runs translate from.
 pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
+    configure_host_target();
     let cfg = victory_core::Config::load()?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let paths = crate::default_paths(paths)?;
-    let threads =
-        jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    let threads = default_warm_threads(jobs);
     let started = std::time::Instant::now();
     let seen = Mutex::new(HashSet::new());
     let done = AtomicUsize::new(0);

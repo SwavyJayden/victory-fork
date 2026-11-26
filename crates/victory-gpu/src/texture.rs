@@ -927,7 +927,10 @@ fn record_upload(
         unsafe { list.list.ResourceBarrier(&[aliasing]) };
     }
     crate::list::ensure_state(list, resource, COPY_DEST);
-    // The staging/plane upload buffer lives until the list is reset.
+    // Keep the staging/plane upload buffer alive (and its COM refcount >= 2)
+    // until this list finishes executing and resets so `gpu_detile`'s VRAM
+    // spare pool never recycles a buffer while `CopyTextureRegion` reads it.
+    list.keep(source);
     for (i, footprint) in staging.footprints.iter().enumerate() {
         #[cfg(feature = "diagnostics")]
         {
