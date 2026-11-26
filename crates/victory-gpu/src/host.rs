@@ -169,10 +169,10 @@ fn vram_idle_for(video_memory: Option<[u64; 4]>, keep: bool) -> u64 {
         let free = budget.saturating_sub(used);
         if used_pct >= 92 || free < GIB {
             HIGH_MS
-        } else if used_pct >= 85 || free < 2 * GIB {
+        } else if used_pct >= 86 || free < 2 * GIB {
             MODERATE_MS
         } else if used_pct >= 75 || free < 3 * GIB {
-            NORMAL_MS
+            if keep { RELAXED_MS } else { NORMAL_MS }
         } else if !keep {
             RELAXED_MS
         } else if used_pct >= 68 {
@@ -11276,7 +11276,7 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // Extended retention on > 12 GiB preserves tiered pressure thresholds
         assert_eq!(keeps(Some([15 * gib, 8 * gib, 0, 0])), 600_000);
         assert_eq!(keeps(Some([15 * gib, 10 * gib + gib / 2, 0, 0])), 30_000);
-        assert_eq!(keeps(Some([15 * gib, 12 * gib, 0, 0])), 5_000);
+        assert_eq!(keeps(Some([15 * gib, 12 * gib, 0, 0])), 15_000);
         assert_eq!(keeps(Some([15 * gib, 13 * gib, 0, 0])), 2_500);
         assert_eq!(keeps(Some([15 * gib, 14 * gib + gib / 2, 0, 0])), 1_000);
         // `VICTORY_TEXTURE_KEEP=0` preserves original tiers
