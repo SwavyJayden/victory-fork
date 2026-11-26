@@ -1762,16 +1762,24 @@ impl Staging {
     /// title memory).
     fn ensure_vram_zeroed(&self) {
         let mut guard = self.upload.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(upload) = guard.as_mut()
+        let cleared = if let Some(upload) = guard.as_mut()
             && upload.vram
             && upload.needs_zero
             && let Some(host) = host()
         {
-            crate::gpu_detile::zero_buffer(host, &upload.buffer, upload.base, self.bytes);
-            upload.needs_zero = false;
+            if crate::gpu_detile::zero_buffer(host, &upload.buffer, upload.base, self.bytes) {
+                upload.needs_zero = false;
+                true
+            } else {
+                false
+            }
+        } else {
+            true
+        };
+        if cleared {
+            self.vram_needs_zero
+                .store(false, std::sync::atomic::Ordering::Release);
         }
-        self.vram_needs_zero
-            .store(false, std::sync::atomic::Ordering::Release);
     }
 
     fn refresh_timed(&self) -> usize {
@@ -2977,6 +2985,211 @@ mod staging_tests {
             [3, 0, 0, 0, 131, 0, 79, (8 << 16) | 1, 28, 1, 0, 0x105, 0, 0],
             true,
         );
+    }
+
+    /// End-to-end batched `Staging` test exercising `BatchGuard::begin()` ->
+    /// multiple textures (including 4–16 KiB textures newly eligible under
+    /// `MIN_BYTES = 4 KiB`) refreshed in ONE batch with zero CPU waits ->
+    /// `BatchGuard::flush(host.queue())` -> direct-queue `CopyTextureRegion` ->
+    /// readback 100% bit-exact against CPU detiling with zero D3D12 debug errors.
+    #[test]
+    fn gpu_detile_batched_staging_end_to_end_matches_cpu() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let res_iid = crate::object::guid(
+            0x6964_42be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+
+        let read_all_mips = |tex: &ID3D12Resource| -> Vec<u8> {
+            // SAFETY: live D3D12 texture.
+            let d = unsafe { tex.GetDesc() };
+            let count = u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize);
+            let mut fps = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
+            let mut sub_rows = vec![0u32; count as usize];
+            let mut sub_row_sizes = vec![0u64; count as usize];
+            let mut total = 0u64;
+            // SAFETY: plain footprint query.
+            unsafe {
+                host.device.GetCopyableFootprints(
+                    &d,
+                    0,
+                    count,
+                    0,
+                    Some(fps.as_mut_ptr()),
+                    Some(sub_rows.as_mut_ptr()),
+                    Some(sub_row_sizes.as_mut_ptr()),
+                    Some(&mut total),
+                );
+            }
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_READBACK,
+                ..Default::default()
+            };
+            let buf_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: total.max(4),
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut rb: Option<ID3D12Resource> = None;
+            // SAFETY: plain readback buffer creation.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &buf_desc,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        None,
+                        &mut rb,
+                    )
+                    .unwrap();
+            }
+            let rb = rb.unwrap();
+            let list = host.new_list().unwrap();
+            for (sub, fp) in fps.iter().enumerate() {
+                let src = D3D12_TEXTURE_COPY_LOCATION {
+                    // SAFETY: borrowed COM pointer.
+                    pResource: unsafe { std::mem::transmute_copy(tex) },
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        SubresourceIndex: sub as u32,
+                    },
+                };
+                let dst = D3D12_TEXTURE_COPY_LOCATION {
+                    // SAFETY: borrowed COM pointer.
+                    pResource: unsafe { std::mem::transmute_copy(&rb) },
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *fp },
+                };
+                // SAFETY: open list; `tex` was left in COPY_SOURCE by caller.
+                unsafe { list.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None) };
+            }
+            list.close();
+            host.execute(&[&list]);
+            let mut ptr = std::ptr::null_mut();
+            // SAFETY: readback completed via `host.execute`.
+            unsafe {
+                rb.Map(0, None, Some(&mut ptr)).unwrap();
+                let raw = std::slice::from_raw_parts(ptr.cast::<u8>(), total as usize);
+                let mut out = Vec::new();
+                for ((fp, &rows), &row_size) in
+                    fps.iter().zip(&sub_rows).zip(&sub_row_sizes)
+                {
+                    let base = fp.Offset as usize;
+                    let pitch = fp.Footprint.RowPitch as usize;
+                    let active = row_size as usize;
+                    for y in 0..rows as usize {
+                        out.extend_from_slice(&raw[base + y * pitch..base + y * pitch + active]);
+                    }
+                }
+                rb.Unmap(0, None);
+                out
+            }
+        };
+
+        let cases: [[u32; 14]; 3] = [
+            // 32x32 RGBA8 (4 KiB tiled, SW_4KB_S 0x105) -> verifies lowered 4 KiB MIN_BYTES!
+            [3, 0, 0, 0, 32, 0, 32, (1 << 16) | 1, 28, 1, 0, 0x105, 0, 0],
+            // 256x256 BC7 9-mip with mip tail (SW_64KB_D 0x10a)
+            [3, 0, 0, 0, 256, 0, 256, (9 << 16) | 1, 98, 1, 0, 0x10a, 0, 0],
+            // 131x79 RGBA8 8-mip NPOT with mip tail (SW_4KB_S 0x105)
+            [3, 0, 0, 0, 131, 0, 79, (8 << 16) | 1, 28, 1, 0, 0x105, 0, 0],
+        ];
+
+        let run_all = |use_gpu: bool| -> Vec<Vec<u8>> {
+            let _guard = crate::gpu_detile::OverrideGuard::set(use_gpu);
+            let mut backings: Vec<Vec<u8>> = Vec::new();
+            let mut resources: Vec<(crate::object::This, &ID3D12Resource)> = Vec::new();
+            for (idx, words) in cases.iter().enumerate() {
+                // SAFETY: 14 u32 words = 56-byte ResourceDesc.
+                let desc: crate::resource::ResourceDesc = unsafe { std::mem::transmute(*words) };
+                let layout = crate::resource::texture_layout(&desc)
+                    .expect("valid console layout")
+                    .planes[0]
+                    .layout
+                    .clone();
+                let backing: Vec<u8> = (0..layout.size as usize)
+                    .map(|i| {
+                        ((i.wrapping_mul(131 + idx * 17).wrapping_add(idx * 29) ^ (i >> 7)) & 0xff)
+                            as u8
+                    })
+                    .collect();
+                backings.push(backing);
+            }
+            let list = host.new_list().unwrap();
+            for (words, backing) in cases.iter().zip(&backings) {
+                // SAFETY: 14 u32 words = 56-byte ResourceDesc.
+                let desc: crate::resource::ResourceDesc = unsafe { std::mem::transmute(*words) };
+                let mut res: crate::object::This = std::ptr::null();
+                let hr = crate::resource::create_at_address(
+                    std::ptr::null(),
+                    backing.as_ptr() as u64,
+                    &desc,
+                    0,
+                    std::ptr::null(),
+                    &res_iid,
+                    &mut res,
+                );
+                assert_eq!(hr, 0, "create_at_address failed");
+                let tex = crate::resource::host_resource(res).expect("host texture");
+                super::upload(&list, res, tex);
+                crate::list::ensure_state(&list, res, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+                resources.push((res, tex));
+            }
+            list.close();
+
+            if use_gpu {
+                // Refresh all 3 textures inside ONE async compute batch and
+                // flush via GPU-side `direct_queue.Wait` right before executing `list`!
+                let batch = crate::gpu_detile::BatchGuard::begin();
+                for &(res, _) in &resources {
+                    let staging = {
+                        let map = super::STAGING.read().unwrap_or_else(|e| e.into_inner());
+                        map.as_ref().unwrap().get(&(res as usize)).unwrap().clone()
+                    };
+                    assert!(staging.gpu_detile, "all 3 cases (>= 4 KiB) must use gpu_detile");
+                    staging.refresh_now();
+                }
+                batch.flush(host.queue());
+            }
+
+            host.execute(&[&list]);
+            if let Some(err) = host.log_messages() {
+                panic!("D3D12 debug layer error (batched use_gpu={use_gpu}): {err}");
+            }
+
+            let out: Vec<Vec<u8>> = resources.iter().map(|&(_, tex)| read_all_mips(tex)).collect();
+            drop(list);
+            for (res, _) in resources {
+                super::forget(res as usize);
+                // SAFETY: valid COM object returned by `create_at_address`.
+                unsafe {
+                    type Release = unsafe extern "system" fn(crate::object::This) -> u32;
+                    let vtable = *res.cast::<*const [Release; 3]>();
+                    ((*vtable)[2])(res);
+                }
+            }
+            out
+        };
+
+        let gpu_out = run_all(true);
+        let cpu_out = run_all(false);
+        assert_eq!(gpu_out.len(), cpu_out.len());
+        for (i, (g, c)) in gpu_out.iter().zip(&cpu_out).enumerate() {
+            assert_eq!(g, c, "batched end-to-end GPU vs CPU mismatch on case {i}");
+        }
     }
 }
 
