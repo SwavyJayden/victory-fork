@@ -672,16 +672,36 @@ pub(crate) fn is_depth_stencil_format(format: u32) -> bool {
 }
 
 #[cfg(any(windows, test))]
-pub(crate) fn ped_tex_diag_from(raw: Option<&str>) -> bool {
-    raw.is_some_and(|v| v.trim() == "1")
+pub(crate) fn ped_tex_diag_level_from(raw: Option<&str>) -> u8 {
+    match raw.map(str::trim) {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => 0,
+    }
 }
 
-/// Opt-in ped / BC texture diagnostic (`VICTORY_PED_TEX_DIAG=1`; off by default,
-/// zero cost when unset or `0`).
+#[cfg(test)]
+pub(crate) fn ped_tex_diag_from(raw: Option<&str>) -> bool {
+    ped_tex_diag_level_from(raw) != 0
+}
+
+/// Opt-in ped / BC texture diagnostic (`VICTORY_PED_TEX_DIAG=1|2`; off by
+/// default, zero cost when unset or `0`; `2` raises signature cap 64 -> 512
+/// so world/cutscene ped textures are not truncated behind loading logs).
+#[cfg(windows)]
+pub(crate) fn ped_tex_diag_level() -> u8 {
+    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| ped_tex_diag_level_from(std::env::var("VICTORY_PED_TEX_DIAG").ok().as_deref()))
+}
+
 #[cfg(windows)]
 pub(crate) fn ped_tex_diag() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| ped_tex_diag_from(std::env::var("VICTORY_PED_TEX_DIAG").ok().as_deref()))
+    ped_tex_diag_level() != 0
+}
+
+#[cfg(windows)]
+pub(crate) fn ped_tex_diag_cap() -> usize {
+    if ped_tex_diag_level() >= 2 { 512 } else { 64 }
 }
 
 impl PlacedFootprint {
@@ -1410,8 +1430,9 @@ fn log_ped_alias_hit(
         (u64::from(o.mip_levels) << 16) | u64::from(o.depth_or_array_size),
     ];
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if seen.len() < 64 && seen.insert(key) {
+    if seen.len() < ped_tex_diag_cap() && seen.insert(key) {
         tracing::info!(
+            frame = crate::frame::current(),
             table,
             matched,
             placed,
@@ -5489,6 +5510,8 @@ float4 lit() : SV_Target { return 1.0; }
         assert!(!ped_tex_diag_from(Some("yes")));
         assert!(ped_tex_diag_from(Some("1")));
         assert!(ped_tex_diag_from(Some(" 1 ")));
+        assert_eq!(ped_tex_diag_level_from(Some("2")), 2);
+        assert!(ped_tex_diag_from(Some("2")));
 
         for fmt in [70u32, 71, 72, 77, 78, 80, 83, 84, 94, 98, 99] {
             assert!(is_bc_format(fmt), "BC format {fmt}");

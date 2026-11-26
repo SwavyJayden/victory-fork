@@ -92,6 +92,77 @@ fn prep_part(i: usize, since: std::time::Instant) -> std::time::Instant {
     now
 }
 
+/// Whether per-stage advanced telemetry is emitted every reporting interval
+/// (`VICTORY_ADV_LOG=1`; off by default for zero timing overhead).
+pub(crate) fn adv_log() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_ADV_LOG")
+            .ok()
+            .is_some_and(|v| matches!(v.trim(), "1" | "2"));
+        if on {
+            tracing::info!("advanced per-stage frame telemetry enabled (VICTORY_ADV_LOG=1)");
+        }
+        on
+    })
+}
+
+/// Per-step timing (us, count) inside `lists' steps` when [`adv_log`] is on:
+/// `[0..2]` Copy, `[2..4]` Fill, `[4..6]` Run/Host, `[6..8]` flush_one,
+/// `[8..10]` shadow.writing, `[10..12]` Texture refresh, `[12..14]` prelude.
+static ADV_STEPS: [std::sync::atomic::AtomicU64; 14] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 14];
+
+/// Per-stage timing and routing counts inside `card_before` when [`adv_log`] is on:
+/// `[0]` copy_q_us, `[1]` scatter_pack_us, `[2]` direct_copy_us, `[3]` scatter_disp_us,
+/// `[4]` rehash_us, `[5]` compare_us, `[6]` scatter_ranges, `[7]` scatter_bytes,
+/// `[8]` copy_ranges, `[9]` copy_bytes, `[10]` scatter_jobs, `[11]` scatter_dispatches.
+static ADV_CARD: [std::sync::atomic::AtomicU64; 12] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 12];
+
+/// Relay copy-back stage timing (us) when [`adv_log`] is on:
+/// `[0]` inflight_copy_down, `[1]` inflight_merge (card_merge_relay).
+static ADV_BACK: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Emits the two structured `adv-log` lines once per reporting interval when
+/// `VICTORY_ADV_LOG=1` is active.
+fn adv_log_line(frames: f64) {
+    if !adv_log() {
+        return;
+    }
+    let s: [u64; 14] = std::array::from_fn(|i| ADV_STEPS[i].swap(0, Ordering::Relaxed));
+    let c: [u64; 12] = std::array::from_fn(|i| ADV_CARD[i].swap(0, Ordering::Relaxed));
+    let b: [u64; 2] = std::array::from_fn(|i| ADV_BACK[i].swap(0, Ordering::Relaxed));
+    let wo = crate::inplace::take_write_own_stats();
+    let ms = |us: u64| us as f64 / 1000.0 / frames;
+    let cnt = |n: u64| n as f64 / frames;
+    let mb = |bytes: u64| bytes as f64 / 1e6 / frames;
+    tracing::info!(
+        "adv-log steps: copy={:.2}ms({:.0}) fill={:.2}ms({:.0}) run={:.2}ms({:.0}) \
+         flush_one={:.2}ms({:.0}) writing={:.2}ms({:.0}) tex={:.2}ms({:.0}) prelude={:.2}ms({:.0})",
+        ms(s[0]), cnt(s[1]),
+        ms(s[2]), cnt(s[3]),
+        ms(s[4]), cnt(s[5]),
+        ms(s[6]), cnt(s[7]),
+        ms(s[8]), cnt(s[9]),
+        ms(s[10]), cnt(s[11]),
+        ms(s[12]), cnt(s[13]),
+    );
+    tracing::info!(
+        "adv-log card-back: copy_q={:.2}ms scatter_pack={:.2}ms direct_copy={:.2}ms \
+         scatter_disp={:.2}ms rehash={:.2}ms compare={:.2}ms | \
+         scatter={:.0}r/{:.2}MB({:.0}j/{:.0}d) copy={:.0}r/{:.2}MB | \
+         inflight_down={:.2}ms inflight_merge={:.2}ms | \
+         write_own ok={:.0} cross={:.0} not_view={:.0} many={:.0} fail={:.0}",
+        ms(c[0]), ms(c[1]), ms(c[2]), ms(c[3]), ms(c[4]), ms(c[5]),
+        cnt(c[6]), mb(c[7]), cnt(c[10]), cnt(c[11]),
+        cnt(c[8]), mb(c[9]),
+        ms(b[0]), ms(b[1]),
+        cnt(wo[0]), cnt(wo[1]), cnt(wo[2]), cnt(wo[3]), cnt(wo[4]),
+    );
+}
+
 /// A retired object, dropped on whatever thread finishes the submission.
 struct Retired(#[allow(dead_code)] Box<dyn std::any::Any>);
 // SAFETY: what is retired is D3D12 objects (free-threaded) and the
@@ -1817,6 +1888,27 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     drop(freed);
 }
 
+/// Per-slot upload buffers feeding [`CARD_SCATTER`]: `jobs` (12 bytes per job:
+/// `(dst_off, src_off, dwords)`) and `payload` (packed 4-byte-aligned bytes).
+struct ScatterBuf {
+    jobs: (ID3D12Resource, usize, u64),
+    payload: (ID3D12Resource, usize, u64),
+}
+
+/// One reusable pre-submission sync list and its optional [`CARD_SCATTER`]
+/// upload buffers, kept alive in [`CardPlan::lists`] until the submission
+/// completes on the GPU.
+struct SyncSlot {
+    prelude: Prelude,
+    scatter: Option<ScatterBuf>,
+}
+
+/// One command list owned by a [`CardPlan`] and returned by [`Host::card_done`].
+enum CardList {
+    Sync(SyncSlot),
+    Check(Prelude),
+}
+
 /// What the host keeps for copies in the card's own memory
 /// ([`crate::shadow::cards`]): three lists of ours and the compare.
 struct CardWork {
@@ -1824,7 +1916,7 @@ struct CardWork {
     /// goes to their card side. Those not in use: a plan takes one and
     /// gives it back when its submission has run (`Host::card_done`), so
     /// that submissions sent ahead ([`late`]) each have their own.
-    sync: Vec<Prelude>,
+    sync: Vec<SyncSlot>,
     /// After them, in the same submission: the compare of the declared
     /// ranges with their bytes from before. As `sync`.
     check: Vec<Prelude>,
@@ -1832,6 +1924,9 @@ struct CardWork {
     fetch: Prelude,
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
+    /// Compute scatter uploader ([`CARD_SCATTER`]) for dense tiny 4B-aligned
+    /// dirty runs, when [`card_scatter`] is enabled and compilation succeeded.
+    scatter: Option<(ID3D12RootSignature, ID3D12PipelineState)>,
     /// One dword per piece compared, set where the piece differs: PC
     /// memory, mapped (buffer, mapping, bytes).
     differs: (ID3D12Resource, usize, u64),
@@ -2243,6 +2338,109 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
     }
 }
 "#;
+/// Compute scatter uploader for dense tiny 4-byte-aligned dirty ranges on
+/// card-local shadows ([`card_scatter`]). Collapses tens of thousands of
+/// `CopyBufferRegion` API calls per frame (e.g. ~65-byte `merge_under_writes`
+/// runs) into a single `Dispatch`, byte-exact without bridging over unwritten
+/// gaps.
+pub(crate) const CARD_SCATTER: &str = r#"
+#define RS "RootConstants(num32BitConstants=2, b0), SRV(t0), SRV(t1), UAV(u0)"
+cbuffer Meta : register(b0) {
+    uint job_base;
+    uint job_count;
+};
+// Each job is 3 uints (12 bytes): dst_off (bytes, 4B aligned),
+// src_off (bytes, 4B aligned), dwords (1..=64).
+ByteAddressBuffer jobs : register(t0);
+ByteAddressBuffer payload : register(t1);
+RWByteAddressBuffer dst : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= job_count) return;
+    uint j = (job_base + id.x) * 12u;
+    uint3 job = jobs.Load3(j);
+    uint d = job.x;
+    uint s = job.y;
+    uint n = job.z;
+    uint i = 0u;
+    [loop]
+    for (; i + 4u <= n; i += 4u) {
+        dst.Store4(d + i * 4u, payload.Load4(s + i * 4u));
+    }
+    [loop]
+    for (; i < n; i += 1u) {
+        dst.Store(d + i * 4u, payload.Load(s + i * 4u));
+    }
+}
+"#;
+
+/// Minimum small 4-byte-aligned dirty ranges on one shadow before routing
+/// them through [`CARD_SCATTER`] instead of `CopyBufferRegion`.
+const SCATTER_MIN_RANGES: usize = 16;
+/// Maximum single dirty range length (bytes) routed to [`CARD_SCATTER`];
+/// larger ranges stay on `CopyBufferRegion` (DMA copy queue).
+const SCATTER_MAX_RUN: usize = 16 << 10;
+/// Maximum dwords copied per [`CARD_SCATTER`] thread job (256 bytes), so
+/// multi-KiB scatter runs fan out cleanly across GPU warps.
+const SCATTER_MAX_JOB_DWORDS: u32 = 64;
+/// Maximum jobs per single `Dispatch` (`65535` groups x `64` threads).
+const SCATTER_MAX_DISPATCH_JOBS: u32 = 65535 * 64;
+
+fn parse_card_scatter(val: Option<&str>) -> bool {
+    val.is_none_or(|v| v.trim() != "0")
+}
+
+/// Whether dense small 4-byte-aligned dirty ranges upload via [`CARD_SCATTER`]
+/// (on by default; `VICTORY_CARD_SCATTER=0` restores `CopyBufferRegion` for all
+/// ranges).
+fn card_scatter() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = parse_card_scatter(std::env::var("VICTORY_CARD_SCATTER").ok().as_deref());
+        if on {
+            tracing::info!(
+                "card copies' dense small dirty ranges upload via GPU compute scatter (VICTORY_CARD_SCATTER=0 for CopyBufferRegion)"
+            );
+        }
+        on
+    })
+}
+
+/// Partitions a shadow's sorted disjoint dirty `ranges` into
+/// `(copy_runs, scatter_runs)`. Only 4-byte-aligned ranges up to
+/// [`SCATTER_MAX_RUN`] bytes are eligible for [`CARD_SCATTER`], and only when
+/// at least [`SCATTER_MIN_RANGES`] such ranges exist for the shadow.
+fn partition_scatter_ranges(
+    ranges: &[(usize, usize)],
+    enabled: bool,
+) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+    if !enabled {
+        return (ranges.to_vec(), Vec::new());
+    }
+    let eligible = |&(a, b): &(usize, usize)| -> bool {
+        a < b
+            && (a & 3) == 0
+            && (b & 3) == 0
+            && (b - a) <= SCATTER_MAX_RUN
+            && b <= u32::MAX as usize
+    };
+    let count = ranges.iter().filter(|r| eligible(r)).count();
+    if count < SCATTER_MIN_RANGES {
+        return (ranges.to_vec(), Vec::new());
+    }
+    let mut copy_runs = Vec::with_capacity(ranges.len() - count);
+    let mut scatter_runs = Vec::with_capacity(count);
+    for &r in ranges {
+        if eligible(&r) {
+            scatter_runs.push(r);
+        } else {
+            copy_runs.push(r);
+        }
+    }
+    (copy_runs, scatter_runs)
+}
+
 /// Whether the pieces hashed again after ranges were sent up to a copy in
 /// the card's memory are hashed in runs of pieces that touch, each piece
 /// once (`VICTORY_CARD_REHASH_RUNS=1`; off by default), and not in a pass
@@ -2321,9 +2519,8 @@ struct CardPlan {
     /// The copies whose card side was brought up to date, alive until the
     /// submission has run.
     _synced: Vec<std::sync::Arc<crate::shadow::Shadow>>,
-    /// The lists of ours the plan recorded (whether the compare, the
-    /// list), given back by `Host::card_done`.
-    lists: Vec<(bool, Prelude)>,
+    /// The lists of ours the plan recorded, given back by `Host::card_done`.
+    lists: Vec<CardList>,
     /// With [`relay`], the number of this plan's send of changed ranges
     /// (`QUEUE_ORDER`); else 0.
     sent_as: u64,
@@ -5586,11 +5783,12 @@ impl Host {
                 ..Default::default()
             })?;
             Ok(CardWork {
-                sync: vec![list()?],
+                sync: vec![SyncSlot { prelude: list()?, scatter: None }],
                 check: vec![list()?],
                 fetch: list()?,
                 root,
                 pso,
+                scatter: if card_scatter() { self.make_card_scatter() } else { None },
                 differs: (differs, data as usize, RESULTS),
                 fetched: None,
                 taken: 0,
@@ -5598,6 +5796,91 @@ impl Host {
                 inflight: if inflight_fetch() { self.make_card_inflight(RESULTS) } else { None },
             })
         }
+    }
+
+    /// Compiles [`CARD_SCATTER`] and creates its root signature and compute
+    /// PSO. Returns `None` on failure so `card_before` falls back cleanly to
+    /// `CopyBufferRegion`.
+    fn make_card_scatter(&self) -> Option<(ID3D12RootSignature, ID3D12PipelineState)> {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        let made = (|| -> windows::core::Result<(ID3D12RootSignature, ID3D12PipelineState)> {
+            let mut code: Option<ID3DBlob> = None;
+            // SAFETY: the source and names live through the call; the out pointer is ours.
+            unsafe {
+                D3DCompile(
+                    CARD_SCATTER.as_ptr().cast(),
+                    CARD_SCATTER.len(),
+                    windows::core::s!("card scatter"),
+                    None,
+                    None,
+                    windows::core::s!("main"),
+                    windows::core::s!("cs_5_1"),
+                    0,
+                    0,
+                    &mut code,
+                    None,
+                )?;
+            }
+            let code = code.ok_or_else(windows::core::Error::empty)?;
+            // SAFETY: the blob's own bytes; the root signature is embedded in the shader.
+            unsafe {
+                let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+                let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
+                let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                })?;
+                Ok((root, pso))
+            }
+        })();
+        match made {
+            Ok(pair) => Some(pair),
+            Err(e) => {
+                tracing::warn!(error = %e, "CARD_SCATTER compute pipeline failed to compile; falling back to CopyBufferRegion");
+                None
+            }
+        }
+    }
+
+    /// Ensures `slot.scatter` holds mapped `UPLOAD` buffers of at least
+    /// `jobs_bytes` and `payload_bytes`, growing monotonically to power-of-two
+    /// capacities. The slot's prior submission has already completed on the GPU.
+    fn ensure_scatter_buf<'a>(
+        &self,
+        slot: &'a mut SyncSlot,
+        jobs_bytes: u64,
+        payload_bytes: u64,
+    ) -> Option<&'a ScatterBuf> {
+        let need_jobs = jobs_bytes.max(256 << 10).next_power_of_two();
+        let need_payload = payload_bytes.max(2 << 20).next_power_of_two();
+        let reuse_jobs = slot.scatter.as_ref().is_some_and(|b| b.jobs.2 >= jobs_bytes);
+        let reuse_payload = slot.scatter.as_ref().is_some_and(|b| b.payload.2 >= payload_bytes);
+        if reuse_jobs && reuse_payload {
+            return slot.scatter.as_ref();
+        }
+        let jobs = if reuse_jobs {
+            slot.scatter.take().map(|b| b.jobs)
+        } else {
+            let (res, ptr) = self.upload_buffer(need_jobs)?;
+            name(&res, || "card scatter: jobs".into());
+            Some((res, ptr as usize, need_jobs))
+        }?;
+        let payload = if reuse_payload {
+            // Re-grab existing payload only if we didn't take `slot.scatter` above.
+            // (If `reuse_jobs` was false, `slot.scatter` still holds the old payload.)
+            slot.scatter.take().map(|b| b.payload)
+        } else {
+            let (res, ptr) = self.upload_buffer(need_payload)?;
+            name(&res, || "card scatter: payload".into());
+            Some((res, ptr as usize, need_payload))
+        }?;
+        slot.scatter = Some(ScatterBuf { jobs, payload });
+        slot.scatter.as_ref()
     }
 
     /// [`CardInflight`] for `results` bytes of the compare's results; `None`
@@ -5760,17 +6043,116 @@ impl Host {
                 }
             }
         }
-        let mut used: Vec<(bool, Prelude)> = Vec::new();
+        let adv = adv_log();
+        let mut used: Vec<CardList> = Vec::new();
+        let wide = hash_wide();
+        let scatter_on = wide && work.scatter.is_some() && card_scatter();
+        let mut dirty_plan: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>, Vec<(usize, usize)>)> =
+            dirty
+                .into_iter()
+                .map(|(shadow, ranges)| {
+                    let (copy_runs, scatter_runs) = partition_scatter_ranges(&ranges, scatter_on);
+                    (shadow, copy_runs, scatter_runs)
+                })
+                .collect();
+        // Pop the sync slot early so we can pack `CARD_SCATTER` jobs/payload
+        // before deciding whether the copy queue even needs to run.
+        let mut sync_slot: Option<SyncSlot> = None;
+        let mut scatter_slices: Vec<(usize, u32, u32)> = Vec::new();
+        if !dirty_plan.is_empty() {
+            let Some(slot) = work.sync.pop().or_else(|| {
+                self.make_prelude().map(|prelude| SyncSlot { prelude, scatter: None })
+            }) else {
+                fail(format_args!("no host list to bring host copies in the card's memory up to date"));
+            };
+            sync_slot = Some(slot);
+        }
+        let total_scatter_jobs: u64 = dirty_plan
+            .iter()
+            .filter(|(shadow, _, sr)| shadow.carded() && !sr.is_empty())
+            .flat_map(|(_, _, sr)| sr.iter())
+            .map(|&(a, b)| ((b - a) as u64 / 4).div_ceil(u64::from(SCATTER_MAX_JOB_DWORDS)))
+            .sum();
+        let total_scatter_bytes: u64 = dirty_plan
+            .iter()
+            .filter(|(shadow, _, sr)| shadow.carded() && !sr.is_empty())
+            .flat_map(|(_, _, sr)| sr.iter())
+            .map(|&(a, b)| (b - a) as u64)
+            .sum();
+        if total_scatter_jobs > 0 {
+            let pack_t = adv.then(std::time::Instant::now);
+            let jobs_bytes = total_scatter_jobs.saturating_mul(12);
+            let fits = jobs_bytes <= (256 << 20)
+                && total_scatter_bytes <= (256 << 20)
+                && total_scatter_jobs <= u64::from(u32::MAX);
+            let packed = if fits
+                && let Some(slot) = sync_slot.as_mut()
+                && let Some(buf) = self.ensure_scatter_buf(slot, jobs_bytes, total_scatter_bytes)
+            {
+                let jobs_ptr = buf.jobs.1 as *mut [u32; 3];
+                let payload_ptr = buf.payload.1 as *mut u8;
+                let mut job_idx = 0u32;
+                let mut payload_off = 0usize;
+                for (idx, (shadow, _, scatter_runs)) in dirty_plan.iter().enumerate() {
+                    if !shadow.carded() || scatter_runs.is_empty() {
+                        continue;
+                    }
+                    let src_base = shadow.cpu_data();
+                    let base_job = job_idx;
+                    for &(a, b) in scatter_runs {
+                        let len = b - a;
+                        // SAFETY: `payload_ptr` is sized to `total_scatter_bytes`, `src_base`
+                        // is valid for `[a, b)` of this card shadow's persistent staging map.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(src_base.add(a), payload_ptr.add(payload_off), len);
+                        }
+                        let mut d = a as u32;
+                        let mut s = payload_off as u32;
+                        let mut rem_dwords = (len / 4) as u32;
+                        while rem_dwords > 0 {
+                            let take = rem_dwords.min(SCATTER_MAX_JOB_DWORDS);
+                            // SAFETY: `job_idx < total_scatter_jobs`, within `buf.jobs`.
+                            unsafe {
+                                jobs_ptr.add(job_idx as usize).write([d, s, take]);
+                            }
+                            job_idx += 1;
+                            d += take * 4;
+                            s += take * 4;
+                            rem_dwords -= take;
+                        }
+                        payload_off += len;
+                    }
+                    let count = job_idx - base_job;
+                    if count > 0 {
+                        scatter_slices.push((idx, base_job, count));
+                    }
+                }
+                true
+            } else {
+                false
+            };
+            if let Some(t) = pack_t {
+                ADV_CARD[1].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
+            if !packed {
+                // OOM or oversize fallback: move scatter runs back into CopyBufferRegion.
+                for (_, copy_runs, scatter_runs) in &mut dirty_plan {
+                    if !scatter_runs.is_empty() {
+                        copy_runs.append(scatter_runs);
+                        copy_runs.sort_unstable();
+                    }
+                }
+            }
+        }
         // The changed bytes through the copy queue (`VICTORY_QUEUE2` bit
-        // 2): the landing buffer they are in, in the order of `dirty`'s
-        // ranges, once the direct queue has waited. `None`: straight from
-        // the PC's memory on the direct queue, as before.
+        // 2): only `copy_runs` (large or unaligned runs not handled by
+        // `CARD_SCATTER`) cross via the landing buffer.
         let mut landed: Option<ID3D12Resource> = None;
         if let Some(second) = crate::queue2::second().filter(|s| s.uploads()) {
-            let bytes: u64 = dirty
+            let bytes: u64 = dirty_plan
                 .iter()
-                .filter(|(shadow, _)| shadow.carded())
-                .flat_map(|(_, ranges)| ranges.iter().map(|&(a, b)| (b - a) as u64))
+                .filter(|(shadow, _, _)| shadow.carded())
+                .flat_map(|(_, copy_runs, _)| copy_runs.iter().map(|&(a, b)| (b - a) as u64))
                 .sum();
             // SAFETY: a plain query.
             let completed = unsafe { self.fence.GetCompletedValue() };
@@ -5779,17 +6161,18 @@ impl Host {
             if bytes > 0
                 && let Some(landing) = second.landing(bytes, completed, sent + 1)
             {
+                let cq_t = adv.then(std::time::Instant::now);
                 // SAFETY: an open copy list of the lane's; live buffers,
                 // and the ranges lie in them; the host's queue.
                 let sent_up = unsafe {
                     (|| -> windows::core::Result<()> {
                         let copy = second.up.list()?;
                         let mut at = 0u64;
-                        for (shadow, ranges) in &dirty {
+                        for (shadow, copy_runs, _) in &dirty_plan {
                             let Some((staging, _, _)) = shadow.card_sides() else {
                                 continue;
                             };
-                            for &(a, b) in ranges {
+                            for &(a, b) in copy_runs {
                                 copy.1.CopyBufferRegion(&landing, at, staging, a as u64, (b - a) as u64);
                                 at += (b - a) as u64;
                             }
@@ -5800,6 +6183,9 @@ impl Host {
                         second.hold(&self.queue, job)
                     })()
                 };
+                if let Some(t) = cq_t {
+                    ADV_CARD[0].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+                }
                 if let Err(e) = sent_up {
                     fail(format_args!(
                         "host copies in the card's memory could not be brought up to date through the copy queue ({e}, VICTORY_QUEUE2)"
@@ -5808,11 +6194,8 @@ impl Host {
                 landed = Some(landing);
             }
         }
-        if !dirty.is_empty() {
-            let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
-                fail(format_args!("no host list to bring host copies in the card's memory up to date"));
-            };
-            let (allocator, list) = &sync;
+        if let Some(sync) = sync_slot {
+            let (allocator, list) = &sync.prelude;
             // SAFETY: the list's last run finished (it ran ahead of a
             // submission that was waited for, and came back after that);
             // live buffers, and the ranges lie in them.
@@ -5821,34 +6204,119 @@ impl Host {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
                     let timed = crate::cardmeter::begin(list, crate::cardmeter::Kind::Sync);
-                    // Where the next range lies in the landing buffer.
+                    // Where the next `copy_runs` range lies in the landing buffer.
                     let mut at = 0u64;
+                    let mut copy_bytes_total = 0u64;
+                    let mut copy_ranges_total = 0u64;
                     let mut copies = |shadow: &crate::shadow::Shadow, staging: &ID3D12Resource, ranges: &[(usize, usize)]| {
                         for &(a, b) in ranges {
                             match &landed {
                                 Some(landing) => list.CopyBufferRegion(&shadow.buffer, a as u64, landing, at, (b - a) as u64),
                                 None => list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64),
                             }
-                            at += (b - a) as u64;
-                            crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
+                            let len = (b - a) as u64;
+                            at += len;
+                            copy_bytes_total += len;
+                            crate::shadow::CARD_STATS[0].fetch_add(len, Ordering::Relaxed);
                         }
+                        copy_ranges_total += ranges.len() as u64;
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
                     };
-                    // All copies first, then one barrier, then all passes
-                    // ([`hash_wide`]).
-                    let wide = hash_wide();
+                    // All copies first, then scatter dispatches, then one batched
+                    // barrier, then all rehash passes ([`hash_wide`]).
                     if wide {
-                        let mut barriers = Vec::new();
-                        for (shadow, ranges) in &dirty {
-                            let Some((staging, before, _)) = shadow.card_sides() else {
+                        let dc_t = adv.then(std::time::Instant::now);
+                        for (shadow, copy_runs, _) in &dirty_plan {
+                            let Some((staging, _, _)) = shadow.card_sides() else {
                                 continue;
                             };
-                            copies(shadow, staging, ranges);
-                            if before.is_some() && !ranges.is_empty() {
+                            copies(shadow, staging, copy_runs);
+                        }
+                        if let Some(t) = dc_t {
+                            ADV_CARD[2].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+                        }
+                        if !scatter_slices.is_empty()
+                            && let (Some((sc_root, sc_pso)), Some(sc_buf)) = (&work.scatter, &sync.scatter)
+                        {
+                            let sd_t = adv.then(std::time::Instant::now);
+                            let mut to_uav = Vec::new();
+                            for &(idx, _, _) in &scatter_slices {
+                                let (shadow, copy_runs, _) = &dirty_plan[idx];
+                                if !copy_runs.is_empty() {
+                                    to_uav.push(transition(
+                                        &shadow.buffer,
+                                        D3D12_RESOURCE_STATE_COPY_DEST,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                    ));
+                                }
+                            }
+                            if !to_uav.is_empty() {
+                                list.ResourceBarrier(&to_uav);
+                            }
+                            list.SetComputeRootSignature(sc_root);
+                            list.SetPipelineState(sc_pso);
+                            list.SetComputeRootShaderResourceView(1, sc_buf.jobs.0.GetGPUVirtualAddress());
+                            list.SetComputeRootShaderResourceView(2, sc_buf.payload.0.GetGPUVirtualAddress());
+                            let mut dispatches = 0u64;
+                            let mut jobs_sent = 0u64;
+                            let mut scatter_ranges_total = 0u64;
+                            let mut scatter_bytes_total = 0u64;
+                            for &(idx, job_base, job_count) in &scatter_slices {
+                                let (shadow, _, scatter_runs) = &dirty_plan[idx];
+                                list.SetComputeRootUnorderedAccessView(3, shadow.buffer.GetGPUVirtualAddress());
+                                let mut base = job_base;
+                                let mut rem = job_count;
+                                while rem > 0 {
+                                    let chunk = rem.min(SCATTER_MAX_DISPATCH_JOBS);
+                                    let constants = [base, chunk];
+                                    list.SetComputeRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
+                                    list.Dispatch(chunk.div_ceil(64), 1, 1);
+                                    base += chunk;
+                                    rem -= chunk;
+                                    dispatches += 1;
+                                }
+                                let sbytes: u64 = scatter_runs.iter().map(|&(a, b)| (b - a) as u64).sum();
+                                let sranges = scatter_runs.len() as u64;
+                                crate::shadow::CARD_STATS[0].fetch_add(sbytes, Ordering::Relaxed);
+                                crate::shadow::CARD_STATS[1].fetch_add(sranges, Ordering::Relaxed);
+                                scatter_ranges_total += sranges;
+                                scatter_bytes_total += sbytes;
+                                jobs_sent += u64::from(job_count);
+                            }
+                            if let Some(t) = sd_t {
+                                ADV_CARD[3].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+                            }
+                            if adv {
+                                ADV_CARD[6].fetch_add(scatter_ranges_total, Ordering::Relaxed);
+                                ADV_CARD[7].fetch_add(scatter_bytes_total, Ordering::Relaxed);
+                                ADV_CARD[10].fetch_add(jobs_sent, Ordering::Relaxed);
+                                ADV_CARD[11].fetch_add(dispatches, Ordering::Relaxed);
+                            }
+                        }
+                        let mut barriers = Vec::new();
+                        for (shadow, copy_runs, scatter_runs) in &dirty_plan {
+                            let Some((_, before, _)) = shadow.card_sides() else {
+                                continue;
+                            };
+                            let has_copy = !copy_runs.is_empty();
+                            let has_scatter = !scatter_runs.is_empty();
+                            if before.is_some() && (has_copy || has_scatter) {
+                                let from_state = if has_scatter {
+                                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+                                } else {
+                                    D3D12_RESOURCE_STATE_COPY_DEST
+                                };
                                 barriers.push(transition(
                                     &shadow.buffer,
-                                    D3D12_RESOURCE_STATE_COPY_DEST,
+                                    from_state,
                                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                ));
+                            } else if has_scatter {
+                                // Explicit UAV flush before the title's command lists read this buffer.
+                                barriers.push(transition(
+                                    &shadow.buffer,
+                                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                    D3D12_RESOURCE_STATE_COMMON,
                                 ));
                             }
                         }
@@ -5856,24 +6324,25 @@ impl Host {
                             list.ResourceBarrier(&barriers);
                         }
                     }
+                    let rh_t = adv.then(std::time::Instant::now);
                     let mut compute_bound = false;
-                    for (shadow, ranges) in &dirty {
+                    for (shadow, copy_runs, scatter_runs) in &dirty_plan {
                         let (Some((staging, before, _)), size) = (shadow.card_sides(), shadow.card_hash_size()) else {
                             continue;
                         };
                         if !wide {
-                            copies(shadow, staging, ranges);
+                            copies(shadow, staging, copy_runs);
                         }
                         let Some(before) = before else {
                             continue;
                         };
                         // No twin (it cost the card the copy's size again,
                         // 399 MB in run 75): `before` holds a 128-bit hash
-                        // of each 64 KiB piece. The pieces just sent up are
+                        // of each 64 KiB piece. The pieces sent up are
                         // hashed again, all of them the first time; the
                         // compare after the lists hashes the declared
                         // pieces and flags those whose hash is another.
-                        if !wide && !ranges.is_empty() {
+                        if !wide && !copy_runs.is_empty() {
                             list.ResourceBarrier(&[transition(
                                 &shadow.buffer,
                                 D3D12_RESOURCE_STATE_COPY_DEST,
@@ -5891,7 +6360,11 @@ impl Host {
                         let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
                             vec![shadow.card_run(0, usize::MAX)]
                         } else {
-                            ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
+                            copy_runs
+                                .iter()
+                                .chain(scatter_runs.iter())
+                                .map(|&(a, b)| shadow.card_run(a, b))
+                                .collect()
                         };
                         // The same pieces in fewer passes (`rehash_runs`).
                         let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
@@ -5906,20 +6379,27 @@ impl Host {
                     crate::cardmeter::end(list, timed);
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                    if let Some(t) = rh_t {
+                        ADV_CARD[4].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    }
+                    if adv {
+                        ADV_CARD[8].fetch_add(copy_ranges_total, Ordering::Relaxed);
+                        ADV_CARD[9].fetch_add(copy_bytes_total, Ordering::Relaxed);
+                    }
                     Ok(())
                 })()
             };
             if let Err(e) = recorded {
                 fail(format_args!("host copies in the card's memory could not be brought up to date ({e})"));
             }
-            used.push((false, sync));
+            used.push(CardList::Sync(sync));
         }
         numbered();
         drop(order);
         let mut plan = CardPlan {
             ranges: Vec::new(),
             check: None,
-            _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
+            _synced: dirty_plan.into_iter().map(|(shadow, _, _)| shadow).collect(),
             lists: used,
             sent_as,
             inflight: false,
@@ -5958,6 +6438,7 @@ impl Host {
         }
         work.taken = at;
         if plan.ranges.iter().any(|r| r.compared) {
+            let cmp_t = adv.then(std::time::Instant::now);
             let Some(check) = work.check.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list for the compare of host copies in the card's memory"));
             };
@@ -6033,11 +6514,14 @@ impl Host {
                     list.cast()
                 })()
             };
+            if let Some(t) = cmp_t {
+                ADV_CARD[5].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
             match recorded {
                 Ok(list) => plan.check = Some(list),
                 Err(e) => fail(format_args!("the compare of host copies in the card's memory could not be recorded ({e})")),
             }
-            plan.lists.push((true, check));
+            plan.lists.push(CardList::Check(check));
         }
         work.out += 1;
         Some(plan)
@@ -6063,8 +6547,11 @@ impl Host {
         let Some(work) = work.as_mut() else {
             return;
         };
-        for (check, list) in plan.lists {
-            if check { work.check.push(list) } else { work.sync.push(list) }
+        for item in plan.lists {
+            match item {
+                CardList::Sync(slot) => work.sync.push(slot),
+                CardList::Check(list) => work.check.push(list),
+            }
         }
         work.out = work.out.saturating_sub(1);
         // With the relay other plans may be on the card, their results
@@ -6556,6 +7043,8 @@ fn bucket_inflight_pieces<T>(
         // With the slots in the card's memory they come down first, into
         // `base` (mapped), one after the other; else `base` is the slots'
         // own mapping.
+        let adv = adv_log();
+        let down_t = adv.then(std::time::Instant::now);
         let base = if inflight_on_card() {
             match self.inflight_copy_down(&ring.0, &pieces, fetch, behind) {
                 Some(data) => data,
@@ -6564,6 +7053,9 @@ fn bucket_inflight_pieces<T>(
         } else {
             ring.1
         };
+        if let Some(t) = down_t {
+            ADV_BACK[0].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
         let mut packed: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, usize, u64)> =
             Vec::with_capacity(pieces.len());
         let mut bytes = 0u64;
@@ -6572,6 +7064,7 @@ fn bucket_inflight_pieces<T>(
             packed.push((shadow.clone(), *lo, *hi, src, *after));
             bytes += (*hi - *lo) as u64;
         }
+        let merge_t = adv.then(std::time::Instant::now);
         let written = if wide_merge() && packed.len() >= 8 {
             // Partition into worker buckets keyed by title 64 KiB page
             // `(shadow.start + lo) / 64 KiB` so pieces touching the same title
@@ -6616,6 +7109,9 @@ fn bucket_inflight_pieces<T>(
             }
             written
         };
+        if let Some(t) = merge_t {
+            ADV_BACK[1].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
         for &(_, plan) in plans {
             for r in &plan.ranges {
                 crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
@@ -7516,12 +8012,18 @@ fn bucket_inflight_pieces<T>(
             settled += settling.elapsed();
         }
         part = prep_part(0, part);
+        let adv = adv_log();
         let detile_batch = crate::gpu_detile::BatchGuard::begin();
         let mut pending_fills = Vec::new();
         for list in runs {
             list.run_deferred_into(&mut batch, &mut pending_fills);
             firsts.push(lists.len());
+            let pre_t = adv.then(std::time::Instant::now);
             if let Some(prelude) = list.prelude() {
+                if let Some(t) = pre_t {
+                    ADV_STEPS[12].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    ADV_STEPS[13].fetch_add(1, Ordering::Relaxed);
+                }
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
@@ -9191,9 +9693,11 @@ impl HostList {
         // Time `Step::Copy` work once per list rather than per step to avoid
         // thousands of `QueryPerformanceCounter` + atomic RMW calls per frame.
         // `Step::Fill` batches are timed once per batch inside `flush_fills`.
+        let adv = adv_log();
         let mut copy_started: Option<std::time::Instant> = None;
         let mut copy_before_us = 0u64;
         let mut copy_bytes = 0usize;
+        let mut adv_copy_count = 0u64;
         #[cfg(feature = "diagnostics")]
         let mut copy_count = 0u64;
         let mut excluded_us = 0u64;
@@ -9206,6 +9710,7 @@ impl HostList {
                         copy_before_us = PREPARING[0].load(Ordering::Relaxed);
                         copy_started = Some(std::time::Instant::now());
                     }
+                    adv_copy_count += 1;
                     #[cfg(feature = "diagnostics")]
                     {
                         copy_count += 1;
@@ -9240,7 +9745,7 @@ impl HostList {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
                     }
-                    let excl_started = copy_started.is_some().then(std::time::Instant::now);
+                    let excl_started = (adv || copy_started.is_some()).then(std::time::Instant::now);
                     work();
                     // It wrote title memory, where is not known here: the
                     // submission's one asking ends, later refreshes ask anew.
@@ -9248,7 +9753,14 @@ impl HostList {
                         crate::watch::ask_once_end();
                     }
                     if let Some(excl) = excl_started {
-                        excluded_us += excl.elapsed().as_micros() as u64;
+                        let dt = excl.elapsed().as_micros() as u64;
+                        if copy_started.is_some() {
+                            excluded_us += dt;
+                        }
+                        if adv {
+                            ADV_STEPS[4].fetch_add(dt, Ordering::Relaxed);
+                            ADV_STEPS[5].fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                     #[cfg(feature = "diagnostics")]
                     {
@@ -9264,10 +9776,15 @@ impl HostList {
                     // askings a frame). Neither `flush_one` nor `writing`
                     // mutates title memory or list upload buffers, so collected
                     // `Step::Fill`s remain valid across it.
+                    let fo_t = adv.then(std::time::Instant::now);
                     batch.flush_one(shadow);
+                    if let Some(t) = fo_t {
+                        ADV_STEPS[6].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+                        ADV_STEPS[7].fetch_add(1, Ordering::Relaxed);
+                    }
                     #[cfg(feature = "diagnostics")]
                     let snapshot = std::time::Instant::now();
-                    let excl_started = copy_started.is_some().then(std::time::Instant::now);
+                    let excl_started = (adv || copy_started.is_some()).then(std::time::Instant::now);
                     if shadow.writing(*address, *len) {
                         batch.note_gpu_write(shadow, *address, *len);
                         #[cfg(feature = "diagnostics")]
@@ -9277,7 +9794,14 @@ impl HostList {
                         }
                     }
                     if let Some(excl) = excl_started {
-                        excluded_us += excl.elapsed().as_micros() as u64;
+                        let dt = excl.elapsed().as_micros() as u64;
+                        if copy_started.is_some() {
+                            excluded_us += dt;
+                        }
+                        if adv {
+                            ADV_STEPS[8].fetch_add(dt, Ordering::Relaxed);
+                            ADV_STEPS[9].fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
                 Step::Texture { staging, upload_hold } => {
@@ -9287,10 +9811,17 @@ impl HostList {
                         batch.uploaded.push(staging.clone());
                     }
                     if batch.texture_due(staging) {
-                        let excl_started = copy_started.is_some().then(std::time::Instant::now);
+                        let excl_started = (adv || copy_started.is_some()).then(std::time::Instant::now);
                         staging.refresh();
                         if let Some(excl) = excl_started {
-                            excluded_us += excl.elapsed().as_micros() as u64;
+                            let dt = excl.elapsed().as_micros() as u64;
+                            if copy_started.is_some() {
+                                excluded_us += dt;
+                            }
+                            if adv {
+                                ADV_STEPS[10].fetch_add(dt, Ordering::Relaxed);
+                                ADV_STEPS[11].fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                     }
                 }
@@ -9309,6 +9840,10 @@ impl HostList {
                 .saturating_sub(excluded_us);
             preparing(0, net_us);
             preparing(1, copy_bytes as u64);
+            if adv {
+                ADV_STEPS[0].fetch_add(net_us, Ordering::Relaxed);
+                ADV_STEPS[1].fetch_add(adv_copy_count, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -9528,8 +10063,13 @@ fn flush_fills(fills: &mut Vec<(usize, usize, usize)>) {
             copy_mapped(dst as *mut u8, src as *const u8, len, false);
         }
     }
-    preparing(0, started.elapsed().as_micros() as u64);
+    let elapsed_us = started.elapsed().as_micros() as u64;
+    preparing(0, elapsed_us);
     preparing(1, total_bytes as u64);
+    if adv_log() {
+        ADV_STEPS[2].fetch_add(elapsed_us, Ordering::Relaxed);
+        ADV_STEPS[3].fetch_add(fills.len() as u64, Ordering::Relaxed);
+    }
     fills.clear();
 }
 
@@ -10387,6 +10927,7 @@ impl Meter {
         crate::queue2::line(frames);
         crate::plaincopy::line(frames);
         crate::backreads::line(frames);
+        adv_log_line(frames);
         if let Some(host) = host() {
             host.drain_messages();
         }
@@ -12859,5 +13400,155 @@ void main() {
             slots_down([(100, 10), (110, 5), (0, 0), (500, 7), (507, 1), (0, 3)]),
             vec![(100, 0, 15), (500, 15, 8), (0, 23, 3)]
         );
+    }
+
+    #[test]
+    fn partition_scatter_ranges_splits_small_aligned_runs_and_keeps_large_or_unaligned() {
+        use super::{SCATTER_MAX_RUN, SCATTER_MIN_RANGES, parse_card_scatter, partition_scatter_ranges};
+        assert!(parse_card_scatter(None));
+        assert!(parse_card_scatter(Some("1")));
+        assert!(!parse_card_scatter(Some("0")));
+        assert!(!parse_card_scatter(Some(" 0 ")));
+
+        // Below threshold: everything stays on CopyBufferRegion.
+        let few: Vec<(usize, usize)> = (0..SCATTER_MIN_RANGES - 1).map(|i| (i * 128, i * 128 + 64)).collect();
+        let (copy, scatter) = partition_scatter_ranges(&few, true);
+        assert_eq!(copy, few);
+        assert!(scatter.is_empty());
+
+        // Above threshold with mixed small aligned, unaligned, and > SCATTER_MAX_RUN ranges.
+        let mut mixed: Vec<(usize, usize)> = (0..SCATTER_MIN_RANGES).map(|i| (i * 128, i * 128 + 64)).collect();
+        mixed.push((4097, 4103)); // unaligned start/end
+        mixed.push((8192, 8192 + SCATTER_MAX_RUN + 4)); // > 16 KiB
+        mixed.push((65536, 65536 + SCATTER_MAX_RUN)); // exactly 16 KiB (eligible)
+        let (copy, scatter) = partition_scatter_ranges(&mixed, true);
+        assert_eq!(copy, vec![(4097, 4103), (8192, 8192 + SCATTER_MAX_RUN + 4)]);
+        assert_eq!(scatter.len(), SCATTER_MIN_RANGES + 1);
+        assert_eq!(*scatter.last().unwrap(), (65536, 65536 + SCATTER_MAX_RUN));
+
+        // Disabled switch routes everything to CopyBufferRegion.
+        let (copy_off, scatter_off) = partition_scatter_ranges(&mixed, false);
+        assert_eq!(copy_off, mixed);
+        assert!(scatter_off.is_empty());
+    }
+
+    #[test]
+    fn card_scatter_writes_exact_runs_without_touching_neighbors() {
+        use super::{CARD_SCATTER, SCATTER_MAX_JOB_DWORDS, SCATTER_MAX_RUN};
+        let Some(host) = host() else {
+            return;
+        };
+        let (root, pso) = host.make_card_scatter().expect("CARD_SCATTER compiles");
+        const SIZE: usize = 128 << 10;
+        let dst = host.uav_buffer(SIZE as u64).expect("dst UAV buffer");
+        let (seed_up, seed_ptr) = host.upload_buffer(SIZE as u64).expect("seed upload");
+        let (rb_buf, rb_ptr) = host.shared_buffer(SIZE as u64).expect("readback buffer");
+
+        // Fill `dst` with a known sentinel pattern (0xA5A5_xxxx), then overwrite
+        // one CopyBufferRegion run + 20 CARD_SCATTER runs (4B, 12B, 64B, 256B, 16KiB).
+        let mut expected = vec![0u8; SIZE];
+        for (i, chunk) in expected.chunks_exact_mut(4).enumerate() {
+            chunk.copy_from_slice(&(0xA500_0000u32 | i as u32).to_le_bytes());
+        }
+        // SAFETY: `seed_ptr` is mapped for `SIZE` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(expected.as_ptr(), seed_ptr, SIZE) };
+
+        let copy_run = (4096usize, 4096usize + (20 << 10));
+        let mut scatter_runs: Vec<(usize, usize)> = vec![
+            (0, 4),
+            (12, 24),
+            (64, 128),
+            (512, 768),
+            (32768, 32768 + SCATTER_MAX_RUN),
+        ];
+        for i in 0..15 {
+            let off = 65536 + i * 256 + 16;
+            scatter_runs.push((off, off + 64));
+        }
+
+        // Write unique non-sentinel payload bytes for both `copy_run` and `scatter_runs`.
+        let (copy_up, copy_ptr) = host.upload_buffer((copy_run.1 - copy_run.0) as u64).expect("copy upload");
+        for (i, byte) in expected[copy_run.0..copy_run.1].iter_mut().enumerate() {
+            *byte = ((i * 7 + 3) & 0xff) as u8;
+        }
+        // SAFETY: mapped for `copy_run` length.
+        unsafe {
+            std::ptr::copy_nonoverlapping(expected[copy_run.0..copy_run.1].as_ptr(), copy_ptr, copy_run.1 - copy_run.0);
+        }
+
+        let total_payload: usize = scatter_runs.iter().map(|&(a, b)| b - a).sum();
+        let total_jobs: usize = scatter_runs
+            .iter()
+            .map(|&(a, b)| ((b - a) / 4).div_ceil(SCATTER_MAX_JOB_DWORDS as usize))
+            .sum();
+        let (jobs_up, jobs_ptr) = host.upload_buffer((total_jobs * 12) as u64).expect("jobs upload");
+        let (pay_up, pay_ptr) = host.upload_buffer(total_payload as u64).expect("payload upload");
+
+        let mut job_idx = 0usize;
+        let mut pay_off = 0usize;
+        for (r_idx, &(a, b)) in scatter_runs.iter().enumerate() {
+            let len = b - a;
+            for (k, byte) in expected[a..b].iter_mut().enumerate() {
+                *byte = (((r_idx + 1) * 31 + k * 13 + 5) & 0xff) as u8;
+            }
+            // SAFETY: inside `pay_ptr` and `jobs_ptr`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(expected[a..b].as_ptr(), pay_ptr.add(pay_off), len);
+            }
+            let mut d = a as u32;
+            let mut s = pay_off as u32;
+            let mut rem = (len / 4) as u32;
+            while rem > 0 {
+                let take = rem.min(SCATTER_MAX_JOB_DWORDS);
+                // SAFETY: `job_idx < total_jobs`.
+                unsafe {
+                    jobs_ptr.cast::<[u32; 3]>().add(job_idx).write([d, s, take]);
+                }
+                job_idx += 1;
+                d += take * 4;
+                s += take * 4;
+                rem -= take;
+            }
+            pay_off += len;
+        }
+        assert_eq!(job_idx, total_jobs);
+
+        let list = host.new_list().expect("host list");
+        // SAFETY: open command list, live resources, exact D3D12 state transitions.
+        unsafe {
+            // Seed entire buffer, then write `copy_run` via CopyBufferRegion,
+            // transition COPY_DEST -> UAV, run CARD_SCATTER, transition UAV -> COPY_SOURCE, read back.
+            list.list.CopyBufferRegion(&dst, 0, &seed_up, 0, SIZE as u64);
+            list.list.CopyBufferRegion(&dst, copy_run.0 as u64, &copy_up, 0, (copy_run.1 - copy_run.0) as u64);
+            list.list.ResourceBarrier(&[transition(
+                &dst,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetPipelineState(&pso);
+            let constants = [0u32, total_jobs as u32];
+            list.list.SetComputeRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
+            list.list.SetComputeRootShaderResourceView(1, jobs_up.GetGPUVirtualAddress());
+            list.list.SetComputeRootShaderResourceView(2, pay_up.GetGPUVirtualAddress());
+            list.list.SetComputeRootUnorderedAccessView(3, dst.GetGPUVirtualAddress());
+            list.list.Dispatch((total_jobs as u32).div_ceil(64), 1, 1);
+            list.list.ResourceBarrier(&[transition(
+                &dst,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            list.list.CopyBufferRegion(&rb_buf, 0, &dst, 0, SIZE as u64);
+        }
+        list.close();
+        host.execute(&[&list]);
+
+        // SAFETY: GPU completed `execute`, `rb_ptr` holds `SIZE` bytes.
+        let got = unsafe { std::slice::from_raw_parts(rb_ptr, SIZE) };
+        assert_eq!(got, expected.as_slice(), "CARD_SCATTER output mismatch (shader len {})", CARD_SCATTER.len());
+        if let Some(err) = host.log_messages() {
+            panic!("D3D12 debug layer error during CARD_SCATTER test: {err}");
+        }
+        drop((list, rb_buf, pay_up, jobs_up, copy_up, seed_up, dst, pso, root));
     }
 }

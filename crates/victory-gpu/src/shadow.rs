@@ -4559,6 +4559,23 @@ impl Shadow {
                         continue;
                     }
                     let n = hi - lo;
+                    let at = lo - start;
+                    // Zero-write AVX2 fast path for card copies: skip `read_into`
+                    // and word-run diffing completely when the stale page is
+                    // byte-identical to `self.data` (e.g. copy-back echo).
+                    if self.card.is_some() {
+                        // SAFETY: inside `self.data`, protected exclusively by `side`.
+                        let held_ptr = unsafe { self.data.add(at).cast_const() };
+                        if let Some(diff) = crate::plaincopy::first_diff(lo as *const u8, held_ptr, n)
+                            && diff >= n
+                        {
+                            MERGED[0].fetch_add(1, Ordering::Relaxed);
+                            if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
+                                updated_pages.push(page);
+                            }
+                            continue;
+                        }
+                    }
                     let title = &mut buf[..n];
                     let tp = std::time::Instant::now();
                     // A page that is not there is left as it is, and looked at
@@ -4569,7 +4586,6 @@ impl Shadow {
                     let tp = under_ns(5, tp);
                     let _compared = Compared(tp);
                     MERGED[0].fetch_add(1, Ordering::Relaxed);
-                    let at = lo - start;
                     if self.card.is_some() {
                         // SAFETY: inside the mapping of the copy's CPU side,
                         // protected exclusively by `side` (`card.side.write()`).
@@ -5136,6 +5152,12 @@ impl Shadow {
     /// Guest virtual start address of the title buffer this shadow mirrors.
     pub(crate) fn title_start(&self) -> usize {
         self.start as usize
+    }
+
+    /// Persistent CPU mapping of this shadow's CPU-side buffer (`card.staging`
+    /// when carded), valid for `[0, self.len)` bytes.
+    pub(crate) fn cpu_data(&self) -> *const u8 {
+        self.data.cast_const()
     }
 
     /// The CPU side's bytes at offsets `[from, to)` changed: they go to the

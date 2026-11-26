@@ -499,8 +499,20 @@ static OWN: Mutex<Option<std::collections::HashMap<usize, Option<Own>>>> = Mutex
 /// title view that shows it (the page of `at` among them), or `None` with
 /// nothing written: not view memory, a page of very many views, the
 /// runtime changing mappings at this moment, or the host refusing.
+/// Per-reason `write_own` outcome counters for `VICTORY_ADV_LOG`:
+/// `[ok, cross_page, not_view, many_views, commit_fail]`.
+static WRITE_OWN_STATS: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// Takes and resets [`WRITE_OWN_STATS`] (`[ok, cross_page, not_view, many_views, commit_fail]`).
+pub(crate) fn take_write_own_stats() -> [u64; 5] {
+    [0, 1, 2, 3, 4].map(|i| WRITE_OWN_STATS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
 pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
+    use std::sync::atomic::Ordering::Relaxed;
     if bytes.is_empty() || at / K64 != (at + bytes.len() - 1) / K64 {
+        WRITE_OWN_STATS[1].fetch_add(1, Relaxed);
         return None;
     }
     // No mapping changes until the bytes are in: wait for any brief streaming
@@ -509,19 +521,31 @@ pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
     let _still = crate::watch::title_memory_reading();
     let (section, offset, shown, section_bytes) = {
         let v = views();
-        let (&base, &(len, section, offset)) = v.views.range(..=at).next_back()?;
+        let Some((&base, &(len, section, offset))) = v.views.range(..=at).next_back() else {
+            WRITE_OWN_STATS[2].fetch_add(1, Relaxed);
+            return None;
+        };
         if at + bytes.len() > base + len {
+            WRITE_OWN_STATS[2].fetch_add(1, Relaxed);
             return None;
         }
         let offset = offset + (at - base) as u64;
-        let shown = v.pages.get(&(section, offset - offset % K64 as u64))?.clone();
+        let Some(shown) = v.pages.get(&(section, offset - offset % K64 as u64)).cloned() else {
+            WRITE_OWN_STATS[2].fetch_add(1, Relaxed);
+            return None;
+        };
         if shown.len() > crate::watch::MANY_VIEWS {
+            WRITE_OWN_STATS[3].fetch_add(1, Relaxed);
             return None;
         }
-        let section_bytes = v.sections.iter().find(|s| s.0 == section)?.1;
+        let Some(section_bytes) = v.sections.iter().find(|s| s.0 == section).map(|s| s.1) else {
+            WRITE_OWN_STATS[2].fetch_add(1, Relaxed);
+            return None;
+        };
         (section, offset, shown, section_bytes)
     };
     if offset + bytes.len() as u64 > section_bytes {
+        WRITE_OWN_STATS[2].fetch_add(1, Relaxed);
         return None;
     }
     // Resolve our own section view and ensure the target 64 KiB block is
@@ -530,7 +554,7 @@ pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
     // serializing on `OWN`.
     let view_base = {
         let mut own = OWN.lock().unwrap_or_else(|e| e.into_inner());
-        let view = own
+        let Some(view) = own
             .get_or_insert_with(Default::default)
             .entry(section)
             .or_insert_with(|| {
@@ -556,8 +580,13 @@ pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
                     committed: vec![0; (section_bytes as usize).div_ceil(K64).div_ceil(64)],
                 })
             })
-            .as_mut()?;
+            .as_mut()
+        else {
+            WRITE_OWN_STATS[4].fetch_add(1, Relaxed);
+            return None;
+        };
         if offset + bytes.len() as u64 > view.bytes {
+            WRITE_OWN_STATS[4].fetch_add(1, Relaxed);
             return None;
         }
         let block = offset as usize / K64;
@@ -569,6 +598,7 @@ pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
                 mem::VirtualAlloc((view.base + block * K64) as *const c_void, K64, mem::MEM_COMMIT, mem::PAGE_READWRITE)
             };
             if there.is_null() {
+                WRITE_OWN_STATS[4].fetch_add(1, Relaxed);
                 return None;
             }
             view.committed[block / 64] |= 1u64 << (block % 64);
@@ -579,6 +609,7 @@ pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
     // whose block was committed above, `_still` holds title mappings steady,
     // and the source is the caller's slice.
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), (view_base + offset as usize) as *mut u8, bytes.len()) };
+    WRITE_OWN_STATS[0].fetch_add(1, Relaxed);
     Some(shown)
 }
 

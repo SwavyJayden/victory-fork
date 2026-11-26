@@ -460,13 +460,57 @@ pub(crate) fn take_vram_buf(host: &Host, total: u64) -> Option<(ID3D12Resource, 
             return Some((buffer, alloc_size, pooled));
         }
     }
-    let Some(buffer) = host.uav_buffer(alloc_size) else {
-        ACTIVE_VRAM_BYTES.fetch_sub(alloc_size, Ordering::Relaxed);
-        note_fallback();
-        return None;
+    let buffer = match host.uav_buffer(alloc_size) {
+        Some(buf) => buf,
+        None => {
+            // Reclaim completed idle spare buffers before falling back to CPU detiling.
+            evict_completed_spares(alloc_size);
+            match host.uav_buffer(alloc_size) {
+                Some(buf) => buf,
+                None => {
+                    ACTIVE_VRAM_BYTES.fetch_sub(alloc_size, Ordering::Relaxed);
+                    note_fallback();
+                    return None;
+                }
+            }
+        }
     };
     crate::host::name(&buffer, || format!("gpu detile linear {alloc_size:#x}"));
     Some((buffer, alloc_size, pooled))
+}
+
+/// Evicts completed idle buffers from [`VRAM_SPARE`] (largest buckets first)
+/// until at least `target_bytes` have been released back to the host.
+fn evict_completed_spares(target_bytes: u64) {
+    let completed = compute_completed_fence();
+    let mut freed = 0u64;
+    let mut retired = Vec::new();
+    {
+        let mut spare = VRAM_SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        let (buckets, total) = &mut *spare;
+        let sizes: Vec<u64> = buckets.keys().copied().rev().collect();
+        for size in sizes {
+            if freed >= target_bytes {
+                break;
+            }
+            if let Some(bucket) = buckets.get_mut(&size) {
+                while freed < target_bytes
+                    && bucket.front().is_some_and(|s| s.until_fence <= completed)
+                {
+                    if let Some(VramSpare { buffer, .. }) = bucket.pop_front() {
+                        *total -= size;
+                        freed += size;
+                        retired.push(buffer);
+                    }
+                }
+                if bucket.is_empty() {
+                    buckets.remove(&size);
+                }
+            }
+        }
+    }
+    // Completed spares already passed `compute_fence`: drop immediately to free VRAM.
+    drop(retired);
 }
 
 /// Returns a VRAM linear staging buffer once its `UploadBuf` drops (after GPU

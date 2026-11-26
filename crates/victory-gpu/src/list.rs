@@ -1482,6 +1482,8 @@ fn log_ped_copy_texture_region(
     dst_staged: bool,
     dst_host_wrote: bool,
     src_kind: u32,
+    src_sub: u32,
+    src_mips: u16,
     src_w: u32,
     src_h: u32,
     src_fmt: u32,
@@ -1490,8 +1492,9 @@ fn log_ped_copy_texture_region(
     y: u32,
     src_box: Option<[u32; 6]>,
     bridged: bool,
+    bridge_ok: bool,
 ) {
-    static SEEN: std::sync::Mutex<std::collections::BTreeSet<[u64; 14]>> =
+    static SEEN: std::sync::Mutex<std::collections::BTreeSet<[u64; 15]>> =
         std::sync::Mutex::new(std::collections::BTreeSet::new());
     let b = src_box.unwrap_or([u32::MAX; 6]);
     let key = [
@@ -1503,8 +1506,10 @@ fn log_ped_copy_texture_region(
         u64::from(dst_tiled)
             | (u64::from(dst_staged) << 1)
             | (u64::from(dst_host_wrote) << 2)
-            | (u64::from(bridged) << 3),
+            | (u64::from(bridged) << 3)
+            | (u64::from(bridge_ok) << 4),
         u64::from(src_kind),
+        (u64::from(src_sub) << 16) | u64::from(src_mips),
         u64::from(src_w),
         u64::from(src_h),
         u64::from(src_fmt),
@@ -1514,28 +1519,61 @@ fn log_ped_copy_texture_region(
         (u64::from(b[3]) << 32) | u64::from(b[4]),
     ];
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if seen.len() < 64 && seen.insert(key) {
-        tracing::info!(
-            dst_w = dst_desc.Width,
-            dst_h = dst_desc.Height,
-            dst_fmt = dst_desc.Format.0,
-            dst_mips = dst_desc.MipLevels,
-            dst_layers = dst_desc.DepthOrArraySize,
-            dst_sub,
-            dst_tiled,
-            dst_staged,
-            dst_host_wrote,
-            src_kind,
-            src_w,
-            src_h,
-            src_fmt,
-            src_pitch,
-            x,
-            y,
-            src_box = ?src_box,
-            bridged,
-            "VICTORY_PED_TEX_DIAG CopyTextureRegion BC"
-        );
+    let cap = crate::resource::ped_tex_diag_cap();
+    if seen.len() < cap && seen.insert(key) {
+        if bridged && !bridge_ok {
+            tracing::warn!(
+                frame = crate::frame::current(),
+                dst_w = dst_desc.Width,
+                dst_h = dst_desc.Height,
+                dst_fmt = dst_desc.Format.0,
+                dst_mips = dst_desc.MipLevels,
+                dst_layers = dst_desc.DepthOrArraySize,
+                dst_sub,
+                dst_tiled,
+                dst_staged,
+                dst_host_wrote,
+                src_kind,
+                src_sub,
+                src_mips,
+                src_w,
+                src_h,
+                src_fmt,
+                src_pitch,
+                x,
+                y,
+                src_box = ?src_box,
+                bridged,
+                bridge_ok,
+                "VICTORY_PED_TEX_DIAG CopyTextureRegion BC bridge failed"
+            );
+        } else {
+            tracing::info!(
+                frame = crate::frame::current(),
+                dst_w = dst_desc.Width,
+                dst_h = dst_desc.Height,
+                dst_fmt = dst_desc.Format.0,
+                dst_mips = dst_desc.MipLevels,
+                dst_layers = dst_desc.DepthOrArraySize,
+                dst_sub,
+                dst_tiled,
+                dst_staged,
+                dst_host_wrote,
+                src_kind,
+                src_sub,
+                src_mips,
+                src_w,
+                src_h,
+                src_fmt,
+                src_pitch,
+                x,
+                y,
+                src_box = ?src_box,
+                bridged,
+                bridge_ok,
+                "VICTORY_PED_TEX_DIAG CopyTextureRegion BC"
+            );
+        }
     }
 }
 
@@ -1560,8 +1598,9 @@ fn log_ped_copy_resource(
         u64::from(dst_tiled) | (u64::from(bridged) << 1),
     ];
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if seen.len() < 64 && seen.insert(key) {
+    if seen.len() < crate::resource::ped_tex_diag_cap() && seen.insert(key) {
         tracing::info!(
+            frame = crate::frame::current(),
             dst_w = dst_desc.Width,
             dst_h = dst_desc.Height,
             dst_fmt = dst_desc.Format.0,
@@ -1736,38 +1775,6 @@ extern "system" fn copy_texture_region(
         let dst_tiled = crate::resource::host_tiled(dst.resource);
         let dst_staged = crate::texture::is_staged(dst.resource);
         let dst_host_wrote = crate::texture::host_wrote(dst.resource as usize);
-        if crate::resource::ped_tex_diag() {
-            let (src_w, src_h, src_fmt, src_pitch) = if src.kind == FOOTPRINT {
-                (
-                    src.footprint.width,
-                    src.footprint.height,
-                    src.footprint.format,
-                    src.footprint.row_pitch,
-                )
-            } else if let Some(sd) = src_tex_desc {
-                (sd.Width as u32, sd.Height, sd.Format.0 as u32, 0)
-            } else {
-                (0, 0, 0, 0)
-            };
-            if crate::resource::is_bc_format(dst_fmt) || crate::resource::is_bc_format(src_fmt) {
-                log_ped_copy_texture_region(
-                    &dst_desc,
-                    dst_sub,
-                    dst_tiled.is_some(),
-                    dst_staged,
-                    dst_host_wrote,
-                    src.kind,
-                    src_w,
-                    src_h,
-                    src_fmt,
-                    src_pitch,
-                    x,
-                    y,
-                    raw_box,
-                    bridged,
-                );
-            }
-        }
         // A depth texture shaders also write: what they wrote, first (the
         // source above too).
         list.twin_use(dst.resource, false, true);
@@ -1828,6 +1835,7 @@ extern "system" fn copy_texture_region(
             return;
         }
         ensure_state(list, dst.resource, COPY_DEST);
+        let mut bridged_ran = false;
         if bridged
             && src.kind != FOOTPRINT
             && let (Some(src_tex), Some(sdesc)) = (src_texture, src_tex_desc)
@@ -1845,6 +1853,54 @@ extern "system" fn copy_texture_region(
                 raw_box,
             )
         {
+            bridged_ran = true;
+        }
+        if crate::resource::ped_tex_diag() {
+            let (src_w, src_h, src_fmt, src_pitch, src_sub, src_mips) = if src.kind == FOOTPRINT {
+                (
+                    src.footprint.width,
+                    src.footprint.height,
+                    src.footprint.format,
+                    src.footprint.row_pitch,
+                    0u32,
+                    0u16,
+                )
+            } else if let Some(sd) = src_tex_desc {
+                (
+                    sd.Width as u32,
+                    sd.Height,
+                    sd.Format.0 as u32,
+                    0u32,
+                    src.footprint.offset as u32,
+                    sd.MipLevels,
+                )
+            } else {
+                (0, 0, 0, 0, 0, 0)
+            };
+            if crate::resource::is_bc_format(dst_fmt) || crate::resource::is_bc_format(src_fmt) {
+                let bridge_ok = !bridged || src.kind == FOOTPRINT || bridged_ran;
+                log_ped_copy_texture_region(
+                    &dst_desc,
+                    dst_sub,
+                    dst_tiled.is_some(),
+                    dst_staged,
+                    dst_host_wrote,
+                    src.kind,
+                    src_sub,
+                    src_mips,
+                    src_w,
+                    src_h,
+                    src_fmt,
+                    src_pitch,
+                    x,
+                    y,
+                    raw_box,
+                    bridged,
+                    bridge_ok,
+                );
+            }
+        }
+        if bridged_ran {
             return;
         }
         let mut to_location = dst;
