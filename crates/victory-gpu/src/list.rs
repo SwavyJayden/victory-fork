@@ -201,6 +201,7 @@ pub(crate) fn hold_state(this: This) -> Option<ActiveStateGuard> {
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
 #[cfg(windows)]
+#[inline]
 fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let active = ACTIVE_STATE.get();
     if active.0 == this as usize && active.0 != 0 && active.2 != 0 {
@@ -272,7 +273,7 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
 pub(crate) struct Detached {
     host: crate::host::HostList,
     _uploads: Vec<Upload>,
-    _state: crate::draw::State,
+    dynamic: crate::draw::DynamicHold,
 }
 
 #[cfg(windows)]
@@ -284,7 +285,7 @@ impl Detached {
     /// Releases this list's dynamic descriptor slots once its GPU submission
     /// has completed, without waiting for the full `bury_lag` allocator delay.
     pub(crate) fn release_tables(&mut self) {
-        self._state.tables_done();
+        self.dynamic.release();
     }
 }
 
@@ -352,9 +353,9 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     if !pools() {
         return;
     }
-    for (i, Detached { host, _uploads, _state }) in lists.into_iter().enumerate() {
+    for (i, Detached { host, _uploads, dynamic }) in lists.into_iter().enumerate() {
         // The descriptor slots and the upload memory its commands named.
-        drop(_state);
+        drop(dynamic);
         drop(_uploads);
         if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
             continue;
@@ -495,8 +496,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
         let earlier = std::mem::take(&mut list.earlier);
         let gate = std::mem::take(&mut list.gate);
         let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
-        let mut state = std::mem::take(&mut *list.state.lock().unwrap_or_else(|e| e.into_inner()));
-        state.trim_slab();
+        let dynamic = list.state.lock().unwrap_or_else(|e| e.into_inner()).take_dynamic();
         let single = earlier.is_empty() && gate.is_empty();
         let mut pieces: Vec<(Vec<ValueWait>, Detached)> = earlier
             .into_iter()
@@ -506,7 +506,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
                     Detached {
                         host: part.host,
                         _uploads: Vec::new(),
-                        _state: Default::default(),
+                        dynamic: Default::default(),
                     },
                 )
             })
@@ -516,7 +516,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             Detached {
                 host,
                 _uploads: uploads,
-                _state: state,
+                dynamic,
             },
         ));
         let mut last = None;
@@ -562,16 +562,18 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
         let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
-        let (host, uploads, state) = unsafe {
+        let (host, uploads, dynamic) = unsafe {
             let Some(host) = (*list).host.replace(fresh) else {
                 continue;
             };
             let uploads =
                 std::mem::take(&mut *(*list).uploads.lock().unwrap_or_else(|e| e.into_inner()));
-            let mut state =
-                std::mem::take(&mut *(*list).state.lock().unwrap_or_else(|e| e.into_inner()));
-            state.trim_slab();
-            (host, uploads, state)
+            let dynamic = (*list)
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take_dynamic();
+            (host, uploads, dynamic)
         };
         order.push(taken.len());
         taken.push((
@@ -579,7 +581,7 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             Detached {
                 host,
                 _uploads: uploads,
-                _state: state,
+                dynamic,
             },
         ));
     }
@@ -737,6 +739,7 @@ extern "system" fn close(this: This) -> HRESULT {
     #[cfg(windows)]
     with_state(this, |host, state| {
         state.trim_slab();
+        state.flush_retired();
         host.close();
     });
     S_OK
@@ -747,10 +750,11 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     }
     let _called = crate::timeline::span("the title's list Reset");
     // A wait recorded and never submitted goes with the recording.
-    VALUE_WAITS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .retain(|&(list, _)| list != this as usize);
+    if VALUE_WAITS_LEN.load(std::sync::atomic::Ordering::Acquire) != 0 {
+        let mut waits = VALUE_WAITS.lock().unwrap_or_else(|e| e.into_inner());
+        waits.retain(|&(list, _)| list != this as usize);
+        VALUE_WAITS_LEN.store(waits.len(), std::sync::atomic::Ordering::Release);
+    }
     // Every submission of the list has run (submissions are waited for).
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
@@ -2174,6 +2178,10 @@ impl ValueWait {
 
 /// The waits lists recorded since their last reset, by list.
 static VALUE_WAITS: std::sync::Mutex<Vec<(usize, ValueWait)>> = std::sync::Mutex::new(Vec::new());
+/// Lock-free mirror of `VALUE_WAITS.len()` so `reset`/`unmet_waits`/`waits_by_list`
+/// skip the global mutex when no uncut waits are queued (the common case when
+/// `crate::queue::cuts()` is enabled).
+static VALUE_WAITS_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// The waits of the submitted `lists` that are not met yet (taken from
 /// them): what the console's GPU would stop at. The title orders work
@@ -2184,6 +2192,9 @@ static VALUE_WAITS: std::sync::Mutex<Vec<(usize, ValueWait)>> = std::sync::Mutex
 /// shortcut: a wait holds its whole list (and submission) back, not only
 /// the commands after it.
 pub(crate) fn unmet_waits(lists: &[This]) -> Vec<ValueWait> {
+    if VALUE_WAITS_LEN.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return Vec::new();
+    }
     let mut waits = VALUE_WAITS.lock().unwrap_or_else(|e| e.into_inner());
     let mut unmet = Vec::new();
     waits.retain(|&(list, wait)| {
@@ -2195,6 +2206,7 @@ pub(crate) fn unmet_waits(lists: &[This]) -> Vec<ValueWait> {
         }
         false
     });
+    VALUE_WAITS_LEN.store(waits.len(), std::sync::atomic::Ordering::Release);
     unmet
 }
 
@@ -2202,6 +2214,9 @@ pub(crate) fn unmet_waits(lists: &[This]) -> Vec<ValueWait> {
 /// met or not, at the list's first place in the submission.
 #[cfg(windows)]
 pub(crate) fn waits_by_list(lists: &[This]) -> Vec<Vec<ValueWait>> {
+    if VALUE_WAITS_LEN.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return vec![Vec::new(); lists.len()];
+    }
     let mut waits = VALUE_WAITS.lock().unwrap_or_else(|e| e.into_inner());
     let mut by = vec![Vec::new(); lists.len()];
     waits.retain(|&(list, wait)| {
@@ -2213,6 +2228,7 @@ pub(crate) fn waits_by_list(lists: &[This]) -> Vec<Vec<ValueWait>> {
             None => true,
         }
     });
+    VALUE_WAITS_LEN.store(waits.len(), std::sync::atomic::Ordering::Release);
     by
 }
 
@@ -2249,10 +2265,9 @@ fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: boo
         cut(this, wait);
         return;
     }
-    VALUE_WAITS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push((this as usize, wait));
+    let mut waits = VALUE_WAITS.lock().unwrap_or_else(|e| e.into_inner());
+    waits.push((this as usize, wait));
+    VALUE_WAITS_LEN.store(waits.len(), std::sync::atomic::Ordering::Release);
 }
 extern "system" fn wait_value(this: This, address: u64, comparison: u32, reference: u64) {
     wait_for(this, address, comparison, reference, false);

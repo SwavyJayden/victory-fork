@@ -72,6 +72,7 @@ pub(crate) fn heap<'a>(this: This) -> &'a Heap {
 
 impl Heap {
     /// Whether this is a sampler heap.
+    #[inline]
     pub(crate) fn samplers(&self) -> bool {
         self.desc.kind == SAMPLERS
     }
@@ -80,10 +81,17 @@ impl Heap {
     /// Made late because a host view heap the size of the title's
     /// costs over 100 MB of commit, which its boot needs for its page pool.
     #[cfg(windows)]
+    #[inline]
     pub(crate) fn host(&self) -> Option<&host::HostHeap> {
         if let Some(h) = self.host.get() {
             return h.as_ref();
         }
+        self.host_init()
+    }
+
+    #[cfg(windows)]
+    #[cold]
+    fn host_init(&self) -> Option<&host::HostHeap> {
         if self.desc.flags & SHADER_VISIBLE == 0 || !matches!(self.desc.kind, VIEWS_KIND | SAMPLERS)
         {
             return None;
@@ -95,9 +103,11 @@ impl Heap {
             .get_or_init(|| {
                 let step = u64::from(increment(self.desc.kind)?);
                 let h = host::HostHeap::new(self.samplers(), self.desc.count)?;
+                let mut retired = Vec::new();
                 for i in pending.drain(..) {
-                    h.mirror(i, self.start + u64::from(i) * step, false);
+                    h.mirror_into(i, self.start + u64::from(i) * step, false, Some(&mut retired));
                 }
+                crate::host::retire_resources(retired);
                 Some(h)
             })
             .as_ref()
@@ -105,16 +115,23 @@ impl Heap {
 
     /// The handle of descriptor `index` of this heap.
     #[cfg(windows)]
+    #[inline]
     pub(crate) fn handle(&self, index: u32) -> Option<u64> {
         let step = u64::from(increment(self.desc.kind)?);
         (index < self.desc.count).then(|| self.start + u64::from(index) * step)
     }
 
     /// The descriptor index of `handle` in this heap, if it lies in it.
+    #[inline]
     pub(crate) fn index(&self, handle: u64) -> Option<u32> {
-        let step = u64::from(increment(self.desc.kind)?);
+        let shift = match self.desc.kind {
+            0 => 5u32,
+            1 => 4,
+            2 | 3 => 7,
+            _ => return None,
+        };
         let at = handle.checked_sub(self.start)?;
-        let index = at / step;
+        let index = at >> shift;
         (index < u64::from(self.desc.count)).then_some(index as u32)
     }
 }
@@ -418,17 +435,39 @@ pub(crate) fn sync_heaps() {
         // The records of some frames ago that no draw read through a table
         // since: a shader may pick them by index.
         let before_began = std::time::Instant::now();
+        let samplers = heap.samplers();
         let (before, mut of_tables) = host.copied_before(frame);
         if !before.is_empty() {
             let extra_tables = std::sync::atomic::AtomicU64::new(0);
-            crate::land::each_view(true, before.len().div_ceil(SYNC_AT_A_TIME), &|n| {
-                for &index in before.chunks(SYNC_AT_A_TIME).nth(n).unwrap_or_default() {
+            let table_bufs = !samplers && host.table_buffers_on();
+            let chunk = (before.len() / 8).clamp(64, SYNC_AT_A_TIME);
+            crate::land::each_view(true, before.len().div_ceil(chunk), &|n| {
+                let mut retired = Vec::new();
+                for &index in before.chunks(chunk).nth(n).unwrap_or_default() {
                     if host.copied_tabled(index, frame) {
                         extra_tables.fetch_add(1, Relaxed);
                     } else {
-                        host.mirror(index, start + u64::from(index) * step, false);
+                        let handle = start + u64::from(index) * step;
+                        // SAFETY: `index < mirrored_count <= heap.desc.count`, valid slot in title heap.
+                        let record = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+                        if table_bufs
+                            && record[0] == VIEW_TAG
+                            && host.buffer_tabled_lately(index, frame)
+                            && is_buffer_record(record[1], record[2])
+                        {
+                            extra_tables.fetch_add(1, Relaxed);
+                        } else {
+                            host.mirror_record_into(
+                                index,
+                                handle,
+                                record,
+                                false,
+                                Some(&mut retired),
+                            );
+                        }
                     }
                 }
+                crate::host::retire_resources(retired);
             });
             let extra = extra_tables.into_inner();
             of_tables += extra;
@@ -486,8 +525,8 @@ pub(crate) fn sync_heaps() {
         // thread at 160 pages, run faults-6).
         let began = std::time::Instant::now();
         let copied = host.copied_begin(step as usize);
-        let samplers = heap.samplers();
         let in_place = sync_in_place() && step == 32 && crate::safecopy::on();
+        let table_bufs = !samplers && host.table_buffers_on();
         let found: Vec<std::sync::Mutex<SyncPart>> = parts.chunks(pages_a_job).map(|_| Default::default()).collect();
         crate::land::each_view(true, found.len(), &|n| {
             let mut out = SyncPart::default();
@@ -574,6 +613,16 @@ pub(crate) fn sync_heaps() {
                             out.tabled += 1;
                             continue;
                         }
+                        // `VICTORY_TABLE_BUFFERS`: buffer/constant views in
+                        // slots recently read via draw tables stay with those
+                        // draws instead of thrashing `sync_heaps`.
+                        if table_bufs
+                            && host.buffer_tabled_lately(index, frame)
+                            && is_buffer_record(w1, w2)
+                        {
+                            out.tabled += 1;
+                            continue;
+                        }
                         // Buffer views and placed textures get no host
                         // slot from this anyway, they wait for a draw
                         // or a pass: noted some frames on, unless a
@@ -626,10 +675,19 @@ pub(crate) fn sync_heaps() {
         }
         spent[1] += since(began);
         let began = std::time::Instant::now();
-        crate::land::each_view(true, make.len().div_ceil(SYNC_AT_A_TIME), &|n| {
-            for &(index, record) in make.chunks(SYNC_AT_A_TIME).nth(n).unwrap_or_default() {
-                host.mirror_record(index, start + u64::from(index) * step, record, false);
+        let chunk = (make.len() / 8).clamp(64, SYNC_AT_A_TIME);
+        crate::land::each_view(true, make.len().div_ceil(chunk), &|n| {
+            let mut retired = Vec::new();
+            for &(index, record) in make.chunks(chunk).nth(n).unwrap_or_default() {
+                host.mirror_record_into(
+                    index,
+                    start + u64::from(index) * step,
+                    record,
+                    false,
+                    Some(&mut retired),
+                );
             }
+            crate::host::retire_resources(retired);
         });
         spent[2] += since(began);
         if !wait.is_empty() {
@@ -1374,6 +1432,10 @@ fn wait_for(resource: usize, handle: u64) {
 #[cfg(windows)]
 pub(crate) fn make_waiting() {
     let made = std::mem::take(&mut *MADE_LATE.lock().unwrap_or_else(|e| e.into_inner()));
+    if made.is_empty() {
+        return;
+    }
+    let mut retired = Vec::new();
     for resource in made {
         let handles = WAITING
             .lock()
@@ -1400,10 +1462,11 @@ pub(crate) fn make_waiting() {
                 _ => false,
             };
             if same && let Some(Some(host)) = heap.host.get() {
-                host.mirror(index, handle, true);
+                host.mirror_into(index, handle, true, Some(&mut retired));
             }
         }
     }
+    crate::host::retire_resources(retired);
 }
 
 fn record(handle: u64, view: View) {
@@ -1459,14 +1522,65 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
     }
 }
 
-/// The words of the record at `handle`, if they are a view's.
-pub(crate) fn record_at(handle: u64) -> Option<[u32; 3]> {
-    if handle == 0 {
+/// Decodes an inline constant-buffer record `[VIEW_TAG, i, generation]` into
+/// `(address, size)` without acquiring `VIEWS` or probing `ListViews`.
+#[cfg(windows)]
+#[inline]
+pub(crate) fn inline_constant(words: [u32; 3]) -> Option<(u64, u32)> {
+    if words[0] != VIEW_TAG || (words[2] >> KIND_SHIFT) != CONSTANT {
         return None;
     }
-    // SAFETY: the handle is a descriptor slot the title passes back.
-    let words = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-    (words[0] == VIEW_TAG).then_some(words)
+    match constant_of(words[1], words[2]) {
+        View::Constant(address, size) => Some((address, size)),
+        _ => None,
+    }
+}
+
+/// Whether record words `(i, generation)` name a buffer or constant-buffer
+/// view (not a texture or sampler), without cloning `View`.
+#[cfg(windows)]
+pub(crate) fn is_buffer_record(i: u32, generation: u32) -> bool {
+    match generation >> KIND_SHIFT {
+        CONSTANT => true,
+        PLACED => {
+            let payload = payload(i, generation);
+            let shape = (payload >> PLACED_ADDRESS_BITS) as usize;
+            views_read()
+                .shapes
+                .get(shape)
+                .is_some_and(|(_, resource, _)| resource[0] == 1)
+        }
+        0 => {
+            let views = views_read();
+            let Some((view, current)) = views.list.get(i as usize) else {
+                return false;
+            };
+            if *current != generation {
+                return false;
+            }
+            match view {
+                View::Constant(..) => true,
+                View::Placed(_, resource, _) => resource[0] == 1,
+                View::Shader(r, desc) => {
+                    crate::resource::buffer_bytes(*r as This).is_some()
+                        || desc.is_some_and(|d| d[1] == 1)
+                }
+                View::Unordered(r, _, desc) => {
+                    crate::resource::buffer_bytes(*r as This).is_some()
+                        || desc.is_some_and(|d| d[1] == 1)
+                }
+                View::Sampler(_) | View::ConsoleSampler(_) => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Resolves an already-read `[tag, i, generation]` descriptor record header.
+#[cfg(windows)]
+#[inline]
+pub(crate) fn view_from_record(words: [u32; 3]) -> Option<View> {
+    (words[0] == VIEW_TAG).then(|| view_at(words[1], words[2])).flatten()
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive).

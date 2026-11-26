@@ -17,13 +17,15 @@
 //! goes (an object of ours the texture holds says so), a staging buffer's
 //! when the last list that recorded its copy is reset.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{GUID, HRESULT, IUnknown, Interface};
+
+use crate::ranges::Ranges;
 
 /// Bytes of a block; pieces of more than half of one are not pooled (with
 /// blocks made ahead, [`ahead`]: of more than one).
@@ -171,48 +173,6 @@ impl Ripe {
 /// Pieces cut from blocks that were not ripe, for want of a ripe one.
 static UNRIPE: AtomicU64 = AtomicU64::new(0);
 
-/// The free ranges of a block: start and length, never two that touch.
-struct Ranges(BTreeMap<u64, u64>);
-
-impl Ranges {
-    fn new(size: u64) -> Ranges {
-        Ranges(BTreeMap::from([(0, size)]))
-    }
-
-    /// The lowest place for `len` bytes at a multiple of `align`.
-    fn take(&mut self, len: u64, align: u64) -> Option<u64> {
-        let (start, size, at) = self.0.iter().find_map(|(&start, &size)| {
-            let at = start.next_multiple_of(align);
-            (at + len <= start + size).then_some((start, size, at))
-        })?;
-        self.0.remove(&start);
-        if at > start {
-            self.0.insert(start, at - start);
-        }
-        if at + len < start + size {
-            self.0.insert(at + len, start + size - at - len);
-        }
-        Some(at)
-    }
-
-    fn give(&mut self, mut start: u64, mut len: u64) {
-        if let Some((&before, &size)) = self.0.range(..start).next_back()
-            && before + size == start
-        {
-            self.0.remove(&before);
-            (start, len) = (before, len + size);
-        }
-        if let Some(size) = self.0.remove(&(start + len)) {
-            len += size;
-        }
-        self.0.insert(start, len);
-    }
-
-    fn whole(&self, size: u64) -> bool {
-        self.0.get(&0) == Some(&size)
-    }
-}
-
 /// A part of a block.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Piece {
@@ -224,9 +184,6 @@ pub(crate) struct Piece {
 struct Block<B> {
     memory: B,
     free: Ranges,
-    /// The end of the highest piece ever taken: above it the memory is as
-    /// it was made (zeros).
-    used_to: u64,
     /// The newest submission begun when it was made ([`Ripe`]).
     made: u64,
     /// When that was (ms).
@@ -252,50 +209,97 @@ impl<B: Clone> Pool<B> {
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
     /// part was ever used before; `make` makes a block when none has room.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn take(&mut self, len: u64, align: u64, now: u64, make: impl FnMut() -> Option<B>) -> Option<(Piece, B, bool)> {
         self.take_ripe(len, align, now, Ripe::ALL, make)
     }
 
+    /// As [`take`](Self::take), returning any evicted empty blocks so callers
+    /// can drop or asynchronously retire them outside the pool lock.
+    fn take_with_evicted(
+        &mut self,
+        len: u64,
+        align: u64,
+        now: u64,
+        mut make: impl FnMut() -> Option<B>,
+    ) -> (Option<(Piece, B, bool)>, Vec<B>) {
+        if len == 0 || len > BLOCK / 2 {
+            return (None, Vec::new());
+        }
+        let evicted = self.reclaim_rested(now);
+        let mut found = None;
+        for (i, block) in self.blocks.iter_mut().enumerate() {
+            if let Some(block) = block
+                && let Some((start, again)) = block.free.take(len, align)
+            {
+                found = Some((i, start, again));
+                break;
+            }
+        }
+        let Some((i, start, again)) = found.or_else(|| {
+            let memory = self.grow(now, &mut make)?;
+            let i = self.add(memory, 0);
+            let (start, again) = self.blocks[i].as_mut()?.free.take(len, align)?;
+            Some((i, start, again))
+        }) else {
+            return (None, evicted);
+        };
+        let Some(block) = self.blocks[i].as_ref() else {
+            return (None, evicted);
+        };
+        (Some((Piece { block: i, start, len }, block.memory.clone(), again)), evicted)
+    }
+
     /// Attempts to cut a piece from an existing block without calling `make`.
-    /// Returns `(Some((piece, mem, again)), need_ahead)` on hit, or
-    /// `(None, can_grow)` when a brand-new block must be allocated outside the lock.
+    /// Returns `(Some((piece, mem, again)), need_ahead, evicted)` on hit, or
+    /// `(None, can_grow, evicted)` when a brand-new block must be allocated
+    /// outside the lock. Evicted empty blocks are returned so the caller can
+    /// retire them outside the lock instead of blocking on D3D12 teardown.
     fn try_take_ripe_existing(
         &mut self,
         len: u64,
         align: u64,
         now: u64,
         ripe: Ripe,
-    ) -> (Option<(Piece, B, bool)>, bool) {
+    ) -> (Option<(Piece, B, bool)>, bool, Vec<B>) {
         if len == 0 || len > if ripe.ahead > 0 { BLOCK } else { BLOCK / 2 } {
-            return (None, false);
+            return (None, false, Vec::new());
         }
-        self.rested(now);
+        let evicted = self.reclaim_rested(now);
         let mut found = None;
         for (i, block) in self.blocks.iter_mut().enumerate() {
             if let Some(block) = block
                 && ripe.is(block)
-                && let Some(start) = block.free.take(len, align)
+                && let Some((start, again)) = block.free.take(len, align)
             {
-                found = Some((i, start));
+                found = Some((i, start, again));
                 break;
             }
         }
         if found.is_none() && ripe.ahead > 0 {
-            let mut unripe: Vec<(u64, usize)> =
-                self.blocks.iter().enumerate().filter_map(|(i, b)| Some((b.as_ref()?.made, i))).collect();
+            let mut unripe: Vec<(u64, usize)> = self
+                .blocks
+                .iter()
+                .enumerate()
+                .filter_map(|(i, b)| {
+                    let b = b.as_ref()?;
+                    (b.free.room() >= len).then_some((b.made, i))
+                })
+                .collect();
             unripe.sort_unstable();
-            found = unripe.into_iter().find_map(|(_, i)| Some((i, self.blocks[i].as_mut()?.free.take(len, align)?)));
+            found = unripe.into_iter().find_map(|(_, i)| {
+                let (start, again) = self.blocks[i].as_mut()?.free.take(len, align)?;
+                Some((i, start, again))
+            });
         }
-        let Some((i, start)) = found else {
-            return (None, now >= self.retry_growth_at);
+        let Some((i, start, again)) = found else {
+            return (None, now >= self.retry_growth_at, evicted);
         };
         let need_ahead = self.finish_ripe_bookkeeping(i, now, ripe);
-        let Some(block) = self.blocks[i].as_mut() else {
-            return (None, false);
+        let Some(block) = self.blocks[i].as_ref() else {
+            return (None, false, evicted);
         };
-        let again = start < block.used_to;
-        block.used_to = block.used_to.max(start + len);
-        (Some((Piece { block: i, start, len }, block.memory.clone(), again)), need_ahead)
+        (Some((Piece { block: i, start, len }, block.memory.clone(), again)), need_ahead, evicted)
     }
 
     fn finish_ripe_bookkeeping(&self, i: usize, now: u64, ripe: Ripe) -> bool {
@@ -336,27 +340,38 @@ impl<B: Clone> Pool<B> {
         for (i, block) in self.blocks.iter_mut().enumerate() {
             if let Some(block) = block
                 && ripe.is(block)
-                && let Some(start) = block.free.take(len, align)
+                && let Some((start, again)) = block.free.take(len, align)
             {
-                found = Some((i, start));
+                found = Some((i, start, again));
                 break;
             }
         }
         if found.is_none() && ripe.ahead > 0 {
             // The one that has been there the longest.
-            let mut unripe: Vec<(u64, usize)> =
-                self.blocks.iter().enumerate().filter_map(|(i, b)| Some((b.as_ref()?.made, i))).collect();
+            let mut unripe: Vec<(u64, usize)> = self
+                .blocks
+                .iter()
+                .enumerate()
+                .filter_map(|(i, b)| {
+                    let b = b.as_ref()?;
+                    (b.free.room() >= len).then_some((b.made, i))
+                })
+                .collect();
             unripe.sort_unstable();
-            found = unripe.into_iter().find_map(|(_, i)| Some((i, self.blocks[i].as_mut()?.free.take(len, align)?)));
+            found = unripe.into_iter().find_map(|(_, i)| {
+                let (start, again) = self.blocks[i].as_mut()?.free.take(len, align)?;
+                Some((i, start, again))
+            });
         }
         // A failed 64 MiB block must not trigger another driver call for each
         // small texture. Existing free ranges remain usable during backoff.
-        let (i, start) = match found {
+        let (i, start, again) = match found {
             Some(found) => found,
             None => {
                 let memory = self.grow(now, &mut make)?;
                 let i = self.add(memory, ripe.started);
-                (i, self.blocks[i].as_mut()?.free.take(len, align)?)
+                let (start, again) = self.blocks[i].as_mut()?.free.take(len, align)?;
+                (i, start, again)
             }
         };
         if ripe.ahead > 0 {
@@ -379,9 +394,7 @@ impl<B: Clone> Pool<B> {
                 self.add(memory, ripe.started);
             }
         }
-        let block = self.blocks[i].as_mut()?;
-        let again = start < block.used_to;
-        block.used_to = block.used_to.max(start + len);
+        let block = self.blocks[i].as_ref()?;
         Some((Piece { block: i, start, len }, block.memory.clone(), again))
     }
 
@@ -404,7 +417,7 @@ impl<B: Clone> Pool<B> {
                 self.blocks.len() - 1
             }
         };
-        self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), used_to: 0, made, since: crate::host::now_ms() });
+        self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), made, since: crate::host::now_ms() });
         i
     }
 
@@ -412,10 +425,17 @@ impl<B: Clone> Pool<B> {
         self.resting.push_back((now + REST, piece));
     }
 
+    /// Makes the pieces that rested long enough free, and returns empty blocks
+    /// past `SPARES` for out-of-lock teardown.
+    fn reclaim_rested(&mut self, now: u64) -> Vec<B> {
+        self.reclaim(now, SPARES.load(Ordering::Relaxed), false)
+    }
+
     /// Makes the pieces that rested long enough free, and lets go of empty
     /// blocks past [`SPARE`].
+    #[cfg_attr(not(test), allow(dead_code))]
     fn rested(&mut self, now: u64) {
-        let _ = self.reclaim(now, SPARES.load(Ordering::Relaxed), false);
+        let _ = self.reclaim_rested(now);
     }
 
     fn reclaim(&mut self, now: u64, limit: usize, sweep: bool) -> Vec<B> {
@@ -501,7 +521,7 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
     let bytes = bytes.next_multiple_of(512);
     let mut speculative_skip = false;
     let mut guard = lock(&STAGING);
-    let (piece, memory, again) = match guard.take(bytes, 512, now(), || {
+    let (taken, evicted) = guard.take_with_evicted(bytes, 512, now(), || {
         // Only gate speculative bindless prefetch on staging-pool growth
         // headroom; table-bound textures and decoration bakes are sampled
         // immediately and would otherwise read uninitialized/reused VRAM.
@@ -513,7 +533,8 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
         let (buffer, data) = host.upload_buffer_private(BLOCK)?;
         crate::host::name(&buffer, || "staging of textures (a block)".into());
         Some(Upload(buffer, data))
-    }) {
+    });
+    let (piece, memory, again) = match taken {
         Some(got) => got,
         None => {
             // Do not apply the 500 ms D3D12 OOM backoff when speculative
@@ -522,10 +543,13 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
             if speculative_skip {
                 guard.retry_growth_at = 0;
             }
+            drop(guard);
+            drop(evicted);
             return None;
         }
     };
     drop(guard);
+    drop(evicted);
     let owned = StagingPiece(piece);
     // SAFETY: the piece lies in the block's mapping.
     let data = unsafe { memory.1.add(piece.start as usize) };
@@ -590,11 +614,19 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
 
 /// Textures made in the last second ([`fresh`]), and when.
 static RECENT: Mutex<VecDeque<(usize, u64)>> = Mutex::new(VecDeque::new());
+/// `timestamp_ms + 1` of the newest entry in [`RECENT`] (`0` if never populated),
+/// letting [`fresh`] skip locking `RECENT` completely when no pooled texture
+/// was created in the last second.
+static RECENT_LAST_MS: AtomicU64 = AtomicU64::new(0);
 
 /// Whether `texture` was made in a block in the last second.
 pub(crate) fn fresh(texture: &ID3D12Resource) -> bool {
-    let raw = texture.as_raw() as usize;
     let since = now().saturating_sub(1000);
+    let last = RECENT_LAST_MS.load(Ordering::Acquire);
+    if last == 0 || last - 1 < since {
+        return false;
+    }
+    let raw = texture.as_raw() as usize;
     RECENT.lock().unwrap_or_else(|e| e.into_inner()).iter().rev().take_while(|r| r.1 >= since).any(|r| r.0 == raw)
 }
 
@@ -605,6 +637,7 @@ fn made_now(texture: &ID3D12Resource) {
         recent.pop_front();
     }
     recent.push_back((texture.as_raw() as usize, now));
+    RECENT_LAST_MS.fetch_max(now.saturating_add(1), Ordering::Release);
 }
 
 /// Makes `texture` give `piece` back when the last reference to it goes.
@@ -677,7 +710,10 @@ pub(crate) unsafe fn texture(
     let tick = now();
     let ripe = Ripe::now();
     let align = info.Alignment.max(1);
-    let (found, need_more) = lock(&TEXTURES).try_take_ripe_existing(info.SizeInBytes, align, tick, ripe);
+    let (found, need_more, evicted) = lock(&TEXTURES).try_take_ripe_existing(info.SizeInBytes, align, tick, ripe);
+    for heap in evicted {
+        crate::host::retire(heap);
+    }
     #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
     let (piece, heap, again) = match found {
         Some(res) => {
@@ -706,11 +742,9 @@ pub(crate) unsafe fn texture(
             let (res, need_ahead) = {
                 let mut pool = lock(&TEXTURES);
                 let i = pool.add(new_heap, ripe.started);
-                let start = pool.blocks[i].as_mut()?.free.take(info.SizeInBytes, align)?;
+                let (start, again) = pool.blocks[i].as_mut()?.free.take(info.SizeInBytes, align)?;
                 let need_ahead = pool.finish_ripe_bookkeeping(i, tick, ripe);
-                let block = pool.blocks[i].as_mut()?;
-                let again = start < block.used_to;
-                block.used_to = block.used_to.max(start + info.SizeInBytes);
+                let block = pool.blocks[i].as_ref()?;
                 ((Piece { block: i, start, len: info.SizeInBytes }, block.memory.clone(), again), need_ahead)
             };
             if need_ahead {
@@ -769,15 +803,35 @@ mod tests {
     #[test]
     fn ranges_are_cut_aligned_and_join_again() {
         let mut r = Ranges::new(1024);
-        assert_eq!(r.take(100, 64), Some(0));
-        assert_eq!(r.take(100, 64), Some(128));
-        assert_eq!(r.take(28, 4), Some(100));
+        assert_eq!(r.take(100, 64), Some((0, false)));
+        assert_eq!(r.take(100, 64), Some((128, false)));
+        assert_eq!(r.take(28, 4), Some((100, true)));
         assert_eq!(r.take(2000, 4), None);
         r.give(128, 100);
         r.give(0, 100);
         assert!(!r.whole(1024));
         r.give(100, 28);
         assert!(r.whole(1024));
+    }
+
+    #[test]
+    fn try_take_ripe_existing_returns_evicted_blocks_for_out_of_lock_retire() {
+        let mut pool: Pool<u32> = Pool::new(SPARE);
+        for id in 1..=5u32 {
+            pool.add(id, 0);
+        }
+        // Take and return one piece so `reclaim_rested` sees an emptied block
+        // past `SPARE` and returns excess blocks instead of dropping inside.
+        let (piece, _, _) = pool
+            .try_take_ripe_existing(4096, 4096, 0, Ripe::ALL)
+            .0
+            .expect("first piece");
+        pool.give(piece, 0);
+        // Set SPARES to SPARE for deterministic eviction count (test-local Pool::most is SPARE).
+        let (taken, _, evicted) = pool.try_take_ripe_existing(4096, 4096, REST, Ripe::ALL);
+        assert!(taken.is_some());
+        assert!(!evicted.is_empty(), "excess empty blocks must be returned for async retire");
+        assert!(pool.blocks() <= SPARE + 1);
     }
 
     #[test]

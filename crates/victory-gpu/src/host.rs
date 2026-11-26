@@ -2074,6 +2074,59 @@ impl<T> Spare<T> {
 /// Scratch chunks no list holds.
 static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
 
+/// Maximum bytes of recycled CPU-visible `shared_buffer`s kept in
+/// [`SHARED_SPARE`] to eliminate repeated `CreateCommittedResource` +
+/// `MakeResident` + `mapped()` stalls on recycled `exact` / `loose` / small
+/// `lookup` shadows.
+const SHARED_SPARE_MOST: u64 = 64 << 20;
+
+/// Recycled CPU-visible `shared_buffer`s (already resident and GPU-VA mapped)
+/// with zero remaining COM references outside this pool.
+static SHARED_SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
+
+/// Whether retired CPU-visible `shared_buffer` shadows are recycled
+/// (`VICTORY_SHARED_POOL=0` disables; on by default).
+fn shared_pool_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SHARED_POOL").is_none_or(|v| v != "0"))
+}
+
+/// Returns a recycled, zero-initialized CPU-visible `shared_buffer` of exact
+/// `size` bytes from [`SHARED_SPARE`], if available.
+fn take_shared_spare(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    if !shared_pool_on() {
+        return None;
+    }
+    let chunk = SHARED_SPARE.lock().unwrap_or_else(|e| e.into_inner()).take(size)?;
+    // SAFETY: `chunk` is uniquely owned (verified `references == 1` on recycle),
+    // persistently mapped for `size` bytes, and already resident/GPU-VA mapped.
+    unsafe { std::ptr::write_bytes(chunk.data as *mut u8, 0, size as usize) };
+    Some((chunk.buffer, chunk.data as *mut u8))
+}
+
+/// Recycles a retired CPU-visible `shared_buffer` (already resident and GPU-VA
+/// mapped, with no live descriptor or command-list references) into
+/// [`SHARED_SPARE`] when host RAM is not constrained.
+pub(crate) fn recycle_shared_buffer(buffer: ID3D12Resource, data: *mut u8, size: u64) {
+    if !shared_pool_on()
+        || size == 0
+        || size > SHARED_SPARE_MOST
+        || data.is_null()
+        || crate::residency::limited_host_ram()
+    {
+        return;
+    }
+    let dropped = SHARED_SPARE.lock().unwrap_or_else(|e| e.into_inner()).give(
+        Chunk {
+            buffer,
+            data: data as usize,
+        },
+        size,
+        SHARED_SPARE_MOST,
+    );
+    drop(dropped);
+}
+
 /// A scratch chunk of `size` bytes: one kept ([`SPARE`]) or a new one.
 fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
     if scratch_pool()
@@ -3436,6 +3489,83 @@ fn join_ranges(ranges: &mut Vec<(usize, usize)>, more: impl IntoIterator<Item = 
         }
     }
     *ranges = out;
+}
+
+/// Once-per-frame rotating working-set watchdog (up to 64 active `GpuOnly`
+/// pieces/frame via `K32QueryWorkingSetEx`) run on the background relay thread
+/// (and at the end of synchronous `card_back`) to catch unexpected late-onset
+/// title CPU reads without stalling `victory-submit`.
+fn run_gpu_only_watchdog() {
+    use crate::gpu_only::{DemoteReason, WATCHDOG_BUDGET_PER_FRAME};
+    if !crate::gpu_only::enabled() || crate::gpu_only::active_pieces() == 0 {
+        return;
+    }
+    let frame = crate::frame::current();
+    if !crate::gpu_only::claim_watchdog_frame(frame) {
+        return;
+    }
+    let tracked = crate::gpu_only::tracked_shadows();
+    let mut active_shadows: Vec<&std::sync::Arc<crate::shadow::Shadow>> =
+        tracked.iter().filter(|s| s.any_gpu_only()).collect();
+    if active_shadows.is_empty() {
+        return;
+    }
+    active_shadows.sort_unstable_by_key(|s| s.id());
+    let total_slots: usize = active_shadows.iter().map(|s| s.gpu_only_pieces()).sum();
+    if total_slots == 0 {
+        return;
+    }
+    let mut left = WATCHDOG_BUDGET_PER_FRAME;
+    let mut cursor = crate::gpu_only::watchdog_cursor() % total_slots;
+    let mut last_global_slot: Option<usize> = None;
+    let mut offset = 0usize;
+    for pass in 0..2 {
+        for shadow in &active_shadows {
+            let count = shadow.gpu_only_pieces();
+            if count == 0 || left == 0 {
+                offset += count;
+                continue;
+            }
+            let start_in = if pass == 0 {
+                if cursor >= offset + count {
+                    offset += count;
+                    continue;
+                }
+                cursor.saturating_sub(offset)
+            } else {
+                0
+            };
+            let candidates = shadow.gpu_only_watchdog_candidates(start_in, left);
+            let mut touched_pieces = Vec::new();
+            for &(piece, block) in &candidates {
+                if left == 0 {
+                    break;
+                }
+                left -= 1;
+                last_global_slot = Some(offset + piece + 1);
+                if let Some((touched, _)) = crate::gpu_only::query_working_set_block(block)
+                    && touched > 0
+                {
+                    touched_pieces.push(piece);
+                }
+            }
+            if !touched_pieces.is_empty() {
+                crate::gpu_only::queue_demotion((*shadow).clone(), touched_pieces, DemoteReason::CpuRead, false);
+            }
+            offset += count;
+            if left == 0 {
+                break;
+            }
+        }
+        if left == 0 || cursor == 0 {
+            break;
+        }
+        cursor = 0;
+        offset = 0;
+    }
+    if let Some(next_slot) = last_global_slot {
+        crate::gpu_only::set_watchdog_cursor(next_slot % total_slots);
+    }
 }
 
 /// Whether anything is in the air.
@@ -5479,6 +5609,9 @@ impl Host {
                     };
                     let any_gpu_only = r.shadow.any_gpu_only();
                     let can_sample_unflagged = gpu_only_on && unflagged_budget > 0 && r.compared && r.shadow.gpu_only_eligible();
+                    if can_sample_unflagged {
+                        r.shadow.gpu_only_ensure_tracked();
+                    }
                     for p in 0..r.span.pieces {
                         let piece_idx = (r.span.first + p) as usize;
                         if any_gpu_only && r.shadow.is_gpu_only_piece(piece_idx) {
@@ -5677,6 +5810,7 @@ impl Host {
                 }
                 notes.flush();
                 for (shadow, list) in after_land {
+                    shadow.gpu_only_ensure_tracked();
                     shadow.gpu_only_after_land(&list);
                 }
                 land::spent(land::stat::CARD_ALL, working);
@@ -5696,6 +5830,7 @@ impl Host {
                 let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
                 let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
                 shadow.walls_merged(gpu.len(), merged);
+                shadow.gpu_only_ensure_tracked();
                 shadow.gpu_only_after_land(&[(*lo, *hi, merged > 0)]);
                 written += merged as u64;
             }
@@ -5876,6 +6011,7 @@ impl Host {
         }
         LINE_MOVED.notify_all();
         LINE_LANDED.notify_all();
+        run_gpu_only_watchdog();
     }
 
     /// After a submission ran, for copies in the card's memory: the pieces
@@ -5994,6 +6130,7 @@ impl Host {
                                 let gpu = unsafe { std::slice::from_raw_parts((fetched + at as usize) as *const u8, hi - lo) };
                                 let merged = shadow.card_merge(lo, gpu, &mut title);
                                 shadow.walls_merged(gpu.len(), merged);
+                                shadow.gpu_only_ensure_tracked();
                                 shadow.gpu_only_after_land(&[(lo, hi, merged > 0)]);
                                 counts[i].fetch_add(merged, Ordering::Relaxed);
                             }
@@ -6013,6 +6150,7 @@ impl Host {
                     let gpu = unsafe { std::slice::from_raw_parts((*data + at as usize) as *const u8, hi - lo) };
                     let merged = plan.ranges[i].shadow.card_merge(lo, gpu, &mut title);
                     plan.ranges[i].shadow.walls_merged(gpu.len(), merged);
+                    plan.ranges[i].shadow.gpu_only_ensure_tracked();
                     plan.ranges[i].shadow.gpu_only_after_land(&[(lo, hi, merged > 0)]);
                     written[i] += merged;
                 }
@@ -6025,6 +6163,7 @@ impl Host {
             crate::copystat::compared(from, to - from, written);
             let _ = (from, to);
         }
+        run_gpu_only_watchdog();
     }
 
     /// Runs closed lists and waits for them, and with [`late`] for
@@ -6387,17 +6526,17 @@ impl Host {
         crate::watch::ask_once(ranges);
     }
 
-    /// Pre-submission `GpuOnly` safety net (runs BEFORE `card_steps` and
-    /// `run_deferred` under `self.submitted`):
-    /// 1. Drains any pending alias/unregister demotions queued on other threads.
-    /// 2. Records CPU-step touches (`Copy`/`Placed`/`Fill`/`Texture`/`Plane`/
-    ///    `Host`/`Run`) and demotes any overlapping `GpuOnly` pieces before
-    ///    those steps read or write title memory.
-    /// 3. Runs the once-per-frame rotating working-set watchdog (up to 64
-    ///    active `GpuOnly` pieces/frame via `K32QueryWorkingSetEx`) to catch
-    ///    unexpected late-onset title CPU reads.
+    /// Zero-fault `GpuOnly` pre-submission gate (runs under `self.submitted`,
+    /// BEFORE `card_steps` and `run_deferred`):
+    /// 1. Drains asynchronous demotions queued by alias creation (`lookup`/
+    ///    `loose`/`exact`/`by_address`), `unregister`, or the background
+    ///    working-set watchdog (`run_gpu_only_watchdog`).
+    /// 2. Notes every CPU step (`Copy`/`Placed`/`Fill`/`Texture`/`Plane`/`Host`/
+    ///    `Run`) overlapping tracked `gpu_only` shadows, resetting their quiet
+    ///    counters and demoting any overlapping `GpuOnly` pieces BEFORE those
+    ///    steps read or write title memory.
     fn gpu_only_pre_submit(&self, submitted: &mut u64, runs: &[&HostList]) {
-        use crate::gpu_only::{DemoteReason, WATCHDOG_BUDGET_PER_FRAME};
+        use crate::gpu_only::DemoteReason;
         if !crate::gpu_only::enabled() {
             return;
         }
@@ -6405,51 +6544,71 @@ impl Host {
         for p in crate::gpu_only::take_pending_demotions() {
             batch.push((p.shadow, p.pieces, p.reason, p.already_cleared));
         }
-        // Coalesce all step title-memory ranges across `runs` so intersection
-        // with eligible carded shadows is O(coalesced_ranges * carded_copies).
-        let mut raw_steps: Vec<(usize, usize)> = Vec::new();
-        let mut has_run = false;
-        for list in runs {
-            for step in &list.deferred().copies {
-                match step {
-                    &Step::Copy(dst, src, len) if len > 0 => {
-                        raw_steps.push((dst, dst.saturating_add(len)));
-                        raw_steps.push((src, src.saturating_add(len)));
-                    }
-                    Step::Placed(p) if p.len > 0 => {
-                        raw_steps.push((p.dst, p.dst.saturating_add(p.len)));
-                        raw_steps.push((p.src, p.src.saturating_add(p.len)));
-                    }
-                    &Step::Fill(_, src, len, _) if len > 0 => {
-                        raw_steps.push((src, src.saturating_add(len)));
-                    }
-                    Step::Texture(upload) => {
-                        let (at, len) = upload.memory();
-                        if len > 0 {
-                            raw_steps.push((at, at.saturating_add(len)));
-                        }
-                    }
-                    &Step::Plane((at, len), _) if len > 0 => {
-                        raw_steps.push((at, at.saturating_add(len)));
-                    }
-                    &Step::Host(_, (from, to)) if from < to => {
-                        raw_steps.push((from, to));
-                    }
-                    Step::Run(_) => has_run = true,
-                    _ => {}
-                }
+        let tracked = crate::gpu_only::tracked_shadows();
+        if tracked.is_empty() {
+            if !batch.is_empty() {
+                self.demote_gpu_only_batch(submitted, batch);
             }
+            return;
         }
-        let mut step_ranges: Vec<(usize, usize)> = Vec::new();
-        if !raw_steps.is_empty() {
-            join_ranges(&mut step_ranges, raw_steps);
+        thread_local! {
+            static STEP_SCRATCH: std::cell::RefCell<(Vec<(usize, usize)>, Vec<(usize, usize)>)> =
+                const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
         }
         let frame = crate::frame::current();
-        let run_watchdog = crate::gpu_only::active_pieces() > 0 && crate::gpu_only::claim_watchdog_frame(frame);
-        if !step_ranges.is_empty() || has_run || run_watchdog {
-            let carded = crate::shadow::carded_copies();
+        STEP_SCRATCH.with_borrow_mut(|(raw_steps, step_ranges)| {
+            raw_steps.clear();
+            step_ranges.clear();
+            // Coalesce all step title-memory ranges across `runs` into thread-local
+            // scratch so intersection with tracked shadows is zero-alloc and
+            // O(coalesced_ranges * tracked_shadows).
+            let mut has_run = false;
+            for list in runs {
+                for step in &list.deferred().copies {
+                    match step {
+                        &Step::Copy(dst, src, len) if len > 0 => {
+                            raw_steps.push((dst, dst.saturating_add(len)));
+                            raw_steps.push((src, src.saturating_add(len)));
+                        }
+                        Step::Placed(p) if p.len > 0 => {
+                            raw_steps.push((p.dst, p.dst.saturating_add(p.len)));
+                            raw_steps.push((p.src, p.src.saturating_add(p.len)));
+                        }
+                        &Step::Fill(_, src, len, _) if len > 0 => {
+                            raw_steps.push((src, src.saturating_add(len)));
+                        }
+                        Step::Texture(upload) => {
+                            let (at, len) = upload.memory();
+                            if len > 0 {
+                                raw_steps.push((at, at.saturating_add(len)));
+                            }
+                        }
+                        &Step::Plane((at, len), _) if len > 0 => {
+                            raw_steps.push((at, at.saturating_add(len)));
+                        }
+                        &Step::Host(_, (from, to)) if from < to => {
+                            raw_steps.push((from, to));
+                        }
+                        Step::Run(_) => has_run = true,
+                        _ => {}
+                    }
+                }
+            }
+            if !raw_steps.is_empty() {
+                raw_steps.sort_unstable();
+                for &(from, to) in raw_steps.as_slice() {
+                    if from >= to {
+                        continue;
+                    }
+                    match step_ranges.last_mut() {
+                        Some(last) if from <= last.1 => last.1 = last.1.max(to),
+                        _ => step_ranges.push((from, to)),
+                    }
+                }
+            }
             if !step_ranges.is_empty() || has_run {
-                for shadow in &carded {
+                let bounds = step_ranges.first().zip(step_ranges.last()).map(|(a, b)| (a.0, b.1));
+                for shadow in &tracked {
                     if !shadow.gpu_only_eligible() {
                         continue;
                     }
@@ -6460,11 +6619,14 @@ impl Host {
                         }
                         continue;
                     }
-                    if step_ranges.is_empty() {
+                    let Some((min_step, max_step)) = bounds else {
                         continue;
-                    }
+                    };
                     let (s_start, s_len) = shadow.span();
                     let (s_start, s_end) = (s_start as usize, s_start.saturating_add(s_len) as usize);
+                    if s_end <= min_step || s_start >= max_step {
+                        continue;
+                    }
                     let first = step_ranges.partition_point(|r| r.1 <= s_start);
                     for &(a, b) in &step_ranges[first..] {
                         if a >= s_end {
@@ -6477,77 +6639,41 @@ impl Host {
                     }
                 }
             }
-            if run_watchdog {
-                let mut active_shadows: Vec<&std::sync::Arc<crate::shadow::Shadow>> =
-                    carded.iter().filter(|s| s.any_gpu_only()).collect();
-                active_shadows.sort_unstable_by_key(|s| s.id());
-                if !active_shadows.is_empty() {
-                    let mut left = WATCHDOG_BUDGET_PER_FRAME;
-                    let total_slots: usize = active_shadows.iter().map(|s| s.gpu_only_pieces()).sum();
-                    if total_slots > 0 {
-                        let mut cursor = crate::gpu_only::watchdog_cursor() % total_slots;
-                        let mut last_global_slot: Option<usize> = None;
-                        let mut offset = 0usize;
-                        for pass in 0..2 {
-                            for shadow in &active_shadows {
-                                let count = shadow.gpu_only_pieces();
-                                if count == 0 || left == 0 {
-                                    offset += count;
-                                    continue;
-                                }
-                                let start_in = if pass == 0 {
-                                    if cursor >= offset + count {
-                                        offset += count;
-                                        continue;
-                                    }
-                                    cursor.saturating_sub(offset)
-                                } else {
-                                    0
-                                };
-                                let candidates = shadow.gpu_only_watchdog_candidates(start_in, left);
-                                let mut touched_pieces = Vec::new();
-                                for &(piece, block) in &candidates {
-                                    if left == 0 {
-                                        break;
-                                    }
-                                    left -= 1;
-                                    last_global_slot = Some(offset + piece + 1);
-                                    if let Some((touched, _)) = crate::gpu_only::query_working_set_block(block)
-                                        && touched > 0
-                                    {
-                                        touched_pieces.push(piece);
-                                    }
-                                }
-                                if !touched_pieces.is_empty() {
-                                    batch.push(((*shadow).clone(), touched_pieces, DemoteReason::CpuRead, false));
-                                }
-                                offset += count;
-                                if left == 0 {
-                                    break;
-                                }
-                            }
-                            if left == 0 || cursor == 0 {
-                                break;
-                            }
-                            cursor = 0;
-                            offset = 0;
-                        }
-                        if let Some(next_slot) = last_global_slot {
-                            crate::gpu_only::set_watchdog_cursor(next_slot % total_slots);
-                        }
-                    }
-                }
-            }
-        }
+        });
         if !batch.is_empty() {
             self.demote_gpu_only_batch(submitted, batch);
         }
     }
 
+    /// Checks `spans` (collected from `Step::Refresh` entries on shadows with
+    /// active `GpuOnly` pieces) for unexpected CPU writes (via write-watch/
+    /// guards after `ask_once`), losslessly demoting any written pieces BEFORE
+    /// `refresh_front`/`update` runs. Returns `true` if any piece was demoted.
+    fn gpu_only_check_refreshed_cpu_writes_spans(
+        &self,
+        submitted: &mut u64,
+        spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    ) -> bool {
+        if spans.is_empty() {
+            return false;
+        }
+        let mut batch = Vec::new();
+        for (shadow, from, to) in spans {
+            let written = shadow.gpu_only_written_pieces(from, to);
+            if !written.is_empty() {
+                batch.push((shadow, written, crate::gpu_only::DemoteReason::CpuWrite, false));
+            }
+        }
+        if batch.is_empty() {
+            return false;
+        }
+        self.demote_gpu_only_batch(submitted, batch);
+        true
+    }
+
     /// Checks all refreshed spans on shadows with active `GpuOnly` pieces for
-    /// unexpected CPU writes (via write-watch/guards after `ask_once`),
-    /// losslessly demoting any written pieces BEFORE `refresh_front`/`update`
-    /// runs. Returns `true` if any piece was demoted.
+    /// unexpected CPU writes (fallback for non-`ask_once` mode or mid-loop
+    /// first promotion). Returns `true` if any piece was demoted.
     fn gpu_only_check_refreshed_cpu_writes(&self, submitted: &mut u64, runs: &[&HostList]) -> bool {
         let mut spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
         let mut places: ByCopy<usize> = ByCopy::default();
@@ -6571,21 +6697,7 @@ impl Host {
                 }
             }
         }
-        if spans.is_empty() {
-            return false;
-        }
-        let mut batch = Vec::new();
-        for (shadow, from, to) in spans {
-            let written = shadow.gpu_only_written_pieces(from, to);
-            if !written.is_empty() {
-                batch.push((shadow, written, crate::gpu_only::DemoteReason::CpuWrite, false));
-            }
-        }
-        if batch.is_empty() {
-            return false;
-        }
-        self.demote_gpu_only_batch(submitted, batch);
-        true
+        self.gpu_only_check_refreshed_cpu_writes_spans(submitted, spans)
     }
 
     /// Losslessly demotes `GpuOnly` pieces back to normal + `Pinned`:
@@ -6755,9 +6867,8 @@ impl Host {
         SPLIT[11].fetch_add(called.elapsed().as_nanos() as u64, Ordering::Relaxed);
         stage.next("submit: steps given to the card");
         // Zero-fault `GpuOnly` safety net: BEFORE `card_steps` and `run_deferred`,
-        // drain pending alias demotions, note/demote any overlapping CPU steps
-        // (`Copy`/`Placed`/`Fill`/`Texture`/`Plane`/`Host`/`Run`), and run the
-        // once-per-frame rotating working-set watchdog.
+        // drain pending alias/watchdog demotions and note/demote any overlapping
+        // CPU steps (`Copy`/`Placed`/`Fill`/`Texture`/`Plane`/`Host`/`Run`).
         self.gpu_only_pre_submit(&mut submitted, runs);
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
@@ -6864,16 +6975,31 @@ impl Host {
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
+            let has_gpu_only = crate::gpu_only::active_pieces() > 0;
             let mut spans: ByCopy<(usize, usize)> = ByCopy::default();
+            let mut gpu_only_spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+            let mut gpu_only_places: ByCopy<usize> = ByCopy::default();
             for list in runs {
                 for step in &list.deferred().copies {
-                    if let Step::Refresh(shadow, address, len) = step
-                        && shadow.asked_ahead()
-                    {
-                        let span = spans
-                            .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                            .or_insert((*address, *address + *len));
-                        *span = (span.0.min(*address), span.1.max(*address + *len));
+                    if let Step::Refresh(shadow, address, len) = step {
+                        let key = std::sync::Arc::as_ptr(shadow) as usize;
+                        let end = address.saturating_add(*len);
+                        if shadow.asked_ahead() {
+                            let span = spans.entry(key).or_insert((*address, end));
+                            *span = (span.0.min(*address), span.1.max(end));
+                        }
+                        if has_gpu_only && shadow.any_gpu_only() {
+                            match gpu_only_places.get(&key).copied() {
+                                Some(i) => {
+                                    gpu_only_spans[i].1 = gpu_only_spans[i].1.min(*address);
+                                    gpu_only_spans[i].2 = gpu_only_spans[i].2.max(end);
+                                }
+                                None => {
+                                    gpu_only_places.insert(key, gpu_only_spans.len());
+                                    gpu_only_spans.push((shadow.clone(), *address, end));
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -6882,7 +7008,14 @@ impl Host {
             SPLIT[8].fetch_add(split.so_far(), Ordering::Relaxed);
             stage.next("submit: asking the write watch");
             crate::watch::ask_once(&ranges);
-            if crate::gpu_only::active_pieces() > 0 && self.gpu_only_check_refreshed_cpu_writes(&mut submitted, runs) {
+            let demoted = if !gpu_only_spans.is_empty() {
+                self.gpu_only_check_refreshed_cpu_writes_spans(&mut submitted, gpu_only_spans)
+            } else if !has_gpu_only && crate::gpu_only::active_pieces() > 0 {
+                self.gpu_only_check_refreshed_cpu_writes(&mut submitted, runs)
+            } else {
+                false
+            };
+            if demoted {
                 crate::watch::ask_once(&ranges);
             }
             prep_mark(&mut p_split, 3);
@@ -6928,15 +7061,80 @@ impl Host {
         }
         prep_mark(&mut p_split, 5);
         stage.next("submit: the lists' steps");
-        for list in runs {
-            let uploads = list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
-            #[cfg(feature = "diagnostics")]
-            firsts.push(lists.len());
-            if let Some(prelude) = list.prelude(&uploads, &mut batch.barriers) {
-                lists.push(Some(prelude));
+        // Buffer write-free lists that have unrefreshed `Step::Texture` entries
+        // so cross-list texture checks run in a single parallel `wide_each`
+        // batch before any title-writing step or the end of `runs`.
+        let mut pending_lists: Vec<(&HostList, Vec<crate::texture::PreludeUpload>)> = Vec::new();
+        let flush_pending_lists = |pending: &mut Vec<(&HostList, Vec<crate::texture::PreludeUpload>)>,
+                                   batch: &mut Batch,
+                                   lists: &mut Vec<Option<ID3D12CommandList>>,
+                                   #[cfg(feature = "diagnostics")] firsts: &mut Vec<usize>| {
+            if pending.is_empty() {
+                return;
             }
-            lists.push(list.command_list());
+            batch.refresh_textures();
+            for (plist, textures) in pending.drain(..) {
+                let mut uploads = Vec::new();
+                for upload in textures {
+                    if let Some(first_upload) = upload.finish_refresh() {
+                        uploads.push((upload, first_upload));
+                    }
+                }
+                #[cfg(feature = "diagnostics")]
+                firsts.push(lists.len());
+                if let Some(prelude) = plist.prelude(&uploads, &mut batch.barriers) {
+                    lists.push(Some(prelude));
+                }
+                lists.push(plist.command_list());
+            }
+        };
+        for list in runs {
+            if !pending_lists.is_empty() && list_may_write_title(list) {
+                flush_pending_lists(
+                    &mut pending_lists,
+                    &mut batch,
+                    &mut lists,
+                    #[cfg(feature = "diagnostics")]
+                    &mut firsts,
+                );
+            }
+            let taken_bits = own.as_ref().and_then(|own| own.takes_bits(list));
+            let (textures, wrote_title) =
+                list.run_deferred(&mut batch, &air, |i| card_steps::Taken::bit_taken(taken_bits, i));
+            if wrote_title || (pending_lists.is_empty() && batch.due.is_empty()) {
+                if !pending_lists.is_empty() {
+                    flush_pending_lists(
+                        &mut pending_lists,
+                        &mut batch,
+                        &mut lists,
+                        #[cfg(feature = "diagnostics")]
+                        &mut firsts,
+                    );
+                }
+                batch.refresh_textures();
+                let mut uploads = Vec::new();
+                for upload in textures {
+                    if let Some(first_upload) = upload.finish_refresh() {
+                        uploads.push((upload, first_upload));
+                    }
+                }
+                #[cfg(feature = "diagnostics")]
+                firsts.push(lists.len());
+                if let Some(prelude) = list.prelude(&uploads, &mut batch.barriers) {
+                    lists.push(Some(prelude));
+                }
+                lists.push(list.command_list());
+            } else {
+                pending_lists.push((list, textures));
+            }
         }
+        flush_pending_lists(
+            &mut pending_lists,
+            &mut batch,
+            &mut lists,
+            #[cfg(feature = "diagnostics")]
+            &mut firsts,
+        );
         batch.fill();
         stage.next("submit: the last refreshes");
         batch.flush();
@@ -8738,7 +8936,7 @@ impl HostList {
         batch: &mut Batch,
         air: &[(usize, usize)],
         taken: impl Fn(usize) -> bool,
-    ) -> Vec<(crate::texture::PreludeUpload, bool)> {
+    ) -> (Vec<crate::texture::PreludeUpload>, bool) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         // The time and the bytes of the copies and fills, some 13,000 a
@@ -8747,6 +8945,7 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let (mut copies, mut refreshes, mut refreshed) = (0u64, 0u64, 0u64);
         let mut textures: Vec<crate::texture::PreludeUpload> = Vec::new();
+        let mut wrote_title = false;
         for (i, step) in self.deferred().copies.iter().enumerate() {
             if matches!(step, Step::Copy(..) | Step::Fill(..)) && taken(i) {
                 continue;
@@ -8754,6 +8953,7 @@ impl HostList {
             let (started, copied) = match step {
                 &Step::Copy(dst, src, len) => {
                     let started = std::time::Instant::now();
+                    wrote_title = true;
                     #[cfg(feature = "diagnostics")]
                     {
                         copies += 1;
@@ -8789,7 +8989,7 @@ impl HostList {
                     }
                     crate::port::filled(src, len);
                     if wide_fills() {
-                        batch.fills.push((dst, src, len));
+                        batch.push_fill(dst, src, len);
                         bytes += len as u64;
                         continue;
                     }
@@ -8804,6 +9004,7 @@ impl HostList {
                     }
                     let free = !touches(air, p.src, p.src + p.len) && !touches(air, p.dst, p.dst + p.len);
                     if free {
+                        wrote_title = true;
                         let write_end = p.dst.saturating_add(p.len);
                         if batch.fills_overlap(p.dst, write_end) {
                             batch.fill();
@@ -8831,6 +9032,7 @@ impl HostList {
                     #[cfg(feature = "diagnostics")]
                     let started = std::time::Instant::now();
                     if matches!(step, Step::Run(_)) {
+                        wrote_title = true;
                         batch.fill();
                         if !batch.due.is_empty() {
                             batch.refresh_textures();
@@ -8838,6 +9040,10 @@ impl HostList {
                         batch.title_written();
                         // (It may write anywhere, a heap's records too.)
                         crate::port_journal::prep_wrote();
+                    } else if !batch.due.is_empty() {
+                        // Host callbacks can inspect a texture refresh result
+                        // (including sparse tile mip masks).
+                        batch.refresh_textures();
                     }
                     let _step = crate::timeline::span("a step of ours");
                     work();
@@ -8872,7 +9078,7 @@ impl HostList {
                 }
                 Step::Texture(upload) => {
                     if batch.texture_due(&upload.staging) {
-                        batch.due.push(upload.staging.clone());
+                        batch.push_due(upload.staging.clone());
                     }
                     textures.push(upload.clone());
                     continue;
@@ -8898,22 +9104,18 @@ impl HostList {
             add(C::RefreshBytes, refreshed);
             SPLIT[7].fetch_add(us.as_nanos() as u64, Ordering::Relaxed);
         }
-        // Finish refreshing any textures not already refreshed in `refresh_front`
-        // (or invalidated by a title write), then claim the ones whose staging
-        // buffer changed so `self.prelude` uploads them on this exact submission.
-        // Sparse (`on_demand`) tile mappings inside `PreludeUpload::finish_refresh`
-        // consume `staging.detiled` only after `batch.refresh_textures()` has
-        // completed, ensuring the mip mask comes from this submission rather than
-        // the preceding one.
-        batch.refresh_textures();
-        let mut uploads = Vec::new();
-        for upload in textures {
-            if let Some(first_upload) = upload.finish_refresh() {
-                uploads.push((upload, first_upload));
-            }
-        }
-        uploads
+        (textures, wrote_title)
     }
+}
+
+/// Whether `list` contains any step that may write title memory or inspect
+/// texture refresh results on the host, requiring pending cross-list texture
+/// checks to finish first.
+fn list_may_write_title(list: &HostList) -> bool {
+    let deferred = list.deferred();
+    deferred.has_copy
+        || deferred.has_placed
+        || deferred.copies.iter().any(|s| matches!(s, Step::Run(_) | Step::Host(..)))
 }
 
 /// The numbers of [`HostList::epoch`].
@@ -9135,6 +9337,9 @@ struct Batch {
     textures: ByCopy<(usize, usize)>,
     /// Those due ([`Batch::refresh_textures`]).
     due: Vec<std::sync::Arc<crate::texture::Staging>>,
+    /// Bounding `[min_addr, max_end)` of queued `due` textures for O(1)
+    /// non-overlap rejection in [`Batch::due_overlap`].
+    due_bounds: Option<(usize, usize)>,
     /// Reused scratch buffer for [`HostList::prelude`] resource barriers so
     /// fast-path preludes allocate nothing per list.
     barriers: Vec<D3D12_RESOURCE_BARRIER>,
@@ -9143,9 +9348,15 @@ struct Batch {
     placed: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, Vec<u8>)>,
     /// Fills not done yet (destination, source, bytes): [`wide_fills`].
     fills: Vec<(usize, usize, usize)>,
+    /// Bounding `[min_src, max_end)` of queued `fills` for O(1) non-overlap
+    /// rejection in [`Batch::fills_overlap`].
+    fills_bounds: Option<(usize, usize)>,
     /// Copies (by address) brought up to date ahead of the steps, and the
     /// range (from, to) ([`Batch::refresh_ahead`]).
     ahead: ByCopy<(usize, usize)>,
+    /// Single-entry hot cache of the last `ahead` hit `(key, from, to)` so
+    /// consecutive `Step::Refresh` calls on the same shadow skip hashing.
+    last_ahead: (usize, usize, usize),
     /// `ahead` holds everything the submission refreshes
     /// ([`Batch::refresh_front`]).
     front: bool,
@@ -9549,7 +9760,14 @@ impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
-        if self.ahead.get(&key).is_some_and(|&(from, to)| from <= address && end <= to) {
+        if key == self.last_ahead.0 && self.last_ahead.1 <= address && end <= self.last_ahead.2 {
+            return;
+        }
+        if let Some(&(from, to)) = self.ahead.get(&key)
+            && from <= address
+            && end <= to
+        {
+            self.last_ahead = (key, from, to);
             return;
         }
         match self.index.get(&key) {
@@ -9564,15 +9782,38 @@ impl Batch {
         }
     }
 
+    fn push_fill(&mut self, dst: usize, src: usize, len: usize) {
+        let end = src.saturating_add(len);
+        self.fills_bounds = Some(match self.fills_bounds {
+            Some((lo, hi)) => (lo.min(src), hi.max(end)),
+            None => (src, end),
+        });
+        self.fills.push((dst, src, len));
+    }
+
+    fn push_due(&mut self, staging: std::sync::Arc<crate::texture::Staging>) {
+        let (addr, len) = staging.memory();
+        let end = addr.saturating_add(len);
+        self.due_bounds = Some(match self.due_bounds {
+            Some((lo, hi)) => (lo.min(addr), hi.max(end)),
+            None => (addr, end),
+        });
+        self.due.push(staging);
+    }
+
     /// Before shaders are given a range of `shadow`'s copy: its pending
     /// refresh is done, the others stay pending.
     fn flush_one(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>) {
         // From here on it is refreshed around what the shaders write. (What
         // is in front of all the steps was, up to here.)
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
         if !self.front {
-            self.ahead.remove(&(std::sync::Arc::as_ptr(shadow) as usize));
+            self.ahead.remove(&key);
+            if self.last_ahead.0 == key {
+                self.last_ahead = (0, 0, 0);
+            }
         }
-        let Some(at) = self.index.remove(&(std::sync::Arc::as_ptr(shadow) as usize)) else {
+        let Some(at) = self.index.remove(&key) else {
             return;
         };
         let (shadow, from, to) = self.refreshes.swap_remove(at);
@@ -9623,6 +9864,12 @@ impl Batch {
 
     /// Whether any queued fill reads title memory overlapping `[from, to)`.
     fn fills_overlap(&self, from: usize, to: usize) -> bool {
+        let Some((lo, hi)) = self.fills_bounds else {
+            return false;
+        };
+        if to <= lo || from >= hi {
+            return false;
+        }
         self.fills
             .iter()
             .any(|&(_, f_src, f_len)| f_src < to && from < f_src.saturating_add(f_len))
@@ -9630,6 +9877,12 @@ impl Batch {
 
     /// Whether any queued texture refresh reads title memory overlapping `[from, to)`.
     fn due_overlap(&self, from: usize, to: usize) -> bool {
+        let Some((lo, hi)) = self.due_bounds else {
+            return false;
+        };
+        if to <= lo || from >= hi {
+            return false;
+        }
         self.due.iter().any(|s| {
             let (addr, len) = s.memory();
             addr < to && from < addr.saturating_add(len)
@@ -9641,6 +9894,7 @@ impl Batch {
     fn title_written(&mut self) {
         self.flush();
         self.ahead.clear();
+        self.last_ahead = (0, 0, 0);
         self.textures.clear();
     }
 
@@ -9659,6 +9913,9 @@ impl Batch {
             }
         }
         self.ahead.retain(|_, &mut (a_from, a_to)| !(a_from < to && from < a_to));
+        if self.last_ahead.0 != 0 && self.last_ahead.1 < to && from < self.last_ahead.2 {
+            self.last_ahead = (0, 0, 0);
+        }
         self.textures.retain(|_, &mut (t_from, t_to)| !(t_from < to && from < t_to));
     }
 
@@ -9782,6 +10039,16 @@ impl Batch {
             let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
             crate::watch::ask_ahead(&ranges);
         }
+        // Schedule large spans (>= 256 KiB, e.g. the 174 MiB heap) first so
+        // they start at t=0 in `wide_each` instead of becoming a late tail.
+        const BIG_SPAN: usize = 256 << 10;
+        let mut big_end = 0usize;
+        for i in 0..spans.len() {
+            if spans[i].2.saturating_sub(spans[i].1) >= BIG_SPAN {
+                spans.swap(big_end, i);
+                big_end += 1;
+            }
+        }
         #[cfg(feature = "diagnostics")]
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
         crate::shadow::wide_each(spans.len() + due.len(), move |i| {
@@ -9867,6 +10134,7 @@ impl Batch {
         if self.fills.is_empty() {
             return;
         }
+        self.fills_bounds = None;
         let started = std::time::Instant::now();
         if self.fills.len() < FEW {
             for (dst, src, len) in self.fills.drain(..) {
@@ -9888,6 +10156,7 @@ impl Batch {
 
     /// The textures due are brought up to date.
     fn refresh_textures(&mut self) {
+        self.due_bounds = None;
         if self.due.len() < 2 || !wide_textures() {
             self.due.drain(..).for_each(|staging| staging.refresh());
             return;
@@ -11254,6 +11523,17 @@ impl Host {
         self.shared_buffer_inner(size, true)
     }
 
+    /// As [`Host::shared_buffer`], reusing an already-resident, GPU-VA-mapped
+    /// buffer of exact `size` from [`SHARED_SPARE`] (zero-initialized) when
+    /// available so recycled shadows skip `CreateCommittedResource` +
+    /// `MakeResident` + `mapped()`.
+    pub(crate) fn shared_buffer_pooled(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        if let Some(reused) = take_shared_spare(size) {
+            return Some(reused);
+        }
+        self.shared_buffer_inner(size, true)
+    }
+
     /// As [`Host::shared_buffer`], for buffers private to command lists
     /// submitted after creation (never placed in a descriptor heap read by
     /// already in-flight lists). Skips `CREATE_NOT_RESIDENT` + `MakeResident`
@@ -12443,7 +12723,7 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert!(batch.texture_due_range(2, 0x2000, 0x3000));
         assert!(!batch.texture_due_range(3, 0x8000, 0x9000));
         // Fill overlap detection matches only intersecting source ranges.
-        batch.fills.push((0x9000_0000, 0x4000, 0x100));
+        batch.push_fill(0x9000_0000, 0x4000, 0x100);
         assert!(!batch.fills_overlap(0x3f00, 0x4000));
         assert!(!batch.fills_overlap(0x4100, 0x4200));
         assert!(batch.fills_overlap(0x4080, 0x4090));
@@ -12582,6 +12862,39 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(super::sweep_settle_interval_ms(Some([100, 92, 0, 0]), false), 1500);
         assert_eq!(super::sweep_settle_interval_ms(Some([16 * gib, 8 * gib, 0, 0]), true), 1500);
         assert_eq!(super::sweep_settle_interval_ms(None, false), 12_000);
+    }
+
+    #[test]
+    fn batch_bounds_and_shared_buffer_pool_preserve_invariants() {
+        let mut batch = super::Batch::default();
+        assert!(!batch.fills_overlap(0x1000, 0x2000));
+        batch.push_fill(0x9000, 0x2000, 0x400);
+        batch.push_fill(0x9400, 0x4000, 0x200);
+        assert!(!batch.fills_overlap(0x1000, 0x2000));
+        assert!(batch.fills_overlap(0x2100, 0x2200));
+        assert!(!batch.fills_overlap(0x2400, 0x4000));
+        assert!(batch.fills_overlap(0x4100, 0x5000));
+        assert!(!batch.fills_overlap(0x4200, 0x5000));
+
+        // Verify shared buffer recycling zeroes stale bytes and returns the exact same GPU VA.
+        let Some(host) = super::host() else {
+            return;
+        };
+        // Use a non-power-of-2 bucket size (3328 B) so parallel shadow tests
+        // never pop our recycled entry out of `SHARED_SPARE`.
+        let size = 3328u64;
+        let (buf, ptr) = host.shared_buffer_pooled(size).expect("pooled shared buffer");
+        // SAFETY: `size` bytes mapped in `buf`.
+        let gpu_before = unsafe { buf.GetGPUVirtualAddress() };
+        unsafe { std::ptr::write_bytes(ptr, 0xA5, size as usize) };
+        super::recycle_shared_buffer(buf, ptr, size);
+        let (reused, ptr2) = host.shared_buffer_pooled(size).expect("reused pooled shared buffer");
+        let gpu_after = unsafe { reused.GetGPUVirtualAddress() };
+        assert_eq!(gpu_after, gpu_before, "expected recycled buffer from SHARED_SPARE");
+        // SAFETY: `size` bytes mapped in `reused`.
+        let bytes = unsafe { std::slice::from_raw_parts(ptr2, size as usize) };
+        assert!(bytes.iter().all(|&b| b == 0), "recycled shared buffer must be zero-initialized");
+        drop(reused);
     }
 }
 

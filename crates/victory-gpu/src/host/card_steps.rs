@@ -458,6 +458,9 @@ struct WriterEntry {
     from: usize,
     to: usize,
     max_to: usize,
+    /// True iff no other entry in `entries` overlaps `[from, to)`, allowing an
+    /// O(1) hot-interval cache hit without binary search or conflict scanning.
+    isolated: bool,
 }
 
 /// Deduplicated, sorted index of in-flight writers plus any `Does::Copy`
@@ -466,6 +469,9 @@ struct WriterIndex {
     shadows: Vec<Arc<Shadow>>,
     entries: Vec<WriterEntry>,
     extra: Vec<(u32, usize, usize)>,
+    /// Verified `(from, to, shadow_idx)` from the last isolated hit whose
+    /// shadow is non-in-place and covers `[from, to)`.
+    last_isolated: Option<(usize, usize, u32)>,
 }
 
 impl WriterIndex {
@@ -514,7 +520,7 @@ impl WriterIndex {
     }
 
     /// Coalesces overlapping/touching intervals with the same shadow and builds
-    /// a `from`-sorted prefix-max index.
+    /// a `from`-sorted prefix-max index with per-entry isolation flags.
     fn build(shadows: Vec<Arc<Shadow>>, mut raw: Vec<(Option<u32>, usize, usize)>) -> Self {
         raw.sort_unstable();
         let mut merged: Vec<(Option<u32>, usize, usize)> = Vec::with_capacity(raw.len());
@@ -529,14 +535,33 @@ impl WriterIndex {
         }
         merged.sort_unstable_by_key(|e| e.1);
         let mut max_to = 0usize;
-        let entries = merged
+        let mut entries: Vec<WriterEntry> = merged
             .into_iter()
             .map(|(shadow, from, to)| {
+                let isolated = from >= max_to;
                 max_to = max_to.max(to);
-                WriterEntry { shadow, from, to, max_to }
+                WriterEntry {
+                    shadow,
+                    from,
+                    to,
+                    max_to,
+                    isolated,
+                }
             })
             .collect();
-        Self { shadows, entries, extra: Vec::new() }
+        let mut next_min_from = usize::MAX;
+        for entry in entries.iter_mut().rev() {
+            if entry.to > next_min_from {
+                entry.isolated = false;
+            }
+            next_min_from = next_min_from.min(entry.from);
+        }
+        Self {
+            shadows,
+            entries,
+            extra: Vec::new(),
+            last_isolated: None,
+        }
     }
 
     #[cfg(test)]
@@ -550,8 +575,11 @@ impl WriterIndex {
         Self::build(shadows, raw)
     }
 
-    fn query_writers(&self, from: usize, to: usize) -> Result<Option<u32>, &'static str> {
+    /// Queries overlapping writers for `[from, to)`, returning
+    /// `Ok(Some((shadow_idx, isolated_bounds)))` when matched.
+    fn query_writers_detail(&self, from: usize, to: usize) -> Result<Option<(u32, Option<(usize, usize)>)>, &'static str> {
         let mut found: Option<u32> = None;
+        let mut isolated_bounds: Option<(usize, usize)> = None;
         let hi = self.entries.partition_point(|e| e.from < to);
         for e in self.entries[..hi].iter().rev() {
             if e.max_to <= from {
@@ -561,24 +589,43 @@ impl WriterIndex {
                 match (e.shadow, found) {
                     (None, _) => return Err("a read-back or a value behind a flight is written there"),
                     (Some(s), Some(f)) if s != f => return Err("flights write it through two host copies"),
-                    (Some(s), _) => found = Some(s),
+                    (Some(s), _) => {
+                        if found.is_none() && e.isolated && self.extra.is_empty() && from >= e.from && to <= e.to {
+                            isolated_bounds = Some((e.from, e.to));
+                        } else {
+                            isolated_bounds = None;
+                        }
+                        found = Some(s);
+                    }
                 }
             }
         }
         for &(s, w_from, w_to) in &self.extra {
             if meet((w_from, w_to), (from, to)) {
+                isolated_bounds = None;
                 match found {
                     Some(f) if f != s => return Err("flights write it through two host copies"),
                     _ => found = Some(s),
                 }
             }
         }
-        Ok(found)
+        Ok(found.map(|s| (s, isolated_bounds)))
+    }
+
+    #[cfg(test)]
+    fn query_writers(&self, from: usize, to: usize) -> Result<Option<u32>, &'static str> {
+        self.query_writers_detail(from, to).map(|hit| hit.map(|(s, _)| s))
     }
 
     fn holder(&mut self, from: usize, to: usize, fallback_cache: &mut HashMap<(usize, usize), u32>) -> Result<u32, &'static str> {
-        let idx = match self.query_writers(from, to)? {
-            Some(idx) => idx,
+        if let Some((c_from, c_to, idx)) = self.last_isolated
+            && from >= c_from
+            && to <= c_to
+        {
+            return Ok(idx);
+        }
+        let (idx, isolated_bounds) = match self.query_writers_detail(from, to)? {
+            Some(hit) => hit,
             None => match fallback_cache.get(&(from, to - from)) {
                 Some(&idx) => return Ok(idx),
                 None => {
@@ -598,10 +645,18 @@ impl WriterIndex {
         if shadow.in_place() || (from as u64) < start || to as u64 > start + len {
             return Err("no host copy holds all of it");
         }
+        if let Some((e_from, e_to)) = isolated_bounds {
+            let c_from = e_from.max(start as usize);
+            let c_to = e_to.min((start + len) as usize);
+            if c_from < c_to {
+                self.last_isolated = Some((c_from, c_to, idx));
+            }
+        }
         Ok(idx)
     }
 
     fn push_extra(&mut self, shadow: u32, from: usize, to: usize) {
+        self.last_isolated = None;
         self.extra.push((shadow, from, to));
     }
 }
@@ -617,33 +672,26 @@ fn holder(writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'s
     Ok(index.shadows[idx as usize].clone())
 }
 
-/// What the steps of `runs` do, which step each is (its list by address,
-/// its place in it), and (when `with_fills`) the cloned [`FillTo`] of each
-/// fill so [`Host::take_steps`] never re-scans `runs` or re-locks each list's
-/// deferred queue per fill. `written`: what flights may write.
-fn does_of(
+/// Populates `does`, `steps`, and (when `with_fills`) `fills` from `runs`
+/// without over-reserving for skipped `Step::Refresh` entries.
+fn does_of_into(
     written: &[(usize, usize)],
     runs: &[&HostList],
     with_fills: bool,
-) -> (Vec<Does>, Vec<(usize, usize)>, Vec<Option<FillTo>>) {
+    does: &mut Vec<Does>,
+    steps: &mut Vec<(usize, usize)>,
+    fills: &mut Vec<Option<FillTo>>,
+) {
+    does.clear();
+    steps.clear();
+    fills.clear();
     // `Does::Refresh` is only inspected by `elsewhere()` for `Does::Copy`
     // steps during `take_steps` (`with_fills == true`); skip pushing them when
     // no list in `runs` contains a `Step::Copy`.
     let keep_refresh = with_fills && runs.iter().any(|list| list.deferred().has_copy);
-    let mut does = Vec::new();
-    // Which step each is. One list's lock at a time: a submission may
-    // name a list twice.
-    let mut steps = Vec::new();
-    let mut fills = Vec::new();
     for list in runs {
         let ptr = std::ptr::from_ref::<HostList>(list) as usize;
         let deferred = list.deferred();
-        let cap = deferred.copies.len();
-        does.reserve(cap);
-        steps.reserve(cap);
-        if with_fills {
-            fills.reserve(cap);
-        }
         for (i, step) in deferred.copies.iter().enumerate() {
             let mut fill_target = None;
             does.push(match step {
@@ -693,6 +741,17 @@ fn does_of(
             }
         }
     }
+}
+
+fn does_of(
+    written: &[(usize, usize)],
+    runs: &[&HostList],
+    with_fills: bool,
+) -> (Vec<Does>, Vec<(usize, usize)>, Vec<Option<FillTo>>) {
+    let mut does = Vec::new();
+    let mut steps = Vec::new();
+    let mut fills = Vec::new();
+    does_of_into(written, runs, with_fills, &mut does, &mut steps, &mut fills);
     (does, steps, fills)
 }
 
@@ -737,6 +796,11 @@ impl Default for MappedCache {
 }
 
 impl MappedCache {
+    fn clear(&mut self) {
+        self.last_page = usize::MAX;
+        self.blocks.clear();
+    }
+
     /// Whether every page of `[from, to)` can be read (through `safecopy` or
     /// the kernel: asking Windows walks the page tables, milliseconds in the
     /// title's heap).
@@ -786,22 +850,34 @@ struct OpRead {
     aligned_256: bool,
 }
 
-/// Coalesces adjacent, overlapping, and near-gap (`<= max_gap`) reads from the
-/// same `(level, shadow)` into contiguous `CopyBufferRegion` spans in `between`
-/// while preserving 256-byte CBV alignment for every `aligned_256` op.
-/// Returns `None` if the packed layout exceeds `budget`.
-fn layout_reads(ops: &[OpRead], budget: u64, max_gap: usize) -> Option<(Vec<ReadSpan>, Vec<u64>, u64)> {
-    if ops.is_empty() {
-        return Some((Vec::new(), Vec::new(), 0));
-    }
-    let mut order: Vec<usize> = (0..ops.len()).collect();
+/// Sorts op indices once into `order` for [`layout_reads_sorted`].
+fn sort_op_reads(ops: &[OpRead], order: &mut Vec<usize>) {
+    order.clear();
+    order.extend(0..ops.len());
     order.sort_unstable_by_key(|&i| {
         let o = ops[i];
         (o.level, o.shadow, o.aligned_256 && !o.src.is_multiple_of(256), o.src, o.len)
     });
+}
 
-    let mut spans: Vec<ReadSpan> = Vec::new();
-    let mut op_ats = vec![0u64; ops.len()];
+/// Coalesces adjacent, overlapping, and near-gap (`<= max_gap`) reads from a
+/// pre-sorted `order` into reusable `spans` / `op_ats` buffers while preserving
+/// 256-byte CBV alignment for every `aligned_256` op. Returns `None` if the
+/// packed layout exceeds `budget`.
+fn layout_reads_sorted(
+    ops: &[OpRead],
+    order: &[usize],
+    budget: u64,
+    max_gap: usize,
+    spans: &mut Vec<ReadSpan>,
+    op_ats: &mut Vec<u64>,
+) -> Option<u64> {
+    spans.clear();
+    op_ats.clear();
+    if ops.is_empty() {
+        return Some(0);
+    }
+    op_ats.resize(ops.len(), 0);
     let mut end = 0u64;
     let mut k = 0usize;
     while k < order.len() {
@@ -875,6 +951,35 @@ fn layout_reads(ops: &[OpRead], budget: u64, max_gap: usize) -> Option<(Vec<Read
             op_ats[idx] = at + (ops[idx].src - span_src) as u64;
         }
     }
+    Some(end)
+}
+
+/// Coalesces `ops` trying widening gap thresholds from largest to 0 while
+/// sorting `order` only once.
+fn layout_reads_cascade(
+    ops: &[OpRead],
+    budget: u64,
+    gaps: &[usize],
+    order: &mut Vec<usize>,
+    spans: &mut Vec<ReadSpan>,
+    op_ats: &mut Vec<u64>,
+) -> Option<u64> {
+    sort_op_reads(ops, order);
+    for &gap in gaps {
+        if let Some(end) = layout_reads_sorted(ops, order, budget, gap, spans, op_ats) {
+            return Some(end);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+fn layout_reads(ops: &[OpRead], budget: u64, max_gap: usize) -> Option<(Vec<ReadSpan>, Vec<u64>, u64)> {
+    let mut order = Vec::new();
+    let mut spans = Vec::new();
+    let mut op_ats = Vec::new();
+    sort_op_reads(ops, &mut order);
+    let end = layout_reads_sorted(ops, &order, budget, max_gap, &mut spans, &mut op_ats)?;
     Some((spans, op_ats, end))
 }
 
@@ -976,12 +1081,38 @@ static POOL: Mutex<Vec<Own>> = Mutex::new(Vec::new());
 /// bytes, and submissions that waited instead, refused by a check.
 static DONE: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Per-`HostList` bitset builder for [`Taken::steps`] (replaces a 9,000-entry
+/// `HashSet<(usize, usize)>` with O(1) bit tests and zero hashing).
+fn build_taken_steps(chosen: &[(usize, u32)], steps: &[(usize, usize)]) -> Vec<(usize, Vec<u64>)> {
+    let mut out: Vec<(usize, Vec<u64>)> = Vec::new();
+    for &(idx, _) in chosen {
+        let (list_ptr, step_i) = steps[idx];
+        let word = step_i >> 6;
+        let bit = 1u64 << (step_i & 63);
+        let bits = match out.last_mut() {
+            Some((ptr, bits)) if *ptr == list_ptr => bits,
+            _ => match out.iter_mut().find(|(ptr, _)| *ptr == list_ptr) {
+                Some((_, bits)) => bits,
+                None => {
+                    out.push((list_ptr, Vec::new()));
+                    &mut out.last_mut().expect("pushed above").1
+                }
+            },
+        };
+        if bits.len() <= word {
+            bits.resize(word + 1, 0);
+        }
+        bits[word] |= bit;
+    }
+    out
+}
+
 /// What [`Host::card_steps`] took off a submission: the list that does it,
-/// for the submission to run first, and the steps the CPU leaves out (their
-/// list by address, their place in it).
+/// for the submission to run first, and the steps the CPU leaves out (per
+/// list address, bitset of deferred step indices).
 pub(super) struct Taken {
     own: Own,
-    steps: std::collections::HashSet<(usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
+    steps: Vec<(usize, Vec<u64>)>,
     copied: Vec<(Arc<Shadow>, usize, usize)>,
 }
 
@@ -990,9 +1121,23 @@ impl Taken {
         &self.own.list
     }
 
+    /// Returns the bitset slice for `list` once per `HostList` so
+    /// `run_deferred` checks each step in 2 instructions with zero hashing.
+    #[inline]
+    pub(super) fn takes_bits(&self, list: &HostList) -> Option<&[u64]> {
+        let ptr = std::ptr::from_ref(list) as usize;
+        self.steps.iter().find(|(p, _)| *p == ptr).map(|(_, bits)| bits.as_slice())
+    }
+
+    #[inline]
+    pub(super) fn bit_taken(bits: Option<&[u64]>, i: usize) -> bool {
+        bits.and_then(|b| b.get(i >> 6)).is_some_and(|&w| (w >> (i & 63)) & 1 != 0)
+    }
+
     /// Whether step `i` of `list` is done by this.
+    #[inline]
     pub(super) fn takes(&self, list: &HostList, i: usize) -> bool {
-        self.steps.contains(&(std::ptr::from_ref(list) as usize, i))
+        Self::bit_taken(self.takes_bits(list), i)
     }
 
     fn copied(&self) -> impl Iterator<Item = Writer> {
@@ -1011,6 +1156,60 @@ impl Taken {
         drop(std::mem::take(&mut *self.own.list.deferred()));
         POOL.lock().unwrap_or_else(|e| e.into_inner()).push(self.own);
     }
+}
+
+/// Reusable thread-local scratch for [`Host::take_steps`] (eliminates ~2.4 MB
+/// of per-submission heap allocations on `victory-submit`).
+struct CardStepsScratch {
+    does: Vec<Does>,
+    steps: Vec<(usize, usize)>,
+    fills: Vec<Option<FillTo>>,
+    ops: Vec<Op>,
+    op_reads: Vec<OpRead>,
+    order: Vec<usize>,
+    read_spans: Vec<ReadSpan>,
+    op_ats: Vec<u64>,
+    shadow_spans: Vec<Option<(usize, usize)>>,
+    buckets: [Vec<(usize, u32, u64, u32)>; 8],
+    held_fallback: HashMap<(usize, usize), u32>,
+    room: MappedCache,
+}
+
+impl Default for CardStepsScratch {
+    fn default() -> Self {
+        Self {
+            does: Vec::new(),
+            steps: Vec::new(),
+            fills: Vec::new(),
+            ops: Vec::new(),
+            op_reads: Vec::new(),
+            order: Vec::new(),
+            read_spans: Vec::new(),
+            op_ats: Vec::new(),
+            shadow_spans: Vec::new(),
+            buckets: std::array::from_fn(|_| Vec::new()),
+            held_fallback: HashMap::default(),
+            room: MappedCache::default(),
+        }
+    }
+}
+
+/// Bucket count for `constant_slots_batch`, matching `land::each_under`'s
+/// active thread count (`workers + caller`) so one balanced wave finishes all
+/// constant-slot writes without a 2-wave tail imbalance on 6C/12T CPUs.
+fn slot_batch_parts(op_count: usize) -> usize {
+    if op_count < 64 {
+        return 1;
+    }
+    static PARTS: OnceLock<usize> = OnceLock::new();
+    *PARTS.get_or_init(|| {
+        let logical = std::thread::available_parallelism().map_or(12, |n| n.get());
+        let workers = std::env::var("VICTORY_UNDER_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or_else(|| (logical / 3).clamp(2, 6));
+        (workers.clamp(1, 7) + 1).min(8)
+    })
 }
 
 impl Host {
@@ -1055,205 +1254,229 @@ impl Host {
     }
 
     fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
-        let mut spent = crate::timeline::span("steps on the card: chosen");
-        let (does, steps, mut fills) = does_of(written, runs, true);
-        let chosen = plan(&does, stage(), placed_order(), &mut None)?;
-        if chosen.is_empty() {
-            return Ok(None);
+        thread_local! {
+            static SCRATCH: std::cell::RefCell<CardStepsScratch> = std::cell::RefCell::new(CardStepsScratch::default());
         }
-        spent.next("steps on the card: what holds their bytes");
-        let (shadows, raw_writers) = {
-            let line = line();
-            WriterIndex::collect_line(&line)
-        };
-        let mut writer_index = WriterIndex::build(shadows, raw_writers);
-        let mut ops: Vec<Op> = Vec::with_capacity(chosen.len());
-        let mut op_reads: Vec<OpRead> = Vec::with_capacity(chosen.len());
-        let mut held_fallback: HashMap<(usize, usize), u32> = HashMap::default();
-        let mut room = MappedCache::default();
-        let mut has_writes = false;
-        let mut copy_count = 0usize;
-        let mut total_bytes = 0u64;
-        let mut max_level = 0u32;
-        for &(i, level) in &chosen {
-            let Some(((src, _), (dst, _))) = reads_writes(&does[i]) else {
-                continue;
-            };
-            let (Does::Copy { len, .. } | Does::Fill { len, .. }) = does[i] else {
-                continue;
-            };
-            if len == 0 {
-                return Err("nothing to read");
-            }
-            let from_shadow = writer_index.holder(src, src + len, &mut held_fallback)?;
-            if !room.check(src, src + len) {
-                return Err("not all of what it reads is mapped");
-            }
-            let to = match does[i] {
-                Does::Copy { .. } => {
-                    let to_shadow = writer_index.holder(dst, dst + len, &mut held_fallback)?;
-                    let to_ptr = Arc::as_ptr(&writer_index.shadows[to_shadow as usize]) as usize;
-                    if elsewhere(&does, to_ptr, dst, dst + len) {
-                        return Err("another host copy of what it writes is read");
-                    }
-                    if !room.check(dst, dst + len) {
-                        return Err("not all of what it writes is mapped");
-                    }
-                    // What the steps behind it read of it is in that host
-                    // copy, or nowhere.
-                    writer_index.push_extra(to_shadow, dst, dst + len);
-                    held_fallback.clear();
-                    has_writes = true;
-                    copy_count += 1;
-                    To::Copy(to_shadow, dst)
+        SCRATCH.with_borrow_mut(|s| {
+            let result = (|| -> Result<Option<Taken>, &'static str> {
+                let mut spent = crate::timeline::span("steps on the card: chosen");
+                does_of_into(written, runs, true, &mut s.does, &mut s.steps, &mut s.fills);
+                let chosen = plan(&s.does, stage(), placed_order(), &mut None)?;
+                if chosen.is_empty() {
+                    return Ok(None);
                 }
-                _ => match fills[i].take() {
-                    Some(FillTo::Slot(heap, index)) => To::Slot(heap, index),
-                    Some(FillTo::Buffer(buffer)) => {
-                        has_writes = true;
-                        To::Buffer(buffer)
+                spent.next("steps on the card: what holds their bytes");
+                let (shadows, raw_writers) = {
+                    let line = line();
+                    WriterIndex::collect_line(&line)
+                };
+                let mut writer_index = WriterIndex::build(shadows, raw_writers);
+                s.ops.clear();
+                s.op_reads.clear();
+                s.held_fallback.clear();
+                s.room.clear();
+                let mut has_writes = false;
+                let mut copy_count = 0usize;
+                let mut total_bytes = 0u64;
+                let mut max_level = 0u32;
+                for &(i, level) in &chosen {
+                    let Some(((src, _), (dst, _))) = reads_writes(&s.does[i]) else {
+                        continue;
+                    };
+                    let (Does::Copy { len, .. } | Does::Fill { len, .. }) = s.does[i] else {
+                        continue;
+                    };
+                    if len == 0 {
+                        return Err("nothing to read");
                     }
-                    None => continue,
-                },
-            };
-            let aligned_256 = matches!(to, To::Slot(..));
-            max_level = max_level.max(level);
-            total_bytes += len as u64;
-            op_reads.push(OpRead { shadow: from_shadow, src, len, level, aligned_256 });
-            ops.push(Op {
-                from_shadow,
-                src,
-                len,
-                at: 0,
-                level,
-                to,
-            });
-        }
-        // Coalesce adjacent/overlapping/near-gap reads per `(level, shadow)` to
-        // collapse thousands of small `CopyBufferRegion` calls into a handful of
-        // bulk VRAM-to-VRAM copies; tighten gap threshold before refusing.
-        let (read_spans, op_ats, end) = layout_reads(&op_reads, BETWEEN, 2048)
-            .or_else(|| layout_reads(&op_reads, BETWEEN, 256))
-            .or_else(|| layout_reads(&op_reads, BETWEEN, 0))
-            .ok_or("too much at once")?;
-        for (op, at) in ops.iter_mut().zip(op_ats) {
-            op.at = at;
-        }
-        spent.next("steps on the card: the list");
-        let Some(own) = self.own_list() else {
-            return Err("no host list or buffer for it");
-        };
-        // First every refresh, then the writes: the bytes compared with are
-        // the title's. (One step for each host copy, over all that is read of
-        // it: a flush brings a copy up to date from the first range asked for
-        // to the last, whatever the steps.)
-        let mut shadow_spans: Vec<Option<(usize, usize)>> = vec![None; writer_index.shadows.len()];
-        let mut extend_span = |shadow_idx: u32, at: usize, len: usize| {
-            let slot = &mut shadow_spans[shadow_idx as usize];
-            match slot {
-                Some((lo, hi)) => {
-                    *lo = (*lo).min(at);
-                    *hi = (*hi).max(at + len);
-                }
-                None => *slot = Some((at, at + len)),
-            }
-        };
-        for op in &ops {
-            extend_span(op.from_shadow, op.src, op.len);
-            if let To::Copy(to_shadow, dst) = op.to {
-                extend_span(to_shadow, dst, op.len);
-            }
-        }
-        for (shadow, span) in writer_index.shadows.iter().zip(shadow_spans) {
-            if let Some((from, to)) = span {
-                shadow.refresh(&own.list, from as u64, (to - from) as u64);
-            }
-        }
-        let mut copied = Vec::with_capacity(copy_count);
-        if copy_count > 0 {
-            for op in &ops {
-                if let To::Copy(to_shadow, dst) = op.to {
-                    let to = &writer_index.shadows[to_shadow as usize];
-                    to.gpu_writes(&own.list, dst as u64, op.len as u64);
-                    copied.push((to.clone(), dst, dst + op.len));
-                }
-            }
-        }
-        #[cfg(feature = "diagnostics")]
-        own.list.note_op(|| {
-            format!(
-                "{} copies of title memory done on the card ({} coalesced reads, {end} bytes, VICTORY_CARD_STEPS)",
-                ops.len(),
-                read_spans.len(),
-            )
-        });
-        #[cfg(not(feature = "diagnostics"))]
-        let _ = end;
-        let mut span_cursor = 0usize;
-        let mut reads = Vec::with_capacity(read_spans.len());
-        let mut writes = Vec::new();
-        for level in 0..=max_level {
-            reads.clear();
-            writes.clear();
-            while span_cursor < read_spans.len() && read_spans[span_cursor].level == level {
-                let s = read_spans[span_cursor];
-                let shadow = &writer_index.shadows[s.shadow as usize];
-                reads.push((&shadow.buffer, shadow.offset(s.src as u64), s.at, s.len as u64));
-                span_cursor += 1;
-            }
-            if has_writes {
-                for op in ops.iter().filter(|op| op.level == level) {
-                    let len = op.len as u64;
-                    match &op.to {
-                        To::Copy(to_shadow, dst) => {
-                            let to = &writer_index.shadows[*to_shadow as usize];
-                            writes.push((&to.buffer, to.offset(*dst as u64), op.at, len));
+                    let from_shadow = writer_index.holder(src, src + len, &mut s.held_fallback)?;
+                    if !s.room.check(src, src + len) {
+                        return Err("not all of what it reads is mapped");
+                    }
+                    let to = match s.does[i] {
+                        Does::Copy { .. } => {
+                            let to_shadow = writer_index.holder(dst, dst + len, &mut s.held_fallback)?;
+                            let to_ptr = Arc::as_ptr(&writer_index.shadows[to_shadow as usize]) as usize;
+                            if elsewhere(&s.does, to_ptr, dst, dst + len) {
+                                return Err("another host copy of what it writes is read");
+                            }
+                            if !s.room.check(dst, dst + len) {
+                                return Err("not all of what it writes is mapped");
+                            }
+                            // What the steps behind it read of it is in that host
+                            // copy, or nowhere.
+                            writer_index.push_extra(to_shadow, dst, dst + len);
+                            s.held_fallback.clear();
+                            has_writes = true;
+                            copy_count += 1;
+                            To::Copy(to_shadow, dst)
                         }
-                        To::Buffer(buffer) => writes.push((buffer, 0, op.at, len)),
-                        To::Slot(..) => {}
+                        _ => match s.fills[i].take() {
+                            Some(FillTo::Slot(heap, index)) => To::Slot(heap, index),
+                            Some(FillTo::Buffer(buffer)) => {
+                                has_writes = true;
+                                To::Buffer(buffer)
+                            }
+                            None => continue,
+                        },
+                    };
+                    let aligned_256 = matches!(to, To::Slot(..));
+                    max_level = max_level.max(level);
+                    total_bytes += len as u64;
+                    s.op_reads.push(OpRead {
+                        shadow: from_shadow,
+                        src,
+                        len,
+                        level,
+                        aligned_256,
+                    });
+                    s.ops.push(Op {
+                        from_shadow,
+                        src,
+                        len,
+                        at: 0,
+                        level,
+                        to,
+                    });
+                }
+                // Coalesce adjacent/overlapping/near-gap reads per `(level, shadow)`
+                // with a single sort pass to collapse thousands of small
+                // `CopyBufferRegion` calls into a handful of bulk GDDR7 copies.
+                let end = layout_reads_cascade(
+                    &s.op_reads,
+                    BETWEEN,
+                    &[65536, 16384, 2048, 256, 0],
+                    &mut s.order,
+                    &mut s.read_spans,
+                    &mut s.op_ats,
+                )
+                .ok_or("too much at once")?;
+                for (op, &at) in s.ops.iter_mut().zip(s.op_ats.iter()) {
+                    op.at = at;
+                }
+                spent.next("steps on the card: the list");
+                let Some(own) = self.own_list() else {
+                    return Err("no host list or buffer for it");
+                };
+                // First every refresh, then the writes: the bytes compared with are
+                // the title's. (One step for each host copy, over all that is read of
+                // it: a flush brings a copy up to date from the first range asked for
+                // to the last, whatever the steps.)
+                s.shadow_spans.clear();
+                s.shadow_spans.resize(writer_index.shadows.len(), None);
+                for op in &s.ops {
+                    let slot = &mut s.shadow_spans[op.from_shadow as usize];
+                    match slot {
+                        Some((lo, hi)) => {
+                            *lo = (*lo).min(op.src);
+                            *hi = (*hi).max(op.src + op.len);
+                        }
+                        None => *slot = Some((op.src, op.src + op.len)),
+                    }
+                    if let To::Copy(to_shadow, dst) = op.to {
+                        let slot = &mut s.shadow_spans[to_shadow as usize];
+                        match slot {
+                            Some((lo, hi)) => {
+                                *lo = (*lo).min(dst);
+                                *hi = (*hi).max(dst + op.len);
+                            }
+                            None => *slot = Some((dst, dst + op.len)),
+                        }
                     }
                 }
-            }
-            record(level == 0, &own.list.list, &own.between, &reads, &writes);
-        }
-        own.list.close();
-        // SAFETY: a live buffer.
-        let gpu = unsafe { own.between.GetGPUVirtualAddress() };
-        spent.next("steps on the card: the slots");
-        // (11,000 slots a frame in a street, two descriptors each: pre-bucket
-        // once so each worker visits only its own slots and acquires
-        // `SHADER_HEAPS.read()` once for its whole batch, preserving step order
-        // per slot.)
-        let parts = if ops.len() < 64 { 1 } else { 8 };
-        let per = ops.len() / parts + 16;
-        let mut buckets: [Vec<(usize, u32, u64, u32)>; 8] = std::array::from_fn(|p| {
-            if p < parts { Vec::with_capacity(per) } else { Vec::new() }
-        });
-        for op in &ops {
-            if let To::Slot(heap, index) = &op.to {
-                let part = (*index as usize / 4) % parts;
-                buckets[part].push((*heap, *index, gpu + op.at, op.len as u32));
-            }
-        }
-        crate::land::each_under(parts, &|part| {
-            if !buckets[part].is_empty() {
-                crate::descriptor::constant_slots_batch(&buckets[part], &own.between);
-            }
-        });
-        DONE[0].fetch_add((ops.len() - copy_count) as u64, Ordering::Relaxed);
-        DONE[1].fetch_add(copy_count as u64, Ordering::Relaxed);
-        DONE[2].fetch_add(total_bytes, Ordering::Relaxed);
-        #[cfg(feature = "diagnostics")]
-        noted(&ops, &writer_index.shadows);
-        spent.end();
-        let mut taken_steps =
-            std::collections::HashSet::with_capacity_and_hasher(chosen.len(), std::hash::BuildHasherDefault::default());
-        taken_steps.extend(chosen.iter().map(|&(i, _)| steps[i]));
-        Ok(Some(Taken {
-            own,
-            steps: taken_steps,
-            copied,
-        }))
+                for (shadow, &span) in writer_index.shadows.iter().zip(s.shadow_spans.iter()) {
+                    if let Some((from, to)) = span {
+                        shadow.refresh(&own.list, from as u64, (to - from) as u64);
+                    }
+                }
+                let mut copied = Vec::with_capacity(copy_count);
+                if copy_count > 0 {
+                    for op in &s.ops {
+                        if let To::Copy(to_shadow, dst) = op.to {
+                            let to = &writer_index.shadows[to_shadow as usize];
+                            to.gpu_writes(&own.list, dst as u64, op.len as u64);
+                            copied.push((to.clone(), dst, dst + op.len));
+                        }
+                    }
+                }
+                #[cfg(feature = "diagnostics")]
+                own.list.note_op(|| {
+                    format!(
+                        "{} copies of title memory done on the card ({} coalesced reads, {end} bytes, VICTORY_CARD_STEPS)",
+                        s.ops.len(),
+                        s.read_spans.len(),
+                    )
+                });
+                #[cfg(not(feature = "diagnostics"))]
+                let _ = end;
+                let mut span_cursor = 0usize;
+                let mut reads = Vec::with_capacity(s.read_spans.len());
+                let mut writes = Vec::new();
+                for level in 0..=max_level {
+                    reads.clear();
+                    writes.clear();
+                    while span_cursor < s.read_spans.len() && s.read_spans[span_cursor].level == level {
+                        let rs = s.read_spans[span_cursor];
+                        let shadow = &writer_index.shadows[rs.shadow as usize];
+                        reads.push((&shadow.buffer, shadow.offset(rs.src as u64), rs.at, rs.len as u64));
+                        span_cursor += 1;
+                    }
+                    if has_writes {
+                        for op in s.ops.iter().filter(|op| op.level == level) {
+                            let len = op.len as u64;
+                            match &op.to {
+                                To::Copy(to_shadow, dst) => {
+                                    let to = &writer_index.shadows[*to_shadow as usize];
+                                    writes.push((&to.buffer, to.offset(*dst as u64), op.at, len));
+                                }
+                                To::Buffer(buffer) => writes.push((buffer, 0, op.at, len)),
+                                To::Slot(..) => {}
+                            }
+                        }
+                    }
+                    record(level == 0, &own.list.list, &own.between, &reads, &writes);
+                }
+                own.list.close();
+                // SAFETY: a live buffer.
+                let gpu = unsafe { own.between.GetGPUVirtualAddress() };
+                spent.next("steps on the card: the slots");
+                // Pre-bucket once into `land::each_under`'s active worker count
+                // so every worker acquires `SHADER_HEAPS.read()` once and
+                // finishes in a single balanced wave, preserving per-slot order.
+                let parts = slot_batch_parts(s.ops.len());
+                for b in &mut s.buckets[..parts] {
+                    b.clear();
+                }
+                for op in &s.ops {
+                    if let To::Slot(heap, index) = &op.to {
+                        let part = (*index as usize / 4) % parts;
+                        s.buckets[part].push((*heap, *index, gpu + op.at, op.len as u32));
+                    }
+                }
+                let buckets = &s.buckets[..parts];
+                crate::land::each_under(parts, &|part| {
+                    if !buckets[part].is_empty() {
+                        crate::descriptor::constant_slots_batch(&buckets[part], &own.between);
+                    }
+                });
+                DONE[0].fetch_add((s.ops.len() - copy_count) as u64, Ordering::Relaxed);
+                DONE[1].fetch_add(copy_count as u64, Ordering::Relaxed);
+                DONE[2].fetch_add(total_bytes, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                noted(&s.ops, &writer_index.shadows);
+                spent.end();
+                let taken_steps = build_taken_steps(&chosen, &s.steps);
+                Ok(Some(Taken {
+                    own,
+                    steps: taken_steps,
+                    copied,
+                }))
+            })();
+            // Always drop any `ID3D12Resource` COM references before returning.
+            s.fills.clear();
+            s.ops.clear();
+            result
+        })
     }
 
     /// A list of ours open for recording, and its buffer.
@@ -1571,6 +1794,65 @@ mod tests {
         assert!(idx.query_writers(3400, 3600).is_err());
         // Overlap with shadowless writer -> error.
         assert!(idx.query_writers(7990, 8010).is_err());
+    }
+
+    #[test]
+    fn writer_index_isolated_flag_and_bitset_helpers_are_exact() {
+        let idx = WriterIndex::build(
+            Vec::new(),
+            vec![
+                (Some(0), 0x1000, 0x3000), // isolated
+                (Some(1), 0x4000, 0x6000), // overlaps shadow 2
+                (Some(2), 0x5000, 0x7000), // overlaps shadow 1
+                (Some(3), 0x7000, 0x9000), // touching [0x5000, 0x7000) at boundary -> isolated!
+            ],
+        );
+        assert_eq!(idx.entries.len(), 4);
+        assert!(idx.entries[0].isolated);
+        assert!(!idx.entries[1].isolated);
+        assert!(!idx.entries[2].isolated);
+        assert!(idx.entries[3].isolated);
+        assert_eq!(idx.query_writers_detail(0x1200, 0x1400), Ok(Some((0, Some((0x1000, 0x3000))))));
+        assert_eq!(idx.query_writers_detail(0x4100, 0x4200), Ok(Some((1, None))));
+        assert_eq!(idx.query_writers_detail(0x7000, 0x7200), Ok(Some((3, Some((0x7000, 0x9000))))));
+
+        let steps = vec![(0xAAA, 0), (0xAAA, 63), (0xAAA, 64), (0xBBB, 5), (0xAAA, 130)];
+        let chosen = vec![(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)];
+        let built = build_taken_steps(&chosen, &steps);
+        assert_eq!(built.len(), 2);
+        let a_bits = built.iter().find(|(p, _)| *p == 0xAAA).map(|(_, b)| b.as_slice());
+        let b_bits = built.iter().find(|(p, _)| *p == 0xBBB).map(|(_, b)| b.as_slice());
+        for &i in &[0, 63, 64, 130] {
+            assert!(Taken::bit_taken(a_bits, i));
+        }
+        assert!(!Taken::bit_taken(a_bits, 1));
+        assert!(!Taken::bit_taken(a_bits, 129));
+        assert!(Taken::bit_taken(b_bits, 5));
+        assert!(!Taken::bit_taken(b_bits, 4));
+    }
+
+    #[test]
+    fn layout_reads_cascade_coalesces_64k_gaps_and_falls_back_cleanly() {
+        let ops = [
+            OpRead { shadow: 0, src: 0x10000, len: 256, level: 0, aligned_256: true },
+            OpRead { shadow: 0, src: 0x18000, len: 256, level: 0, aligned_256: true }, // 32 KiB gap
+            OpRead { shadow: 0, src: 0x20000, len: 256, level: 0, aligned_256: true }, // 32 KiB gap
+        ];
+        let (mut order, mut spans, mut ats) = (Vec::new(), Vec::new(), Vec::new());
+        // Plenty of budget: 64 KiB gap collapses all 3 CBVs into 1 span while keeping 256B alignment.
+        let end = layout_reads_cascade(&ops, BETWEEN, &[65536, 16384, 2048, 256, 0], &mut order, &mut spans, &mut ats)
+            .expect("coalesced fits");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].len, 0x10100);
+        assert!(ats.iter().all(|&a| a.is_multiple_of(256)));
+        assert!(end <= BETWEEN);
+
+        // Tight budget (1024 B): cascades down to gap=0 -> 3 separate 256B spans (768 B total).
+        let end_tight = layout_reads_cascade(&ops, 1024, &[65536, 16384, 2048, 256, 0], &mut order, &mut spans, &mut ats)
+            .expect("tight fallback fits");
+        assert_eq!(spans.len(), 3);
+        assert_eq!(end_tight, 768);
+        assert_eq!(ats, vec![0, 256, 512]);
     }
 
     /// `layout_reads` merges adjacent, overlapping, and near-gap reads into

@@ -307,6 +307,54 @@ pub(super) struct Own {
 /// Runs whose pairs/scatter jobs are one parallel chunk of work.
 const RUNS_AT_A_TIME: usize = 4096;
 
+/// Minimum total `CopyBufferRegion` bytes to parallelize CPU-side copies on
+/// `crate::land::each_under`; lowered when `pair_work`/`scatter_work` already
+/// wake the pool.
+const PARALLEL_MOVE_BYTES: usize = 512 << 10;
+const PARALLEL_MOVE_BYTES_WITH_SCATTER: usize = 256 << 10;
+const MOVE_CHUNK_MIN: usize = 128 << 10;
+const MOVE_CHUNK_MAX: usize = 1 << 20;
+const MOVE_SPLIT_FLOOR: usize = 64 << 10;
+
+fn should_parallelize_moves(move_bytes: usize, other_jobs: usize) -> bool {
+    move_bytes >= PARALLEL_MOVE_BYTES
+        || (other_jobs > 0 && move_bytes >= PARALLEL_MOVE_BYTES_WITH_SCATTER)
+}
+
+/// Splits `(src, dst, len)` CPU-to-upload copy runs into balanced chunks of
+/// `~128 KiB..=1 MiB` (exact contiguous byte coverage with zero gaps/overlaps)
+/// for `crate::land::each_under`.
+fn split_move_chunks(
+    moves: &[(usize, usize, usize)],
+    move_bytes: usize,
+) -> (Vec<(usize, usize, usize)>, Vec<(usize, usize)>) {
+    let target = (move_bytes / 4).clamp(MOVE_CHUNK_MIN, MOVE_CHUNK_MAX);
+    let mut split_moves = Vec::with_capacity(moves.len() + move_bytes / target + 1);
+    let mut move_chunks = Vec::new();
+    let mut chunk_start = 0usize;
+    let mut chunk_bytes = 0usize;
+    for &(mut src, mut dst, mut len) in moves {
+        while len > 0 {
+            let room = target.saturating_sub(chunk_bytes).max(MOVE_SPLIT_FLOOR);
+            let take = len.min(room);
+            split_moves.push((src, dst, take));
+            src += take;
+            dst += take;
+            len -= take;
+            chunk_bytes += take;
+            if chunk_bytes >= target {
+                move_chunks.push((chunk_start, split_moves.len()));
+                chunk_start = split_moves.len();
+                chunk_bytes = 0;
+            }
+        }
+    }
+    if chunk_start < split_moves.len() {
+        move_chunks.push((chunk_start, split_moves.len()));
+    }
+    (split_moves, move_chunks)
+}
+
 fn jobs_for_run(len_bytes: usize) -> u32 {
     let dwords = (len_bytes / 4) as u32;
     dwords.div_ceil(SCATTER_MAX_JOB_DWORDS)
@@ -450,12 +498,22 @@ pub(super) fn take(
         }
     }
 
+    let move_bytes: usize = moves.iter().map(|m| m.2).sum();
+    let pair_count = pair_work.len();
+    let scatter_count = scatter_work.len();
+    let parallel_moves = should_parallelize_moves(move_bytes, pair_count + scatter_count);
+    let (split_moves, move_chunks) = if parallel_moves {
+        split_move_chunks(&moves, move_bytes)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
     thread_local! {
         static SCATTER_JOBS: std::cell::RefCell<Vec<[u32; 3]>> =
             const { std::cell::RefCell::new(Vec::new()) };
     }
 
-    let pair_count = pair_work.len();
+    let total_jobs = pair_count + scatter_count + move_chunks.len();
     let do_compute = |i: usize| {
         if i < pair_count {
             let (from, ranges, to) = pair_work[i];
@@ -471,7 +529,7 @@ pub(super) fn take(
                     }
                 }
             }
-        } else {
+        } else if i < pair_count + scatter_count {
             let (from, ranges, job_ptr, mut pay_ptr, mut pay_rel, chunk_jobs) =
                 scatter_work[i - pair_count];
             // Stage 12-byte `[dst_off, src_off, dwords]` job headers in cached
@@ -527,11 +585,20 @@ pub(super) fn take(
                     jobs.shrink_to(4096);
                 }
             });
+        } else {
+            let (a, b) = move_chunks[i - pair_count - scatter_count];
+            for &(src, dst, len) in &split_moves[a..b] {
+                // SAFETY: disjoint reserved slice inside `memory` and live
+                // CPU-side shadow bytes.
+                unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
+            }
         }
     };
-    crate::land::each_under(pair_count + scatter_work.len(), &do_compute);
+    if total_jobs > 0 {
+        crate::land::each_under(total_jobs, &do_compute);
+    }
 
-    STATS[0].fetch_add(moves.iter().map(|m| m.2 as u64).sum(), Ordering::Relaxed);
+    STATS[0].fetch_add(move_bytes as u64, Ordering::Relaxed);
     STATS[1].fetch_add(moves.len() as u64, Ordering::Relaxed);
     STATS[2].fetch_add(
         copies.iter().map(|c| u64::from(c.pairs.1)).sum(),
@@ -539,7 +606,12 @@ pub(super) fn take(
     );
     STATS[4].fetch_add(dense_runs_total, Ordering::Relaxed);
     STATS[5].fetch_add(dense_bytes_total, Ordering::Relaxed);
-    crate::shadow::copy_all(moves);
+    if !parallel_moves {
+        for (src, dst, len) in moves {
+            // SAFETY: disjoint reserved slice inside `memory` and live CPU-side shadow bytes.
+            unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
+        }
+    }
     STATS[3].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
     Some(Own { memory, copies })
 }
@@ -686,6 +758,103 @@ mod tests {
         // Legacy mode: <= 256 B -> Pair; > 256 B -> Copy.
         assert_eq!(classify_with(0, 256, false), Route::Pair);
         assert_eq!(classify_with(0, 260, false), Route::Copy);
+    }
+
+    #[test]
+    fn move_chunk_splitting_covers_exact_bytes_without_gaps_or_overlaps() {
+        assert!(!should_parallelize_moves(0, 0));
+        assert!(!should_parallelize_moves((256 << 10) - 1, 1));
+        assert!(should_parallelize_moves(256 << 10, 1));
+        assert!(!should_parallelize_moves((512 << 10) - 1, 0));
+        assert!(should_parallelize_moves(512 << 10, 0));
+
+        // Empty and zero-length moves produce zero chunks.
+        let (empty_splits, empty_chunks) = split_move_chunks(&[], 0);
+        assert!(empty_splits.is_empty() && empty_chunks.is_empty());
+        let (zero_splits, zero_chunks) = split_move_chunks(&[(0x1000, 0x2000, 0)], 0);
+        assert!(zero_splits.is_empty() && zero_chunks.is_empty());
+
+        // Verify exact byte-for-byte coverage across small, boundary-straddling,
+        // and multi-MiB runs (including zero-length entries and unaligned tails).
+        let cases: &[&[(usize, usize, usize)]] = &[
+            // Small moves summing to 512 KiB (target = 128 KiB -> 4 chunks)
+            &[
+                (0, 0, 20 << 10),
+                (20 << 10, 24 << 10, 100 << 10),
+                (120 << 10, 128 << 10, 80 << 10), // crosses 128 KiB with 8 KiB left -> hits 64 KiB floor
+                (200 << 10, 212 << 10, 312 << 10),
+            ],
+            // Single large 3.5 MiB move (target = (3.5 MiB / 4) = 896 KiB -> 4 chunks)
+            &[(64, 128, (3 << 20) + (512 << 10))],
+            // Mixed tiny, zero-length, medium, and >1 MiB moves (target clamped at 1 MiB)
+            &[
+                (0, 0, 0),
+                (13, 17, 777),
+                (4096, 8192, 64 << 10),
+                (70_000, 80_000, 960 << 10),
+                (1_200_000, 1_300_000, (3 << 20) + 12345),
+                (5_000_000, 5_100_000, (1 << 20) + 99),
+                (6_200_000, 6_300_000, 0),
+                (6_300_000, 6_400_000, 33_333),
+            ],
+        ];
+
+        for &case in cases {
+            let max_src = case.iter().map(|&(s, _, l)| s + l).max().unwrap_or(0);
+            let max_dst = case.iter().map(|&(_, d, l)| d + l).max().unwrap_or(0);
+            let move_bytes: usize = case.iter().map(|&(_, _, l)| l).sum();
+
+            let src_buf: Vec<u8> = (0..max_src)
+                .map(|i| ((i.wrapping_mul(131) ^ (i >> 7) ^ 0x5D) as u8).max(1))
+                .collect();
+            let mut dst_buf = vec![0xAAu8; max_dst];
+            let mut writes = vec![0u8; max_dst];
+            let mut expected = vec![0xAAu8; max_dst];
+            for &(s, d, l) in case {
+                expected[d..d + l].copy_from_slice(&src_buf[s..s + l]);
+            }
+
+            let base_src = src_buf.as_ptr() as usize;
+            let base_dst = dst_buf.as_mut_ptr() as usize;
+            let raw_moves: Vec<(usize, usize, usize)> = case
+                .iter()
+                .map(|&(s, d, l)| (base_src + s, base_dst + d, l))
+                .collect();
+
+            let (split_moves, move_chunks) = split_move_chunks(&raw_moves, move_bytes);
+            assert!(!move_chunks.is_empty());
+
+            // Chunks must partition `0..split_moves.len()` contiguously and non-emptily.
+            let mut cursor = 0usize;
+            let mut copied_bytes = 0usize;
+            for &(a, b) in &move_chunks {
+                assert_eq!(a, cursor, "gap or overlap between move chunks");
+                assert!(b > a, "empty move chunk");
+                for &(src, dst, len) in &split_moves[a..b] {
+                    assert!(len > 0, "zero-length split move");
+                    let d_off = dst - base_dst;
+                    for slot in &mut writes[d_off..d_off + len] {
+                        *slot = slot.saturating_add(1);
+                    }
+                    // SAFETY: all slices lie strictly within `src_buf` and `dst_buf`.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len);
+                    }
+                    copied_bytes += len;
+                }
+                cursor = b;
+            }
+            assert_eq!(cursor, split_moves.len());
+            assert_eq!(copied_bytes, move_bytes);
+            assert_eq!(dst_buf, expected);
+
+            // Every destination byte inside a move was written exactly once; outside, zero times.
+            let mut expected_writes = vec![0u8; max_dst];
+            for &(_, d, l) in case {
+                expected_writes[d..d + l].fill(1);
+            }
+            assert_eq!(writes, expected_writes);
+        }
     }
 
     /// End-to-end GPU test verifying mixed word-pair (`4 B`, `8 B`), dense

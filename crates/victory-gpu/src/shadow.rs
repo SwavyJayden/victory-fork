@@ -131,6 +131,9 @@ pub(crate) struct Shadow {
     changes_only: std::sync::atomic::AtomicBool,
     /// A window in card memory the CPU maps ([`window_mapped_for`]).
     mapped: bool,
+    /// Non-zero allocation size (bytes) when `buffer` is a plain CPU-visible
+    /// `shared_buffer` eligible for recycling into `host::SHARED_SPARE` on drop.
+    pooled_shared: u64,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
     /// heap opened on the title memory itself, so shaders read and write
     /// the title's own bytes and nothing is copied either way. The heap,
@@ -364,8 +367,10 @@ pub(crate) fn card_room_kept() -> u64 {
     card_limits().1.min(SEEN).saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
 }
 
-/// The copies in the card's memory.
-static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+/// The copies in the card's memory, paired with their title `[start, end)`
+/// bounds so [`send_copied`] only upgrades overlapping shadows instead of
+/// cloning/dropping thousands of unrelated `Arc<Shadow>`s per `Step::Copy`.
+static CARDED: Mutex<Vec<(usize, usize, std::sync::Weak<Shadow>)>> = Mutex::new(Vec::new());
 
 /// Subset of [`CARDED`] whose CPU side changed since the last [`card_dirty`]
 /// drain. Keeping a dedicated dirty queue turns per-submission collection from
@@ -381,7 +386,9 @@ fn register_carded(shadow: &Arc<Shadow>) {
     };
     let weak = Arc::downgrade(shadow);
     let _ = card.self_weak.set(weak.clone());
-    CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(weak);
+    let start = shadow.start as usize;
+    let end = shadow.start.saturating_add(shadow.len) as usize;
+    CARDED.lock().unwrap_or_else(|e| e.into_inner()).push((start, end, weak));
 }
 
 /// Since the last frame line: bytes copied to card sides and the ranges
@@ -403,7 +410,7 @@ pub(crate) fn card_stats() -> [u64; 10] {
         out[i] = stat.swap(0, Ordering::Relaxed);
     }
     let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
-    carded.retain(|w| w.strong_count() > 0);
+    carded.retain(|(_, _, w)| w.strong_count() > 0);
     out[7] = carded.len() as u64;
     drop(carded);
     out[8] = CARD_BYTES[0].load(Ordering::Relaxed)
@@ -792,29 +799,24 @@ pub(crate) fn stale_pages(most: usize, say: &mut dyn FnMut(&Shadow, usize, usize
     done
 }
 
-/// Copies of memory (from, to, bytes: apart), on several threads if they are
-/// many.
-pub(crate) fn copy_all(copies: Vec<(usize, usize, usize)>) {
-    let bytes: usize = copies.iter().map(|c| c.2).sum();
-    if bytes > 2 << 20 {
-        let chunk = (bytes / (wide_threads() + 1)).clamp(64 << 10, WIDE_JOB);
-        wide(copy_jobs_sized(copies, chunk));
-        return;
-    }
-    for (src, dst, len) in copies {
-        // SAFETY: the caller's ranges.
-        unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
-    }
-}
-
 /// A title buffer copy was done on the CPU into `[dst, dst + len)`: all of it
 /// goes up to the copies in the card's memory that hold it, whether their
 /// CPU side held the same before or not. Left out is what shaders in the air
 /// may be writing (such a copy waits for them, or is done on the card).
 pub(crate) fn send_copied(dst: usize, len: usize) {
-    for shadow in carded_copies() {
+    if len == 0 {
+        return;
+    }
+    let dst_end = dst.saturating_add(len);
+    let hits: Vec<Arc<Shadow>> = CARDED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter_map(|(s_start, s_end, w)| (*s_start < dst_end && *s_end > dst).then(|| w.upgrade()).flatten())
+        .collect();
+    for shadow in hits {
         let (start, end) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
-        let (from, to) = (dst.max(start), (dst + len).min(end));
+        let (from, to) = (dst.max(start), dst_end.min(end));
         if from >= to {
             continue;
         }
@@ -832,7 +834,12 @@ pub(crate) fn send_copied(dst: usize, len: usize) {
 
 /// The copies in the card's memory (diagnostics: `crate::host::upcheck`).
 pub(crate) fn carded_copies() -> Vec<Arc<Shadow>> {
-    CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(std::sync::Weak::upgrade).collect()
+    CARDED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter_map(|(_, _, w)| w.upgrade())
+        .collect()
 }
 
 /// Ranges in order, those that overlap or touch as one.
@@ -2718,6 +2725,9 @@ impl Drop for Shadow {
                 CARD_BYTES[1].fetch_sub(card_hash_bytes(card.size), Ordering::Relaxed);
             }
         }
+        if self.pooled_shared > 0 && !self.data.is_null() && crate::host::references(&self.buffer) == 1 {
+            crate::host::recycle_shared_buffer(self.buffer.clone(), self.data, self.pooled_shared);
+        }
     }
 }
 
@@ -3207,6 +3217,7 @@ impl Shadow {
             window: false,
             changes_only: Default::default(),
             mapped: false,
+            pooled_shared: 0,
             place: None,
         }
     }
@@ -4245,37 +4256,91 @@ impl Shadow {
         bytes
     }
 
+/// Splits and groups `runs` (ascending `(from, to, known)` title ranges) into
+/// `~part`-byte work chunks whose boundaries fall strictly between 64 KiB
+/// (`PAGE`) blocks so parallel workers never touch the same 64 KiB `gpu_only`
+/// piece or landing block concurrently, while coalescing tiny 4 KiB `by_parts`
+/// sub-runs into cache-friendly batches.
+fn chunk_take_runs(
+    runs: Vec<(usize, usize, bool)>,
+    part: usize,
+) -> (Vec<(usize, usize, bool)>, Vec<std::ops::Range<usize>>) {
+    let part = part.max(PAGE);
+    let mut split: Vec<(usize, usize, bool)> = Vec::with_capacity(runs.len());
+    for (from, to, known) in runs {
+        if from >= to {
+            continue;
+        }
+        let mut at = from;
+        while at < to {
+            // Cut long runs on whole 64 KiB page boundaries.
+            let next = ((at / PAGE) * PAGE + part).min(to);
+            split.push((at, next, known));
+            at = next;
+        }
+    }
+    let mut chunks: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut chunk_start = 0usize;
+    let mut chunk_bytes = 0usize;
+    let mut last_page = usize::MAX;
+    for (i, &(from, to, _)) in split.iter().enumerate() {
+        let first_page = from / PAGE;
+        if i > chunk_start && chunk_bytes >= part && first_page != last_page {
+            chunks.push(chunk_start..i);
+            chunk_start = i;
+            chunk_bytes = 0;
+        }
+        chunk_bytes += to - from;
+        last_page = (to - 1) / PAGE;
+    }
+    if chunk_start < split.len() {
+        chunks.push(chunk_start..split.len());
+    }
+    (split, chunks)
+}
+
     /// [`Shadow::take`] of `runs` (from, to, known), on several threads if
     /// they are long: the big heap's copy has some 4 MB of them in each of
     /// 14 refreshes a frame, on one thread while the others had nothing.
+    ///
+    /// When already running inside `wide_each` (`IN_WIDE`), dispatches to the
+    /// separate idle `victory-under` pool (`crate::land::each_under`) instead
+    /// of falling back to serial execution, avoiding nested `victory-wide`
+    /// waits while parallelizing 4–8 MB big-heap refreshes in `refresh_front`.
     fn take_all(&self, runs: Vec<(usize, usize, bool)>) -> usize {
-        const LONG: usize = 1 << 20;
+        const LONG: usize = 512 << 10;
         const PART: usize = 256 << 10;
         let bytes = runs.iter().map(|r| r.1 - r.0).sum();
-        if bytes < LONG || !crate::watch::light() || IN_WIDE.get() {
+        if bytes < LONG || !crate::watch::light() {
             for (from, to, known) in runs {
                 self.take(from, to, known);
             }
             return bytes;
         }
-        let mut parts = Vec::with_capacity(bytes / PART + runs.len());
-        for (from, to, known) in runs {
-            let mut at = from;
-            while at < to {
-                // Whole pages to a part.
-                let next = ((at / PAGE) * PAGE + PART).min(to);
-                parts.push((at, next, known));
-                at = next;
+        let (split, chunks) = Self::chunk_take_runs(runs, PART);
+        if chunks.len() <= 1 {
+            for (from, to, known) in split {
+                self.take(from, to, known);
             }
+            return bytes;
         }
-        let this = std::ptr::from_ref(self) as usize;
-        wide_each(parts.len(), move |i| {
-            // SAFETY: `wide_each` returns when every part is done, before
-            // the borrow of `self` ends. The parts lie apart.
-            let this = unsafe { &*(this as *const Shadow) };
-            let (from, to, known) = parts[i];
-            this.take(from, to, known);
-        });
+        if IN_WIDE.get() {
+            crate::land::each_under(chunks.len(), &|c| {
+                for &(from, to, known) in &split[chunks[c].clone()] {
+                    self.take(from, to, known);
+                }
+            });
+        } else {
+            let this = std::ptr::from_ref(self) as usize;
+            wide_each(chunks.len(), move |c| {
+                // SAFETY: `wide_each` returns when every chunk is done, before
+                // the borrow of `self` ends. Chunks lie on disjoint 64 KiB pages.
+                let this = unsafe { &*(this as *const Shadow) };
+                for &(from, to, known) in &split[chunks[c].clone()] {
+                    this.take(from, to, known);
+                }
+            });
+        }
         bytes
     }
 
@@ -4326,10 +4391,11 @@ impl Shadow {
                 at = next;
             }
         }
-        if crate::gpu_only::enabled() && self.gpu_only_eligible() {
-            // Probe working set on private MEM_WRITE_WATCH pieces BEFORE
-            // `copy_mapped` reads title memory below, so our own echo read is
-            // never mistaken for a title CPU touch.
+        let mut retrim_pieces: Vec<usize> = Vec::new();
+        let gpu_only_frame = if crate::gpu_only::enabled() && self.gpu_only_eligible() {
+            // Probe working set (or clear same-frame trim) on private
+            // MEM_WRITE_WATCH pieces BEFORE `copy_mapped` reads title memory
+            // below, so our own echo read is never mistaken for a title CPU touch.
             let frame = crate::frame::current();
             let mut last_piece = usize::MAX;
             for &(r_from, r_to, noted) in &runs {
@@ -4341,10 +4407,15 @@ impl Shadow {
                         continue;
                     }
                     last_piece = piece;
-                    self.gpu_only_probe_before_read_piece(piece, frame);
+                    if self.gpu_only_probe_before_read_piece(piece, frame) {
+                        retrim_pieces.push(piece);
+                    }
                 }
             }
-        }
+            frame
+        } else {
+            0
+        };
         let mut dirty_runs: Vec<(usize, usize)> = Vec::new();
         let mut push_dirty = |a: usize, b: usize| {
             if a >= b {
@@ -4387,7 +4458,27 @@ impl Shadow {
         });
         if !dirty_runs.is_empty() {
             self.note_cpu_write_offsets(&dirty_runs);
-            self.card_changed_runs(dirty_runs.into_iter());
+            self.card_changed_runs(dirty_runs.iter().copied());
+        }
+        if !retrim_pieces.is_empty()
+            && let Some(card) = &self.card
+        {
+            // Re-trim pieces whose pure-echo read above just brought pages back
+            // into the working set, so the next frame still gets a clean probe
+            // (prevents same-frame `take_landed` from stalling at 0 probes).
+            for piece in retrim_pieces {
+                let (p_lo, p_hi) = self.piece(piece);
+                if dirty_runs.iter().any(|&(a, b)| a < p_hi && b > p_lo) {
+                    continue;
+                }
+                if let Some(block) = card.gpu_only.piece_block_if_whole(piece)
+                    && card.gpu_only.needs_trim(piece, gpu_only_frame, false)
+                    && crate::inplace::pages_of(block).len() <= 1
+                    && crate::gpu_only::trim_block(block)
+                {
+                    card.gpu_only.mark_trimmed(piece, gpu_only_frame, false);
+                }
+            }
         }
         to - from
     }
@@ -5127,19 +5218,36 @@ impl Shadow {
         }
     }
 
-    fn gpu_only_probe_before_read_piece(&self, piece: usize, frame: u64) {
+    /// Registers this eligible carded shadow in `crate::gpu_only::TRACKED_SHADOWS`
+    /// at most once, linearizably before any trim or promotion becomes visible.
+    #[inline]
+    pub(crate) fn gpu_only_ensure_tracked(self: &Arc<Self>) {
+        if let Some(card) = &self.card
+            && card.gpu_only.eligible()
+            && !card.gpu_only.is_registered()
+        {
+            crate::gpu_only::register_tracked_shadow(self);
+            let _ = card.gpu_only.mark_registered();
+        }
+    }
+
+    fn gpu_only_probe_before_read_piece(&self, piece: usize, frame: u64) -> bool {
+        use crate::gpu_only::{BeforeReadAction, ProbeOutcome};
         let Some(card) = &self.card else {
-            return;
+            return false;
         };
         let Some(block) = card.gpu_only.piece_block_if_whole(piece) else {
-            return;
+            return false;
         };
-        let Some(saved_changes) = card.gpu_only.needs_probe_before_read(piece, frame) else {
-            return;
-        };
-        let touched = crate::gpu_only::query_working_set_block(block).map(|(t, _)| t);
-        let changes_ok = crate::watch::changes() == saved_changes;
-        card.gpu_only.apply_probe_result(piece, frame, touched, changes_ok, true);
+        match card.gpu_only.before_read_action(piece, frame) {
+            BeforeReadAction::Skip => false,
+            BeforeReadAction::ClearedSameFrame => true,
+            BeforeReadAction::Probe => {
+                let touched = crate::gpu_only::query_working_set_block(block).map(|(t, _)| t);
+                let outcome = card.gpu_only.apply_probe_result(piece, frame, touched, true);
+                !matches!(outcome, ProbeOutcome::Pinned)
+            }
+        }
     }
 
     /// Probes previously trimmed pieces right before a landing reads/writes title memory.
@@ -5149,14 +5257,14 @@ impl Shadow {
         }
         let frame = crate::frame::current();
         for piece in self.pieces(lo, hi) {
-            self.gpu_only_probe_before_read_piece(piece, frame);
+            let _ = self.gpu_only_probe_before_read_piece(piece, frame);
         }
     }
 
     /// After landing completes (and `Notes::flush` has updated `copied` for
     /// view memory): trims candidate pieces via `VirtualUnlock` and promotes
     /// pieces satisfying all 5 rules to `GpuOnly`.
-    pub(crate) fn gpu_only_after_land(&self, pieces: &[(usize, usize, bool)]) {
+    pub(crate) fn gpu_only_after_land(self: &Arc<Self>, pieces: &[(usize, usize, bool)]) {
         if !crate::gpu_only::enabled() || !self.gpu_only_eligible() {
             return;
         }
@@ -5167,6 +5275,7 @@ impl Shadow {
         let Some(card) = &self.card else {
             return;
         };
+        self.gpu_only_ensure_tracked();
         let frame = crate::frame::current();
         for &(lo, hi, wrote_title) in pieces {
             if lo >= hi {
@@ -5194,11 +5303,11 @@ impl Shadow {
                 {
                     continue;
                 }
-                if card.gpu_only.needs_trim(piece, frame) && crate::inplace::pages_of(block).len() <= 1 {
-                    let changes = crate::watch::changes();
-                    if crate::gpu_only::trim_block(block) {
-                        card.gpu_only.mark_trimmed(piece, frame, changes, false);
-                    }
+                if card.gpu_only.needs_trim(piece, frame, wrote_title)
+                    && crate::inplace::pages_of(block).len() <= 1
+                    && crate::gpu_only::trim_block(block)
+                {
+                    card.gpu_only.mark_trimmed(piece, frame, false);
                 }
             }
         }
@@ -5235,7 +5344,7 @@ impl Shadow {
     /// Probes or trims a declared-but-unflagged piece (`CARD_COMPARE` proved
     /// its GPU hash unchanged). Returns `true` if it performed an OS working-set
     /// operation (consuming 1 budget unit).
-    pub(crate) fn gpu_only_probe_unflagged(&self, piece: usize, frame: u64) -> bool {
+    pub(crate) fn gpu_only_probe_unflagged(self: &Arc<Self>, piece: usize, frame: u64) -> bool {
         use crate::gpu_only::{ProbeOutcome, UnflaggedAction};
         let Some(card) = &self.card else {
             return false;
@@ -5260,16 +5369,16 @@ impl Shadow {
                 {
                     return false;
                 }
-                let changes = crate::watch::changes();
+                self.gpu_only_ensure_tracked();
                 if crate::gpu_only::trim_block(block) {
-                    card.gpu_only.mark_trimmed(piece, frame, changes, true);
+                    card.gpu_only.mark_trimmed(piece, frame, true);
                 }
                 true
             }
-            UnflaggedAction::NeedQuery { trimmed_watch_changes } => {
+            UnflaggedAction::NeedQuery => {
+                self.gpu_only_ensure_tracked();
                 let touched = crate::gpu_only::query_working_set_block(block).map(|(t, _)| t);
-                let changes_ok = crate::watch::changes() == trimmed_watch_changes;
-                let outcome = card.gpu_only.apply_probe_result(piece, frame, touched, changes_ok, false);
+                let outcome = card.gpu_only.apply_probe_result(piece, frame, touched, false);
                 if matches!(outcome, ProbeOutcome::Untouched(_))
                     && card.gpu_only.ready_to_promote(piece, frame, true)
                     && self.piece_is_copied(piece)
@@ -5445,7 +5554,7 @@ fn notify_new_shadow_overlap(new_id: u64, start: u64, len: u64) {
         return;
     }
     let end = start.saturating_add(len);
-    for shadow in carded_copies() {
+    for shadow in crate::gpu_only::tracked_shadows() {
         if shadow.id == new_id || !shadow.gpu_only_eligible() {
             continue;
         }
@@ -5829,7 +5938,7 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
         crate::host::retire(shadow);
     }
     if crate::gpu_only::enabled() && len > 0 {
-        for shadow in carded_copies() {
+        for shadow in crate::gpu_only::tracked_shadows() {
             if shadow.gpu_only_eligible() && shadow.start < end && shadow.start.saturating_add(shadow.len) > at {
                 // Memory is being unmapped/remapped: clear `GpuOnly` & pin
                 // without writing stale bytes over the new mapping.
@@ -5952,7 +6061,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             notify_new_shadow_overlap(id, key.0, len);
             return Some(shadow);
         }
-        let (buffer, data, card) = match card_for(size) {
+        let (buffer, data, card, pooled_shared) = match card_for(size) {
             Some(on_card) => {
                 let Some((staging, data)) = host()?.shared_buffer_private(size) else {
                     CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
@@ -5965,12 +6074,12 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     len,
                     "a buffer's host copy is in the card's memory"
                 );
-                (on_card, data, Some(Card::new(staging, size, key.0, len)))
+                (on_card, data, Some(Card::new(staging, size, key.0, len)), 0)
             }
             None => {
-                let (buffer, data) = host()?.shared_buffer(size)?;
+                let (buffer, data) = host()?.shared_buffer_pooled(size)?;
                 crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
-                (buffer, data, None)
+                (buffer, data, None, size)
             }
         };
         // SAFETY: a live buffer.
@@ -5990,6 +6099,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         }
         let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
         shadow.card = card;
+        shadow.pooled_shared = pooled_shared;
         let shadow = Arc::new(shadow);
         let new_id = shadow.id;
         if shadow.card.is_some() {
@@ -6300,10 +6410,11 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             (on_card, data, Some(Card::new(staging, len, start, len)))
         }
         None => {
-            // Drop `LOOSE.write()` before `shared_buffer()` so `CreateCommittedResource`
-            // + `MakeResident` + `mapped()` never serialize concurrent title/recording threads.
+            // Drop `LOOSE.write()` before `shared_buffer_pooled()` so
+            // `CreateCommittedResource` + `MakeResident` + `mapped()` never
+            // serialize concurrent title/recording threads.
             drop(map);
-            let (buffer, data) = host()?.shared_buffer(len)?;
+            let (buffer, data) = host()?.shared_buffer_pooled(len)?;
             crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -6314,6 +6425,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             );
             let mut shadow = Shadow::new(buffer, data, gpu, start, len);
             shadow.window = true;
+            shadow.pooled_shared = len;
             let shadow = Arc::new(shadow);
             let new_id = shadow.id;
             let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
@@ -6405,13 +6517,21 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         }
         now
     };
-    // Allocate outside `EXACT` so `CreateCommittedResource` + `MakeResident`
-    // + `mapped()` never stall concurrent callers looking up cached views.
-    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
+    // Allocate outside `EXACT` using bucketed sizes + `SHARED_SPARE` so
+    // recycled ring-position views skip `CreateCommittedResource` + `MakeResident`
+    // + `mapped()` stalls completely.
+    let alloc = if len <= 64 << 10 {
+        len.max(256).next_power_of_two()
+    } else {
+        len.next_multiple_of(64 << 10)
+    };
+    let (buffer, data) = host()?.shared_buffer_pooled(alloc)?;
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
+    let mut shadow = Shadow::new(buffer, data, gpu, address, len);
+    shadow.pooled_shared = alloc;
+    let shadow = Arc::new(shadow);
     let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((existing, used)) = guard.1.get_mut(&(address, len)) {
         *used = now.max(*used);
@@ -6730,6 +6850,43 @@ mod window_tests {
         assert!(!flights.still_held(&split2[0]));
         assert!(!flights.still_held(&split2[1]));
         assert!(flights.normal.is_empty() && flights.splits.is_empty() && flights.split_subs.is_empty());
+    }
+
+    #[test]
+    fn chunk_take_runs_preserves_order_and_never_splits_64k_page() {
+        const P: usize = super::PAGE;
+        const K4: usize = 4096;
+        // Mix of a large 640 KiB run and multiple 4 KiB sub-runs inside the same 64 KiB pages.
+        let runs = vec![
+            (0x1000_0000, 0x1000_0000 + 10 * P, false),
+            (0x100A_0000, 0x100A_0000 + K4, true),
+            (0x100A_0000 + 3 * K4, 0x100A_0000 + 4 * K4, true),
+            (0x100A_0000 + 15 * K4, 0x100A_0000 + 16 * K4, true),
+            (0x100B_0000, 0x100B_0000 + K4, true),
+        ];
+        let total_before: usize = runs.iter().map(|r| r.1 - r.0).sum();
+        let (split, chunks) = super::Shadow::chunk_take_runs(runs, 4 * P);
+        assert!(chunks.len() >= 3, "large run should split into multiple chunks");
+        let mut total_after = 0usize;
+        let mut prev_max_page: Option<usize> = None;
+        for range in &chunks {
+            let mut chunk_min_page = usize::MAX;
+            let mut chunk_max_page = 0usize;
+            for &(from, to, _) in &split[range.clone()] {
+                assert!(from < to);
+                total_after += to - from;
+                chunk_min_page = chunk_min_page.min(from / P);
+                chunk_max_page = chunk_max_page.max((to - 1) / P);
+            }
+            if let Some(prev) = prev_max_page {
+                assert!(
+                    chunk_min_page > prev,
+                    "chunks must never share a 64 KiB page ({chunk_min_page} <= {prev})"
+                );
+            }
+            prev_max_page = Some(chunk_max_page);
+        }
+        assert_eq!(total_after, total_before);
     }
 }
 

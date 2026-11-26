@@ -420,6 +420,10 @@ macro_rules! plain {
         #[allow(clippy::upper_case_acronyms, non_camel_case_types)]
         #[repr(u64)]
         enum Plain { $($op),* , END }
+        mod plain_op {
+            use super::Plain;
+            $(pub(super) const $op: u64 = Plain::$op as u64;)*
+        }
         $(extern "system" fn $name(this: This $(, $a: $t)*) {
             front(this).put(Plain::$op as u64, &[$(Word::word($a)),*]);
         })*
@@ -427,7 +431,7 @@ macro_rules! plain {
         #[inline]
         fn run_plain(op: u64, list: This, w: &[u64]) -> bool {
             match op {
-                $(n if n == Plain::$op as u64 => {
+                $(plain_op::$op => {
                     let mut words = w.iter();
                     $(let $a: $t = Word::unword(words.next().copied().unwrap_or(0));)*
                     let _ = words;
@@ -730,13 +734,13 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
         // Ops that may mutate `list.host` (`cut`, `value_written`, `reset`) or
         // directly touch `list.state` / close the list must run without the
         // scoped `ActiveStateGuard` held.
-        if op == Plain::WAIT_VALUE as u64
-            || op == Plain::WAIT_VALUE64 as u64
-            || op == Plain::WRITE32 as u64
-            || op == Plain::WRITE64 as u64
-            || op == RESET
-            || op == CLOSE
-        {
+        const UNHOLD_MASK: u64 = (1u64 << Plain::WAIT_VALUE as u64)
+            | (1u64 << Plain::WAIT_VALUE64 as u64)
+            | (1u64 << Plain::WRITE32 as u64)
+            | (1u64 << Plain::WRITE64 as u64)
+            | (1u64 << RESET)
+            | (1u64 << CLOSE);
+        if op < 64 && (UNHOLD_MASK & (1u64 << op)) != 0 {
             held_state = None;
             try_hold = true;
         } else if held_state.is_none() && try_hold {

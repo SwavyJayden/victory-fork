@@ -13,15 +13,15 @@
 //! 1. Size & carded (`shadow.carded() && shadow.len >= 64 KiB`, whole 64 KiB block).
 //! 2. Disjoint / non-aliased (`inplace::pages_of(block).len() <= 1` and no other
 //!    live `Shadow` overlapping `[block, block + 64 KiB)`).
-//! 3. CPU-write-quiet and step-quiet for `>= 45` consecutive frames.
+//! 3. CPU-write-quiet and step-quiet for `>= 30` consecutive frames.
 //! 4. Working-set verified (`K32QueryWorkingSetEx` sees 0 of 16 4 KiB pages in
-//!    working set across `>= 12` landed probes or `>= 6` unflagged probes).
+//!    working set across `>= 8` landed probes or `>= 6` unflagged probes).
 //! 5. Instant lossless demotion + permanent session pin on any CPU write, CPU
 //!    step (`Copy`/`Placed`/`Fill`/`Texture`/`Plane`/`Host`/`Run`), alias/new
 //!    overlapping shadow, or background watchdog working-set touch.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 /// Size of one residency-tracked piece (matches `shadow::PIECE` / `watch::BLOCK`).
 pub(crate) const PIECE: usize = 64 << 10;
@@ -32,15 +32,20 @@ const PAGES_PER_PIECE: usize = PIECE / KERNEL_PAGE;
 
 /// Consecutive frames without CPU writes or overlapping CPU steps required
 /// before a piece may promote to `GpuOnly`.
-pub(crate) const QUIET_FRAMES: u64 = 45;
+pub(crate) const QUIET_FRAMES: u64 = 30;
 /// Consecutive untouched working-set probes required on landed pieces.
-pub(crate) const LANDED_CLEAN_PROBES: u16 = 12;
+pub(crate) const LANDED_CLEAN_PROBES: u16 = 8;
 /// Consecutive untouched working-set probes required on declared-but-unflagged pieces.
 pub(crate) const UNFLAGGED_CLEAN_PROBES: u16 = 6;
 /// Minimum frames between trim and working-set probe for unflagged pieces.
 pub(crate) const UNFLAGGED_MIN_PROBE_GAP: u64 = 2;
 /// Maximum active `GpuOnly` pieces audited per frame by the rotating watchdog.
-pub(crate) const WATCHDOG_BUDGET_PER_FRAME: usize = 64;
+pub(crate) const WATCHDOG_BUDGET_PER_FRAME: usize = 256;
+/// Minimum shadow byte length eligible for unflagged-only promotion (`256 KiB`).
+/// Small `< 256 KiB` buffers (e.g. occlusion/streaming feedback buffers that may
+/// sit unchanged across a cutscene) still promote via active landed probes (`>= 64 KiB`),
+/// but are kept out of unflagged-only promotion.
+pub(crate) const UNFLAGGED_MIN_SHADOW_LEN: usize = 256 << 10;
 /// Maximum unflagged candidate piece actions (trim or probe) per frame.
 pub(crate) const UNFLAGGED_BUDGET_PER_FRAME: usize = 64;
 
@@ -72,7 +77,48 @@ static ACTIVE_GPU_ONLY_PIECES: AtomicU64 = AtomicU64::new(0);
 /// 4: demoted_step
 /// 5: demoted_alias
 /// 6: demoted_read
-static STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+/// 7: pinned_by_touch
+static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// Compact registry of only the shader-written shadows that have entered
+/// `gpu_only` tracking (~10–40 shadows instead of all ~3,600 carded shadows).
+static TRACKED_SHADOWS: Mutex<Vec<Weak<crate::shadow::Shadow>>> = Mutex::new(Vec::new());
+static TRACKED_SHADOW_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Registers `shadow` in [`TRACKED_SHADOWS`] once it first enters `gpu_only`
+/// probing/trimming so `gpu_only_pre_submit` and the background watchdog never
+/// scan thousands of read-only static carded buffers.
+pub(crate) fn register_tracked_shadow(shadow: &Arc<crate::shadow::Shadow>) {
+    let mut list = TRACKED_SHADOWS.lock().unwrap_or_else(|e| e.into_inner());
+    list.retain(|w| w.strong_count() > 0);
+    if !list.iter().any(|w| w.as_ptr() == Arc::as_ptr(shadow)) {
+        list.push(Arc::downgrade(shadow));
+    }
+    TRACKED_SHADOW_COUNT.store(list.len(), Ordering::Release);
+}
+
+#[inline]
+pub(crate) fn has_tracked_shadows() -> bool {
+    TRACKED_SHADOW_COUNT.load(Ordering::Acquire) != 0
+}
+
+/// Upgrades all currently live tracked shadows (~10–40), pruning dead entries.
+pub(crate) fn tracked_shadows() -> Vec<Arc<crate::shadow::Shadow>> {
+    if !has_tracked_shadows() {
+        return Vec::new();
+    }
+    let mut list = TRACKED_SHADOWS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out = Vec::with_capacity(list.len());
+    list.retain(|w| match w.upgrade() {
+        Some(s) => {
+            out.push(s);
+            true
+        }
+        None => false,
+    });
+    TRACKED_SHADOW_COUNT.store(list.len(), Ordering::Release);
+    out
+}
 
 /// Number of currently active `GpuOnly` pieces across all live shadows.
 #[inline]
@@ -111,8 +157,9 @@ pub(crate) fn log_line(frames: f64) {
         return;
     }
     let active = ACTIVE_GPU_ONLY_PIECES.load(Ordering::Relaxed);
-    let [compare_skipped, pending_skipped, promoted, d_write, d_step, d_alias, d_read] =
-        [0, 1, 2, 3, 4, 5, 6].map(|i| STATS[i].swap(0, Ordering::Relaxed));
+    let tracked = TRACKED_SHADOW_COUNT.load(Ordering::Relaxed);
+    let [compare_skipped, pending_skipped, promoted, d_write, d_step, d_alias, d_read, pin_touch] =
+        [0, 1, 2, 3, 4, 5, 6, 7].map(|i| STATS[i].swap(0, Ordering::Relaxed));
     if active == 0
         && compare_skipped == 0
         && pending_skipped == 0
@@ -121,13 +168,14 @@ pub(crate) fn log_line(frames: f64) {
         && d_step == 0
         && d_alias == 0
         && d_read == 0
+        && pin_touch == 0
     {
         return;
     }
     tracing::info!(
-        "gpu-only readback residency (VICTORY_GPU_ONLY_BACK=1): {active} active pieces ({:.1} MiB), \
+        "gpu-only readback residency (VICTORY_GPU_ONLY_BACK=1): {active} active pieces ({:.1} MiB, {tracked} shadows), \
          skipped/frame: {:.0} compare pieces, {:.0} pending ranges; \
-         promoted +{promoted}, demoted -{} (write {d_write}, step {d_step}, alias {d_alias}, read {d_read})",
+         promoted +{promoted}, pin_touch {pin_touch}, demoted -{} (write {d_write}, step {d_step}, alias {d_alias}, read {d_read})",
         (active as f64 * PIECE as f64) / (1 << 20) as f64,
         compare_skipped as f64 / frames,
         pending_skipped as f64 / frames,
@@ -236,7 +284,6 @@ pub(crate) enum PieceState {
         trimmed_at_frame: u64,
         trimmed: bool,
         unflagged_probe: bool,
-        trimmed_watch_changes: u64,
     },
     GpuOnly {
         promoted_frame: u64,
@@ -246,12 +293,26 @@ pub(crate) enum PieceState {
     Pinned,
 }
 
+/// Action decided before a landing or `take_landed` reads/writes title memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BeforeReadAction {
+    /// Piece is not trimmed (or not `Normal`).
+    Skip,
+    /// Piece was trimmed earlier on the same frame (`trimmed_at_frame >= frame`);
+    /// `trimmed` was cleared to `false` so our upcoming read/write cannot leave
+    /// resident pages under `trimmed = true` and trigger a false pin next frame.
+    ClearedSameFrame,
+    /// Piece was trimmed on an earlier frame (`trimmed_at_frame < frame`);
+    /// caller should query `K32QueryWorkingSetEx` and call `apply_probe_result`.
+    Probe,
+}
+
 /// Action decided for an unflagged declared piece on a given frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum UnflaggedAction {
     Skip,
     NeedTrim,
-    NeedQuery { trimmed_watch_changes: u64 },
+    NeedQuery,
 }
 
 /// Outcome of applying a working-set probe result.
@@ -271,6 +332,8 @@ pub(crate) struct Tracker {
     start: usize,
     len: usize,
     piece_count: usize,
+    /// Whether this shadow has been registered in [`TRACKED_SHADOWS`].
+    registered: AtomicBool,
     /// Number of pieces currently in `PieceState::GpuOnly`.
     active_count: AtomicU32,
     /// Lock-free bitmap of `GpuOnly` pieces (1 bit per 64 KiB piece).
@@ -295,6 +358,7 @@ impl Tracker {
             start: 0,
             len: 0,
             piece_count: 0,
+            registered: AtomicBool::new(false),
             active_count: AtomicU32::new(0),
             gpu_only_bits: Box::new([]),
             states: Mutex::new(Vec::new()),
@@ -329,16 +393,29 @@ impl Tracker {
             trimmed_at_frame: 0,
             trimmed: false,
             unflagged_probe: false,
-            trimmed_watch_changes: 0,
         };
         Self {
             start,
             len,
             piece_count,
+            registered: AtomicBool::new(false),
             active_count: AtomicU32::new(0),
             gpu_only_bits: gpu_only_bits.into_boxed_slice(),
             states: Mutex::new(vec![initial; piece_count]),
         }
+    }
+
+    /// Whether this shadow has already been registered in [`TRACKED_SHADOWS`].
+    #[inline]
+    pub(crate) fn is_registered(&self) -> bool {
+        self.registered.load(Ordering::Acquire)
+    }
+
+    /// Marks this tracker as registered in [`TRACKED_SHADOWS`], returning `true`
+    /// only on the first call.
+    #[inline]
+    pub(crate) fn mark_registered(&self) -> bool {
+        !self.registered.load(Ordering::Acquire) && !self.registered.swap(true, Ordering::AcqRel)
     }
 
     /// Whether this shadow is eligible by size (Rule 1: `>= 64 KiB` and enabled).
@@ -614,28 +691,42 @@ impl Tracker {
         demoted
     }
 
-    /// Checks whether `piece` was trimmed on an earlier frame and should be
-    /// queried via `K32QueryWorkingSetEx` before a landing or `take_landed`
-    /// reads title memory. Returns `Some(trimmed_watch_changes)` if so.
-    pub(crate) fn needs_probe_before_read(&self, piece: usize, frame: u64) -> Option<u64> {
+    /// Decides what working-set action to take before a landing or `take_landed`
+    /// reads/writes title memory for `piece` at `frame`.
+    ///
+    /// - If trimmed on an earlier frame (`trimmed_at_frame < frame`), returns
+    ///   [`BeforeReadAction::Probe`].
+    /// - If trimmed earlier on the same frame (`trimmed_at_frame >= frame`),
+    ///   clears `trimmed = false` immediately and returns
+    ///   [`BeforeReadAction::ClearedSameFrame`] so our own memory access does
+    ///   not leave resident pages under `trimmed = true` and trigger a false
+    ///   working-set pin on the next frame.
+    pub(crate) fn before_read_action(&self, piece: usize, frame: u64) -> BeforeReadAction {
         if piece >= self.piece_count {
-            return None;
+            return BeforeReadAction::Skip;
         }
-        let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        match states.get(piece) {
+        let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        match states.get_mut(piece) {
             Some(PieceState::Normal {
                 trimmed: true,
                 trimmed_at_frame,
-                trimmed_watch_changes,
                 ..
-            }) if *trimmed_at_frame < frame => Some(*trimmed_watch_changes),
-            _ => None,
+            }) if *trimmed_at_frame < frame => BeforeReadAction::Probe,
+            Some(PieceState::Normal {
+                trimmed,
+                trimmed_at_frame,
+                ..
+            }) if *trimmed && *trimmed_at_frame >= frame => {
+                *trimmed = false;
+                BeforeReadAction::ClearedSameFrame
+            }
+            _ => BeforeReadAction::Skip,
         }
     }
 
     /// Decides what unflagged probe action (if any) to take for `piece` at `frame`.
     pub(crate) fn unflagged_action(&self, piece: usize, frame: u64) -> UnflaggedAction {
-        if self.piece_block_if_whole(piece).is_none() {
+        if self.len < UNFLAGGED_MIN_SHADOW_LEN || self.piece_block_if_whole(piece).is_none() {
             return UnflaggedAction::Skip;
         }
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
@@ -659,29 +750,25 @@ impl Tracker {
             Some(PieceState::Normal {
                 trimmed: true,
                 trimmed_at_frame,
-                trimmed_watch_changes,
                 ..
             }) if frame >= trimmed_at_frame.saturating_add(UNFLAGGED_MIN_PROBE_GAP) => {
-                UnflaggedAction::NeedQuery {
-                    trimmed_watch_changes: *trimmed_watch_changes,
-                }
+                UnflaggedAction::NeedQuery
             }
             _ => UnflaggedAction::Skip,
         }
     }
 
     /// Applies the result of a `K32QueryWorkingSetEx` probe for `piece`.
-    /// - `touched == None` or `!watch_changes_match`: sample discarded safely
-    ///   (remapping busy or occurred since trim); clears `trimmed`.
+    /// - `touched == None`: sample discarded safely (remapping busy); clears `trimmed`.
     /// - `touched == Some(0)`: increments `clean_probes`, updates `trimmed_at_frame`
     ///   if keeping trimmed (`!clear_trimmed`), else clears `trimmed`.
-    /// - `touched == Some(n > 0)`: marks `Pinned` permanently for this session.
+    /// - `touched == Some(n > 0)`: marks `Pinned` permanently for this session and
+    ///   increments `STATS[7]` (`pin_touch`).
     pub(crate) fn apply_probe_result(
         &self,
         piece: usize,
         frame: u64,
         touched: Option<u32>,
-        watch_changes_match: bool,
         clear_trimmed: bool,
     ) -> ProbeOutcome {
         if piece >= self.piece_count {
@@ -703,7 +790,7 @@ impl Tracker {
         if !*trimmed {
             return ProbeOutcome::Skipped;
         }
-        let Some(touched) = touched.filter(|_| watch_changes_match) else {
+        let Some(touched) = touched else {
             *trimmed = false;
             return ProbeOutcome::Skipped;
         };
@@ -717,6 +804,8 @@ impl Tracker {
             ProbeOutcome::Untouched(*clean_probes)
         } else {
             *st = PieceState::Pinned;
+            drop(states);
+            STATS[7].fetch_add(1, Ordering::Relaxed);
             ProbeOutcome::Pinned
         }
     }
@@ -724,7 +813,7 @@ impl Tracker {
     /// Whether `piece` meets Rule 3 & Rule 4 counts for promotion at `frame`
     /// (caller must also verify Rule 1, Rule 2, `copied`, and working-set trim).
     pub(crate) fn ready_to_promote(&self, piece: usize, frame: u64, unflagged: bool) -> bool {
-        if self.piece_block_if_whole(piece).is_none() {
+        if (unflagged && self.len < UNFLAGGED_MIN_SHADOW_LEN) || self.piece_block_if_whole(piece).is_none() {
             return false;
         }
         let needed = if unflagged {
@@ -747,7 +836,10 @@ impl Tracker {
     }
 
     /// Whether `piece` is `Normal` and should be soft-trimmed via `VirtualUnlock`.
-    pub(crate) fn needs_trim(&self, piece: usize, frame: u64) -> bool {
+    /// Passing `force_retrim: true` (e.g., after a landing writes title memory
+    /// directly) forces re-trimming even if `piece` was already trimmed earlier
+    /// on the same `frame`.
+    pub(crate) fn needs_trim(&self, piece: usize, frame: u64, force_retrim: bool) -> bool {
         if self.piece_block_if_whole(piece).is_none() {
             return false;
         }
@@ -758,12 +850,12 @@ impl Tracker {
                 trimmed,
                 trimmed_at_frame,
                 ..
-            }) if !*trimmed || *trimmed_at_frame < frame
+            }) if force_retrim || !*trimmed || *trimmed_at_frame < frame
         )
     }
 
     /// Notes that `piece` was successfully soft-trimmed at `frame`.
-    pub(crate) fn mark_trimmed(&self, piece: usize, frame: u64, watch_changes: u64, unflagged: bool) {
+    pub(crate) fn mark_trimmed(&self, piece: usize, frame: u64, unflagged: bool) {
         if piece >= self.piece_count {
             return;
         }
@@ -772,14 +864,12 @@ impl Tracker {
             trimmed,
             trimmed_at_frame,
             unflagged_probe,
-            trimmed_watch_changes,
             ..
         }) = states.get_mut(piece)
         {
             *trimmed = true;
             *trimmed_at_frame = frame;
             *unflagged_probe = unflagged;
-            *trimmed_watch_changes = watch_changes;
         }
     }
 
@@ -788,7 +878,7 @@ impl Tracker {
     /// `note_step_and_collect_gpu_only`, or `pin_range_and_demote` can never
     /// race with promotion.
     pub(crate) fn try_promote(&self, piece: usize, frame: u64, unflagged: bool) -> bool {
-        if self.piece_block_if_whole(piece).is_none() {
+        if (unflagged && self.len < UNFLAGGED_MIN_SHADOW_LEN) || self.piece_block_if_whole(piece).is_none() {
             return false;
         }
         let needed = if unflagged {
@@ -1018,9 +1108,9 @@ mod tests {
         };
         for i in 0..probes {
             let f = u64::from(i) * 2 + 1;
-            tracker.mark_trimmed(piece, f, 0, unflagged);
+            tracker.mark_trimmed(piece, f, unflagged);
             assert_eq!(
-                tracker.apply_probe_result(piece, f + 2, Some(0), true, !unflagged),
+                tracker.apply_probe_result(piece, f + 2, Some(0), !unflagged),
                 ProbeOutcome::Untouched(i + 1)
             );
         }
@@ -1106,19 +1196,19 @@ mod tests {
         assert!(!promote_piece(&unaligned, 0, 100, false));
         assert!(promote_piece(&unaligned, 1, 100, false));
 
-        // Rule 3: CPU write within 45 frames blocks promotion even with 12 clean probes.
+        // Rule 3: CPU write within QUIET_FRAMES blocks promotion even with LANDED_CLEAN_PROBES clean probes.
         let tracker = Tracker::with_frame(0x3000_0000, 3 * PIECE, 10);
-        // Too early (only 44 frames since creation at frame 10).
+        // Too early (QUIET_FRAMES - 1 frames since creation at frame 10).
         assert!(!promote_piece(&tracker, 0, 10 + QUIET_FRAMES - 1, false));
         assert!(!tracker.is_gpu_only(0));
-        // At frame 10 + 45: promotes cleanly!
+        // At frame 10 + QUIET_FRAMES: promotes cleanly!
         assert!(tracker.try_promote(0, 10 + QUIET_FRAMES, false));
         assert!(tracker.is_gpu_only(0));
 
-        // CPU write at frame 40 resets clean_probes and delays quiet window to frame 85.
+        // CPU write at frame 40 resets clean_probes and delays quiet window to frame 40 + QUIET_FRAMES.
         for i in 0..LANDED_CLEAN_PROBES {
-            tracker.mark_trimmed(1, u64::from(i) + 11, 0, false);
-            tracker.apply_probe_result(1, u64::from(i) + 12, Some(0), true, true);
+            tracker.mark_trimmed(1, u64::from(i) + 11, false);
+            tracker.apply_probe_result(1, u64::from(i) + 12, Some(0), true);
         }
         tracker.note_cpu_write(0x3001_0000, 0x3001_0010, 40);
         assert!(!tracker.try_promote(1, 40 + QUIET_FRAMES - 1, false));
@@ -1127,14 +1217,111 @@ mod tests {
         assert!(tracker.is_gpu_only(1));
 
         // Rule 4: any working-set touch pins the piece permanently.
-        tracker.mark_trimmed(2, 20, 0, false);
+        tracker.mark_trimmed(2, 20, false);
         assert_eq!(
-            tracker.apply_probe_result(2, 21, Some(1), true, true),
+            tracker.apply_probe_result(2, 21, Some(1), true),
             ProbeOutcome::Pinned
         );
         assert_eq!(tracker.state_of(2), Some(PieceState::Pinned));
         assert!(!tracker.try_promote(2, 1000, false));
         assert!(!tracker.try_promote(2, 1000, true));
+    }
+
+    #[test]
+    fn same_frame_before_read_clears_trimmed_without_pinning() {
+        let tracker = Tracker::with_frame(0x4000_0000, 2 * PIECE, 0);
+
+        // Untrimmed piece returns Skip.
+        assert_eq!(tracker.before_read_action(0, 10), BeforeReadAction::Skip);
+
+        // Trim at frame 10; same-frame read at frame 10 clears `trimmed` without pinning.
+        tracker.mark_trimmed(0, 10, false);
+        assert_eq!(tracker.before_read_action(0, 10), BeforeReadAction::ClearedSameFrame);
+        assert!(matches!(
+            tracker.state_of(0),
+            Some(PieceState::Normal {
+                trimmed: false,
+                clean_probes: 0,
+                ..
+            })
+        ));
+        // Because `trimmed` was cleared before our own read touched title memory,
+        // frame 11 sees `Skip` instead of probing our own resident pages and false-pinning.
+        assert_eq!(tracker.before_read_action(0, 11), BeforeReadAction::Skip);
+        assert_ne!(tracker.state_of(0), Some(PieceState::Pinned));
+
+        // Trim at frame 11; next-frame read at frame 12 requests a working-set probe.
+        tracker.mark_trimmed(0, 11, false);
+        assert_eq!(tracker.before_read_action(0, 12), BeforeReadAction::Probe);
+        assert_eq!(
+            tracker.apply_probe_result(0, 12, Some(0), true),
+            ProbeOutcome::Untouched(1)
+        );
+    }
+
+    #[test]
+    fn force_retrim_allows_same_frame_retrim_on_normal_only() {
+        let tracker = Tracker::with_frame(0x5000_0000, 2 * PIECE, 0);
+
+        // Initially untrimmed -> both false and true request trim.
+        assert!(tracker.needs_trim(0, 10, false));
+        assert!(tracker.needs_trim(0, 10, true));
+
+        // After trimming on frame 10: without force_retrim same frame is skipped,
+        // while `force_retrim: true` (e.g. second landing wrote title memory) re-trims!
+        tracker.mark_trimmed(0, 10, false);
+        assert!(!tracker.needs_trim(0, 10, false));
+        assert!(tracker.needs_trim(0, 10, true));
+        assert!(tracker.needs_trim(0, 11, false));
+
+        // Pinned and GpuOnly pieces never trim, even with force_retrim: true.
+        tracker.apply_probe_result(0, 11, Some(1), true);
+        assert_eq!(tracker.state_of(0), Some(PieceState::Pinned));
+        assert!(!tracker.needs_trim(0, 11, true));
+
+        assert!(promote_piece(&tracker, 1, QUIET_FRAMES, false));
+        assert!(tracker.is_gpu_only(1));
+        assert!(!tracker.needs_trim(1, QUIET_FRAMES, true));
+    }
+
+    #[test]
+    fn pin_touch_stat_increments_on_working_set_touch_and_mark_registered_is_once() {
+        let tracker = Tracker::with_frame(0x6000_0000, 2 * PIECE, 0);
+        assert!(!tracker.is_registered());
+        assert!(tracker.mark_registered());
+        assert!(tracker.is_registered());
+        assert!(!tracker.mark_registered());
+
+        let before = STATS[7].load(Ordering::Relaxed);
+        // Clean probe and discarded (None) probe do NOT increment pin_touch.
+        tracker.mark_trimmed(0, 5, false);
+        assert_eq!(tracker.apply_probe_result(0, 6, Some(0), true), ProbeOutcome::Untouched(1));
+        tracker.mark_trimmed(0, 6, false);
+        assert_eq!(tracker.apply_probe_result(0, 7, None, true), ProbeOutcome::Skipped);
+        // Non-zero touch transitions Normal -> Pinned and increments STATS[7].
+        tracker.mark_trimmed(0, 7, false);
+        assert_eq!(tracker.apply_probe_result(0, 8, Some(4), true), ProbeOutcome::Pinned);
+        let after = STATS[7].load(Ordering::Relaxed);
+        assert!(after > before, "STATS[7] (pin_touch) must increment on touched > 0 ({before} -> {after})");
+    }
+
+    #[test]
+    fn unflagged_promotion_skips_small_buffers_below_256k() {
+        // 192 KiB (< UNFLAGGED_MIN_SHADOW_LEN = 256 KiB): unflagged probing and
+        // unflagged promotion are skipped, while landed promotion still works.
+        let small = Tracker::with_frame(0x7000_0000, 3 * PIECE, 0);
+        assert_eq!(small.unflagged_action(0, 100), UnflaggedAction::Skip);
+        assert!(!promote_piece(&small, 0, QUIET_FRAMES, true));
+        assert!(!small.ready_to_promote(0, QUIET_FRAMES, true));
+        assert!(!small.is_gpu_only(0));
+        assert!(promote_piece(&small, 1, QUIET_FRAMES, false));
+        assert!(small.is_gpu_only(1));
+
+        // 256 KiB (== UNFLAGGED_MIN_SHADOW_LEN): unflagged probing & promotion work.
+        let large = Tracker::with_frame(0x7100_0000, UNFLAGGED_MIN_SHADOW_LEN, 0);
+        assert_eq!(large.unflagged_action(0, 10), UnflaggedAction::NeedTrim);
+        assert!(promote_piece(&large, 0, QUIET_FRAMES, true));
+        assert!(large.is_gpu_only(0));
     }
 
     #[test]

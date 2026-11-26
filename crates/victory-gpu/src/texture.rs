@@ -17,8 +17,9 @@
 
 pub(crate) mod ahead;
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
@@ -148,7 +149,11 @@ unsafe impl Send for Staging {}
 // SAFETY: as above.
 unsafe impl Sync for Staging {}
 
-static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
+static STAGING: OnceLock<RwLock<HashMap<usize, Arc<Staging>>>> = OnceLock::new();
+
+fn staging_map() -> &'static RwLock<HashMap<usize, Arc<Staging>>> {
+    STAGING.get_or_init(|| RwLock::new(HashMap::new()))
+}
 
 /// The buffer a texture the host writes is copied through into the texture
 /// of a view the title placed in its memory in another format
@@ -172,7 +177,13 @@ unsafe impl Send for Through {}
 unsafe impl Sync for Through {}
 
 /// The copy buffers of [`alias`], by the placed view's texture.
-static THROUGH: Mutex<Option<HashMap<usize, Arc<Through>>>> = Mutex::new(None);
+static THROUGH: OnceLock<RwLock<HashMap<usize, Arc<Through>>>> = OnceLock::new();
+/// Lock-free count of entries in [`THROUGH`] so [`forget`] skips locking when empty.
+static THROUGH_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn through_map() -> &'static RwLock<HashMap<usize, Arc<Through>>> {
+    THROUGH.get_or_init(|| RwLock::new(HashMap::new()))
+}
 
 /// Brings `placed`, the texture of a view the title placed in the memory
 /// of `source` in another format (`crate::resource::alias_of`), up to date
@@ -197,90 +208,105 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         return false;
     };
     let Some(host) = host() else { return false };
-    let through = {
-        let mut map = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
-        let map = map.get_or_insert_with(HashMap::new);
-        match map.get(&(placed as usize)) {
-            Some(through) => through.clone(),
-            None => {
-                // SAFETY: live textures.
-                let (of_from, of_to) = unsafe { (from.GetDesc(), to.GetDesc()) };
-                // Levels times layers (a volume's slices are one part).
-                let count = |d: &D3D12_RESOURCE_DESC| {
-                    let layers = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
-                        1
-                    } else {
-                        u32::from(d.DepthOrArraySize)
-                    };
-                    u32::from(d.MipLevels) * layers
+    let existing = if THROUGH_COUNT.load(Ordering::Acquire) > 0 {
+        through_map()
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(placed as usize))
+            .cloned()
+    } else {
+        None
+    };
+    let through = match existing {
+        Some(through) => through,
+        None => {
+            // SAFETY: live textures.
+            let (of_from, of_to) = unsafe { (from.GetDesc(), to.GetDesc()) };
+            // Levels times layers (a volume's slices are one part).
+            let count = |d: &D3D12_RESOURCE_DESC| {
+                let layers = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+                    1
+                } else {
+                    u32::from(d.DepthOrArraySize)
                 };
-                let parts = count(&of_from);
-                if parts == 0 || parts > ALIAS_PARTS || parts != count(&of_to) {
-                    return false;
-                }
-                let mut rows = [(); 2]
-                    .map(|()| vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); parts as usize]);
-                let mut bytes = [0u64; 2];
-                // SAFETY: plain queries; the out pointers are ours and
-                // hold `parts` layouts each.
-                unsafe {
-                    host.device.GetCopyableFootprints(
-                        &of_from,
-                        0,
-                        parts,
-                        0,
-                        Some(rows[0].as_mut_ptr()),
-                        None,
-                        None,
-                        Some(&mut bytes[0]),
-                    );
-                    host.device.GetCopyableFootprints(
-                        &of_to,
-                        0,
-                        parts,
-                        0,
-                        Some(rows[1].as_mut_ptr()),
-                        None,
-                        None,
-                        Some(&mut bytes[1]),
-                    );
-                }
-                let alike = rows[0].iter().zip(&rows[1]).all(|(a, b)| {
-                    let (fa, fb) = (a.Footprint, b.Footprint);
-                    a.Offset == b.Offset
-                        && (fa.Width, fa.Height, fa.Depth, fa.RowPitch)
-                            == (fb.Width, fb.Height, fb.Depth, fb.RowPitch)
-                });
-                if bytes[0] == 0 || bytes[0] != bytes[1] || !alike {
-                    return false;
-                }
-                let Some(buffer) = host.uav_buffer_private(bytes[0]) else {
-                    return false;
-                };
-                crate::host::name(&buffer, || {
-                    format!(
-                        "alias copy {}x{} f{} to f{}",
-                        of_from.Width, of_from.Height, of_from.Format.0, of_to.Format.0
-                    )
-                });
-                tracing::info!(
-                    view = ?placed,
-                    texture = ?source,
-                    width = of_from.Width,
-                    height = of_from.Height,
-                    parts,
-                    written_as = of_from.Format.0,
-                    read_as = of_to.Format.0,
-                    "a view placed in the memory of a texture the host writes, in another format: read from that texture by a copy on the host"
-                );
-                let [of_written, of_read] = rows;
-                let through = Arc::new(Through {
-                    buffer,
-                    parts: of_written.into_iter().zip(of_read).collect(),
-                });
-                map.insert(placed as usize, through.clone());
-                through
+                u32::from(d.MipLevels) * layers
+            };
+            let parts = count(&of_from);
+            if parts == 0 || parts > ALIAS_PARTS || parts != count(&of_to) {
+                return false;
             }
+            let mut rows = [(); 2]
+                .map(|()| vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); parts as usize]);
+            let mut bytes = [0u64; 2];
+            // SAFETY: plain queries; the out pointers are ours and
+            // hold `parts` layouts each.
+            unsafe {
+                host.device.GetCopyableFootprints(
+                    &of_from,
+                    0,
+                    parts,
+                    0,
+                    Some(rows[0].as_mut_ptr()),
+                    None,
+                    None,
+                    Some(&mut bytes[0]),
+                );
+                host.device.GetCopyableFootprints(
+                    &of_to,
+                    0,
+                    parts,
+                    0,
+                    Some(rows[1].as_mut_ptr()),
+                    None,
+                    None,
+                    Some(&mut bytes[1]),
+                );
+            }
+            let alike = rows[0].iter().zip(&rows[1]).all(|(a, b)| {
+                let (fa, fb) = (a.Footprint, b.Footprint);
+                a.Offset == b.Offset
+                    && (fa.Width, fa.Height, fa.Depth, fa.RowPitch)
+                        == (fb.Width, fb.Height, fb.Depth, fb.RowPitch)
+            });
+            if bytes[0] == 0 || bytes[0] != bytes[1] || !alike {
+                return false;
+            }
+            let Some(buffer) = host.uav_buffer_private(bytes[0]) else {
+                return false;
+            };
+            crate::host::name(&buffer, || {
+                format!(
+                    "alias copy {}x{} f{} to f{}",
+                    of_from.Width, of_from.Height, of_from.Format.0, of_to.Format.0
+                )
+            });
+            tracing::info!(
+                view = ?placed,
+                texture = ?source,
+                width = of_from.Width,
+                height = of_from.Height,
+                parts,
+                written_as = of_from.Format.0,
+                read_as = of_to.Format.0,
+                "a view placed in the memory of a texture the host writes, in another format: read from that texture by a copy on the host"
+            );
+            let [of_written, of_read] = rows;
+            let built = Arc::new(Through {
+                buffer,
+                parts: of_written.into_iter().zip(of_read).collect(),
+            });
+            let (chosen, displaced) = {
+                let mut map = through_map().write().unwrap_or_else(|e| e.into_inner());
+                if let Some(existing) = map.get(&(placed as usize)) {
+                    (existing.clone(), Some(built))
+                } else {
+                    map.insert(placed as usize, built.clone());
+                    THROUGH_COUNT.store(map.len(), Ordering::Release);
+                    (built, None)
+                }
+            };
+            drop(displaced);
+            chosen
         }
     };
     let first = list.first_use(placed as usize);
@@ -506,11 +532,7 @@ impl Drop for Staging {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 3] {
     use std::sync::atomic::Ordering::Relaxed;
-    let kept = STAGING
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .map_or(0, |map| map.len() as u64);
+    let kept = staging_map().read().unwrap_or_else(|e| e.into_inner()).len() as u64;
     [STAGED[0].load(Relaxed), STAGED[1].load(Relaxed), kept]
 }
 
@@ -534,30 +556,33 @@ pub(crate) fn let_go() -> [u64; 2] {
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(map) = map.as_mut() else {
-        return;
-    };
-    if map.is_empty() {
-        return;
-    }
     let idle_ms = crate::host::ram_idle_ms(crate::residency::headroom());
     crate::gpu_detile::trim_idle(idle_ms);
+    if staging_map().read().unwrap_or_else(|e| e.into_inner()).is_empty() {
+        return;
+    }
     // A list that recorded an upload or a check holds the staging until it
     // is reset: one only the table holds is named by no list, recorded or
-    // running.
+    // running. Collect evicted `Arc<Staging>`s and drop them outside `STAGING`
+    // so `pool::STAGING` / `gpu_detile` teardown never runs under the table lock.
     let (mut went, mut bytes) = (0u64, 0u64);
-    map.retain(|_, s| {
-        let keep = Arc::strong_count(s) > 1
-            || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES);
-        if !keep {
-            LET_GO[0].fetch_add(1, Relaxed);
-            LET_GO[1].fetch_add(s.bytes, Relaxed);
-            went += 1;
-            bytes += s.bytes;
-        }
-        keep
-    });
+    let mut dropped: Vec<Arc<Staging>> = Vec::new();
+    {
+        let mut map = staging_map().write().unwrap_or_else(|e| e.into_inner());
+        map.retain(|_, s| {
+            let keep = Arc::strong_count(s) > 1
+                || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES);
+            if !keep {
+                LET_GO[0].fetch_add(1, Relaxed);
+                LET_GO[1].fetch_add(s.bytes, Relaxed);
+                went += 1;
+                bytes += s.bytes;
+                dropped.push(s.clone());
+            }
+            keep
+        });
+    }
+    drop(dropped);
     if went > 0 {
         crate::host::trail(|| format!("sweep: {went} staging buffers of textures let go ({} KiB), held by no list", bytes >> 10));
     }
@@ -565,13 +590,33 @@ pub(crate) fn let_go_idle() {
 
 /// Textures the host GPU wrote by a copy or resolve: their contents are on
 /// the host, not in title memory, which stays as it was.
-static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+static HOST_WRITTEN: OnceLock<RwLock<HashSet<usize>>> = OnceLock::new();
+/// Lock-free count of [`HOST_WRITTEN`] entries so [`host_wrote`] and [`forget`]
+/// skip locking completely when empty.
+static HOST_WRITTEN_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn host_written_set() -> &'static RwLock<HashSet<usize>> {
+    HOST_WRITTEN.get_or_init(|| RwLock::new(HashSet::new()))
+}
 
 /// A host copy or resolve writes `resource`.
 pub(crate) fn host_written(resource: This) {
+    let key = resource as usize;
+    if HOST_WRITTEN_COUNT.load(Ordering::Acquire) > 0
+        && host_written_set()
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&key)
+    {
+        return;
+    }
     let new = {
-        let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-        set.get_or_insert_with(Default::default).insert(resource as usize)
+        let mut set = host_written_set().write().unwrap_or_else(|e| e.into_inner());
+        let inserted = set.insert(key);
+        if inserted {
+            HOST_WRITTEN_COUNT.store(set.len(), Ordering::Release);
+        }
+        inserted
     };
     // Diagnostics (run 177): where its title memory is, for placed views
     // the title reads that memory through ([`placed_in_host_written`]).
@@ -580,10 +625,9 @@ pub(crate) fn host_written(resource: This) {
         let words = unsafe { std::ptr::from_ref(&desc).cast::<[u32; 14]>().read_unaligned() };
         let bytes = crate::resource::placed_bytes(&words).unwrap_or(0);
         if !at.is_null() && bytes > 0 {
-            HOST_WRITTEN_AT
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(at as u64, (bytes, words[4], words[6], words[7], words[8], resource as usize));
+            let mut map = HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner());
+            map.insert(at as u64, (bytes, words[4], words[6], words[7], words[8], key));
+            HOST_WRITTEN_AT_COUNT.store(map.len(), Ordering::Release);
         }
     }
 }
@@ -593,6 +637,8 @@ pub(crate) fn host_written(resource: This) {
 /// format).
 static HOST_WRITTEN_AT: Mutex<std::collections::BTreeMap<u64, (u64, u32, u32, u32, u32, usize)>> =
     Mutex::new(std::collections::BTreeMap::new());
+/// Lock-free count of [`HOST_WRITTEN_AT`] entries.
+static HOST_WRITTEN_AT_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// A texture the title placed at `address` (description words `desc`) was
 /// made: says so once if it lies in the memory of a texture the host
@@ -601,6 +647,9 @@ static HOST_WRITTEN_AT: Mutex<std::collections::BTreeMap<u64, (u64, u32, u32, u3
 /// card in the other texture, where no shader that reads this view finds
 /// them.
 pub(crate) fn placed_in_host_written(address: u64, desc: &[u32; 14]) {
+    if HOST_WRITTEN_AT_COUNT.load(Ordering::Acquire) == 0 {
+        return;
+    }
     let hit = {
         let map = HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner());
         map.range(..=address)
@@ -634,29 +683,59 @@ pub(crate) fn placed_in_host_written(address: u64, desc: &[u32; 14]) {
 /// ([`host_written`]): its host copy cannot be made again from title
 /// memory.
 pub(crate) fn host_wrote(resource: usize) -> bool {
-    HOST_WRITTEN
-        .lock()
+    if HOST_WRITTEN_COUNT.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    host_written_set()
+        .read()
         .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .is_some_and(|set| set.contains(&resource))
+        .contains(&resource)
 }
 
 /// The title released a resource.
 pub(crate) fn forget(resource: usize) {
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(map) = map.as_mut() {
-        map.remove(&resource);
+    if staging_map()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&resource)
+    {
+        let removed = staging_map()
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&resource);
+        drop(removed);
     }
-    let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(set) = set.as_mut() {
-        set.remove(&resource);
+    if HOST_WRITTEN_COUNT.load(Ordering::Acquire) > 0
+        && host_written_set()
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&resource)
+    {
+        let mut set = host_written_set().write().unwrap_or_else(|e| e.into_inner());
+        if set.remove(&resource) {
+            HOST_WRITTEN_COUNT.store(set.len(), Ordering::Release);
+        }
     }
     // Its memory may be given to other textures now (run 177: most of the
     // "HERO LEAD" lines were views in memory a released texture had held).
-    HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, d| d.5 != resource);
-    let mut through = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(through) = through.as_mut() {
-        through.remove(&resource);
+    if HOST_WRITTEN_AT_COUNT.load(Ordering::Acquire) > 0 {
+        let mut map = HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner());
+        map.retain(|_, d| d.5 != resource);
+        HOST_WRITTEN_AT_COUNT.store(map.len(), Ordering::Release);
+    }
+    if THROUGH_COUNT.load(Ordering::Acquire) > 0
+        && through_map()
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&resource)
+    {
+        let removed = {
+            let mut map = through_map().write().unwrap_or_else(|e| e.into_inner());
+            let removed = map.remove(&resource);
+            THROUGH_COUNT.store(map.len(), Ordering::Release);
+            removed
+        };
+        drop(removed);
     }
 }
 
@@ -752,21 +831,17 @@ pub(crate) struct Digest(u128);
 /// what lies there is another texture's. (After victory-amd 4436f8f1.)
 pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     let first = if crate::resource::held_only() { first } else { 0 };
-    let host_written = HOST_WRITTEN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .is_some_and(|set| set.contains(&(resource as usize)));
-    // shortcut: a texture the host copied into keeps the host's contents
-    // even if the title later writes its memory too.
-    if host_written {
-        return;
-    }
-    // Once a list for each first level; not again for one that the list's
-    // upload of larger ones held too.
+    // Once a list for each first level; check list-local deduplication before
+    // touching any global table.
     if !list.first_use(1 << 63 | (resource as usize) << 4 | first as usize & 15) {
         return;
     }
+    // shortcut: a texture the host copied into keeps the host's contents
+    // even if the title later writes its memory too.
+    if host_wrote(resource as usize) {
+        return;
+    }
+    // Not again for one that the list's upload of larger ones held too.
     if !list.first_use(resource as usize) && staged_from(resource) <= first {
         return;
     }
@@ -1773,16 +1848,25 @@ impl Staging {
 /// upload from it hold it until they have run); the next upload makes one
 /// anew.
 pub(crate) fn unstage(resource: This) {
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(map) = map.as_mut() {
-        map.remove(&(resource as usize));
+    let key = resource as usize;
+    if !staging_map()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&key)
+    {
+        return;
     }
+    let removed = staging_map()
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key);
+    drop(removed);
 }
 
 /// Where a staged title texture's memory is: address and bytes.
 pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
-    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let (at, len) = map.as_ref()?.get(&(resource as usize))?.memory();
+    let map = staging_map().read().unwrap_or_else(|e| e.into_inner());
+    let (at, len) = map.get(&(resource as usize))?.memory();
     Some((at as u64, len as u64))
 }
 
@@ -1824,17 +1908,16 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn staged_state(resource: This) -> Option<(bool, bool)> {
     use std::sync::atomic::Ordering::Relaxed;
-    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let staging = map.as_ref()?.get(&(resource as usize))?;
+    let map = staging_map().read().unwrap_or_else(|e| e.into_inner());
+    let staging = map.get(&(resource as usize))?;
     Some((staging.uploaded.load(Relaxed), staging.dirty.load(Relaxed)))
 }
 
 /// The first level a title texture's staging buffer holds; `u32::MAX`
 /// without one.
 fn staged_from(resource: This) -> u32 {
-    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    map.as_ref()
-        .and_then(|map| map.get(&(resource as usize)))
+    let map = staging_map().read().unwrap_or_else(|e| e.into_inner());
+    map.get(&(resource as usize))
         .map_or(u32::MAX, |s| s.first)
 }
 
@@ -1883,8 +1966,8 @@ pub(crate) fn title_span(resource: This, first: u32) -> Option<(u64, u64)> {
 }
 
 pub(crate) fn is_staged(resource: This) -> bool {
-    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    map.as_ref().is_some_and(|map| map.contains_key(&(resource as usize)))
+    let map = staging_map().read().unwrap_or_else(|e| e.into_inner());
+    map.contains_key(&(resource as usize))
 }
 
 /// The bytes of a title texture's memory, and whether all of it is mapped,
@@ -1892,8 +1975,8 @@ pub(crate) fn is_staged(resource: This) -> bool {
 /// (Whether it is mapped is asked only if `ask`; else it counts as mapped.)
 pub(crate) fn staged(resource: This, ask: bool) -> Option<(u64, bool)> {
     let s = {
-        let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-        map.as_ref()?.get(&(resource as usize))?.clone()
+        let map = staging_map().read().unwrap_or_else(|e| e.into_inner());
+        map.get(&(resource as usize))?.clone()
     };
     Some((s.read as u64, !ask || committed(s.memory, s.read)))
 }
@@ -2063,17 +2146,23 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
 /// The staging state of a title texture, made on first use.
 fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> Option<Arc<Staging>> {
     let texture = &copy.texture;
-    // Asked before the table is locked: the sweep lets go of a staging
-    // buffer with its texture's host side locked, in that order.
-    let on_demand = crate::resource::host_tiled(resource).is_some();
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let map = map.get_or_insert_with(HashMap::new);
-    if let Some(s) = map.get(&(resource as usize))
+    // Fast path: concurrent O(1) hit under a shared read lock (before touching
+    // `host_tiled` or allocating anything).
+    if let Some(s) = staging_map()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(resource as usize))
         && s.first <= first.max(copy.base)
         && s.serial == copy.serial
     {
         return Some(s.clone());
     }
+    // Slow path runs completely outside `STAGING`'s lock so D3D12 allocations
+    // (`gpu_detile::take_vram_buf`, `pool::staging`, `upload_buffer_private`)
+    // and WC memory zeroing never stall concurrent worker threads.
+    // `host_tiled` is asked without holding `STAGING` to respect lock order
+    // (`r.host.made -> STAGING`).
+    let on_demand = crate::resource::host_tiled(resource).is_some();
     let (memory, desc) = crate::resource::texture_memory(resource)?;
     let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
     else {
@@ -2193,8 +2282,20 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         waiting: std::sync::atomic::AtomicU64::new(0),
         exact: std::sync::atomic::AtomicBool::new(BAKING.get()),
     });
-    map.insert(resource as usize, s.clone());
-    Some(s)
+    let (chosen, displaced) = {
+        let mut map = staging_map().write().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = map.get(&(resource as usize))
+            && existing.first <= first
+            && existing.serial == copy.serial
+        {
+            (existing.clone(), Some(s))
+        } else {
+            let prev = map.insert(resource as usize, s.clone());
+            (s, prev)
+        }
+    };
+    drop(displaced);
+    Some(chosen)
 }
 
 #[cfg(test)]
@@ -2729,5 +2830,28 @@ mod prelude_upload_tests {
                 gpu_frame[slot]
             );
         }
+    }
+
+    #[test]
+    fn host_written_and_forget_keep_fast_path_count_in_sync() {
+        use std::sync::atomic::Ordering::Acquire;
+        // Use a sentinel non-Resource pointer that cannot collide with real heap addresses.
+        let fake = 0x10_usize as crate::object::This;
+        assert!(!super::host_wrote(fake as usize));
+        let before = super::HOST_WRITTEN_COUNT.load(Acquire);
+        {
+            let mut set = super::host_written_set().write().unwrap_or_else(|e| e.into_inner());
+            assert!(set.insert(fake as usize));
+            super::HOST_WRITTEN_COUNT.store(set.len(), std::sync::atomic::Ordering::Release);
+        }
+        assert_eq!(super::HOST_WRITTEN_COUNT.load(Acquire), before + 1);
+        assert!(super::host_wrote(fake as usize));
+        // Duplicate insert via `host_written` hits the read-lock fast path and is a no-op.
+        super::host_written(fake);
+        assert_eq!(super::HOST_WRITTEN_COUNT.load(Acquire), before + 1);
+        // `forget` removes it and decrements the lock-free count back cleanly.
+        super::forget(fake as usize);
+        assert!(!super::host_wrote(fake as usize));
+        assert_eq!(super::HOST_WRITTEN_COUNT.load(Acquire), before);
     }
 }
