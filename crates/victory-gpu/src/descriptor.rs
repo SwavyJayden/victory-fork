@@ -338,7 +338,7 @@ pub(crate) fn sync_heaps() {
         mirrored += before.len() as u64 - of_tables;
         kinds[4] += before.len() as u64 - of_tables;
         // Those of the changed pages, made together at the end.
-        let mut make: Vec<u32> = Vec::new();
+        let mut make: Vec<(u32, [u32; 3])> = Vec::new();
         let began = std::time::Instant::now();
         let taken = written.take(start as usize, end as usize);
         spent[0] += since(began);
@@ -395,7 +395,10 @@ pub(crate) fn sync_heaps() {
                             .and_then(|b| b.try_into().ok())
                             .map_or(0, u32::from_le_bytes)
                     };
-                    if !samplers && word(0) == VIEW_TAG {
+                    let w0 = word(0);
+                    let w1 = word(1);
+                    let w2 = word(2);
+                    if !samplers && w0 == VIEW_TAG {
                         // A draw's own table: the draw makes what it
                         // reads of it (`draw.rs` `tables`).
                         if host.copied_tabled(index, frame) {
@@ -406,7 +409,7 @@ pub(crate) fn sync_heaps() {
                         // slot from this anyway, they wait for a draw
                         // or a pass: noted some frames on, unless a
                         // draw's table turns out to hold them.
-                        if matches!(word(2) >> KIND_SHIFT, CONSTANT | PLACED) && host.copied_waits() {
+                        if matches!(w2 >> KIND_SHIFT, CONSTANT | PLACED) && host.copied_waits() {
                             out.wait.push(index);
                             continue;
                         }
@@ -414,16 +417,16 @@ pub(crate) fn sync_heaps() {
                     // No view, in a slot that shows none: nothing to make or
                     // unmake (32,000 of 41,000 a frame on the water, run
                     // b2-water).
-                    if word(0) != VIEW_TAG && host.shows_none(index) {
+                    if w0 != VIEW_TAG && host.shows_none(index) {
                         out.nothing += 1;
                         continue;
                     }
-                    out.make.push(index);
+                    out.make.push((index, [w0, w1, w2]));
                     out.kinds[if samplers {
                         3
-                    } else if word(0) != VIEW_TAG {
+                    } else if w0 != VIEW_TAG {
                         0
-                    } else if word(2) >> KIND_SHIFT == 0 {
+                    } else if w2 >> KIND_SHIFT == 0 {
                         1
                     } else {
                         2
@@ -452,8 +455,8 @@ pub(crate) fn sync_heaps() {
         spent[1] += since(began);
         let began = std::time::Instant::now();
         crate::land::each_view(true, make.len().div_ceil(SYNC_AT_A_TIME), &|n| {
-            for &index in make.chunks(SYNC_AT_A_TIME).nth(n).unwrap_or_default() {
-                host.mirror(index, start + u64::from(index) * step, false);
+            for &(index, record) in make.chunks(SYNC_AT_A_TIME).nth(n).unwrap_or_default() {
+                host.mirror_record(index, start + u64::from(index) * step, record, false);
             }
         });
         spent[2] += since(began);
@@ -490,7 +493,7 @@ struct SyncPart {
     looked: u64,
     tabled: u64,
     nothing: u64,
-    make: Vec<u32>,
+    make: Vec<(u32, [u32; 3])>,
     wait: Vec<u32>,
     kinds: [u64; 5],
 }

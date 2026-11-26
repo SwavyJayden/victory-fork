@@ -447,52 +447,52 @@ pub(super) fn take(
         }
     }
 
-    let do_pairs = |i: usize| {
-        let (from, ranges, to) = pair_work[i];
-        let mut to = to as *mut [u32; 2];
-        for &(a, b) in ranges.iter().filter(|r| route(r) == Route::Pair) {
-            for offset in (a..b).step_by(4) {
-                // SAFETY: inside the copy's CPU side and within `memory`'s
-                // uniquely reserved pair slice.
-                unsafe {
-                    let word = ((from + offset) as *const u32).read_unaligned();
-                    to.write([offset as u32, word]);
-                    to = to.add(1);
+    let pair_count = pair_work.len();
+    let do_compute = |i: usize| {
+        if i < pair_count {
+            let (from, ranges, to) = pair_work[i];
+            let mut to = to as *mut [u32; 2];
+            for &(a, b) in ranges.iter().filter(|r| route(r) == Route::Pair) {
+                for offset in (a..b).step_by(4) {
+                    // SAFETY: inside the copy's CPU side and within `memory`'s
+                    // uniquely reserved pair slice.
+                    unsafe {
+                        let word = ((from + offset) as *const u32).read_unaligned();
+                        to.write([offset as u32, word]);
+                        to = to.add(1);
+                    }
                 }
+            }
+        } else {
+            let (from, ranges, mut job_ptr, mut pay_ptr, mut pay_rel) = scatter_work[i - pair_count];
+            for &(a, b) in ranges.iter().filter(|r| route(r) == Route::DenseScatter) {
+                let len = b - a;
+                // SAFETY: disjoint reserved payload slice inside `memory` and
+                // live CPU-side shadow bytes `[from + a, from + b)`.
+                unsafe {
+                    std::ptr::copy_nonoverlapping((from + a) as *const u8, pay_ptr as *mut u8, len);
+                }
+                let mut rem_dwords = (len / 4) as u32;
+                let mut dst_off = a as u32;
+                let mut src_off = pay_rel;
+                while rem_dwords > 0 {
+                    let take_dw = rem_dwords.min(SCATTER_MAX_JOB_DWORDS);
+                    // SAFETY: disjoint reserved 12-byte job slot inside `memory`.
+                    unsafe {
+                        (job_ptr as *mut [u32; 3]).write_unaligned([dst_off, src_off, take_dw]);
+                    }
+                    job_ptr += 12;
+                    let step_bytes = take_dw * 4;
+                    dst_off += step_bytes;
+                    src_off += step_bytes;
+                    rem_dwords -= take_dw;
+                }
+                pay_ptr += len;
+                pay_rel += len as u32;
             }
         }
     };
-    crate::land::each_under(pair_work.len(), &do_pairs);
-
-    let do_scatter = |i: usize| {
-        let (from, ranges, mut job_ptr, mut pay_ptr, mut pay_rel) = scatter_work[i];
-        for &(a, b) in ranges.iter().filter(|r| route(r) == Route::DenseScatter) {
-            let len = b - a;
-            // SAFETY: disjoint reserved payload slice inside `memory` and
-            // live CPU-side shadow bytes `[from + a, from + b)`.
-            unsafe {
-                std::ptr::copy_nonoverlapping((from + a) as *const u8, pay_ptr as *mut u8, len);
-            }
-            let mut rem_dwords = (len / 4) as u32;
-            let mut dst_off = a as u32;
-            let mut src_off = pay_rel;
-            while rem_dwords > 0 {
-                let take_dw = rem_dwords.min(SCATTER_MAX_JOB_DWORDS);
-                // SAFETY: disjoint reserved 12-byte job slot inside `memory`.
-                unsafe {
-                    (job_ptr as *mut [u32; 3]).write_unaligned([dst_off, src_off, take_dw]);
-                }
-                job_ptr += 12;
-                let step_bytes = take_dw * 4;
-                dst_off += step_bytes;
-                src_off += step_bytes;
-                rem_dwords -= take_dw;
-            }
-            pay_ptr += len;
-            pay_rel += len as u32;
-        }
-    };
-    crate::land::each_under(scatter_work.len(), &do_scatter);
+    crate::land::each_under(pair_count + scatter_work.len(), &do_compute);
 
     STATS[0].fetch_add(moves.iter().map(|m| m.2 as u64).sum(), Ordering::Relaxed);
     STATS[1].fetch_add(moves.len() as u64, Ordering::Relaxed);

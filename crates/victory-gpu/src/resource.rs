@@ -2481,8 +2481,11 @@ fn host_texture_as(
     };
     // A texture the title fills, whose every subresource is uploaded before
     // anything reads it: cut from a block (what the piece held before shows
-    // in no texel).
-    if fills(desc)
+    // in no texel). Reserved (`VICTORY_LEVELS_ON_DEMAND`) textures must bypass
+    // the pool and go straight to `CreateReservedResource` so `GetResourceTiling`
+    // succeeds instead of falling back to a full-mip allocation.
+    if !reserved
+        && fills(desc)
         && d.sample_count <= 1
         && clear_value.is_none()
         && texture_layout(desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor())
@@ -4578,5 +4581,36 @@ float4 lit() : SV_Target { return 1.0; }
         let d = unsafe { more.texture.GetDesc() };
         assert_eq!((more.base, d.Width, d.MipLevels), (0, 256, 9));
         assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// Regression test: `host_texture_as(..., true)` must bypass `crate::pool`
+    /// and call `CreateReservedResource` so `Tiled::make` sees non-zero tiles
+    /// even when `VICTORY_TEXTURE_POOL` is enabled.
+    #[cfg(windows)]
+    #[test]
+    fn reserved_host_texture_bypasses_pool_and_supports_tiling() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let desc = ResourceDesc {
+            dimension: 3, // TEXTURE2D
+            alignment: 0,
+            width: 1024,
+            height: 1024,
+            depth_or_array_size: 1,
+            mip_levels: 11,
+            format: 98, // BC7_UNORM
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0x105, // 4KB_S (non-XOR swizzle, eligible for pool)
+            flags: 0,
+        };
+        let reserved = host_texture_as(&desc, 0, std::ptr::null(), true)
+            .expect("CreateReservedResource must succeed for 1024x1024 BC7");
+        let tiled = crate::tiles::Tiled::make(&host.device, &reserved, u32::from(desc.mip_levels));
+        assert!(
+            tiled.is_some(),
+            "reserved host texture bypassed CreateReservedResource into pool::texture"
+        );
     }
 }

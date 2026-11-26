@@ -1488,9 +1488,15 @@ fn spin(there: impl Fn() -> bool) {
     }
 }
 
-/// How many threads are kept for [`wide`].
+/// How many threads are kept for [`wide`] (`VICTORY_WIDE_THREADS` overrides).
 fn wide_threads() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
+    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *THREADS.get_or_init(|| {
+        let asked = std::env::var("VICTORY_WIDE_THREADS").ok().and_then(|v| v.trim().parse().ok());
+        asked
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() / 3).clamp(2, 6))
+            .clamp(1, 16)
+    })
 }
 
 fn workers() -> &'static Workers {
@@ -2215,7 +2221,7 @@ fn put_changed(at: usize, title: &[u8], merged: &[u8]) -> usize {
         }
         return merged.len();
     }
-    let mut runs = dword_runs(at, title, merged, 0);
+    let mut runs = word_runs(at, title, merged);
     if runs.len() > 64 {
         runs = dword_runs(at, title, merged, 32);
         PUT[3].fetch_add(1, Ordering::Relaxed);
@@ -4047,7 +4053,7 @@ impl Shadow {
                 // refresh lie apart.
                 let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at - start), n) };
                 let was = crate::host::upcheck::on().then(|| held.to_vec());
-                let runs = if whole { vec![(0, n)] } else { dword_runs(at, held, title, 0) };
+                let runs = if whole { vec![(0, n)] } else { word_runs(at, title, held) };
                 for &(a, len) in &runs {
                     held[a..a + len].copy_from_slice(&title[a..a + len]);
                     self.changed(at - start + a, at - start + a + len);
