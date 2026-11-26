@@ -1240,14 +1240,7 @@ fn off_elements(offset: u64, stride: u32, raw: bool, element: u64) -> bool {
     if raw {
         !offset.is_multiple_of(16)
     } else if stride > 0 {
-        // On NVIDIA (`raw_views() == 0`), translated shaders read 4B-multiple
-        // structured buffers via `rawBufferLoad`/`rawBufferStore`; a structured
-        // D3D12 view reads zeros on NVIDIA, so require 16-byte raw alignment.
-        if victory_shader::emit::raw_views() == 0 && stride.is_multiple_of(4) {
-            !offset.is_multiple_of(16)
-        } else {
-            !offset.is_multiple_of(16) && !offset.is_multiple_of(u64::from(stride))
-        }
+        !offset.is_multiple_of(16) && !offset.is_multiple_of(u64::from(stride))
     } else {
         element > 0 && !offset.is_multiple_of(element)
     }
@@ -5276,11 +5269,9 @@ mod tests {
         assert!(off_elements(8, 0, true, 4));
         assert!(!off_elements(0, 0, true, 4));
         assert!(!off_elements(48, 0, true, 4));
-        // 456-byte elements: on 16 bytes is always valid; at 456 (456 % 16 == 8),
-        // NVIDIA (`raw_views() == 0`) requires a 16B-aligned exact copy because
-        // shaders emit raw loads/stores on 4B-multiple structured buffers.
-        let need_raw = victory_shader::emit::raw_views() == 0;
-        assert_eq!(off_elements(456, 456, false, 0), need_raw);
+        // 456-byte elements: on 16 bytes (raw_window) or on a multiple of stride
+        // (kept on the parent shadow to preserve GPU-to-GPU SRV/UAV aliasing).
+        assert!(!off_elements(456, 456, false, 0));
         assert!(!off_elements(32, 456, false, 0));
         assert!(off_elements(100, 456, false, 0));
         // A typed view of 12-byte elements on 16 bytes and not on an element.
