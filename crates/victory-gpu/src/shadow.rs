@@ -1860,6 +1860,18 @@ struct Workers {
     more: std::sync::Condvar,
 }
 
+thread_local! {
+    /// True while this thread is already executing inside [`wide`] (either as
+    /// a pool worker or the submitting/joining thread), so nested parallel
+    /// helpers run inline instead of re-entering the shared worker queue.
+    static IN_WIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Returns whether the current thread is already inside [`wide`].
+pub(crate) fn in_wide() -> bool {
+    IN_WIDE.get()
+}
+
 fn workers() -> &'static Workers {
     static WORKERS: std::sync::OnceLock<Workers> = std::sync::OnceLock::new();
     static STARTED: std::sync::Once = std::sync::Once::new();
@@ -1868,7 +1880,7 @@ fn workers() -> &'static Workers {
         more: std::sync::Condvar::new(),
     });
     STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 3).clamp(2, 6);
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 let workers = WORKERS.get().expect("made above");
@@ -1882,7 +1894,9 @@ fn workers() -> &'static Workers {
                             jobs = workers.more.wait(jobs).unwrap_or_else(|e| e.into_inner());
                         }
                     };
+                    let prev = IN_WIDE.replace(true);
                     job();
+                    IN_WIDE.set(prev);
                     waiter.finish();
                 }
             });
@@ -1894,7 +1908,7 @@ fn workers() -> &'static Workers {
 /// Runs `jobs` on the kept threads and on this one, and returns when all
 /// of them are done. The jobs copy and compare memory; they do not panic.
 fn wide(jobs: Vec<Job>) {
-    if jobs.len() < 2 {
+    if jobs.len() < 2 || IN_WIDE.get() {
         for job in jobs {
             job();
         }
@@ -1913,6 +1927,7 @@ fn wide(jobs: Vec<Job>) {
         }
     }
     workers.more.notify_all();
+    let prev = IN_WIDE.replace(true);
     loop {
         let item = workers.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
         match item {
@@ -1923,6 +1938,7 @@ fn wide(jobs: Vec<Job>) {
             None => break,
         }
     }
+    IN_WIDE.set(prev);
     if waiter.left.load(Ordering::Acquire) > 0 {
         let mut done = waiter.done.lock().unwrap_or_else(|e| e.into_inner());
         while !*done {
@@ -2510,6 +2526,47 @@ static ECHO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// leaves them alone, and `Shadow::copy_stale` is given whole pages).
 const COPY_CHANGED_CHUNK: usize = 256;
 
+/// Default maximum gap (bytes) between adjacent changed chunks in
+/// [`Shadow::copy_changed`] that gets bridged into a single `CopyBufferRegion`
+/// range (`VICTORY_COPY_CHANGED_GAP`, default 4 KiB). Live Wave 15 telemetry
+/// showed unbridged 256 B chunks shattering 15 MB/frame into 39,864 separate
+/// `CopyBufferRegion` commands (~80,000 D3D12 copy calls/frame across both
+/// queues, inflating `card_before` from 9.8 ms to 55-69 ms/frame). Bridging
+/// gaps <= 4 KiB inside a single non-pending refresh span preserves the byte
+/// savings while collapsing D3D12 command count by ~50x.
+const DEFAULT_COPY_CHANGED_GAP: usize = 4096;
+
+fn parse_copy_changed_gap(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_COPY_CHANGED_GAP)
+}
+
+fn copy_changed_gap() -> usize {
+    static GAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *GAP.get_or_init(|| parse_copy_changed_gap(std::env::var("VICTORY_COPY_CHANGED_GAP").ok().as_deref()))
+}
+
+/// Bridges sorted, non-overlapping `(offset, len)` stretches whose separating
+/// gap is at most `max_gap` bytes into single contiguous stretches.
+fn coalesce_gap(stretches: &mut Vec<(usize, usize)>, max_gap: usize) {
+    if stretches.len() < 2 || max_gap == 0 {
+        return;
+    }
+    let mut write = 0usize;
+    for read in 1..stretches.len() {
+        let (next_at, next_len) = stretches[read];
+        let prev = &mut stretches[write];
+        let prev_end = prev.0 + prev.1;
+        if next_at.saturating_sub(prev_end) <= max_gap {
+            prev.1 = (next_at + next_len) - prev.0;
+        } else {
+            write += 1;
+            stretches[write] = (next_at, next_len);
+        }
+    }
+    stretches.truncate(write + 1);
+}
+
 /// The stretches of `now` that differ from `was` (of one length), in
 /// whole chunks of `chunk` bytes (the last one shorter), as (offset,
 /// bytes) in order, chunks side by side made one stretch. Uses
@@ -2828,9 +2885,12 @@ unsafe fn word_runs_put_avx2_limited<const STORE: bool>(
 
 #[cfg(test)]
 mod merge_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::{
-        PAGE, PIECE, back_piece, changed_chunks, changed_runs, word_runs_put_limited,
-        word_runs_put_scalar_limited,
+        PAGE, PIECE, back_piece, changed_chunks, changed_runs, coalesce_gap, in_wide,
+        parse_copy_changed_gap, wide_run, word_runs_put_limited, word_runs_put_scalar_limited,
     };
 
     #[test]
@@ -2858,6 +2918,49 @@ mod merge_tests {
             }
         }
         assert_eq!(changed_chunks(&[1, 2, 3], &[1, 2, 4], 256), [(0, 3)], "a last chunk shorter than the others");
+    }
+
+    #[test]
+    fn coalesce_gap_bridges_close_stretches_and_preserves_far_ones() {
+        let mut s = vec![(0, 256), (512, 256), (4864, 256), (10_000, 256), (14_352, 256)];
+        // Gaps: 512-256=256 (<=4096 -> merge), 4864-768=4096 (<=4096 -> merge),
+        // 10000-5120=4880 (>4096 -> separate), 14352-10256=4096 (<=4096 -> merge).
+        coalesce_gap(&mut s, 4096);
+        assert_eq!(s, [(0, 5120), (10_000, 4608)]);
+
+        let mut untouched = vec![(0, 256), (512, 256)];
+        coalesce_gap(&mut untouched, 0);
+        assert_eq!(untouched, [(0, 256), (512, 256)]);
+
+        assert_eq!(parse_copy_changed_gap(None), 4096);
+        assert_eq!(parse_copy_changed_gap(Some("")), 4096);
+        assert_eq!(parse_copy_changed_gap(Some("0")), 0);
+        assert_eq!(parse_copy_changed_gap(Some(" 8192 ")), 8192);
+    }
+
+    #[test]
+    fn nested_wide_run_executes_inline_without_deadlock() {
+        let sum = Arc::new(AtomicU64::new(0));
+        let outer: Vec<Box<dyn FnOnce() + Send>> = (0..4)
+            .map(|i| {
+                let sum = sum.clone();
+                Box::new(move || {
+                    assert!(in_wide());
+                    let inner: Vec<Box<dyn FnOnce() + Send>> = (0..4)
+                        .map(|j| {
+                            let sum = sum.clone();
+                            Box::new(move || {
+                                sum.fetch_add((i * 10 + j + 1) as u64, Ordering::Relaxed);
+                            }) as Box<dyn FnOnce() + Send>
+                        })
+                        .collect();
+                    wide_run(inner);
+                }) as Box<dyn FnOnce() + Send>
+            })
+            .collect();
+        wide_run(outer);
+        let expected: u64 = (0..4).flat_map(|i| (0..4).map(move |j| (i * 10 + j + 1) as u64)).sum();
+        assert_eq!(sum.load(Ordering::Relaxed), expected);
     }
 
     #[test]
@@ -4088,6 +4191,36 @@ impl Shadow {
     /// this one too. False with nothing done if the switch is off or the
     /// memory cannot be written that way (the caller writes as before).
     fn put_back_own(&self, at: usize, bytes: &[u8]) -> bool {
+        if !crate::inplace::back_own() || bytes.is_empty() {
+            return false;
+        }
+        // Single 64 KiB guest-page fast path (always taken by `card_merge_relay`
+        // and `relay_merge` whose pieces are cut at 64 KiB title boundaries).
+        if at / PAGE == (at + bytes.len() - 1) / PAGE {
+            return self.put_back_own_page(at, bytes);
+        }
+        // Cross-page stretch: split strictly at 64 KiB guest-page boundaries so
+        // every section-backed sub-page writes cleanly without dirtying guards.
+        let mut off = 0usize;
+        let mut any_own = false;
+        while off < bytes.len() {
+            let cur = at + off;
+            let take = (PAGE - (cur % PAGE)).min(bytes.len() - off);
+            let sub = &bytes[off..off + take];
+            if self.put_back_own_page(cur, sub) {
+                any_own = true;
+            } else if !any_own {
+                return false;
+            } else {
+                crate::watch::writing(cur, take);
+                crate::host::write_mapped(cur as *mut u8, sub.as_ptr(), take);
+            }
+            off += take;
+        }
+        any_own
+    }
+
+    fn put_back_own_page(&self, at: usize, bytes: &[u8]) -> bool {
         /// Since the start: stretches and bytes stored this way, pages
         /// noted current for their copy, stretches written the old way;
         /// and with `VICTORY_BACK_OWN_CHECK=1`: stores the title's own
@@ -4098,9 +4231,6 @@ impl Shadow {
         static OWN_WRITES: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
         static CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let check = *CHECK.get_or_init(|| std::env::var_os("VICTORY_BACK_OWN_CHECK").is_some_and(|v| v == "1"));
-        if !crate::inplace::back_own() {
-            return false;
-        }
         let Some(shown) = crate::inplace::write_own(at, bytes) else {
             OWN_WRITES[3].fetch_add(1, Ordering::Relaxed);
             return false;
@@ -4849,8 +4979,10 @@ impl Shadow {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
         if self.card.is_some() && from < to {
-            if copy_changed() && self.copy_changed(from, to) {
-                return to - from;
+            if copy_changed()
+                && let Some(sent) = self.copy_changed(from, to)
+            {
+                return sent;
             }
             if self.landing.load(Ordering::Acquire) && land_echo() {
                 return self.take_landed(from, to);
@@ -4865,58 +4997,145 @@ impl Shadow {
         to - from
     }
 
-    /// [`Shadow::copy`] for a copy in the card's memory, with
-    /// [`copy_changed`]: title memory `[from, to)` (inside the buffer) is
-    /// read beside the copy's CPU side and only the stretches that differ
-    /// are stored there and noted for the card. False with nothing done if
-    /// title memory could not be read whole (the caller copies as before).
-    fn copy_changed(&self, from: usize, to: usize) -> bool {
+    /// Compares and updates one contiguous slice `[from, from + n)` (inside
+    /// the buffer) into `self.data`, returning `Some((card_runs, sent_bytes))`
+    /// where `card_runs` are buffer-relative `(start_off, end_off)` spans that
+    /// changed, or `None` if title memory could not be read whole.
+    fn copy_changed_slice(&self, from: usize, n: usize, gap: usize) -> Option<(Vec<(usize, usize)>, usize)> {
         thread_local! {
             static NOW: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
-        let (start, n) = (self.start as usize, to - from);
+        let start = self.start as usize;
+        let base_off = from - start;
+        // SAFETY: `[from, from + n)` lies inside the buffer; callers only pass
+        // disjoint slices of a non-pending refresh span.
+        let held_all = unsafe { std::slice::from_raw_parts(self.data.add(base_off).cast_const(), n) };
+        // Zero-write AVX2 fast path: ~81% of copy-changed refreshes read back
+        // identical bytes (e.g. MEM_PRIVATE copy-back echo). Skip copying into
+        // scratch `NOW` completely when unchanged, or skip any identical prefix.
+        let prefix = match crate::plaincopy::first_diff(from as *const u8, held_all.as_ptr(), n) {
+            Some(diff) if diff >= n => return Some((Vec::new(), 0)),
+            Some(diff) => (diff / COPY_CHANGED_CHUNK) * COPY_CHANGED_CHUNK,
+            None => 0,
+        };
+        let tail_len = n - prefix;
         NOW.with(|now| {
             let mut now = now.borrow_mut();
-            if now.len() < n {
-                now.resize(n, 0);
+            if now.len() < tail_len {
+                now.resize(tail_len, 0);
             }
-            if !crate::host::read_into(from as *const u8, &mut now[..n]) {
-                return false;
+            if !crate::host::read_into((from + prefix) as *const u8, &mut now[..tail_len]) {
+                return None;
             }
-            // SAFETY: inside the copy's mapping (`from` and `to` are within
-            // the buffer); nothing else writes the CPU side of these bytes
-            // while a refresh has them (a refresh is one thread's).
-            let held = unsafe { std::slice::from_raw_parts(self.data.add(from - start).cast_const(), n) };
-            let stretches = changed_chunks(&now[..n], held, COPY_CHANGED_CHUNK);
-            let mut sent = 0;
+            let held = &held_all[prefix..n];
+            let mut stretches = changed_chunks(&now[..tail_len], held, COPY_CHANGED_CHUNK);
+            coalesce_gap(&mut stretches, gap);
+            let mut sent = 0usize;
+            let mut runs = Vec::with_capacity(stretches.len());
             for &(at, len) in &stretches {
-                // SAFETY: as above; the stretch lies inside both.
-                unsafe { std::ptr::copy_nonoverlapping(now.as_ptr().add(at), self.data.add(from - start + at), len) };
-                // After the bytes are in: a snapshot taken meanwhile is not current.
-                self.changed(from - start + at, from - start + at + len);
-                self.card_changed(from - start + at, from - start + at + len);
+                let off = base_off + prefix + at;
+                // SAFETY: `off + len <= self.len` and disjoint across parallel slices.
+                unsafe { std::ptr::copy_nonoverlapping(now.as_ptr().add(at), self.data.add(off), len) };
+                runs.push((off, off + len));
                 sent += len;
             }
-            COPY_CHANGED[0].fetch_add(n as u64, Ordering::Relaxed);
-            COPY_CHANGED[1].fetch_add(sent as u64, Ordering::Relaxed);
-            COPY_CHANGED[2].fetch_add(stretches.len() as u64, Ordering::Relaxed);
-            let calls = COPY_CHANGED[3].fetch_add(1, Ordering::Relaxed) + 1;
-            if calls.is_multiple_of(65536) {
-                tracing::info!(
-                    "copies in the card's memory, refreshed by what differs (VICTORY_COPY_CHANGED=1), since the start: {calls} refreshes read {} MB of title memory the title had written to; {} MB of it differed from the copy and went on to the card, in {} stretches",
-                    COPY_CHANGED[0].load(Ordering::Relaxed) >> 20,
-                    COPY_CHANGED[1].load(Ordering::Relaxed) >> 20,
-                    COPY_CHANGED[2].load(Ordering::Relaxed)
-                );
-            }
-            true
+            Some((runs, sent))
         })
+    }
+
+    /// [`Shadow::copy`] for a copy in the card's memory, with
+    /// [`copy_changed`]: title memory `[from, to)` (inside the buffer) is
+    /// compared against the copy's CPU side and only coalesced changed
+    /// stretches are stored and noted for the card. Returns `Some(sent)` on
+    /// success, or `None` with nothing done if title memory could not be read
+    /// whole (the caller copies as before).
+    fn copy_changed(&self, from: usize, to: usize) -> Option<usize> {
+        let n = to - from;
+        let gap = copy_changed_gap();
+        const WIDE_MIN_BYTES: usize = 512 << 10;
+        let (all_runs, sent) = if n >= WIDE_MIN_BYTES && !in_wide() {
+            let chunks = (n / (256 << 10)).clamp(2, 5);
+            let step = n.div_ceil(chunks).next_multiple_of(PAGE);
+            let mut ranges = Vec::with_capacity(chunks);
+            let mut at = from;
+            while at < to {
+                let next = (at + step).min(to);
+                ranges.push((at, next - at));
+                at = next;
+            }
+            if ranges.len() >= 2 {
+                let failed = std::sync::atomic::AtomicBool::new(false);
+                let out: Vec<Mutex<Option<(Vec<(usize, usize)>, usize)>>> =
+                    (0..ranges.len()).map(|_| Mutex::new(None)).collect();
+                let self_addr = self as *const Self as usize;
+                let failed_addr = &failed as *const std::sync::atomic::AtomicBool as usize;
+                let out_addr = out.as_ptr() as usize;
+                let jobs: Vec<Job> = ranges
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &(chunk_from, chunk_len))| {
+                        Box::new(move || {
+                            // SAFETY: `wide_run` joins all workers before
+                            // `self`, `failed`, and `out` go out of scope, and
+                            // each chunk operates on a strictly disjoint slice.
+                            let this = unsafe { &*(self_addr as *const Self) };
+                            let failed = unsafe { &*(failed_addr as *const std::sync::atomic::AtomicBool) };
+                            let slot = unsafe { &*(out_addr as *const Mutex<Option<(Vec<(usize, usize)>, usize)>>).add(i) };
+                            match this.copy_changed_slice(chunk_from, chunk_len, gap) {
+                                Some(res) => *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(res),
+                                None => failed.store(true, Ordering::Relaxed),
+                            }
+                        }) as Job
+                    })
+                    .collect();
+                wide(jobs);
+                if failed.load(Ordering::Relaxed) {
+                    return None;
+                }
+                let mut merged_runs = Vec::new();
+                let mut total_sent = 0usize;
+                for slot in out {
+                    if let Some((runs, s)) = slot.into_inner().unwrap_or_else(|e| e.into_inner()) {
+                        merged_runs.extend(runs);
+                        total_sent += s;
+                    }
+                }
+                (merged_runs, total_sent)
+            } else {
+                self.copy_changed_slice(from, n, gap)?
+            }
+        } else {
+            self.copy_changed_slice(from, n, gap)?
+        };
+        for &(a, b) in &all_runs {
+            self.changed(a, b);
+        }
+        let stretch_count = all_runs.len() as u64;
+        self.card_changed_runs(all_runs);
+        COPY_CHANGED[0].fetch_add(n as u64, Ordering::Relaxed);
+        COPY_CHANGED[1].fetch_add(sent as u64, Ordering::Relaxed);
+        COPY_CHANGED[2].fetch_add(stretch_count, Ordering::Relaxed);
+        let calls = COPY_CHANGED[3].fetch_add(1, Ordering::Relaxed) + 1;
+        if calls.is_multiple_of(65536) {
+            tracing::info!(
+                "copies in the card's memory, refreshed by what differs (VICTORY_COPY_CHANGED=1), since the start: {calls} refreshes read {} MB of title memory the title had written to; {} MB of it differed from the copy and went on to the card, in {} stretches",
+                COPY_CHANGED[0].load(Ordering::Relaxed) >> 20,
+                COPY_CHANGED[1].load(Ordering::Relaxed) >> 20,
+                COPY_CHANGED[2].load(Ordering::Relaxed)
+            );
+        }
+        Some(sent)
     }
 
     /// Whether shaders read and write this copy in the card's own memory
     /// ([`cards`]).
     pub(crate) fn carded(&self) -> bool {
         self.card.is_some()
+    }
+
+    /// Guest virtual start address of the title buffer this shadow mirrors.
+    pub(crate) fn title_start(&self) -> usize {
+        self.start as usize
     }
 
     /// The CPU side's bytes at offsets `[from, to)` changed: they go to the

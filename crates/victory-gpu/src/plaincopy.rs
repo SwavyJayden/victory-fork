@@ -41,6 +41,10 @@ core::arch::global_asm!(
     ".globl victory_write_avx2_try_start",
     ".globl victory_write_avx2_try_end",
     ".globl victory_write_avx2_fault",
+    ".globl victory_diff_avx2",
+    ".globl victory_diff_avx2_try_start",
+    ".globl victory_diff_avx2_try_end",
+    ".globl victory_diff_avx2_fault",
     "victory_copy_guarded:",
     // rcx: to, rdx: from, r8: bytes. rsi and rdi are the caller's: kept in
     // r9 and r10, which are ours to use, so nothing is on the stack.
@@ -363,6 +367,140 @@ core::arch::global_asm!(
     "    vzeroupper",
     "    xor eax, eax",
     "    ret",
+
+    // =========================================================================
+    // Fault-guarded 256-bit AVX2 in-place compare: title (`rcx`) vs host (`rdx`),
+    // length `r8`. Windows x64 leaf function: touches ONLY volatile registers
+    // (rax, rcx, rdx, r8, r9, r10, ymm0..ymm3), ZERO stack, ZERO callee-saved.
+    //
+    // Returns:
+    //   - `len` (`r8`) if all bytes in `[0..len)` are equal
+    //   - `0..len` exact byte offset of the first differing byte
+    //   - `usize::MAX` (`-1`) if reading `title` faulted (caught by VEH)
+    // =========================================================================
+    ".p2align 4",
+    "victory_diff_avx2:",
+    "    xor r9, r9",
+    "    mov r10, r8",
+    "    cmp r10, 32",
+    "    jb .Ldiff_small_entry",
+    "victory_diff_avx2_try_start:",
+    "    cmp r10, 128",
+    "    jb .Ldiff_avx32_loop",
+    ".p2align 4",
+    ".Ldiff_avx128_loop:",
+    "    vmovdqu ymm0, ymmword ptr [rcx + r9]",
+    "    vpcmpeqb ymm0, ymm0, ymmword ptr [rdx + r9]",
+    "    vmovdqu ymm1, ymmword ptr [rcx + r9 + 32]",
+    "    vpcmpeqb ymm1, ymm1, ymmword ptr [rdx + r9 + 32]",
+    "    vmovdqu ymm2, ymmword ptr [rcx + r9 + 64]",
+    "    vpcmpeqb ymm2, ymm2, ymmword ptr [rdx + r9 + 64]",
+    "    vmovdqu ymm3, ymmword ptr [rcx + r9 + 96]",
+    "    vpcmpeqb ymm3, ymm3, ymmword ptr [rdx + r9 + 96]",
+    "    vpand ymm0, ymm0, ymm1",
+    "    vpand ymm2, ymm2, ymm3",
+    "    vpand ymm0, ymm0, ymm2",
+    "    vpmovmskb eax, ymm0",
+    "    cmp eax, -1",
+    "    jne .Ldiff_avx32_loop",
+    "    add r9, 128",
+    "    sub r10, 128",
+    "    cmp r10, 128",
+    "    jae .Ldiff_avx128_loop",
+    "    test r10, r10",
+    "    jz .Ldiff_equal_avx",
+    "    cmp r10, 32",
+    "    jb .Ldiff_avx_tail8_check",
+    ".Ldiff_avx32_loop:",
+    "    vmovdqu ymm0, ymmword ptr [rcx + r9]",
+    "    vpcmpeqb ymm0, ymm0, ymmword ptr [rdx + r9]",
+    "    vpmovmskb eax, ymm0",
+    "    not eax",
+    "    test eax, eax",
+    "    jnz .Ldiff_found_mask",
+    "    add r9, 32",
+    "    sub r10, 32",
+    "    cmp r10, 32",
+    "    jae .Ldiff_avx32_loop",
+    "    test r10, r10",
+    "    jz .Ldiff_equal_avx",
+    ".Ldiff_avx_tail8_check:",
+    "    cmp r10, 8",
+    "    jb .Ldiff_avx_tail1_loop",
+    ".Ldiff_avx_tail8_loop:",
+    "    mov rax, qword ptr [rcx + r9]",
+    "    xor rax, qword ptr [rdx + r9]",
+    "    jnz .Ldiff_found_qword_avx",
+    "    add r9, 8",
+    "    sub r10, 8",
+    "    cmp r10, 8",
+    "    jae .Ldiff_avx_tail8_loop",
+    "    test r10, r10",
+    "    jz .Ldiff_equal_avx",
+    ".Ldiff_avx_tail1_loop:",
+    "    mov al, byte ptr [rcx + r9]",
+    "    cmp al, byte ptr [rdx + r9]",
+    "    jne .Ldiff_found_here_avx",
+    "    inc r9",
+    "    dec r10",
+    "    jnz .Ldiff_avx_tail1_loop",
+    ".Ldiff_equal_avx:",
+    "    vzeroupper",
+    "    mov rax, r8",
+    "    ret",
+    ".Ldiff_found_mask:",
+    "    bsf eax, eax",
+    "    add rax, r9",
+    "    vzeroupper",
+    "    ret",
+    ".Ldiff_found_qword_avx:",
+    "    bsf rax, rax",
+    "    shr rax, 3",
+    "    add rax, r9",
+    "    vzeroupper",
+    "    ret",
+    ".Ldiff_found_here_avx:",
+    "    vzeroupper",
+    "    mov rax, r9",
+    "    ret",
+    // Small-length path (< 32 bytes): avoids touching YMM registers & vzeroupper.
+    ".Ldiff_small_entry:",
+    "    cmp r10, 8",
+    "    jb .Ldiff_small_byte_check",
+    ".Ldiff_small_qword_loop:",
+    "    mov rax, qword ptr [rcx + r9]",
+    "    xor rax, qword ptr [rdx + r9]",
+    "    jnz .Ldiff_found_qword_no_avx",
+    "    add r9, 8",
+    "    sub r10, 8",
+    "    cmp r10, 8",
+    "    jae .Ldiff_small_qword_loop",
+    ".Ldiff_small_byte_check:",
+    "    test r10, r10",
+    "    jz .Ldiff_equal_no_avx",
+    ".Ldiff_small_byte_loop:",
+    "    mov al, byte ptr [rcx + r9]",
+    "    cmp al, byte ptr [rdx + r9]",
+    "    jne .Ldiff_found_here_no_avx",
+    "    inc r9",
+    "    dec r10",
+    "    jnz .Ldiff_small_byte_loop",
+    "victory_diff_avx2_try_end:",
+    ".Ldiff_equal_no_avx:",
+    "    mov rax, r8",
+    "    ret",
+    ".Ldiff_found_qword_no_avx:",
+    "    bsf rax, rax",
+    "    shr rax, 3",
+    "    add rax, r9",
+    "    ret",
+    ".Ldiff_found_here_no_avx:",
+    "    mov rax, r9",
+    "    ret",
+    "victory_diff_avx2_fault:",
+    "    vzeroupper",
+    "    mov rax, -1",
+    "    ret",
 );
 
 #[cfg(target_arch = "x86_64")]
@@ -381,6 +519,10 @@ unsafe extern "C" {
     static victory_write_avx2_try_start: u8;
     static victory_write_avx2_try_end: u8;
     static victory_write_avx2_fault: u8;
+    fn victory_diff_avx2(title: *const u8, held: *const u8, len: usize) -> usize;
+    static victory_diff_avx2_try_start: u8;
+    static victory_diff_avx2_try_end: u8;
+    static victory_diff_avx2_fault: u8;
 }
 
 #[cfg(test)]
@@ -544,20 +686,26 @@ fn install() {
         const READ: usize = 0;
         const WRITE: usize = 1;
 
-        // Only at our own copy instructions (read faults from title memory;
+        // Only at our own copy/compare instructions (read faults from title memory;
         // a write fault to host memory MUST NOT be swallowed).
         let in_copy_rep = rip == (&raw const victory_copy_guarded_at) as u64;
         let in_copy_avx2 = !in_copy_rep
             && rip >= (&raw const victory_copy_avx2_try_start) as u64
             && rip < (&raw const victory_copy_avx2_try_end) as u64;
-        if in_copy_rep || in_copy_avx2 {
+        let in_diff_avx2 = !in_copy_rep
+            && !in_copy_avx2
+            && rip >= (&raw const victory_diff_avx2_try_start) as u64
+            && rip < (&raw const victory_diff_avx2_try_end) as u64;
+        if in_copy_rep || in_copy_avx2 || in_diff_avx2 {
             let read = r.NumberParameters >= 1 && r.ExceptionInformation[0] == READ;
             let gone =
                 (r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION || r.ExceptionCode == EXCEPTION_IN_PAGE_ERROR) && read;
             let guard =
                 r.ExceptionCode == EXCEPTION_GUARD_PAGE && (r.NumberParameters == 0 || r.ExceptionInformation[0] == READ);
             if gone || guard {
-                context.Rip = if in_copy_avx2 {
+                context.Rip = if in_diff_avx2 {
+                    (&raw const victory_diff_avx2_fault) as u64
+                } else if in_copy_avx2 {
                     (&raw const victory_copy_avx2_fault) as u64
                 } else {
                     (&raw const victory_copy_guarded_fault) as u64
@@ -698,6 +846,43 @@ pub(crate) fn copy(to: *mut u8, from: *const u8, len: usize) -> bool {
         note_fault(from as usize, len);
     }
     whole
+}
+
+/// Compares title memory `[title, title + len)` directly against mapped host
+/// memory `[held, held + len)` in place using 256-bit AVX2 without allocating
+/// or writing a scratch buffer.
+///
+/// Returns `Some(len)` when all bytes are equal, `Some(offset)` (`offset < len`)
+/// at the exact first differing byte, or `None` if disabled, `VICTORY_BACK_READS`
+/// is active, the source faulted recently, or a page of `title` is not mapped.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn first_diff(title: *const u8, held: *const u8, len: usize) -> Option<usize> {
+    if len == 0 {
+        return Some(0);
+    }
+    if !on() || !avx2_on() || crate::backreads::on() {
+        return None;
+    }
+    if len < least() || faulted_lately(title as usize, len) {
+        return None;
+    }
+    install();
+    // SAFETY: CPU supports AVX2 (verified by `avx2_on`); `held` is mapped host
+    // memory of `len` bytes, and any read fault on `title` redirects to
+    // `victory_diff_avx2_fault` returning `usize::MAX`.
+    let res = unsafe { victory_diff_avx2(title, held, len) };
+    if res == usize::MAX {
+        COUNT[2].fetch_add(1, Relaxed);
+        note_fault(title as usize, len);
+        None
+    } else {
+        Some(res)
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) fn first_diff(_: *const u8, _: *const u8, _: usize) -> Option<usize> {
+    None
 }
 
 /// With [`on`]: copies title memory at `from` into host memory at `to` in
@@ -1277,6 +1462,61 @@ mod tests {
         assert!(!copy_committed(to.as_mut_ptr(), base.wrapping_add(PAGE), PAGE));
 
         // SAFETY: the test's reservation.
+        unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn diff_avx2_finds_exact_offset_and_handles_faults() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let _on = force_on_for_test();
+        install();
+        // Exact match and exact mismatch offset across all AVX2/qword/byte tails.
+        for len in [0usize, 1, 7, 8, 15, 16, 31, 32, 33, 63, 64, 127, 128, 129, 255, 256, 4096, 65536] {
+            let a: Vec<u8> = (0..len).map(|i| (i.wrapping_mul(37).wrapping_add(11)) as u8).collect();
+            let mut b = a.clone();
+            // SAFETY: valid equal buffers of `len` bytes.
+            assert_eq!(unsafe { victory_diff_avx2(a.as_ptr(), b.as_ptr(), len) }, len, "equal len={len}");
+            for &pos in &[0usize, 1, 7, 8, 31, 32, 63, 64, 95, 96, 127, 128, 129, len.saturating_sub(1)] {
+                if pos >= len {
+                    continue;
+                }
+                b[pos] ^= 0x80;
+                // SAFETY: valid buffers of `len` bytes.
+                assert_eq!(
+                    unsafe { victory_diff_avx2(a.as_ptr(), b.as_ptr(), len) },
+                    pos,
+                    "len={len} pos={pos}"
+                );
+                b[pos] ^= 0x80;
+            }
+        }
+        // Fault handling: page 0 committed RW, page 1 uncommitted, page 2 NOACCESS.
+        // Clear `RECENT` in case Windows recycles a 64 KiB VA freed by an earlier test.
+        for place in &RECENT {
+            place.store(0, Relaxed);
+        }
+        // SAFETY: private test reservation.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 3 * PAGE, MEM_RESERVE, PAGE_NOACCESS) } as *mut u8;
+        assert!(!base.is_null());
+        assert!(!unsafe { VirtualAlloc(base.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+        assert!(!unsafe { VirtualAlloc(base.wrapping_add(2 * PAGE).cast(), PAGE, MEM_COMMIT, PAGE_NOACCESS) }.is_null());
+        let held = vec![0x5Au8; 2 * PAGE];
+        // SAFETY: page 0 is committed RW.
+        unsafe { std::slice::from_raw_parts_mut(base, PAGE) }.fill(0x5A);
+        assert_eq!(first_diff(base, held.as_ptr(), PAGE), Some(PAGE));
+        // SAFETY: page 0 is committed RW.
+        unsafe { *base.add(2049) = 0x5B };
+        assert_eq!(first_diff(base, held.as_ptr(), PAGE), Some(2049));
+        // Spanning into uncommitted page 1 faults cleanly and returns None.
+        // SAFETY: page 0 is committed RW.
+        unsafe { *base.add(2049) = 0x5A };
+        assert_eq!(first_diff(base.wrapping_add(PAGE / 2), held.as_ptr(), PAGE), None);
+        // NOACCESS page 2 returns usize::MAX directly from asm.
+        // SAFETY: VEH catches the read fault cleanly.
+        assert_eq!(unsafe { victory_diff_avx2(base.wrapping_add(2 * PAGE), held.as_ptr(), 64) }, usize::MAX);
+        // SAFETY: private test reservation.
         unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
     }
 }

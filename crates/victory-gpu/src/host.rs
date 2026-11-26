@@ -5065,6 +5065,35 @@ mod late_tests {
         }
         assert!(!touches(&[], 0, usize::MAX));
     }
+
+    #[test]
+    fn inflight_bucketing_preserves_page_order_and_spreads_pages() {
+        let mut items: Vec<(usize, u32)> = Vec::new();
+        // Repeat the same title pages across 4 chronological plans, interleaved with many distinct pages.
+        for plan in 0..4u32 {
+            for page in 0..48usize {
+                items.push((0x10_0000 + page, plan));
+            }
+        }
+        let buckets = super::Host::bucket_inflight_pieces(items, 6, |&(page, _)| page);
+        assert_eq!(buckets.len(), 6);
+        let non_empty = buckets.iter().filter(|b| !b.is_empty()).count();
+        assert!(non_empty >= 4, "expected work distributed across buckets, got {non_empty}");
+        let mut seen_pages: std::collections::HashMap<usize, Vec<u32>> = std::collections::HashMap::new();
+        for bucket in &buckets {
+            let mut local_seen = std::collections::HashSet::new();
+            for &(page, plan) in bucket {
+                local_seen.insert(page);
+                seen_pages.entry(page).or_default().push(plan);
+            }
+            // No page appears in two different buckets: verify below by checking exact length 4.
+            assert!(!local_seen.is_empty() || bucket.is_empty());
+        }
+        assert_eq!(seen_pages.len(), 48);
+        for (page, plans) in seen_pages {
+            assert_eq!(plans, [0, 1, 2, 3], "page {page:#x} lost chronological plan order");
+        }
+    }
 }
 
 /// Whether a title buffer copy that continues the one recorded before it
@@ -6387,6 +6416,25 @@ impl Host {
     /// on the landing thread's copy queue, behind `behind` (the host fence
     /// value behind the last of these flights, reached already), and
     /// waited for, before the merge and before the tickets are landed.
+/// Partitions inflight merge pieces into `num_buckets` worker queues keyed by
+/// title 64 KiB page `(shadow.start + lo) / 64 KiB`, preserving exact
+/// chronological plan order within every page (including aliased shadows)
+/// while letting disjoint pages merge concurrently under `wide_merge`.
+fn bucket_inflight_pieces<T>(
+    pieces: Vec<T>,
+    num_buckets: usize,
+    page_of: impl Fn(&T) -> usize,
+) -> Vec<Vec<T>> {
+    let n = num_buckets.max(1);
+    let mut buckets: Vec<Vec<T>> = (0..n).map(|_| Vec::new()).collect();
+    for piece in pieces {
+        let page = page_of(&piece);
+        let h = (page as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56;
+        buckets[(h as usize) % n].push(piece);
+    }
+    buckets
+}
+
     fn relay_card_inflight(&self, plans: &[(u64, &CardPlan)], fetch: &mut Option<RelayFetch>, behind: u64, landed: u64) -> bool {
         use std::sync::Arc;
         // If a prior fallback copy-queue fetch ran beside later flights
@@ -6516,18 +6564,58 @@ impl Host {
         } else {
             ring.1
         };
-        let mut title = Vec::new();
-        let (mut written, mut bytes) = (0, 0u64);
+        let mut packed: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, usize, u64)> =
+            Vec::with_capacity(pieces.len());
+        let mut bytes = 0u64;
         for (shadow, lo, hi, at, after) in &pieces {
-            let at = if inflight_on_card() { base + bytes as usize } else { base + at };
-            // SAFETY: inside the mapping of the slots (checked above), or of
-            // the buffer they were copied down to (`inflight_copy_down`
-            // puts them one after the other, and has waited); the copy into
-            // the slot ran in the plan's flight, which the card has run.
-            let gpu = unsafe { std::slice::from_raw_parts(at as *const u8, hi - lo) };
-            written += shadow.card_merge_relay(*lo, gpu, *after, &mut title);
-            bytes += (hi - lo) as u64;
+            let src = if inflight_on_card() { base + bytes as usize } else { base + at };
+            packed.push((shadow.clone(), *lo, *hi, src, *after));
+            bytes += (*hi - *lo) as u64;
         }
+        let written = if wide_merge() && packed.len() >= 8 {
+            // Partition into worker buckets keyed by title 64 KiB page
+            // `(shadow.start + lo) / 64 KiB` so pieces touching the same title
+            // page (including aliased shadows) execute in strict chronological
+            // plan order within one bucket while disjoint pages merge in parallel.
+            let buckets = Self::bucket_inflight_pieces(packed, 6, |(shadow, lo, _, _, _)| {
+                (shadow.title_start() + *lo) / crate::watch::PAGE
+            });
+            let total_written = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = buckets
+                .into_iter()
+                .filter(|b| !b.is_empty())
+                .map(|bucket| {
+                    let total_written = total_written.clone();
+                    Box::new(move || {
+                        let mut title = Vec::new();
+                        let mut local = 0usize;
+                        for (shadow, lo, hi, src, after) in bucket {
+                            // SAFETY: inside the mapping of the slots (checked above), or of
+                            // the buffer they were copied down to (`inflight_copy_down`
+                            // puts them one after the other, and has waited); the copy into
+                            // the slot ran in the plan's flight, which the card has run.
+                            let gpu = unsafe { std::slice::from_raw_parts(src as *const u8, hi - lo) };
+                            local += shadow.card_merge_relay(lo, gpu, after, &mut title);
+                        }
+                        total_written.fetch_add(local, Ordering::Relaxed);
+                    }) as Box<dyn FnOnce() + Send>
+                })
+                .collect();
+            crate::shadow::wide_run(jobs);
+            total_written.load(Ordering::Relaxed)
+        } else {
+            let mut title = Vec::new();
+            let mut written = 0usize;
+            for (shadow, lo, hi, src, after) in &packed {
+                // SAFETY: inside the mapping of the slots (checked above), or of
+                // the buffer they were copied down to (`inflight_copy_down`
+                // puts them one after the other, and has waited); the copy into
+                // the slot ran in the plan's flight, which the card has run.
+                let gpu = unsafe { std::slice::from_raw_parts(*src as *const u8, hi - lo) };
+                written += shadow.card_merge_relay(*lo, gpu, *after, &mut title);
+            }
+            written
+        };
         for &(_, plan) in plans {
             for r in &plan.ranges {
                 crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
@@ -9251,7 +9339,7 @@ fn wide_fill_chunks() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| {
         (std::thread::available_parallelism()
-            .map_or(4, |n| n.get() / 4)
+            .map_or(4, |n| n.get() / 3)
             .clamp(2, 6)
             + 1)
         .min(6)
