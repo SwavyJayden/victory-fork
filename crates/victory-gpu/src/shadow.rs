@@ -173,17 +173,47 @@ fn default_card_buffers_mb(vram_budget: Option<u64>) -> u64 {
     }
 }
 
+fn parse_card_limits(
+    vram_budget: Option<u64>,
+    min_mb: Option<&str>,
+    min_kb: Option<&str>,
+    max_mb: Option<&str>,
+) -> (u64, u64) {
+    let parse = |val: Option<&str>, default: u64| {
+        val.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default)
+    };
+    let mut min_bytes = parse(min_mb, 1).max(1) << 20;
+    let max_bytes = parse(max_mb, default_card_buffers_mb(vram_budget)) << 20;
+    // `VICTORY_CARD_BUFFERS_MIN_KB` (after fxceless c36971b2) says the
+    // least size in KiB, so that it can go under 1 MiB: 64 is every title
+    // buffer. Copies under 1 MiB are nearly all there are and few bytes;
+    // in the PC's memory every load, store and atomic a shader does on
+    // them crosses the bus.
+    if let Some(kib) = min_kb.and_then(|v| v.trim().parse::<u64>().ok())
+        && kib > 0
+    {
+        min_bytes = kib.saturating_mul(1 << 10);
+    }
+    (min_bytes, max_bytes)
+}
+
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
-        let mb = |name: &str, default: u64| {
-            std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
-        };
-        let default_mb = default_card_buffers_mb(
-            host().and_then(|h| h.video_memory()).map(|m| m[0]),
+        let vram_budget = host().and_then(|h| h.video_memory()).map(|m| m[0]);
+        let (min_bytes, max_bytes) = parse_card_limits(
+            vram_budget,
+            std::env::var("VICTORY_CARD_BUFFERS_MIN_MB").ok().as_deref(),
+            std::env::var("VICTORY_CARD_BUFFERS_MIN_KB").ok().as_deref(),
+            std::env::var("VICTORY_CARD_BUFFERS_MB").ok().as_deref(),
         );
-        // From 1 MiB up and VRAM-scaled total by default (1024 / 2048 / 3072 MiB).
-        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", default_mb))
+        tracing::info!(
+            vram_budget_mb = vram_budget.map(|b| b >> 20),
+            card_buffers_min_kb = min_bytes >> 10,
+            card_buffers_max_mb = max_bytes >> 20,
+            "card buffer limits"
+        );
+        (min_bytes, max_bytes)
     })
 }
 
@@ -230,6 +260,19 @@ fn card_room_kept_on() -> bool {
 /// buffers, so no room is kept for them any more.
 static CARD_REFUSED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// Kept card buffer room for a configured max `limit`, `used` bytes already on
+/// the card, and `refused` bytes turned down: capped at 1 GiB (`SEEN`) so
+/// unused buffer reservation never starves texture streaming.
+fn card_room_kept_for(limit: u64, used: u64, refused: u64) -> u64 {
+    // Not more than such copies came to in any session, whatever they may
+    // come to: on a card of 24 GB a quarter of its budget was kept for them,
+    // 5 GB that never came (941 MB in 97 copies after fifteen minutes), and
+    // no texture was made any more with 5 GB of the card free (session
+    // play-1125-0127: 1,453 passes refused, the ground and people black).
+    const SEEN: u64 = 1 << 30;
+    limit.min(SEEN).saturating_sub(used.saturating_add(refused))
+}
+
 /// The bytes of the card's memory the texture queue leaves free for card
 /// copies of title buffers not made yet ([`card_room_kept_on`]): 0 with
 /// the switch off or without card copies.
@@ -237,7 +280,11 @@ pub(crate) fn card_room_kept() -> u64 {
     if !card_room_kept_on() || !cards() {
         return 0;
     }
-    card_limits().1.saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
+    card_room_kept_for(
+        card_limits().1,
+        CARD_BYTES[0].load(Ordering::Relaxed),
+        CARD_REFUSED[1].load(Ordering::Relaxed),
+    )
 }
 
 /// The copies in the card's memory.
@@ -559,9 +606,31 @@ fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32) -> (usize, u
     (lo.max(span.from as usize), hi.min(span.to as usize))
 }
 
+/// The offsets [`Shadow::card_hashed`] gives, for a hashed byte length of
+/// `size` bytes of title memory from `start` on.
+#[cfg_attr(not(test), allow(dead_code))]
+fn card_hashed_of(start: usize, size: usize, piece: usize) -> (usize, usize) {
+    let (lo, hi) = piece_at(start, size, piece);
+    (lo & !15, hi.next_multiple_of(16))
+}
+
+/// The bytes of a copy covered by the card's hashes: with `own` enabled, the
+/// title buffer's own length rounded up to 16 bytes (capped at `card_size`);
+/// otherwise the whole `card_size`.
+fn card_hash_size_for(len: u64, card_size: u64, own: bool) -> u64 {
+    if own {
+        len.next_multiple_of(16).min(card_size)
+    } else {
+        card_size
+    }
+}
+
 #[cfg(test)]
 mod card_tests {
-    use super::{CardSpan, PIECE, card_piece_of, card_span_of, joined, joined_piece_runs};
+    use super::{
+        CardSpan, PIECE, card_hash_size_for, card_hashed_of, card_piece_of, card_room_kept_for, card_span_of, joined,
+        joined_piece_runs, parse_card_limits,
+    };
 
     /// Joined runs hold every piece of the runs given, once, and no other.
     #[test]
@@ -715,6 +784,57 @@ mod card_tests {
         // Without the switch every later merge fetches after 7: as before.
         assert_eq!(fallback_fetched_mark(false, 7, Some(5)), 7);
         assert_eq!(fallback_fetched_mark(true, 7, None), 0);
+    }
+
+    /// What is fetched of a piece to hash it is what the shader hashes.
+    #[test]
+    fn a_piece_is_hashed_here_as_on_the_card() {
+        for start in [0usize, 0x10_0000, 0xd_5edb_c780, 0x12_3456_7008, 0xfff8] {
+            for size in [288usize, 304, 4096, 1usize << 16, 5 << 16, 0x20_0000] {
+                let span = card_span_of(start, 0, size);
+                for i in 0..span.pieces {
+                    // As `CARD_COMPARE` has it.
+                    let (piece, skew, size) = (span.first + i, span.skew, size as u32);
+                    let lo = (piece * 65536).saturating_sub(skew);
+                    let hi = ((piece + 1) * 65536 - skew).min(size);
+                    let shader = (lo & !15, (hi + 15) & !15);
+                    let here = card_hashed_of(start, size as usize, piece as usize);
+                    assert_eq!((here.0 as u32, here.1 as u32), shader, "start {start:#x} size {size:#x} piece {piece}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn card_hash_size_rounds_up_to_16_and_caps_at_card_size() {
+        assert_eq!(card_hash_size_for(288, 64 << 10, true), 288);
+        assert_eq!(card_hash_size_for(290, 64 << 10, true), 304);
+        assert_eq!(card_hash_size_for(1, 64 << 10, true), 16);
+        assert_eq!(card_hash_size_for((64 << 10) - 3, 64 << 10, true), 64 << 10);
+        assert_eq!(card_hash_size_for(288, 64 << 10, false), 64 << 10);
+        assert_eq!(card_hash_size_for(288, 0, true), 0);
+    }
+
+    #[test]
+    fn card_limits_supports_min_kb_and_defaults() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(parse_card_limits(Some(8 * GIB), None, None, None), (1 << 20, 1024 << 20));
+        assert_eq!(parse_card_limits(Some(16 * GIB), None, None, None), (1 << 20, 2048 << 20));
+        assert_eq!(parse_card_limits(Some(24 * GIB), None, None, None), (1 << 20, 3072 << 20));
+        assert_eq!(parse_card_limits(Some(16 * GIB), None, Some("64"), None), (64 << 10, 2048 << 20));
+        assert_eq!(parse_card_limits(Some(16 * GIB), Some("4"), Some("128"), None), (128 << 10, 2048 << 20));
+        // Zero or invalid `VICTORY_CARD_BUFFERS_MIN_KB` is ignored.
+        assert_eq!(parse_card_limits(Some(16 * GIB), Some("4"), Some("0"), None), (4 << 20, 2048 << 20));
+        assert_eq!(parse_card_limits(Some(16 * GIB), None, Some("bad"), Some("512")), (1 << 20, 512 << 20));
+    }
+
+    #[test]
+    fn card_room_kept_caps_reservation_at_one_gib() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(card_room_kept_for(2 * GIB, 0, 0), GIB);
+        assert_eq!(card_room_kept_for(3 * GIB, 400 << 20, 100 << 20), GIB - (500 << 20));
+        assert_eq!(card_room_kept_for(3 * GIB, 900 << 20, 200 << 20), 0);
+        assert_eq!(card_room_kept_for(512 << 20, 128 << 20, 0), 384 << 20);
     }
 
     /// Changed ranges are joined where they overlap or touch, and only there.
@@ -2655,7 +2775,7 @@ static LET_GO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 #[cfg(feature = "diagnostics")]
 pub(crate) fn windows() -> [u64; 3] {
     let asked: u64 = {
-        let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
         loose
             .values()
             .map(|s| {
@@ -2679,7 +2799,7 @@ pub(crate) fn windows() -> [u64; 3] {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn window_use() -> [u64; 8] {
     let mut out = [0u64; 8];
-    let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
     for s in loose.values() {
         let copied = s.copied.lock().unwrap_or_else(|e| e.into_inner());
         let pages = copied.iter().filter(|&&at| at != 0).count() as u64;
@@ -2720,7 +2840,7 @@ pub(crate) fn let_go_idle() {
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
-        let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
         if map.is_empty() {
             return;
         }
@@ -2757,7 +2877,7 @@ pub(crate) fn let_go_idle() {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 6] {
     let (windows, window_bytes) = {
-        let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
         // Each copy once: a window may stand under several keys.
         let mut seen = std::collections::HashSet::new();
         let bytes: u64 = loose
@@ -4016,6 +4136,26 @@ impl Shadow {
         card_piece_of(self.start as usize, self.len as usize, span, i)
     }
 
+    /// The offsets the compare on the card hashes of a piece: what lies of
+    /// it in the card's hashed bytes, widened to 16 bytes.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn card_hashed(&self, piece: u32) -> (usize, usize) {
+        let size = self.card_hash_size() as usize;
+        card_hashed_of(self.start as usize, size, piece as usize)
+    }
+
+    /// The bytes of the copy the card's hashes cover: the title buffer's own,
+    /// rounded up to the hash's 16-byte step. The card's buffer is the title
+    /// buffer rounded up to 64 KiB, of which a title buffer of 288 bytes can
+    /// give nothing back but those (after fxceless c36971b2).
+    /// `VICTORY_CARD_HASH_LEN=0`: the whole buffer.
+    pub(crate) fn card_hash_size(&self) -> u64 {
+        static OWN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let own = *OWN.get_or_init(|| std::env::var_os("VICTORY_CARD_HASH_LEN").is_none_or(|v| v != "0"));
+        let size = self.card.as_ref().map_or(self.len, |c| c.size);
+        card_hash_size_for(self.len, size, own)
+    }
+
     /// The walls trace (`crate::host::walls_trace`): a piece of `fetched`
     /// bytes of this copy came back from the card and `written` of them
     /// went into title memory. Summed per buffer and logged once a frame:
@@ -4210,10 +4350,74 @@ struct Entry {
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
-static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
+///
+/// Read by every view a draw names, on all recording threads at once, and
+/// written when a buffer comes, goes or gets its copy: readers share it.
+static BUFFERS: std::sync::RwLock<BTreeMap<(u64, usize), Entry>> = std::sync::RwLock::new(BTreeMap::new());
 
-fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
-    BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
+fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    let map = BUFFERS.write().unwrap_or_else(|e| e.into_inner());
+    // What threads remember of it ([`FOUND`]) is of before.
+    BUFFERS_CHANGED.fetch_add(1, Ordering::SeqCst);
+    map
+}
+
+/// How often [`BUFFERS`] was taken to be changed.
+static BUFFERS_CHANGED: AtomicU64 = AtomicU64::new(1);
+
+/// Answers a thread remembers.
+const FOUND_MOST: usize = 1024;
+
+/// An ask (address, bytes), the count of changes it was answered at, and the
+/// answer.
+type Found = (u64, u64, u64, std::sync::Weak<Shadow>);
+
+thread_local! {
+    /// The last answers of [`lookup`] out of [`BUFFERS`], by a hash of the
+    /// ask: the same buffers are asked about draw after draw, from five
+    /// threads, each time through the map's lock and a dozen of its nodes
+    /// (7 % of the recording threads' time, profile waits-1).
+    static FOUND: std::cell::RefCell<Vec<Found>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Whether [`FOUND`] is kept (`VICTORY_QUICK_FIND=0`: not).
+fn quick_find() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_QUICK_FIND").is_none_or(|v| v != "0"))
+}
+
+fn found_at(address: u64, len: u64) -> usize {
+    let h = (address ^ len.rotate_left(32)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    (h >> 54) as usize % FOUND_MOST
+}
+
+/// What this thread remembers of an ask, if nothing changed since.
+fn found(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let changed = BUFFERS_CHANGED.load(Ordering::SeqCst);
+    let shadow = FOUND.with(|f| {
+        let f = f.borrow();
+        let (a, n, at, shadow) = f.get(found_at(address, len))?;
+        ((*a, *n, *at) == (address, len, changed)).then(|| shadow.upgrade()).flatten()
+    })?;
+    // Whoever takes the map to let a copy go that nobody holds finds it held
+    // now, or had counted before: then it is not handed out.
+    std::sync::atomic::fence(Ordering::SeqCst);
+    (BUFFERS_CHANGED.load(Ordering::SeqCst) == changed).then_some(shadow)
+}
+
+/// Remembers an answer given while `changed` was the count.
+fn remember(address: u64, len: u64, changed: u64, shadow: &Arc<Shadow>) {
+    FOUND.with(|f| {
+        let mut f = f.borrow_mut();
+        if f.is_empty() {
+            f.resize_with(FOUND_MOST, || (0, 0, 0, std::sync::Weak::new()));
+        }
+        f[found_at(address, len)] = (address, len, changed, Arc::downgrade(shadow));
+    });
+}
+
+fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    BUFFERS.read().unwrap_or_else(|e| e.into_inner())
 }
 
 /// A title buffer exists at `start` (`len` bytes).
@@ -4236,7 +4440,7 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 /// its copy (diagnostics: which buffer a dropped program's root view names).
 #[cfg(feature = "diagnostics")]
 pub(crate) fn extent(address: u64) -> Option<(u64, u64)> {
-    buffers()
+    buffers_read()
         .range(..=(address, usize::MAX))
         .rev()
         .take(64)
@@ -4252,7 +4456,7 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     let end = at.saturating_add(len);
     let mut gone: Vec<Arc<Shadow>> = Vec::new();
     {
-        let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
         let keys: Vec<(u64, u64)> = map
             .range((at.saturating_sub(WINDOW), 0)..(end, 0))
             .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
@@ -4280,8 +4484,8 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
 /// bytes, false) and the windows outside buffers that have a copy (start,
 /// bytes, true).
 pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
-    let mut spans: Vec<(u64, u64, bool)> = buffers().iter().map(|(key, entry)| (key.0, entry.end - key.0, false)).collect();
-    let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut spans: Vec<(u64, u64, bool)> = buffers_read().iter().map(|(key, entry)| (key.0, entry.end - key.0, false)).collect();
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
     spans.extend(loose.keys().map(|&(start, len)| (start, len, true)));
     spans
 }
@@ -4310,7 +4514,7 @@ pub(crate) enum NotSole {
 pub(crate) fn sole_buffer_copy(address: u64, len: u64) -> Result<Arc<Shadow>, NotSole> {
     let end = address.checked_add(len.max(1)).ok_or(NotSole::NoBuffer)?;
     {
-        let map = buffers();
+        let map = buffers_read();
         let key = map
             .range(..=(address, usize::MAX))
             .rev()
@@ -4328,7 +4532,7 @@ pub(crate) fn sole_buffer_copy(address: u64, len: u64) -> Result<Arc<Shadow>, No
         }
     }
     {
-        let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
         if map
             .range((address.saturating_sub(64 << 20), 0)..(end, 0))
             .any(|(k, _)| k.0 + k.1 > address)
@@ -4365,7 +4569,29 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
 }
 
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+    let quick = quick_find();
+    if quick && let Some(shadow) = found(address, len) {
+        return Some(shadow);
+    }
     let end = address.checked_add(len.max(1))?;
+    {
+        let map = buffers_read();
+        match map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end) {
+            // The copy is made already (nearly always).
+            Some((_, Entry { shadow: Some(shadow), .. })) => {
+                if quick {
+                    // (Nobody changes the map while this lock is held.)
+                    remember(address, len, BUFFERS_CHANGED.load(Ordering::SeqCst), shadow);
+                }
+                return Some(shadow.clone());
+            }
+            Some(_) => {}
+            None => {
+                drop(map);
+                return loose(address, end, len <= 1, any);
+            }
+        }
+    }
     let mut map = buffers();
     let key = map
         .range(..=(address, usize::MAX))
@@ -4554,7 +4780,7 @@ fn fine() -> bool {
 /// which is copied once for each.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn window_cover() -> u64 {
-    let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
     cover(loose.keys().copied())
 }
 
@@ -4585,12 +4811,37 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
 }
 
 /// Copies of title memory outside buffers, by (start, length).
-static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+static LOOSE: std::sync::RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = std::sync::RwLock::new(BTreeMap::new());
 
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
-    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     let (cell, _) = window_of(address, end, WINDOW);
     let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
+    // Under the lock, with the handing out: see `let_go_idle`.
+    let note = |shadow: &Shadow| {
+        // (Read first: the lines are shared by all recording threads.)
+        let now = crate::host::moment();
+        if shadow.used.load(Ordering::Relaxed) != now {
+            shadow.used.store(now, Ordering::Relaxed);
+        }
+        if shadow.asked[0].load(Ordering::Relaxed) > address {
+            shadow.asked[0].fetch_min(address, Ordering::Relaxed);
+        }
+        if shadow.asked[1].load(Ordering::Relaxed) < end {
+            shadow.asked[1].fetch_max(end, Ordering::Relaxed);
+        }
+        if unsized_ask {
+            shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
+        }
+    };
+    // The window is there already (nearly always): readers share the lock.
+    if !(unsized_ask && tails()) && !(any && fine() && !unsized_ask) {
+        let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(shadow) = map.get(&named) {
+            note(shadow);
+            return Some(shadow.clone());
+        }
+    }
+    let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
     let (start, len) = if unsized_ask && tails() {
         let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
         longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
@@ -4602,15 +4853,6 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         holder(there, address, end).unwrap_or(named)
     } else {
         named
-    };
-    // Under the lock, with the handing out: see `let_go_idle`.
-    let note = |shadow: &Shadow| {
-        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
-        shadow.asked[0].fetch_min(address, Ordering::Relaxed);
-        shadow.asked[1].fetch_max(end, Ordering::Relaxed);
-        if unsized_ask {
-            shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
-        }
     };
     if let Some(shadow) = map.get(&(start, len)) {
         note(shadow);
@@ -4963,8 +5205,11 @@ mod card_merge_tests {
         assert_eq!(before[title_byte], content[title_byte]);
     }
 
+    static BUFFERS_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn sole_buffer_copy_rejects_overlapping_buffers_and_loose_windows() {
+        let _serial = BUFFERS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(buffer) = warp_buffer() else {
             return;
         };
@@ -5019,7 +5264,7 @@ mod card_merge_tests {
         }
         // Loose window overlapping the range must also be rejected.
         {
-            let mut loose = super::LOOSE.lock().unwrap();
+            let mut loose = super::LOOSE.write().unwrap();
             loose.insert((outer + 0x2_0000, 0x1_0000), shadow_inner);
         }
         assert_eq!(
@@ -5031,22 +5276,80 @@ mod card_merge_tests {
             super::NotSole::NoBuffer
         );
         {
-            super::LOOSE.lock().unwrap().remove(&(outer + 0x2_0000, 0x1_0000));
+            super::LOOSE.write().unwrap().remove(&(outer + 0x2_0000, 0x1_0000));
             super::buffers().remove(&(outer, 0x9001));
         }
+    }
+
+    #[test]
+    fn quick_find_caches_and_invalidates_on_buffers_change_and_card_hashed_uses_own_len() {
+        let _serial = BUFFERS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (Some(buffer), Some(staging)) = (warp_buffer(), warp_buffer()) else {
+            return;
+        };
+        let addr = 0x7FF0_5000_0000u64;
+        let mut backing = vec![0u8; 64 << 10];
+        let mut s = Shadow::new(buffer, backing.as_mut_ptr(), 0, addr, 290);
+        s.card = Some(Card {
+            staging,
+            before: Mutex::new(None),
+            dirty: Mutex::default(),
+            sent: Mutex::default(),
+            side: std::sync::RwLock::new(()),
+            size: 64 << 10,
+        });
+        assert_eq!(s.card_hash_size(), 304);
+        assert_eq!(s.card_hashed(0), (0, 304));
+        // Clear `card` before `Drop` so global `CARD_BYTES` is untouched.
+        s.card = None;
+
+        let shadow = std::sync::Arc::new(s);
+        {
+            let mut map = super::buffers();
+            map.insert(
+                (addr, 0x9101),
+                super::Entry {
+                    end: addr + 290,
+                    shadow: Some(shadow.clone()),
+                },
+            );
+        }
+        // First lookup populates thread-local cache; retry if another parallel
+        // test outside this module mutates `BUFFERS` mid-check.
+        let mut hit = false;
+        for _ in 0..16 {
+            let before = super::BUFFERS_CHANGED.load(std::sync::atomic::Ordering::SeqCst);
+            let got1 = super::find(addr, 64).expect("first lookup");
+            assert!(std::sync::Arc::ptr_eq(&got1, &shadow));
+            let cached = super::found(addr, 64);
+            let after = super::BUFFERS_CHANGED.load(std::sync::atomic::Ordering::SeqCst);
+            if before == after {
+                let cached = cached.expect("thread-local cache hit with unchanged BUFFERS_CHANGED");
+                assert!(std::sync::Arc::ptr_eq(&cached, &shadow));
+                let got2 = super::find(addr, 64).expect("cached lookup");
+                assert!(std::sync::Arc::ptr_eq(&got2, &shadow));
+                hit = true;
+                break;
+            }
+        }
+        assert!(hit, "expected a stable BUFFERS_CHANGED window for quick_find cache hit");
+
+        // Any mutation of `BUFFERS` via `buffers()` invalidates the cache.
+        super::unregister(0x9101, addr);
+        assert!(super::found(addr, 64).is_none());
     }
 }
 
 /// For device-removed reports: the copy of title memory whose host range
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
-    let mut all: Vec<(u64, u64, u64)> = buffers()
+    let mut all: Vec<(u64, u64, u64)> = buffers_read()
         .values()
         .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))
         .collect();
     all.extend(
         LOOSE
-            .lock()
+            .read()
             .unwrap_or_else(|e| e.into_inner())
             .values()
             .map(|s| (s.gpu, s.start, s.len)),

@@ -125,8 +125,21 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
 /// remains, preventing eviction/recreation thrashing. Never returns less
 /// than 1,000 ms so handles not yet recorded into a list or slot remain
 /// protected.
+///
+/// With room on the card nothing has to go: in session play-1125-0127 88,000
+/// of them (31 GB) went after 5 s with 7 GB of the card free, and 24,700
+/// (12 GB) had to be made and uploaded again.
+/// `VICTORY_TEXTURE_KEEP=0`: disable extended retention (5 s / 15 s as before).
 pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
+    static KEEP: OnceLock<bool> = OnceLock::new();
+    let keep = *KEEP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_KEEP").is_none_or(|v| v != "0"));
+    vram_idle_for(video_memory, keep)
+}
+
+fn vram_idle_for(video_memory: Option<[u64; 4]>, keep: bool) -> u64 {
     const GIB: u64 = 1024 * 1024 * 1024;
+    const KEPT_MS: u64 = 600_000;
+    const LONG_MS: u64 = 30_000;
     const RELAXED_MS: u64 = 15_000;
     const NORMAL_MS: u64 = 5_000;
     const MODERATE_MS: u64 = 2_500;
@@ -146,15 +159,23 @@ pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
             MODERATE_MS
         } else if used_pct >= 75 || free < 3 * GIB {
             NORMAL_MS
-        } else {
+        } else if !keep {
             RELAXED_MS
+        } else if used_pct >= 68 {
+            LONG_MS
+        } else {
+            KEPT_MS
         }
     } else if used_pct >= 85 {
         HIGH_MS
     } else if used_pct >= 75 {
         MODERATE_MS
-    } else {
+    } else if !keep {
         NORMAL_MS
+    } else if used_pct >= 68 {
+        LONG_MS
+    } else {
+        KEPT_MS
     }
 }
 
@@ -1866,8 +1887,37 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
     lo = lo & ~15u;
     hi = (hi + 15u) & ~15u;
     uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu) ^ ((t + 1u) * 0x9E3779B1u);
+    uint at = lo + t * 16u;
+    // Eight loads at once: one after the other, each waits for memory.
     [loop]
-    for (uint at = lo + t * 16u; at < hi; at += 4096u) {
+    for (; at + 28672u < hi; at += 32768u) {
+        uint4 v0 = now.Load4(at + 0u);
+        uint4 v1 = now.Load4(at + 4096u);
+        uint4 v2 = now.Load4(at + 8192u);
+        uint4 v3 = now.Load4(at + 12288u);
+        uint4 v4 = now.Load4(at + 16384u);
+        uint4 v5 = now.Load4(at + 20480u);
+        uint4 v6 = now.Load4(at + 24576u);
+        uint4 v7 = now.Load4(at + 28672u);
+        h = (h ^ v0) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        h = h.yzwx ^ (h >> 15);
+        h = (h ^ v1) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        h = h.yzwx ^ (h >> 15);
+        h = (h ^ v2) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        h = h.yzwx ^ (h >> 15);
+        h = (h ^ v3) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        h = h.yzwx ^ (h >> 15);
+        h = (h ^ v4) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        h = h.yzwx ^ (h >> 15);
+        h = (h ^ v5) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        h = h.yzwx ^ (h >> 15);
+        h = (h ^ v6) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        h = h.yzwx ^ (h >> 15);
+        h = (h ^ v7) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        h = h.yzwx ^ (h >> 15);
+    }
+    [loop]
+    for (; at < hi; at += 4096u) {
         h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
         h = h.yzwx ^ (h >> 15);
     }
@@ -4829,7 +4879,7 @@ impl Host {
                     }
                     let mut compute_bound = false;
                     for (shadow, ranges) in &dirty {
-                        let Some((staging, before, size)) = shadow.card_sides() else {
+                        let (Some((staging, before, _)), size) = (shadow.card_sides(), shadow.card_hash_size()) else {
                             continue;
                         };
                         if !wide {
@@ -4955,7 +5005,7 @@ impl Host {
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
                     for r in plan.ranges.iter().filter(|r| r.compared) {
-                        let Some((_, Some(before), size)) = r.shadow.card_sides() else {
+                        let (Some((_, Some(before), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) else {
                             continue;
                         };
                         let constants = [r.span.first, r.span.skew, size as u32, r.span.pieces, r.at * 4, if flown { 2 } else { 1 }];
@@ -9767,8 +9817,24 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 
     #[test]
     fn vram_idle_ms_scales_with_pressure() {
-        use super::vram_idle_ms;
+        let vram_idle_ms = |memory| super::vram_idle_for(memory, false);
+        let keeps = |memory| super::vram_idle_for(memory, true);
         let gib = 1024 * 1024 * 1024;
+        // Extended retention (`VICTORY_TEXTURE_KEEP` on, default) on <= 12 GiB
+        assert_eq!(keeps(Some([100, 67, 0, 0])), 600_000);
+        assert_eq!(keeps(Some([100, 68, 0, 0])), 30_000);
+        assert_eq!(keeps(Some([100, 74, 0, 0])), 30_000);
+        assert_eq!(keeps(Some([100, 75, 0, 0])), 2_500);
+        assert_eq!(keeps(Some([100, 85, 0, 0])), 1_000);
+        assert_eq!(keeps(None), 5_000);
+        assert_eq!(keeps(Some([0, 100, 0, 0])), 5_000);
+        // Extended retention on > 12 GiB preserves tiered pressure thresholds
+        assert_eq!(keeps(Some([15 * gib, 8 * gib, 0, 0])), 600_000);
+        assert_eq!(keeps(Some([15 * gib, 10 * gib + gib / 2, 0, 0])), 30_000);
+        assert_eq!(keeps(Some([15 * gib, 12 * gib, 0, 0])), 5_000);
+        assert_eq!(keeps(Some([15 * gib, 13 * gib, 0, 0])), 2_500);
+        assert_eq!(keeps(Some([15 * gib, 14 * gib + gib / 2, 0, 0])), 1_000);
+        // `VICTORY_TEXTURE_KEEP=0` preserves original tiers
         // Normal (< 75%)
         assert_eq!(vram_idle_ms(Some([10 * gib, 0, 0, 0])), 5_000);
         assert_eq!(vram_idle_ms(Some([10 * gib, 7 * gib, 0, 0])), 5_000);
