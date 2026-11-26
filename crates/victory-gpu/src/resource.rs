@@ -653,37 +653,77 @@ fn mip_count(desc: &ResourceDesc) -> u32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlacedFootprint {
     pub(crate) offset: u64,
-    format: u32,
-    width: u32,
-    height: u32,
-    depth: u32,
-    row_pitch: u32,
+    pub(crate) format: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) depth: u32,
+    pub(crate) row_pitch: u32,
+}
+
+/// Whether `format` is a DXGI block-compressed format (`BC1`..`BC7`).
+pub(crate) fn is_bc_format(format: u32) -> bool {
+    matches!(format, 70..=84 | 94..=99)
+}
+
+/// Whether `format` is a DXGI depth/stencil (or depth-only) format that should
+/// not be bridged through a colour copy buffer.
+pub(crate) fn is_depth_stencil_format(format: u32) -> bool {
+    matches!(format, 19..=22 | 40 | 44..=47 | 55 | 118..=120)
+}
+
+#[cfg(any(windows, test))]
+pub(crate) fn ped_tex_diag_from(raw: Option<&str>) -> bool {
+    raw.is_some_and(|v| v.trim() == "1")
+}
+
+/// Opt-in ped / BC texture diagnostic (`VICTORY_PED_TEX_DIAG=1`; off by default,
+/// zero cost when unset or `0`).
+#[cfg(windows)]
+pub(crate) fn ped_tex_diag() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| ped_tex_diag_from(std::env::var("VICTORY_PED_TEX_DIAG").ok().as_deref()))
 }
 
 impl PlacedFootprint {
     /// The bytes it spans in a buffer: every row pitched but the last.
     pub(crate) fn bytes(&self) -> Option<u64> {
+        if self.width == 0 || self.height == 0 || self.depth == 0 {
+            return None;
+        }
         let (element, block) = element(self.format)?;
-        let lines = u64::from(self.height).div_ceil(block) * u64::from(self.depth);
-        let last = u64::from(self.width).div_ceil(block) * element;
-        Some(u64::from(self.row_pitch) * lines.saturating_sub(1) + last)
+        let lines = u64::from(self.height).div_ceil(block).checked_mul(u64::from(self.depth))?;
+        let last = u64::from(self.width).div_ceil(block).checked_mul(element)?;
+        u64::from(self.row_pitch)
+            .checked_mul(lines.saturating_sub(1))?
+            .checked_add(last)
     }
 
-    /// For a read back through a host buffer: this footprint at offset 0
-    /// with its rows pitched as the host wants them (multiples of 256
-    /// bytes), then the bytes that buffer needs, the bytes of a row, the
-    /// rows, and the title's own pitch.
+    /// For a read back or re-pitched upload through a host buffer: this
+    /// footprint at offset 0 with BC dimensions rounded up to whole blocks and
+    /// rows pitched as the host wants them (multiples of 256 bytes), then the
+    /// bytes that buffer needs, the bytes of a row, the rows, and the title's
+    /// own pitch.
     pub(crate) fn host_rows(&self) -> Option<(PlacedFootprint, [u64; 4])> {
+        if self.width == 0 || self.height == 0 || self.depth == 0 {
+            return None;
+        }
         let (element, block) = element(self.format)?;
-        let lines = (u64::from(self.height).div_ceil(block) * u64::from(self.depth)).max(1);
-        let row = u64::from(self.width).div_ceil(block) * element;
+        let lines = (u64::from(self.height).div_ceil(block).checked_mul(u64::from(self.depth))?).max(1);
+        let row = u64::from(self.width).div_ceil(block).checked_mul(element)?;
         let pitch = row.max(1).next_multiple_of(256);
+        let block_u32 = block as u32;
+        let width = self.width.max(1).checked_next_multiple_of(block_u32)?;
+        let height = self.height.max(1).checked_next_multiple_of(block_u32)?;
         let host = PlacedFootprint {
             offset: 0,
+            width,
+            height,
             row_pitch: u32::try_from(pitch).ok()?,
             ..*self
         };
-        Some((host, [pitch * lines, row, lines, u64::from(self.row_pitch)]))
+        let total = pitch.checked_mul(lines.saturating_sub(1))?.checked_add(row)?;
+        let _ = total;
+        Some((host, [pitch.checked_mul(lines)?, row, lines, u64::from(self.row_pitch)]))
     }
 }
 const _: () = assert!(size_of::<PlacedFootprint>() == 32);
@@ -1288,6 +1328,111 @@ static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
 /// all zeros from a first stage that held light (run 88).
 /// `VICTORY_ALIAS_COPY=0`: none is found, as before; `=1`: only textures
 /// of one level and one layer, as at first.
+/// Whether a GPU-written texture `o` and a sampled texture `r` at the same
+/// memory address have compatible layout for an on-host alias copy:
+/// - Same-block (both uncompressed, block=1, same element byte width and exact
+///   dimensions/levels/layers), OR
+/// - Uncompressed GPU block-compressor UAV (`o`: `(W/4 x H/4)`, block=1, 8 or
+///   16 bytes/texel such as `R32G32_UINT` / `R32G32B32A32_UINT`) aliased at
+///   the VA of a block-compressed texture (`r`: `(W x H)`, block=4, same
+///   bytes/block such as `BC1`/`BC4` or `BC2`/`BC3`/`BC5`/`BC6H`/`BC7`) with
+///   `mip_count(o) <= mip_count(r)`, OR
+/// - Same-block block-compressed (`o` and `r` both block=4, same bytes/block,
+///   same dimensions/levels/layers, e.g. from `HOST_WRITTEN_AT`).
+#[cfg(any(windows, test))]
+fn alias_compatible(r: &ResourceDesc, o: &ResourceDesc, whole: bool) -> bool {
+    const DEPTH: u32 = 0x2;
+    let r_mips = mip_count(r);
+    let o_mips = mip_count(o);
+    let shape_ok = |d: &ResourceDesc, mips: u32| {
+        d.dimension != BUFFER
+            && mips >= 1
+            && d.depth_or_array_size >= 1
+            && (whole || (mips == 1 && d.depth_or_array_size == 1))
+            && d.sample_count <= 1
+    };
+    if !shape_ok(r, r_mips) || !shape_ok(o, o_mips) {
+        return false;
+    }
+    if o.dimension != r.dimension
+        || o.depth_or_array_size != r.depth_or_array_size
+        || o.flags & DEPTH != 0
+        || target_format(o.format) != o.format
+    {
+        return false;
+    }
+    let (Some((o_bpe, o_blk)), Some((r_bpe, r_blk))) = (element(o.format), element(r.format))
+    else {
+        return false;
+    };
+    if o_bpe != r_bpe {
+        return false;
+    }
+    match (o_blk, r_blk) {
+        (1, 1) | (4, 4) => o.width == r.width && o.height == r.height && o_mips == r_mips,
+        (1, 4) => {
+            o.width == r.width.div_ceil(4)
+                && o.height == r.height.div_ceil(4)
+                && o_mips <= r_mips
+        }
+        _ => false,
+    }
+}
+
+/// Logs an opt-in diagnostic line for a `TARGETS_AT` / `HOST_WRITTEN_AT` VA hit
+/// inside [`alias_of`] when `VICTORY_PED_TEX_DIAG=1` (deduplicated up to 64
+/// unique signatures).
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn log_ped_alias_hit(
+    table: &'static str,
+    matched: bool,
+    placed: bool,
+    va_offset: u64,
+    view: This,
+    r: &ResourceDesc,
+    other: This,
+    o: &ResourceDesc,
+) {
+    static SEEN: std::sync::Mutex<std::collections::BTreeSet<[u64; 11]>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let key = [
+        u64::from(table.as_bytes()[0]),
+        u64::from(matched) | (u64::from(placed) << 1),
+        va_offset,
+        r.width,
+        u64::from(r.height),
+        u64::from(r.format),
+        (u64::from(r.mip_levels) << 16) | u64::from(r.depth_or_array_size),
+        o.width,
+        u64::from(o.height),
+        u64::from(o.format),
+        (u64::from(o.mip_levels) << 16) | u64::from(o.depth_or_array_size),
+    ];
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.len() < 64 && seen.insert(key) {
+        tracing::info!(
+            table,
+            matched,
+            placed,
+            va_offset = format_args!("{va_offset:#x}"),
+            view = ?view,
+            r_size = format_args!("{}x{}", r.width, r.height),
+            r_fmt = r.format,
+            r_mips = mip_count(r),
+            r_layers = r.depth_or_array_size,
+            r_flags = format_args!("{:#x}", r.flags),
+            other = ?other,
+            o_size = format_args!("{}x{}", o.width, o.height),
+            o_fmt = o.format,
+            o_mips = mip_count(o),
+            o_layers = o.depth_or_array_size,
+            o_flags = format_args!("{:#x}", o.flags),
+            "VICTORY_PED_TEX_DIAG alias_of VA hit"
+        );
+    }
+}
+
 #[cfg(windows)]
 pub(crate) fn alias_of(this: This) -> Option<This> {
     use std::sync::atomic::Ordering::Relaxed;
@@ -1301,56 +1446,116 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
     let whole =
         *WHOLE.get_or_init(|| std::env::var_os("VICTORY_ALIAS_COPY").is_none_or(|v| v != "1"));
     let r = resource(this);
-    // A level count of 0 asks for a full chain: not counted here.
-    let one = |d: &ResourceDesc| {
-        d.dimension != BUFFER
-            && d.mip_levels >= 1
-            && d.depth_or_array_size >= 1
-            && (whole || (d.mip_levels == 1 && d.depth_or_array_size == 1))
-            && d.sample_count <= 1
-    };
-    if !r.host.placed.load(Relaxed) || !fills(&r.desc) || !one(&r.desc) {
+    if r.desc.dimension == BUFFER || !fills(&r.desc) {
         return None;
     }
-    // Under the table's lock: a texture leaves it before it is freed.
-    let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
-    let other = *targets.get(&(r.data() as u64))? as This;
-    let o = resource(other);
-    const DEPTH: u32 = 0x2;
-    let same = one(&o.desc)
-        && o.desc.dimension == r.desc.dimension
-        && o.desc.width == r.desc.width
-        && o.desc.height == r.desc.height
-        && o.desc.mip_levels == r.desc.mip_levels
-        && o.desc.depth_or_array_size == r.desc.depth_or_array_size
-        && o.desc.flags & DEPTH == 0
-        && target_format(o.desc.format) == o.desc.format
-        && element(o.desc.format).is_some_and(|e| e.1 == 1 && Some(e) == element(r.desc.format));
-    if !same && r.desc.sample_count <= 1 {
-        // What shaders wrote there is on the card in the other texture; this
-        // one is filled from title memory, which they never reached. Each
-        // kind of pair is said once.
-        static SAID: std::sync::Mutex<std::collections::BTreeSet<[u32; 6]>> =
-            std::sync::Mutex::new(std::collections::BTreeSet::new());
-        let pair = [
-            r.desc.width as u32,
-            r.desc.height,
-            r.desc.format,
-            o.desc.width as u32,
-            o.desc.height,
-            o.desc.format,
-        ];
-        let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
-        if said.len() < 64 && said.insert(pair) {
-            tracing::warn!(
-                view = ?this,
-                texture = ?other,
-                "a placed texture lies where a texture the host writes does, and is not like it (width, height, format of each): {pair:?}, levels {} and {}, layers {} and {}",
-                r.desc.mip_levels, o.desc.mip_levels, r.desc.depth_or_array_size, o.desc.depth_or_array_size
-            );
+    let placed = r.host.placed.load(Relaxed);
+    let diag = ped_tex_diag();
+    // Title-filled textures that already received a host GPU copy keep those
+    // contents rather than aliasing another resource.
+    if crate::texture::host_wrote(this as usize) {
+        return None;
+    }
+    let addr = r.data() as u64;
+    // Check TARGETS_AT first (render targets / UAVs). Under the table's lock,
+    // a texture leaves it before it is freed.
+    {
+        let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&other_addr) = targets.get(&addr) {
+            let other = other_addr as This;
+            if other != this {
+                let o = resource(other);
+                let same = alias_compatible(&r.desc, &o.desc, whole);
+                if diag {
+                    log_ped_alias_hit("TARGETS_AT", same, placed, 0, this, &r.desc, other, &o.desc);
+                }
+                if !same && placed && r.desc.sample_count <= 1 {
+                    // What shaders wrote there is on the card in the other texture; this
+                    // one is filled from title memory, which they never reached. Each
+                    // kind of pair is said once.
+                    static SAID: std::sync::Mutex<std::collections::BTreeSet<[u32; 6]>> =
+                        std::sync::Mutex::new(std::collections::BTreeSet::new());
+                    let pair = [
+                        r.desc.width as u32,
+                        r.desc.height,
+                        r.desc.format,
+                        o.desc.width as u32,
+                        o.desc.height,
+                        o.desc.format,
+                    ];
+                    let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+                    if said.len() < 64 && said.insert(pair) {
+                        tracing::warn!(
+                            view = ?this,
+                            texture = ?other,
+                            "a placed texture lies where a texture the host writes does, and is not like it (width, height, format of each): {pair:?}, levels {} and {}, layers {} and {}",
+                            mip_count(&r.desc), mip_count(&o.desc), r.desc.depth_or_array_size, o.desc.depth_or_array_size
+                        );
+                    }
+                }
+                if same {
+                    return Some(other);
+                }
+            }
+        } else if diag
+            && let Some((&base, &other_addr)) = targets.range(..addr).next_back()
+        {
+            let other = other_addr as This;
+            if other != this {
+                let o = resource(other);
+                let span = footprint(&o.desc).map_or(0, |f| f.size);
+                if addr < base.saturating_add(span) {
+                    log_ped_alias_hit(
+                        "TARGETS_AT_OFFSET",
+                        false,
+                        placed,
+                        addr - base,
+                        this,
+                        &r.desc,
+                        other,
+                        &o.desc,
+                    );
+                }
+            }
         }
     }
-    same.then_some(other)
+    // Fallback for placed SRVs lying at the exact VA of a live title-filled
+    // texture written on the host GPU via CopyTextureRegion / CopyResource /
+    // ResolveSubresource (`HOST_WRITTEN_AT`). Lock acquired strictly after
+    // releasing `TARGETS_AT`.
+    if placed {
+        return crate::texture::with_host_written_at(addr, |exact, offset_hit| {
+            if let Some(other) = exact
+                && other != this
+            {
+                let o = resource(other);
+                let same = alias_compatible(&r.desc, &o.desc, whole);
+                if diag {
+                    log_ped_alias_hit("HOST_WRITTEN_AT", same, placed, 0, this, &r.desc, other, &o.desc);
+                }
+                if same {
+                    return Some(other);
+                }
+            } else if diag
+                && let Some((base, other)) = offset_hit
+                && other != this
+            {
+                let o = resource(other);
+                log_ped_alias_hit(
+                    "HOST_WRITTEN_OFFSET",
+                    false,
+                    placed,
+                    addr - base,
+                    this,
+                    &r.desc,
+                    other,
+                    &o.desc,
+                );
+            }
+            None
+        });
+    }
+    None
 }
 
 /// Whether host copies are made on first use. On by default;
@@ -4980,5 +5185,284 @@ float4 lit() : SV_Target { return 1.0; }
             "the range of a texture nothing holds did not come back"
         );
         drop((b, b_cut, c, c_cut, d, d_cut));
+    }
+
+    #[test]
+    fn ped_tex_diag_bc_formats_and_footprint_alignment() {
+        assert!(!ped_tex_diag_from(None));
+        assert!(!ped_tex_diag_from(Some("0")));
+        assert!(!ped_tex_diag_from(Some("yes")));
+        assert!(ped_tex_diag_from(Some("1")));
+        assert!(ped_tex_diag_from(Some(" 1 ")));
+
+        for fmt in [70u32, 71, 72, 77, 78, 80, 83, 84, 94, 98, 99] {
+            assert!(is_bc_format(fmt), "BC format {fmt}");
+        }
+        for fmt in [0u32, 2, 3, 17, 28, 42, 67, 69, 85, 93, 100] {
+            assert!(!is_bc_format(fmt), "non-BC format {fmt}");
+        }
+
+        // BC7 2x2 tail mip pads footprint width/height to 4x4 and pitch to 256.
+        let tail = PlacedFootprint {
+            offset: 0,
+            format: 98,
+            width: 2,
+            height: 2,
+            depth: 1,
+            row_pitch: 16,
+        };
+        let (host, [size, row, lines, pitch]) = tail.host_rows().expect("host_rows");
+        assert_eq!((host.width, host.height, host.row_pitch), (4, 4, 256));
+        assert_eq!((size, row, lines, pitch), (256, 16, 1, 16));
+
+        // Zero-dimension footprints return None cleanly.
+        let zero = PlacedFootprint { width: 0, ..tail };
+        assert!(zero.bytes().is_none());
+        assert!(zero.host_rows().is_none());
+    }
+
+    #[test]
+    fn alias_compatible_accepts_uav_to_bc_and_full_mip_chains() {
+        let uav_16_1 = ResourceDesc {
+            flags: 4,
+            ..texture(16, 16, 3, 1) // R32G32B32A32_UINT
+        };
+        let bc7_64_1 = texture(64, 64, 98, 1);
+        assert!(alias_compatible(&bc7_64_1, &uav_16_1, true));
+        assert!(alias_compatible(&bc7_64_1, &uav_16_1, false));
+
+        // Multi-mip: 64x64 BC7 (7 mips: 64..1) aliased by 16x16 R32G32B32A32_UINT (5 mips: 16..1).
+        let uav_16_5 = ResourceDesc {
+            flags: 4,
+            ..texture(16, 16, 3, 5)
+        };
+        let bc7_64_7 = texture(64, 64, 98, 7);
+        let bc7_64_full = texture(64, 64, 98, 0); // mip_levels == 0 => full chain (7 mips)
+        assert!(alias_compatible(&bc7_64_7, &uav_16_5, true));
+        assert!(alias_compatible(&bc7_64_full, &uav_16_5, true));
+        assert!(!alias_compatible(&bc7_64_7, &uav_16_5, false));
+
+        // 8-byte pair: R32G32_UINT (17) <-> BC1_UNORM (71).
+        let uav_bc1 = ResourceDesc {
+            flags: 4,
+            ..texture(16, 16, 17, 1)
+        };
+        assert!(alias_compatible(&texture(64, 64, 71, 1), &uav_bc1, true));
+        // Mismatched byte width (8B UAV vs 16B BC7) must be rejected.
+        assert!(!alias_compatible(&bc7_64_1, &uav_bc1, true));
+        // Wrong dimensions must be rejected.
+        assert!(!alias_compatible(&texture(128, 64, 98, 1), &uav_16_1, true));
+    }
+
+    /// End-to-end GPU test (D3D12 debug layer clean):
+    /// - `(16x16, 5 mips)` R32G32B32A32_UINT UAV aliased at the VA of a
+    ///   `(64x64, 7 mips)` BC7_UNORM placed texture copies all 5 mips bit-exact.
+    /// - Non-placed `create_at_address` BC7 texture at the same VA also matches `alias_of`.
+    /// - `HOST_WRITTEN_AT` fallback matches a placed SRV lying at the VA of a
+    ///   host-copied BC3 texture and copies cleanly on the GPU.
+    #[cfg(windows)]
+    #[test]
+    fn alias_bridges_multimip_uav_to_bc7_and_host_written_bc3_on_gpu() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let uav_desc = ResourceDesc {
+            flags: 4,
+            ..texture(16, 16, 3, 5)
+        };
+        let bc7_desc = texture(64, 64, 98, 7);
+        let mut backing = vec![0u8; 64 << 10];
+        let va = backing.as_mut_ptr() as u64;
+        let (mut uav, mut placed_bc7, mut direct_bc7) = (null, null, null);
+        assert_eq!(
+            create_at_address(null, va, &uav_desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut uav),
+            S_OK
+        );
+        assert_eq!(
+            create_at_address(null, va, &bc7_desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut placed_bc7),
+            S_OK
+        );
+        assert_eq!(
+            create_at_address(null, va, &bc7_desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut direct_bc7),
+            S_OK
+        );
+        resource(placed_bc7).host.placed.store(true, Relaxed);
+        assert_eq!(alias_of(placed_bc7), Some(uav));
+        assert_eq!(alias_of(direct_bc7), Some(uav), "non-placed VA alias must also match");
+
+        // Upload known block patterns into mip 0 (16x16) and mip 1 (8x8) of `uav`.
+        let host_uav = host_resource(uav).unwrap();
+        let host_bc7 = host_resource(placed_bc7).unwrap();
+        // SAFETY: live texture.
+        let uav_d3d = unsafe { host_uav.GetDesc() };
+        let mut uav_fps = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); 5];
+        let mut uav_total = 0u64;
+        // SAFETY: plain footprint query.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &uav_d3d,
+                0,
+                5,
+                0,
+                Some(uav_fps.as_mut_ptr()),
+                None,
+                None,
+                Some(&mut uav_total),
+            );
+        }
+        let (upload, ptr) = host.upload_buffer(uav_total).unwrap();
+        // SAFETY: freshly mapped upload buffer of `uav_total` bytes.
+        unsafe {
+            std::ptr::write_bytes(ptr, 0, uav_total as usize);
+            // Mip 0: first 16 bytes = 0x11..0x20
+            for i in 0..16usize {
+                ptr.add(uav_fps[0].Offset as usize + i).write((0x11 + i) as u8);
+            }
+            // Mip 1: first 16 bytes = 0xA0..0xAF
+            for i in 0..16usize {
+                ptr.add(uav_fps[1].Offset as usize + i).write((0xA0 + i) as u8);
+            }
+        }
+        let seed = host.new_list().unwrap();
+        crate::list::ensure_state(&seed, uav, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
+        for (sub, fp) in uav_fps.iter().enumerate() {
+            let dst = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: borrowed pointer.
+                pResource: unsafe { std::mem::transmute_copy(host_uav) },
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: sub as u32 },
+            };
+            let src = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: borrowed pointer.
+                pResource: unsafe { std::mem::transmute_copy(&upload) },
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *fp },
+            };
+            // SAFETY: open list.
+            unsafe { seed.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None) };
+        }
+        seed.close();
+        host.execute(&[&seed]);
+
+        let list = host.new_list().unwrap();
+        assert!(crate::texture::alias(&list, placed_bc7, uav));
+        crate::list::ensure_state(&list, placed_bc7, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+        // Read back mip 0 and mip 1 of `host_bc7`.
+        // SAFETY: live texture.
+        let bc_d3d = unsafe { host_bc7.GetDesc() };
+        let mut bc_fps = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); 2];
+        let mut bc_total = 0u64;
+        // SAFETY: plain footprint query.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &bc_d3d,
+                0,
+                2,
+                0,
+                Some(bc_fps.as_mut_ptr()),
+                None,
+                None,
+                Some(&mut bc_total),
+            );
+        }
+        let rb_heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let rb_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: bc_total.max(256),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut rb: Option<ID3D12Resource> = None;
+        // SAFETY: plain readback buffer creation.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &rb_heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &rb_desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut rb,
+                )
+                .unwrap();
+        }
+        let rb = rb.unwrap();
+        for (sub, fp) in bc_fps.iter().enumerate() {
+            let dst = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: borrowed pointer.
+                pResource: unsafe { std::mem::transmute_copy(&rb) },
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *fp },
+            };
+            let src = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: borrowed pointer.
+                pResource: unsafe { std::mem::transmute_copy(host_bc7) },
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: sub as u32 },
+            };
+            // SAFETY: open list.
+            unsafe { list.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None) };
+        }
+        list.close();
+        host.execute(&[&list]);
+        if let Some(err) = host.log_messages() {
+            panic!("D3D12 debug layer error (multimip UAV->BC7 alias): {err}");
+        }
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: completed readback buffer.
+        let (mip0_got, mip1_got) = unsafe {
+            rb.Map(0, None, Some(&mut mapped)).unwrap();
+            let raw = std::slice::from_raw_parts(mapped.cast::<u8>(), bc_total as usize);
+            let m0 = raw[bc_fps[0].Offset as usize..bc_fps[0].Offset as usize + 16].to_vec();
+            let m1 = raw[bc_fps[1].Offset as usize..bc_fps[1].Offset as usize + 16].to_vec();
+            rb.Unmap(0, None);
+            (m0, m1)
+        };
+        let want0: Vec<u8> = (0x11..0x21).collect();
+        let want1: Vec<u8> = (0xA0..0xB0).collect();
+        assert_eq!(mip0_got, want0, "BC7 mip 0 must match UAV mip 0");
+        assert_eq!(mip1_got, want1, "BC7 mip 1 must match UAV mip 1");
+
+        // --- HOST_WRITTEN_AT fallback for placed SRV at VA of host-copied BC3 ---
+        let mut bc3_backing = vec![0u8; 64 << 10];
+        let bc3_va = bc3_backing.as_mut_ptr() as u64;
+        let bc3_desc = texture(16, 16, 77, 1);
+        let (mut copied_bc3, mut placed_bc3) = (null, null);
+        assert_eq!(
+            create_at_address(null, bc3_va, &bc3_desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut copied_bc3),
+            S_OK
+        );
+        assert_eq!(
+            create_at_address(null, bc3_va, &bc3_desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut placed_bc3),
+            S_OK
+        );
+        resource(placed_bc3).host.placed.store(true, Relaxed);
+        assert_eq!(alias_of(placed_bc3), None, "not host_written yet");
+        crate::texture::host_written(copied_bc3);
+        assert_eq!(alias_of(placed_bc3), Some(copied_bc3), "HOST_WRITTEN_AT fallback matches");
+        let list2 = host.new_list().unwrap();
+        assert!(crate::texture::alias(&list2, placed_bc3, copied_bc3));
+        list2.close();
+        host.execute(&[&list2]);
+        if let Some(err) = host.log_messages() {
+            panic!("D3D12 debug layer error (HOST_WRITTEN_AT BC3 alias): {err}");
+        }
+
+        resource_release(placed_bc3);
+        resource_release(copied_bc3);
+        resource_release(direct_bc7);
+        resource_release(placed_bc7);
+        resource_release(uav);
     }
 }
