@@ -3097,12 +3097,17 @@ impl Drop for Resource {
         // in it, under its lock.
         if self.desc.dimension != BUFFER {
             let address = std::ptr::from_ref::<Resource>(self) as usize;
+            if !fills(&self.desc) && self.host.placed.load(std::sync::atomic::Ordering::Relaxed) {
+                let mut map = PLACED_UAV_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+                let at = self.data() as u64;
+                map.retain(|&(a, _), &mut r| !(a == at && r == address));
+            }
             crate::texback::released(address);
             textures().remove(&address);
             if !fills(&self.desc) {
                 let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
                 let at = self.data() as u64;
-                if targets.get(&at) == Some(&(std::ptr::from_ref::<Resource>(self) as usize)) {
+                if targets.get(&at) == Some(&address) {
                     targets.remove(&at);
                 }
             }
@@ -3312,6 +3317,201 @@ pub(crate) extern "system" fn create_at_address(
 static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// Textures the title placed in its own memory and writes through unordered
+/// access views without a resource object (device 0x238), by address and
+/// filler-normalized description. Global lock order:
+/// `PLACED_UAV_TEXTURES` -> `TEXTURES` -> `TARGETS_AT`.
+#[cfg(windows)]
+static PLACED_UAV_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Whether placed 1D/2D/3D texture unordered access views are mirrored into
+/// host UAV textures (`VICTORY_PLACED_TEXTURE_UAV=0` disables; on by default).
+#[cfg(any(windows, test))]
+pub(crate) fn placed_texture_uav_from(val: Option<&str>) -> bool {
+    val.is_none_or(|v| v.trim() != "0")
+}
+
+#[cfg(windows)]
+pub(crate) fn placed_texture_uav_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        placed_texture_uav_from(std::env::var("VICTORY_PLACED_TEXTURE_UAV").ok().as_deref())
+    })
+}
+
+/// Whether `format` is the typeless head of a multi-format DXGI family.
+#[cfg(any(windows, test))]
+fn is_typeless_format(format: u32) -> bool {
+    format != 0 && family(format) == format && family(format + 1) == format
+}
+
+/// Concrete typed DXGI format to probe with `D3D12_FEATURE_FORMAT_SUPPORT` for
+/// a placed UAV texture in `format`; `None` for formats PC D3D12 never allows
+/// `ALLOW_UNORDERED_ACCESS` on (UNKNOWN, BC1..BC7, depth-stencil, 96-bit RGB).
+#[cfg(any(windows, test))]
+fn uav_probe_format(format: u32) -> Option<u32> {
+    let f = pc_format(format);
+    if f == 0 || is_bc_format(f) || is_depth_stencil_format(f) || matches!(f, 5..=8) {
+        return None;
+    }
+    let f = target_format(f);
+    let f = SRGB.iter().find(|&&(s, _)| s == f).map_or(f, |&(_, l)| l);
+    let probe = match f {
+        1 => 3,   // R32G32B32A32_TYPELESS -> R32G32B32A32_UINT
+        9 => 12,  // R16G16B16A16_TYPELESS -> R16G16B16A16_UINT
+        15 => 17, // R32G32_TYPELESS -> R32G32_UINT
+        23 => 24, // R10G10B10A2_TYPELESS -> R10G10B10A2_UNORM
+        27 => 28, // R8G8B8A8_TYPELESS -> R8G8B8A8_UNORM
+        33 => 34, // R16G16_TYPELESS -> R16G16_FLOAT
+        39 => 42, // R32_TYPELESS -> R32_UINT
+        48 => 49, // R8G8_TYPELESS -> R8G8_UNORM
+        53 => 57, // R16_TYPELESS -> R16_UINT
+        60 => 61, // R8_TYPELESS -> R8_UNORM
+        90 => 87, // B8G8R8A8_TYPELESS -> B8G8R8A8_UNORM
+        92 => 88, // B8G8R8X8_TYPELESS -> B8G8R8X8_UNORM
+        other => other,
+    };
+    element(probe)?;
+    Some(probe)
+}
+
+/// Validates and normalizes `d` for creation as a PC D3D12 placed UAV texture.
+#[cfg(any(windows, test))]
+fn validate_placed_uav_desc(d: &mut ResourceDesc) -> bool {
+    const TEXTURE_1D: u32 = 2;
+    const TEXTURE_2D: u32 = 3;
+    const DEPTH: u32 = 0x2;
+    const MAX_1D_2D: u64 = 16_384;
+    const MAX_3D_ARRAY: u32 = 2_048;
+    if !matches!(d.dimension, TEXTURE_1D | TEXTURE_2D | TEXTURE_3D)
+        || d.width == 0
+        || d.height == 0
+        || d.depth_or_array_size == 0
+        || d.sample_count > 1
+        || d.flags & DEPTH != 0
+    {
+        return false;
+    }
+    let dims_ok = match d.dimension {
+        TEXTURE_1D => {
+            d.width <= MAX_1D_2D
+                && d.height == 1
+                && u32::from(d.depth_or_array_size) <= MAX_3D_ARRAY
+        }
+        TEXTURE_2D => {
+            d.width <= MAX_1D_2D
+                && u64::from(d.height) <= MAX_1D_2D
+                && u32::from(d.depth_or_array_size) <= MAX_3D_ARRAY
+        }
+        TEXTURE_3D => {
+            d.width <= u64::from(MAX_3D_ARRAY)
+                && d.height <= MAX_3D_ARRAY
+                && u32::from(d.depth_or_array_size) <= MAX_3D_ARRAY
+        }
+        _ => false,
+    };
+    if !dims_ok {
+        return false;
+    }
+    let max_dim = match d.dimension {
+        TEXTURE_1D => d.width,
+        TEXTURE_2D => d.width.max(u64::from(d.height)),
+        TEXTURE_3D => d
+            .width
+            .max(u64::from(d.height))
+            .max(u64::from(d.depth_or_array_size)),
+        _ => return false,
+    };
+    let max_mips = 64 - max_dim.leading_zeros();
+    if u32::from(d.mip_levels) > max_mips {
+        return false;
+    }
+    if d.sample_count == 0 {
+        d.sample_count = 1;
+        d.sample_quality = 0;
+    }
+    true
+}
+
+/// Whether an existing live `TARGETS_AT` texture `existing` can be reused for a
+/// placed UAV texture with description `wanted`.
+#[cfg(any(windows, test))]
+fn placed_uav_target_compatible(existing: &ResourceDesc, wanted: &ResourceDesc) -> bool {
+    const DEPTH: u32 = 0x2;
+    const UNORDERED_ACCESS: u32 = 0x4;
+    if existing.dimension != wanted.dimension
+        || existing.width != wanted.width
+        || existing.height != wanted.height
+        || existing.depth_or_array_size != wanted.depth_or_array_size
+        || mip_count(existing) != mip_count(wanted)
+        || existing.sample_count.max(1) != 1
+        || existing.flags & UNORDERED_ACCESS == 0
+        || existing.flags & DEPTH != 0
+    {
+        return false;
+    }
+    let e_fmt = target_format(pc_format(existing.format));
+    let w_fmt = target_format(pc_format(wanted.format));
+    let linear = |f: u32| SRGB.iter().find(|&&(s, _)| s == f).map_or(f, |&(_, l)| l);
+    if e_fmt == w_fmt || linear(e_fmt) == linear(w_fmt) {
+        return true;
+    }
+    let e_host = if SRGB.iter().any(|&(s, _)| s == e_fmt) {
+        family(e_fmt)
+    } else {
+        e_fmt
+    };
+    is_typeless_format(e_host) && e_host == family(w_fmt)
+}
+
+/// Whether the host D3D12 device supports creating a UAV texture of `dimension`
+/// (`2`=1D, `3`=2D, `4`=3D) in `format`.
+#[cfg(windows)]
+fn uav_texture_format_supported(format: u32, dimension: u32) -> bool {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    let Some(probe) = uav_probe_format(format) else {
+        return false;
+    };
+    let dim_bit = match dimension {
+        2 => D3D12_FORMAT_SUPPORT1_TEXTURE1D.0,
+        3 => D3D12_FORMAT_SUPPORT1_TEXTURE2D.0,
+        4 => D3D12_FORMAT_SUPPORT1_TEXTURE3D.0,
+        _ => return false,
+    };
+    static KNOWN: std::sync::Mutex<Vec<((u32, u32), bool)>> = std::sync::Mutex::new(Vec::new());
+    {
+        let known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&(_, ok)) = known.iter().find(|(k, _)| *k == (probe, dimension)) {
+            return ok;
+        }
+    }
+    let Some(host) = crate::host::host() else {
+        return false;
+    };
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: DXGI_FORMAT(probe as i32),
+        ..Default::default()
+    };
+    let need = dim_bit | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
+    // SAFETY: plain format-support query into our own struct.
+    let ok = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_SUPPORT,
+            (&raw mut support).cast(),
+            size_of_val(&support) as u32,
+        )
+    }
+    .is_ok()
+        && support.Support1.0 & need == need;
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if !known.iter().any(|(k, _)| *k == (probe, dimension)) {
+        known.push(((probe, dimension), ok));
+    }
+    ok
+}
+
 /// The placed textures asked for with filler words set, as asked
 /// (address and description): for [`PLACED_TWINS`].
 #[cfg(windows)]
@@ -3506,6 +3706,101 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         .host
         .placed
         .store(true, std::sync::atomic::Ordering::Relaxed);
+    Some(out)
+}
+
+/// The host UAV-capable texture resource for a placed unordered access texture
+/// view at `address` with resource description `desc` (as words). Reuses a
+/// compatible live `TARGETS_AT` UAV texture at `address` when present, or
+/// creates and registers a host UAV texture in `TARGETS_AT` (so compute writes
+/// land on a real GPU texture and aliased placed SRVs read them via
+/// [`alias_of`]). Returns `None` when disabled (`VICTORY_PLACED_TEXTURE_UAV=0`)
+/// or when PC D3D12 cannot create a UAV texture in that shape/format.
+#[cfg(windows)]
+pub(crate) fn unordered_texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+    const UNORDERED_ACCESS: u32 = 0x4;
+    const UNORDERED_STATE: u32 = 0x8; // D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+    if address == 0 || !placed_texture_uav_enabled() {
+        return None;
+    }
+    let mut key = *desc;
+    key[1] = 0;
+    key[13] = 0;
+    // SAFETY: 56 bytes in the description's layout.
+    let mut d = unsafe { key.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    if !validate_placed_uav_desc(&mut d) || !uav_texture_format_supported(d.format, d.dimension) {
+        return None;
+    }
+    let raw_flags = d.flags;
+    d.flags = UNORDERED_ACCESS;
+
+    let mut map = PLACED_UAV_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    // Reuse a live compatible UAV texture already in TARGETS_AT at `address`.
+    {
+        let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&existing) = targets.get(&address) {
+            let existing_this = existing as This;
+            if placed_uav_target_compatible(&resource(existing_this).desc, &d) {
+                return Some(existing_this);
+            }
+        }
+    }
+    if let Some(&existing) = map.get(&(address, key)) {
+        let existing_this = existing as This;
+        TARGETS_AT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(address, existing);
+        return Some(existing_this);
+    }
+    const DEFAULT: HeapProperties = HeapProperties {
+        kind: 1,
+        cpu_pages: 0,
+        pool: 0,
+        creation_nodes: 1,
+        visible_nodes: 1,
+    };
+    let mut out = std::ptr::null();
+    let made = hand_out_resource(
+        d,
+        DEFAULT,
+        0,
+        Backing::Address(address as *mut u8),
+        UNORDERED_STATE,
+        std::ptr::null(),
+        &RESOURCE_IIDS[0],
+        &mut out,
+    );
+    if made != S_OK || out.is_null() {
+        return None;
+    }
+    // Realize the host texture eagerly so any unexpected driver rejection fails
+    // cleanly without leaving an unusable entry in TARGETS_AT.
+    if hosted(out, true).is_none() {
+        drop(map);
+        resource_release(out);
+        return None;
+    }
+    resource(out)
+        .host
+        .placed
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    map.insert((address, key), out as usize);
+    drop(map);
+    static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 32 {
+        tracing::info!(
+            address = format_args!("{address:#x}"),
+            dimension = d.dimension,
+            width = d.width,
+            height = d.height,
+            depth_or_array = d.depth_or_array_size,
+            mips = d.mip_levels,
+            format = d.format,
+            flags = format_args!("{raw_flags:#x}"),
+            "placed unordered texture mirrored"
+        );
+    }
     Some(out)
 }
 
@@ -5463,6 +5758,163 @@ float4 lit() : SV_Target { return 1.0; }
         resource_release(copied_bc3);
         resource_release(direct_bc7);
         resource_release(placed_bc7);
+        resource_release(uav);
+    }
+
+    #[test]
+    fn placed_texture_uav_switch_and_validation_helpers() {
+        assert!(placed_texture_uav_from(None));
+        assert!(placed_texture_uav_from(Some("1")));
+        assert!(placed_texture_uav_from(Some("true")));
+        assert!(!placed_texture_uav_from(Some("0")));
+        assert!(!placed_texture_uav_from(Some(" 0 ")));
+
+        // Supported UAV formats (typed, sRGB -> linear, typeless -> representative).
+        assert_eq!(uav_probe_format(3), Some(3));
+        assert_eq!(uav_probe_format(17), Some(17));
+        assert_eq!(uav_probe_format(28), Some(28));
+        assert_eq!(uav_probe_format(29), Some(28)); // R8G8B8A8_UNORM_SRGB -> UNORM
+        assert_eq!(uav_probe_format(91), Some(87)); // B8G8R8A8_UNORM_SRGB -> UNORM
+        assert_eq!(uav_probe_format(1), Some(3));   // R32G32B32A32_TYPELESS -> UINT
+        assert_eq!(uav_probe_format(27), Some(28)); // R8G8B8A8_TYPELESS -> UNORM
+        assert_eq!(uav_probe_format(39), Some(42)); // R32_TYPELESS -> UINT
+        // Rejected formats: UNKNOWN, BC1..BC7, depth-stencil (incl. console D16S8), 96-bit RGB.
+        for bad in [0, 5, 6, 7, 8, 19, 20, 40, 44, 45, 55, 70, 71, 77, 80, 95, 98, 99, 118, 119, 120] {
+            assert_eq!(uav_probe_format(bad), None, "format {bad} must be rejected");
+        }
+
+        // Geometry / flag validation.
+        let mut valid_2d = texture(64, 64, 28, 1);
+        valid_2d.sample_count = 0;
+        assert!(validate_placed_uav_desc(&mut valid_2d));
+        assert_eq!(valid_2d.sample_count, 1);
+
+        let mut buf = ResourceDesc { dimension: BUFFER, ..valid_2d };
+        assert!(!validate_placed_uav_desc(&mut buf));
+        let mut zero_w = ResourceDesc { width: 0, ..valid_2d };
+        assert!(!validate_placed_uav_desc(&mut zero_w));
+        let mut msaa = ResourceDesc { sample_count: 4, ..valid_2d };
+        assert!(!validate_placed_uav_desc(&mut msaa));
+        let mut depth = ResourceDesc { flags: 0x2, ..valid_2d };
+        assert!(!validate_placed_uav_desc(&mut depth));
+        let mut too_many_mips = ResourceDesc { mip_levels: 10, ..valid_2d };
+        assert!(!validate_placed_uav_desc(&mut too_many_mips));
+        let mut bad_1d = ResourceDesc { dimension: 2, height: 2, ..valid_2d };
+        assert!(!validate_placed_uav_desc(&mut bad_1d));
+
+        // TARGETS_AT reuse compatibility.
+        let uav_unorm = ResourceDesc { flags: 4, ..texture(64, 64, 28, 1) };
+        let rt_only = ResourceDesc { flags: 1, ..texture(64, 64, 28, 1) };
+        let uav_srgb = ResourceDesc { flags: 4, ..texture(64, 64, 29, 1) };
+        let uav_typeless = ResourceDesc { flags: 4, ..texture(64, 64, 27, 1) };
+        let uav_uint = ResourceDesc { flags: 4, ..texture(64, 64, 30, 1) };
+        assert!(placed_uav_target_compatible(&uav_unorm, &uav_unorm));
+        assert!(!placed_uav_target_compatible(&rt_only, &uav_unorm));
+        assert!(placed_uav_target_compatible(&uav_unorm, &uav_srgb));
+        assert!(placed_uav_target_compatible(&uav_srgb, &uav_unorm));
+        assert!(placed_uav_target_compatible(&uav_typeless, &uav_uint));
+        assert!(!placed_uav_target_compatible(&uav_unorm, &uav_uint));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn placed_uav_texture_registers_in_targets_at_and_aliases_into_placed_srv() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let to_words = |d: ResourceDesc| -> [u32; 14] {
+            // SAFETY: `ResourceDesc` is 56 bytes (`[u32; 14]`).
+            unsafe { std::mem::transmute(d) }
+        };
+        let mut backing = vec![0u8; 64 << 10];
+        let va = backing.as_mut_ptr() as u64;
+
+        // 16x16 R32G32B32A32_UINT placed UAV with dirty stack filler words.
+        let mut uav_words = to_words(texture(16, 16, 3, 1));
+        uav_words[1] = 0xdead_beef;
+        uav_words[13] = 0xcafe_babe;
+        let uav = unordered_texture_at(va, &uav_words).expect("2D R32G32B32A32_UINT placed UAV");
+        // Different filler words at the same VA must hit the same resource.
+        let mut uav_words_alt = uav_words;
+        uav_words_alt[1] = 0x1234_5678;
+        uav_words_alt[13] = 0x9abc_def0;
+        assert_eq!(unordered_texture_at(va, &uav_words_alt), Some(uav));
+        // Host texture must exist and carry ALLOW_UNORDERED_ACCESS.
+        let host_uav = host_resource(uav).expect("host UAV resource");
+        // SAFETY: live resource.
+        let hd = unsafe { host_uav.GetDesc() };
+        assert_ne!(hd.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0, 0);
+
+        // Both a same-format placed SRV and a (64x64) BC7 placed SRV at `va`
+        // must find `uav` via `alias_of` through `TARGETS_AT`.
+        let null = std::ptr::null();
+        let same_srv_desc = texture(16, 16, 3, 1);
+        let bc7_srv_desc = texture(64, 64, 98, 1);
+        let (mut same_srv, mut bc7_srv) = (null, null);
+        assert_eq!(
+            create_at_address(null, va, &same_srv_desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut same_srv),
+            S_OK
+        );
+        assert_eq!(
+            create_at_address(null, va, &bc7_srv_desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut bc7_srv),
+            S_OK
+        );
+        resource(same_srv).host.placed.store(true, Relaxed);
+        resource(bc7_srv).host.placed.store(true, Relaxed);
+        assert_eq!(alias_of(same_srv), Some(uav), "same-format placed SRV aliases placed UAV");
+        assert_eq!(alias_of(bc7_srv), Some(uav), "4x4 BC7 placed SRV aliases placed UAV");
+
+        // Pre-existing TARGETS_AT UAV texture is reused instead of duplicated.
+        let mut backing2 = vec![0u8; 64 << 10];
+        let va2 = backing2.as_mut_ptr() as u64;
+        let pre_desc = ResourceDesc { flags: 4, ..texture(32, 32, 28, 1) };
+        let mut pre = null;
+        assert_eq!(
+            create_at_address(null, va2, &pre_desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut pre),
+            S_OK
+        );
+        let placed_at_va2 = to_words(texture(32, 32, 28, 1));
+        assert_eq!(unordered_texture_at(va2, &placed_at_va2), Some(pre));
+
+        // 3D placed UAV texture (dimension = 4) and sRGB placed UAV (format = 29).
+        let mut backing3 = vec![0u8; 64 << 10];
+        let va3 = backing3.as_mut_ptr() as u64;
+        let tex3d_desc = ResourceDesc {
+            dimension: TEXTURE_3D,
+            depth_or_array_size: 4,
+            ..texture(8, 8, 10, 1)
+        };
+        let uav3d = unordered_texture_at(va3, &to_words(tex3d_desc)).expect("3D placed UAV");
+        assert!(host_resource(uav3d).is_some());
+
+        let mut backing4 = vec![0u8; 64 << 10];
+        let va4 = backing4.as_mut_ptr() as u64;
+        let srgb_uav = unordered_texture_at(va4, &to_words(texture(16, 16, 29, 1)))
+            .expect("sRGB placed UAV promoted to typeless");
+        // SAFETY: live resource.
+        assert_eq!(unsafe { host_resource(srgb_uav).unwrap().GetDesc() }.Format.0, 27);
+
+        // Unsupported / BC / depth formats must return None cleanly.
+        for bad_fmt in [0, 6, 40, 45, 71, 77, 98, 118] {
+            let bad = to_words(texture(16, 16, bad_fmt, 1));
+            assert_eq!(unordered_texture_at(va4 + 0x1000, &bad), None, "format {bad_fmt}");
+        }
+        assert_eq!(unordered_texture_at(0, &uav_words), None);
+
+        if let Some(err) = host.log_messages() {
+            panic!("D3D12 debug layer error (placed UAV resource): {err}");
+        }
+        // SAFETY: plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+
+        // Release all resources (verifying Drop cleans up PLACED_UAV_TEXTURES & TARGETS_AT).
+        resource_release(srgb_uav);
+        resource_release(uav3d);
+        resource_release(pre);
+        resource_release(bc7_srv);
+        resource_release(same_srv);
         resource_release(uav);
     }
 }
