@@ -110,7 +110,7 @@ fn times(taken: usize) -> Vec<(u64, u64)> {
 
 impl Host {
     fn make_stamps(&self) -> windows::core::Result<Stamps> {
-        let Some((buffer, back)) = self.shared_buffer(16 * MOST as u64) else {
+        let Some((buffer, back)) = self.shared_buffer_private(16 * MOST as u64) else {
             return Err(windows::core::Error::from(windows::Win32::Foundation::E_OUTOFMEMORY));
         };
         // SAFETY: plain object creation; a fresh mapping of that size.

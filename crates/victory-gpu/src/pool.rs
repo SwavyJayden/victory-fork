@@ -410,7 +410,7 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
             speculative_skip = true;
             return None;
         }
-        let (buffer, data) = host.upload_buffer(BLOCK)?;
+        let (buffer, data) = host.upload_buffer_private(BLOCK)?;
         crate::host::name(&buffer, || "staging of textures (a block)".into());
         Some(Upload(buffer, data))
     }) {

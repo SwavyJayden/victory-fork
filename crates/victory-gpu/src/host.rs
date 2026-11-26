@@ -77,7 +77,7 @@ fn adv_log_line(
     let host_staging_mb = crate::texture::live_staging_bytes() >> 20;
     let ps = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
         .map(|i| PREP_SPLIT[i].swap(0, Ordering::Relaxed) as f64 / 1e6 / frames);
-    let [mp_pool, mp_tex] = [0, 1].map(|i| MAPPED_SRC[i].swap(0, Ordering::Relaxed));
+    let [mp_pool, mp_tex, mp_buf] = [0, 1, 2].map(|i| MAPPED_SRC[i].swap(0, Ordering::Relaxed));
     tracing::info!(
         "adv-log: fps={fps:.1} frame={ms:.2}ms prep={prep_ms:.2}ms \
          (copy={copy_ms:.2}ms/{copy_mb:.1}MB tex={tex_ms:.2}ms/{tex_mb:.1}MB) \
@@ -88,7 +88,7 @@ fn adv_log_line(
     );
     tracing::info!(
         "prep-split: lock={:.2}ms steps={:.2}ms sweep={:.2}ms ask={:.2}ms stale={:.2}ms \
-         front={:.2}ms def={:.2}ms card={:.2}ms heap={:.2}ms exec={:.2}ms | mapped={mp_pool}/{mp_tex}",
+         front={:.2}ms def={:.2}ms card={:.2}ms heap={:.2}ms exec={:.2}ms | mapped={mp_pool}/{mp_tex}/{mp_buf}",
         ps[0], ps[1], ps[2], ps[3], ps[4], ps[5], ps[6], ps[7], ps[8], ps[9],
     );
 }
@@ -382,11 +382,16 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
 /// Times, microseconds and the longest of [`mapped`].
 static MAPPED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 /// Calls to [`mapped`] since the last `adv-log` line: `[0]` from `pool::texture`
-/// 64 MiB blocks, `[1]` from standalone committed textures in `resource::host_texture_as`.
-static MAPPED_SRC: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// 64 MiB blocks, `[1]` from standalone committed textures in `resource::host_texture_as`,
+/// `[2]` from descriptor-visible host buffers (`shared_buffer`, `mapped_card_buffer`, `uav_buffer`).
+static MAPPED_SRC: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 pub(crate) fn note_mapped_source(from_pool: bool) {
     MAPPED_SRC[usize::from(!from_pool)].fetch_add(1, Ordering::Relaxed);
+}
+
+fn note_mapped_buffer() {
+    MAPPED_SRC[2].fetch_add(1, Ordering::Relaxed);
 }
 
 /// Release-mode per-phase submit breakdown (nanoseconds, gated on `VICTORY_ADV_LOG=1`):
@@ -2050,8 +2055,9 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     drop(freed);
 }
 
-/// Drops spare scratch chunks kept idle when host memory is pressured.
+/// Drops spare scratch chunks and pooled list uploads kept idle when host memory is pressured.
 fn trim_spare_chunks() {
+    trim_list_uploads();
     let freed: Vec<(Chunk, u64)> = {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         if spare.kept.is_empty() {
@@ -2066,6 +2072,77 @@ fn trim_spare_chunks() {
     ALIVE[2].fetch_sub(bytes, Ordering::Relaxed);
     ALIVE[3].fetch_sub(count, Ordering::Relaxed);
     ALIVE[4].fetch_sub(bytes, Ordering::Relaxed);
+    drop(freed);
+}
+
+/// Pooled list upload buffers (`HostList::upload`), reused after a list resets.
+/// Bucketed by power-of-two size (`64 KiB..=16 MiB`) up to `LIST_UPLOAD_POOL_CAP`.
+const LIST_UPLOAD_POOL_MIN: u64 = 64 << 10;
+const LIST_UPLOAD_POOL_MAX: u64 = 16 << 20;
+const LIST_UPLOAD_POOL_CAP: u64 = 64 << 20;
+
+static LIST_UPLOADS: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
+
+fn list_upload_bucket(size: u64) -> Option<u64> {
+    let bucket = size.max(LIST_UPLOAD_POOL_MIN).next_power_of_two();
+    (bucket <= LIST_UPLOAD_POOL_MAX).then_some(bucket)
+}
+
+fn take_list_upload(host: &Host, size: u64) -> Option<(Chunk, u64, bool)> {
+    let bucket = list_upload_bucket(size);
+    if let Some(alloc) = bucket
+        && let Some(chunk) = LIST_UPLOADS.lock().unwrap_or_else(|e| e.into_inner()).take(alloc)
+    {
+        return Some((chunk, alloc, true));
+    }
+    let alloc = bucket.unwrap_or_else(|| size.max(1));
+    let (buffer, data) = if card_steps::stage() > 1 {
+        host.shared_buffer_private(alloc)?
+    } else {
+        host.upload_buffer_private(alloc)?
+    };
+    name(&buffer, || format!("list upload {alloc:#x}"));
+    Some((
+        Chunk {
+            buffer,
+            data: data as usize,
+        },
+        alloc,
+        bucket.is_some(),
+    ))
+}
+
+fn give_list_uploads(uploads: Vec<(Chunk, u64)>) {
+    if uploads.is_empty() {
+        return;
+    }
+    let mut freed = Vec::new();
+    {
+        let mut pool = LIST_UPLOADS.lock().unwrap_or_else(|e| e.into_inner());
+        for (chunk, size) in uploads {
+            // Only recycle when this list was the sole COM owner (no card_steps
+            // or external command list retains a reference).
+            if references(&chunk.buffer) == 1 {
+                if let Some(overflow) = pool.give(chunk, size, LIST_UPLOAD_POOL_CAP) {
+                    freed.push(overflow);
+                }
+            } else {
+                freed.push(chunk);
+            }
+        }
+    }
+    drop(freed);
+}
+
+fn trim_list_uploads() {
+    let freed = {
+        let mut pool = LIST_UPLOADS.lock().unwrap_or_else(|e| e.into_inner());
+        if pool.kept.is_empty() {
+            return;
+        }
+        pool.bytes = 0;
+        std::mem::take(&mut pool.kept)
+    };
     drop(freed);
 }
 
@@ -2343,9 +2420,11 @@ struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
+    /// Pooled upload buffers from [`HostList::upload`], recycled on reset.
+    list_uploads: Vec<(Chunk, u64)>,
     /// Standalone upload footprints kept through this list's fence (movie planes).
     plane_uploads: Vec<(Chunk, u64)>,
-    /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
+    /// The bytes of `uploads` and `list_uploads` (counted in [`ALIVE`] while they are held).
     upload_bytes: u64,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
@@ -2398,6 +2477,14 @@ impl Deferred {
         self.uploads.push(buffer);
     }
 
+    /// Holds a pooled upload `chunk` (`size` bytes) until the list is reset.
+    fn hold_pooled_upload(&mut self, chunk: Chunk, size: u64) {
+        ALIVE[6].fetch_add(1, Ordering::Relaxed);
+        ALIVE[7].fetch_add(size, Ordering::Relaxed);
+        self.upload_bytes += size;
+        self.list_uploads.push((chunk, size));
+    }
+
     /// The steps recorded last write title memory: what was brought up to
     /// date before them is not any more.
     fn title_written(&mut self) {
@@ -2409,8 +2496,13 @@ impl Deferred {
 
 impl Drop for Deferred {
     fn drop(&mut self) {
+        // Drop deferred steps first so any `Step::Fill` COM clones of pooled
+        // upload buffers release before `give_list_uploads` checks sole ownership.
+        self.copies.clear();
         give_chunks(std::mem::take(&mut self.plane_uploads));
-        ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
+        let count = (self.uploads.len() + self.list_uploads.len()) as u64;
+        give_list_uploads(std::mem::take(&mut self.list_uploads));
+        ALIVE[6].fetch_sub(count, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
     }
 }
@@ -4298,7 +4390,7 @@ impl Host {
         // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
         // in one submission.
         const RESULTS: u64 = 1 << 20;
-        let (differs, data) = self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
+        let (differs, data) = self.shared_buffer_private(RESULTS).ok_or_else(windows::core::Error::empty)?;
         name(&differs, || "card compare results".into());
         // SAFETY: the blob's own bytes; the root signature is inside the
         // shader.
@@ -4375,7 +4467,7 @@ impl Host {
         let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
         for shadow in declared.iter().map(|d| &d.0).chain(looked.iter().map(|l| &l.0)) {
             if shadow.card_make_before(|size| {
-                let before = self.uav_buffer(crate::shadow::card_hash_bytes(size))?;
+                let before = self.uav_buffer_private(crate::shadow::card_hash_bytes(size))?;
                 name(&before, || "title buffer on the card, hashes of its pieces".into());
                 Some(before)
             }) {
@@ -4817,7 +4909,7 @@ impl Host {
         };
         if f.buffer.as_ref().is_none_or(|b| b.2 < total) {
             let size = total.next_multiple_of(16 << 20);
-            f.buffer = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+            f.buffer = self.shared_buffer_private(size).map(|(buffer, data)| (buffer, data as usize, size));
         }
         let Some((buffer, data, _)) = f.buffer.clone() else {
             fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes, VICTORY_RELAY=1)"));
@@ -5135,7 +5227,7 @@ impl Host {
         if !pieces.is_empty() {
             if work.fetched.as_ref().is_none_or(|f| f.2 < total) {
                 let size = total.next_multiple_of(16 << 20);
-                work.fetched = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+                work.fetched = self.shared_buffer_private(size).map(|(buffer, data)| (buffer, data as usize, size));
             }
             let Some((fetched, data, _)) = &work.fetched else {
                 fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes)"));
@@ -7062,14 +7154,18 @@ impl HostList {
     }
 
     /// A mapped upload buffer of `size` bytes, alive until the list is
-    /// reset.
-    ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
+    /// reset. Pooled by power-of-two size (`64 KiB..=16 MiB`) and created
+    /// privately (never placed in a descriptor heap read by already in-flight
+    /// lists, so it avoids per-copy `MakeResident` + `mapped()` fence stalls).
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        // With [`card_steps`] the card may be the one that fills it.
-        let (buffer, data) = if card_steps::stage() > 1 { host.shared_buffer(size)? } else { host.upload_buffer(size)? };
-        name(&buffer, || format!("list upload {size:#x}"));
-        self.deferred().hold_upload(buffer.clone(), size);
+        let (chunk, alloc, pooled) = take_list_upload(host, size)?;
+        let buffer = chunk.buffer.clone();
+        let data = chunk.data as *mut u8;
+        if pooled {
+            self.deferred().hold_pooled_upload(chunk, alloc);
+        } else {
+            self.deferred().hold_upload(chunk.buffer, alloc);
+        }
         Some((buffer, data))
     }
 
@@ -7136,7 +7232,7 @@ impl HostList {
         let (buffer, data) = self
             .budget
             .get_or_init(|| {
-                let (b, d) = host()?.shared_buffer(256)?;
+                let (b, d) = host()?.shared_buffer_private(256)?;
                 Some((b, d as usize))
             })
             .as_ref()?;
@@ -7180,7 +7276,7 @@ impl HostList {
             return None;
         }
         self.list.cast::<ID3D12GraphicsCommandList2>().ok()?;
-        let buffer = host()?.uav_buffer(256)?;
+        let buffer = host()?.uav_buffer_private(256)?;
         name(&buffer, || "indirect budget".to_owned());
         Some(buffer)
     }
@@ -7261,7 +7357,7 @@ impl HostList {
             .saturating_mul(2)
             .max(needed)
             .next_multiple_of(64 << 10);
-        let buffer = host()?.uav_buffer(alloc)?;
+        let buffer = host()?.uav_buffer_private(alloc)?;
         name(&buffer, || format!("indirect arguments {alloc:#x}"));
         let old = slot.replace((buffer.clone(), alloc));
         drop(slot);
@@ -7283,7 +7379,7 @@ impl HostList {
         let (buffer, i) = ((args.1 / BATCHES) as usize, args.1 % BATCHES);
         if buffer == args.0.len() {
             let size = u64::from(BATCHES * JOBS * SLOT);
-            let made = host()?.uav_buffer(size)?;
+            let made = host()?.uav_buffer_private(size)?;
             name(&made, || format!("indirect batches {size:#x}"));
             args.0.push(made);
         }
@@ -8694,6 +8790,17 @@ impl Host {
     }
 
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.upload_buffer_inner(size, true)
+    }
+
+    /// As [`Host::upload_buffer`], for buffers private to command lists
+    /// submitted after creation (never placed in a descriptor heap read by
+    /// already in-flight lists). Skips `CREATE_NOT_RESIDENT` + `MakeResident`.
+    pub(crate) fn upload_buffer_private(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.upload_buffer_inner(size, false)
+    }
+
+    fn upload_buffer_inner(&self, size: u64, sync_resident: bool) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -8715,12 +8822,13 @@ impl Host {
         };
         let mut buffer: Option<ID3D12Resource> = None;
         let mut data = std::ptr::null_mut();
+        let flags = if sync_resident { not_resident() } else { D3D12_HEAP_FLAG_NONE };
         // SAFETY: plain creation and mapping of an upload buffer.
         let made = unsafe {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    not_resident(),
+                    flags,
                     &desc,
                     D3D12_RESOURCE_STATE_GENERIC_READ,
                     None,
@@ -8728,7 +8836,9 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
+                    if sync_resident {
+                        resident(&self.device, b)?;
+                    }
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -9577,9 +9687,26 @@ impl Host {
 
     /// A buffer in system memory that the CPU maps (write-back, so reading
     /// it is fast too) and shaders read and write: for host copies of title
-    /// memory that shaders write, which upload memory cannot be. Starts in
-    /// the common state (buffers move out of it implicitly).
+    /// A buffer of `size` bytes that shaders can read and write (unordered
+    /// access) and the CPU maps (`MEMORY_POOL_L0`, write-back): PC memory that
+    /// shaders write, which upload memory cannot be. Starts in the common state
+    /// (buffers move out of it implicitly).
+    ///
+    /// Waits for residency + GPU VA mapping (`resident` + `mapped`) so already
+    /// in-flight lists reading the live descriptor heap never page-fault on it.
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.shared_buffer_inner(size, true)
+    }
+
+    /// As [`Host::shared_buffer`], for buffers private to command lists
+    /// submitted after creation (never placed in a descriptor heap read by
+    /// already in-flight lists). Skips `CREATE_NOT_RESIDENT` + `MakeResident`
+    /// + the global `mapped()` copy-queue fence wait.
+    pub(crate) fn shared_buffer_private(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.shared_buffer_inner(size, false)
+    }
+
+    fn shared_buffer_inner(&self, size: u64, sync_resident: bool) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[2].fetch_add(1, Ordering::Relaxed);
         MADE[3].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -9604,12 +9731,13 @@ impl Host {
         };
         let mut buffer: Option<ID3D12Resource> = None;
         let mut data = std::ptr::null_mut();
+        let flags = if sync_resident { not_resident() } else { D3D12_HEAP_FLAG_NONE };
         // SAFETY: plain creation and mapping of a CPU-visible buffer.
         let made = unsafe {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    not_resident(),
+                    flags,
                     &desc,
                     D3D12_RESOURCE_STATE_COMMON,
                     None,
@@ -9617,8 +9745,11 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
-                    mapped(&self.device)?;
+                    if sync_resident {
+                        resident(&self.device, b)?;
+                        note_mapped_buffer();
+                        mapped(&self.device)?;
+                    }
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -9664,6 +9795,16 @@ impl Host {
     /// (with `written`) may write. The CPU should only write it: a read of the
     /// mapping crosses the bus a few bytes at a time.
     pub(crate) fn mapped_card_buffer(&self, size: u64, written: bool) -> Option<(ID3D12Resource, *mut u8)> {
+        self.mapped_card_buffer_inner(size, written, true)
+    }
+
+    /// As [`Host::mapped_card_buffer`], for buffers private to command lists
+    /// submitted after creation (no live descriptor-heap exposure).
+    pub(crate) fn mapped_card_buffer_private(&self, size: u64, written: bool) -> Option<(ID3D12Resource, *mut u8)> {
+        self.mapped_card_buffer_inner(size, written, false)
+    }
+
+    fn mapped_card_buffer_inner(&self, size: u64, written: bool, sync_resident: bool) -> Option<(ID3D12Resource, *mut u8)> {
         if !self.mapped_card_memory() {
             return None;
         }
@@ -9693,12 +9834,13 @@ impl Host {
         };
         let mut buffer: Option<ID3D12Resource> = None;
         let mut data = std::ptr::null_mut();
+        let flags = if sync_resident { not_resident() } else { D3D12_HEAP_FLAG_NONE };
         // SAFETY: plain creation and mapping of a CPU-visible buffer.
         let made = unsafe {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    not_resident(),
+                    flags,
                     &desc,
                     D3D12_RESOURCE_STATE_COMMON,
                     None,
@@ -9706,8 +9848,11 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
-                    mapped(&self.device)?;
+                    if sync_resident {
+                        resident(&self.device, b)?;
+                        note_mapped_buffer();
+                        mapped(&self.device)?;
+                    }
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -9723,6 +9868,18 @@ impl Host {
     /// A device-local buffer shaders may write (unordered access) and indirect
     /// execution may read, starting in the common state.
     pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        self.uav_buffer_inner(size, true)
+    }
+
+    /// As [`Host::uav_buffer`], for buffers private to command lists submitted
+    /// after creation (never placed in a descriptor heap read by already
+    /// in-flight lists). Skips `CREATE_NOT_RESIDENT` + `MakeResident` +
+    /// `mapped()`.
+    pub(crate) fn uav_buffer_private(&self, size: u64) -> Option<ID3D12Resource> {
+        self.uav_buffer_inner(size, false)
+    }
+
+    fn uav_buffer_inner(&self, size: u64, sync_resident: bool) -> Option<ID3D12Resource> {
         MADE[4].fetch_add(1, Ordering::Relaxed);
         MADE[5].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -9744,11 +9901,12 @@ impl Host {
             ..Default::default()
         };
         let mut buffer: Option<ID3D12Resource> = None;
+        let flags = if sync_resident { not_resident() } else { D3D12_HEAP_FLAG_NONE };
         // SAFETY: plain creation of a device-local buffer.
         let made = unsafe {
             self.device.CreateCommittedResource(
                 &heap,
-                not_resident(),
+                flags,
                 &desc,
                 D3D12_RESOURCE_STATE_COMMON,
                 None,
@@ -9759,7 +9917,15 @@ impl Host {
         if let Some(b) = &buffer {
             crate::book::made(b, || "an unordered access buffer".into());
         }
-        let made = made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b))).and_then(|()| mapped(&self.device));
+        let made = if sync_resident {
+            made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b)))
+                .and_then(|()| {
+                    note_mapped_buffer();
+                    mapped(&self.device)
+                })
+        } else {
+            made
+        };
         match made {
             Ok(()) => buffer,
             Err(e) => {
@@ -10800,6 +10966,33 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+
+    #[test]
+    fn list_upload_bucket_boundaries() {
+        assert_eq!(super::list_upload_bucket(0), Some(64 << 10));
+        assert_eq!(super::list_upload_bucket(4096), Some(64 << 10));
+        assert_eq!(super::list_upload_bucket((64 << 10) + 1), Some(128 << 10));
+        assert_eq!(super::list_upload_bucket(16 << 20), Some(16 << 20));
+        assert_eq!(super::list_upload_bucket((16 << 20) + 1), None);
+    }
+
+    #[test]
+    fn private_buffers_skip_mapped_and_resident_waits() {
+        use std::sync::atomic::Ordering;
+        let Some(host) = super::host() else {
+            return;
+        };
+        let mapped_before = super::MAPPED[0].load(Ordering::Relaxed);
+        let resident_before = super::RESIDENT[0].load(Ordering::Relaxed);
+        let (u, u_ptr) = host.upload_buffer_private(4096).expect("private upload buffer");
+        let (s, s_ptr) = host.shared_buffer_private(4096).expect("private shared buffer");
+        let d = host.uav_buffer_private(4096).expect("private uav buffer");
+        assert!(!u_ptr.is_null());
+        assert!(!s_ptr.is_null());
+        assert_eq!(super::MAPPED[0].load(Ordering::Relaxed), mapped_before);
+        assert_eq!(super::RESIDENT[0].load(Ordering::Relaxed), resident_before);
+        drop((u, s, d));
     }
 }
 

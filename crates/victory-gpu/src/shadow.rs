@@ -112,10 +112,12 @@ struct Card {
     /// the card's side before the next submission.
     staging: ID3D12Resource,
     /// The card side's bytes as they were when the submission's shaders
-    /// started, in the card's memory too: made when shader writes are
+    /// started, in the card's memory too: made once when shader writes are
     /// first declared for the copy, and compared with the card's side, on
     /// the card, after each submission that declares some.
-    before: Mutex<Option<ID3D12Resource>>,
+    before: std::sync::OnceLock<ID3D12Resource>,
+    /// Serializes the one-time fallible creation of [`Self::before`].
+    before_init: Mutex<()>,
     /// Offsets of the copy whose bytes changed on the CPU's side and have
     /// not gone to the card's side yet.
     dirty: Mutex<Vec<(usize, usize)>>,
@@ -124,10 +126,28 @@ struct Card {
     /// ([`card_dirty`]), kept until a fetch sent after it has been merged.
     /// Locked inside `dirty`'s lock.
     sent: Mutex<SentRuns>,
-    /// Whether something was put into `dirty` since it was last taken.
+    /// Whether this copy is currently queued in [`CARDED_DIRTY`].
     touched: std::sync::atomic::AtomicBool,
+    /// Weak self-pointer populated when the owning `Arc<Shadow>` is registered
+    /// so `card_changed_runs` can enqueue only dirty copies in O(1).
+    self_weak: std::sync::OnceLock<std::sync::Weak<Shadow>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
+}
+
+impl Card {
+    fn new(staging: ID3D12Resource, size: u64) -> Self {
+        Self {
+            staging,
+            before: std::sync::OnceLock::new(),
+            before_init: Mutex::new(()),
+            dirty: Mutex::default(),
+            sent: Mutex::default(),
+            touched: std::sync::atomic::AtomicBool::new(false),
+            self_weak: std::sync::OnceLock::new(),
+            size,
+        }
+    }
 }
 
 /// Whether the host copies of big title buffers are in the card's own
@@ -309,6 +329,23 @@ pub(crate) fn card_room_kept() -> u64 {
 /// The copies in the card's memory.
 static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 
+/// Subset of [`CARDED`] whose CPU side changed since the last [`card_dirty`]
+/// drain. Keeping a dedicated dirty queue turns per-submission collection from
+/// O(all carded copies) (~3,700 Weak upgrades/submission) into O(dirty copies).
+static CARDED_DIRTY: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+
+/// Registers a newly constructed `Arc<Shadow>` with card memory in [`CARDED`]
+/// and wires its `self_weak` pointer so [`Shadow::card_changed_runs`] can
+/// enqueue it into [`CARDED_DIRTY`] in O(1).
+fn register_carded(shadow: &Arc<Shadow>) {
+    let Some(card) = &shadow.card else {
+        return;
+    };
+    let weak = Arc::downgrade(shadow);
+    let _ = card.self_weak.set(weak.clone());
+    CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(weak);
+}
+
 /// Since the last frame line: bytes copied to card sides and the ranges
 /// they were; pieces compared on the card, pieces fetched and their
 /// bytes; the waits for the card the fetches added and their microseconds.
@@ -327,7 +364,10 @@ pub(crate) fn card_stats() -> [u64; 10] {
     for (i, stat) in CARD_STATS.iter().enumerate() {
         out[i] = stat.swap(0, Ordering::Relaxed);
     }
-    out[7] = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|w| w.strong_count() > 0).count() as u64;
+    let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+    carded.retain(|w| w.strong_count() > 0);
+    out[7] = carded.len() as u64;
+    drop(carded);
     out[8] = CARD_BYTES[0].load(Ordering::Relaxed)
         + WINDOW_CARD_BYTES.load(Ordering::Relaxed)
         + WINDOW_MAPPED_BYTES.load(Ordering::Relaxed);
@@ -616,33 +656,42 @@ impl SentRuns {
 /// ([`Shadow::card_merge_relay`]). Notes of sends that every fetch still to
 /// be merged came after are dropped.
 pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
-    let mut out = Vec::new();
-    let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+    let pending = {
+        let mut queue = CARDED_DIRTY.lock().unwrap_or_else(|e| e.into_inner());
+        if queue.is_empty() {
+            return Vec::new();
+        }
+        std::mem::take(&mut *queue)
+    };
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
-    carded.retain(|weak| {
+    let mut out = Vec::with_capacity(pending.len());
+    for weak in pending {
         let Some(shadow) = weak.upgrade() else {
-            return false;
+            continue;
         };
-        let ranges = shadow
-            .card
-            .as_ref()
-            .filter(|c| c.touched.swap(false, Ordering::AcqRel))
-            .map(|c| {
-                let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
-                let ranges = joined(std::mem::take(&mut *dirty));
-                if relay() {
-                    let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
-                    sent.forget(fetched);
-                    sent.note_joined(sent_as, ranges.clone());
-                }
-                ranges
-            })
-            .unwrap_or_default();
+        let Some(c) = shadow.card.as_ref() else {
+            continue;
+        };
+        let ranges = {
+            let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
+            // Clear `touched` inside `dirty`'s lock so any concurrent writer
+            // arriving after this take is guaranteed to re-enqueue `shadow`.
+            c.touched.store(false, Ordering::Release);
+            if dirty.is_empty() {
+                continue;
+            }
+            let ranges = joined(std::mem::take(&mut *dirty));
+            if relay() {
+                let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
+                sent.forget(fetched);
+                sent.note_joined(sent_as, ranges.clone());
+            }
+            ranges
+        };
         if !ranges.is_empty() {
             out.push((shadow, ranges));
         }
-        true
-    });
+    }
     out
 }
 
@@ -2507,7 +2556,7 @@ impl Drop for Shadow {
             } else {
                 CARD_BYTES[0].fetch_sub(card.size, Ordering::Relaxed);
             }
-            if card.before.get_mut().unwrap_or_else(|e| e.into_inner()).is_some() {
+            if card.before.get().is_some() {
                 CARD_BYTES[1].fetch_sub(card_hash_bytes(card.size), Ordering::Relaxed);
             }
         }
@@ -4037,7 +4086,7 @@ impl Shadow {
             }
             return self.copy(from, to);
         };
-        let whole = !known && card.before.lock().unwrap_or_else(|e| e.into_inner()).is_none();
+        let whole = !known && card.before.get().is_none();
         let start = self.start as usize;
         TITLE.with_borrow_mut(|title| {
             title.resize(PAGE, 0);
@@ -4128,15 +4177,23 @@ impl Shadow {
         if runs.peek().is_none() {
             return;
         }
-        let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
-        for (from, to) in runs {
-            match dirty.last_mut() {
-                Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
-                _ => dirty.push((from, to)),
+        let enqueue = {
+            let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+            for (from, to) in runs {
+                match dirty.last_mut() {
+                    Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
+                    _ => dirty.push((from, to)),
+                }
             }
+            // Tested and set inside `dirty`'s lock so `card_dirty` cannot clear
+            // `touched` between pushing ranges and deciding whether to enqueue.
+            !card.touched.swap(true, Ordering::AcqRel)
+        };
+        if enqueue
+            && let Some(weak) = card.self_weak.get()
+        {
+            CARDED_DIRTY.lock().unwrap_or_else(|e| e.into_inner()).push(weak.clone());
         }
-        // (Under the lock: what takes the list sees it or finds it set.)
-        card.touched.store(true, Ordering::Release);
     }
 
     /// Whether shaders were ever declared to write it.
@@ -4193,10 +4250,9 @@ impl Shadow {
 
     /// Of a copy in the card's memory: the CPU's side (PC memory), the
     /// card side's bytes from before if made yet, and their size.
-    pub(crate) fn card_sides(&self) -> Option<(&ID3D12Resource, Option<ID3D12Resource>, u64)> {
+    pub(crate) fn card_sides(&self) -> Option<(&ID3D12Resource, Option<&ID3D12Resource>, u64)> {
         let card = self.card.as_ref()?;
-        let before = card.before.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        Some((&card.staging, before, card.size))
+        Some((&card.staging, card.before.get(), card.size))
     }
 
     /// Shader writes are declared for a copy in the card's memory: makes
@@ -4208,15 +4264,22 @@ impl Shadow {
         let Some(card) = &self.card else {
             return false;
         };
-        let mut before = card.before.lock().unwrap_or_else(|e| e.into_inner());
-        if before.is_some() {
+        if card.before.get().is_some() {
             return false;
         }
-        *before = make(card.size);
-        if before.is_some() {
-            CARD_BYTES[1].fetch_add(card_hash_bytes(card.size), Ordering::Relaxed);
+        let _guard = card.before_init.lock().unwrap_or_else(|e| e.into_inner());
+        if card.before.get().is_some() {
+            return false;
         }
-        before.is_some()
+        let Some(buf) = make(card.size) else {
+            return false;
+        };
+        if card.before.set(buf).is_ok() {
+            CARD_BYTES[1].fetch_add(card_hash_bytes(card.size), Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
     }
 
     /// The declared range `[address, end)` as the compare on the card
@@ -4427,14 +4490,7 @@ impl Shadow {
         let none = || unsafe { std::mem::transmute::<usize, ID3D12Resource>(8) };
         let mut shadow = Shadow::new(none(), data, 0, start, len);
         if card {
-            shadow.card = Some(Card {
-                staging: none(),
-                before: Mutex::default(),
-                dirty: Mutex::default(),
-                sent: Mutex::default(),
-                touched: Default::default(),
-                size: len.next_multiple_of(PIECE as u64),
-            });
+            shadow.card = Some(Card::new(none(), len.next_multiple_of(PIECE as u64)));
         }
         let shadow = Arc::new(shadow);
         std::mem::forget(shadow.clone());
@@ -4573,7 +4629,6 @@ impl Shadow {
 #[cfg(test)]
 mod land_tests {
     use super::{Card, PIECE, Shadow};
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     /// A copy in the card's memory of title memory at `title` (its card side
@@ -4583,14 +4638,7 @@ mod land_tests {
         // SAFETY: the mapping, `len` bytes.
         unsafe { std::ptr::write_bytes(data, 0, len) };
         let mut shadow = Shadow::new(buffer.clone(), data, 0, title as u64, len as u64);
-        shadow.card = Some(Card {
-            staging: buffer,
-            before: Mutex::default(),
-            dirty: Mutex::default(),
-            sent: Mutex::default(),
-                touched: Default::default(),
-            size: len as u64,
-        });
+        shadow.card = Some(Card::new(buffer, len as u64));
         Some(shadow)
     }
 
@@ -4986,29 +5034,26 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
-        let (buffer, data) = host()?.shared_buffer(size)?;
-        crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
-        // A big one, with `cards`: shaders get a buffer in the card's own
-        // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
+        let (buffer, data, card) = match card_for(size) {
             Some(on_card) => {
+                let Some((staging, data)) = host()?.shared_buffer_private(size) else {
+                    CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+                    return None;
+                };
+                crate::host::name(&staging, || format!("title buffer {:#x}+{len:#x}", key.0));
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
                 tracing::info!(
                     start = format_args!("{:#x}", key.0),
                     len,
                     "a buffer's host copy is in the card's memory"
                 );
-                let card = Card {
-                    staging: buffer,
-                    before: Mutex::default(),
-                    dirty: Mutex::default(),
-                    sent: Mutex::default(),
-                touched: Default::default(),
-                    size,
-                };
-                (on_card, Some(card))
+                (on_card, data, Some(Card::new(staging, size)))
             }
-            None => (buffer, None),
+            None => {
+                let (buffer, data) = host()?.shared_buffer(size)?;
+                crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
+                (buffer, data, None)
+            }
         };
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -5029,7 +5074,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         shadow.card = card;
         let shadow = Arc::new(shadow);
         if shadow.card.is_some() {
-            CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+            register_carded(&shadow);
         }
         entry.shadow = Some(shadow);
     }
@@ -5207,7 +5252,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         mb.unwrap_or(4096) << 20
     });
     let room = host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
-    let (staging, data) = host.shared_buffer(len)?;
+    let (staging, data) = host.shared_buffer_private(len)?;
     let reserved = room
         && USED
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
@@ -5236,16 +5281,9 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
     shadow.changes_only.store(true, Ordering::Relaxed);
-    shadow.card = Some(Card {
-        staging,
-        before: Mutex::default(),
-        dirty: Mutex::default(),
-        sent: Mutex::default(),
-        touched: Default::default(),
-        size: len,
-    });
+    shadow.card = Some(Card::new(staging, len));
     let shadow = Arc::new(shadow);
-    CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+    register_carded(&shadow);
     Some(shadow)
 }
 
@@ -5318,24 +5356,23 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
-    let (buffer, data) = host()?.shared_buffer(len)?;
-    crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // With room for windows on the card (`window_card_most`): shaders get a
-    // buffer there, and the one just made is the CPU's side.
-    let (buffer, card) = match window_card_for(len) {
+    // buffer there, and the CPU side is strictly private staging (no mapped() stall).
+    let (buffer, data, card) = match window_card_for(len) {
         Some(on_card) => {
-            crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
-            let card = Card {
-                staging: buffer,
-                before: Mutex::default(),
-                dirty: Mutex::default(),
-                sent: Mutex::default(),
-                touched: Default::default(),
-                size: len,
+            let Some((staging, data)) = host()?.shared_buffer_private(len) else {
+                WINDOW_CARD_BYTES.fetch_sub(len, Ordering::Relaxed);
+                return None;
             };
-            (on_card, Some(card))
+            crate::host::name(&staging, || format!("title memory {start:#x}+{len:#x}"));
+            crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
+            (on_card, data, Some(Card::new(staging, len)))
         }
-        None => (buffer, None),
+        None => {
+            let (buffer, data) = host()?.shared_buffer(len)?;
+            crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
+            (buffer, data, None)
+        }
     };
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -5349,7 +5386,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     shadow.card = card;
     let shadow = Arc::new(shadow);
     if shadow.card.is_some() {
-        CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+        register_carded(&shadow);
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());
@@ -5382,9 +5419,10 @@ static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// change every frame).
 pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     /// Copies kept before the idle ones are looked for, and the askings an
-    /// idle one stays for.
-    const MANY: usize = 256;
-    const LATELY: u64 = 512;
+    /// idle one stays for. Sized to absorb multi-frame ring positions without
+    /// triggering 5-second eviction-recreation (`mapped()`) churn.
+    const MANY: usize = 1024;
+    const LATELY: u64 = 4096;
     /// The largest, and no view the title made on purpose: off its dwords.
     const MOST: u64 = 64 << 20;
     if len == 0 || len > MOST || !address.is_multiple_of(4) {
@@ -5574,6 +5612,50 @@ mod window_tests {
             assert!(start <= address && start + len >= end);
             assert!(start % g == 0 && len % g == 0);
         }
+    }
+
+    /// `CARDED_DIRTY` returns only shadows written since the last drain and
+    /// re-enqueues a shadow when written again in a later submission.
+    #[test]
+    fn card_dirty_queue_tracks_only_modified_copies() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let make = |addr: u64| {
+            let (staging, data) = host.shared_buffer_private(4096).expect("staging");
+            let on_card = host.uav_buffer_private(4096).expect("card");
+            let mut s = super::Shadow::new(on_card, data, 0, addr, 4096);
+            s.card = Some(super::Card::new(staging, 4096));
+            let s = std::sync::Arc::new(s);
+            super::register_carded(&s);
+            s
+        };
+        let a = make(0x1000_0000);
+        let b = make(0x2000_0000);
+        // Drain any unrelated entries from parallel tests before asserting.
+        let _ = super::card_dirty(0);
+        a.card_changed(0, 64);
+        a.card_changed(64, 128);
+        let got = super::card_dirty(1);
+        let a_ranges: Vec<_> = got
+            .iter()
+            .filter(|(s, _)| std::sync::Arc::ptr_eq(s, &a))
+            .flat_map(|(_, r)| r.iter().copied())
+            .collect();
+        assert_eq!(a_ranges, vec![(0, 128)]);
+        assert!(!got.iter().any(|(s, _)| std::sync::Arc::ptr_eq(s, &b)));
+        // Second drain with no new writes yields neither `a` nor `b`.
+        let got2 = super::card_dirty(2);
+        assert!(!got2.iter().any(|(s, _)| std::sync::Arc::ptr_eq(s, &a) || std::sync::Arc::ptr_eq(s, &b)));
+        // Writing `a` again re-enqueues it cleanly.
+        a.card_changed(256, 320);
+        let got3 = super::card_dirty(3);
+        let a_ranges3: Vec<_> = got3
+            .iter()
+            .filter(|(s, _)| std::sync::Arc::ptr_eq(s, &a))
+            .flat_map(|(_, r)| r.iter().copied())
+            .collect();
+        assert_eq!(a_ranges3, vec![(256, 320)]);
     }
 }
 

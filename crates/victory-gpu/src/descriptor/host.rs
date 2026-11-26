@@ -538,7 +538,7 @@ fn neutral() -> Option<&'static ID3D12Resource> {
         .get_or_init(|| {
             let host = host()?;
             let device = &host.device;
-            let (from, data) = host.upload_buffer(256)?;
+            let (from, data) = host.upload_buffer_private(256)?;
             // SAFETY: the buffer's mapping; plain creation and recording,
             // waited for before what it names goes.
             unsafe {

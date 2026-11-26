@@ -172,9 +172,9 @@ pub(super) fn record(
         return None;
     }
     let pass = pass(host)?;
-    let (bytes, to) = host.shared_buffer(total.min(MOST) as u64)?;
+    let (bytes, to) = host.shared_buffer_private(total.min(MOST) as u64)?;
     let size = (all.len() as u64 * ANSWER).next_multiple_of(256);
-    let (found, answers) = host.shared_buffer(size)?;
+    let (found, answers) = host.shared_buffer_private(size)?;
     // SAFETY: mappings of the sizes asked for; an open list, whose compute
     // state is set whole by what follows; live buffers, the ranges in them.
     unsafe {
@@ -530,7 +530,7 @@ fn look(host: &Host) -> Option<u64> {
         return Some(0);
     }
     let size = (pieces.len() as u64 * ANSWER).next_multiple_of(256);
-    let (found, answers) = host.shared_buffer(size)?;
+    let (found, answers) = host.shared_buffer_private(size)?;
     // SAFETY: a mapping of that size.
     unsafe { std::ptr::write_bytes(answers, 0, size as usize) };
     run(host, |list| {
@@ -584,7 +584,7 @@ fn look(host: &Host) -> Option<u64> {
     // Per copy, what stands where, of a few pieces.
     const SHOWN: usize = 64;
     let shown = &differs[..differs.len().min(SHOWN)];
-    let (held, data) = host.shared_buffer((SHOWN * PIECE) as u64)?;
+    let (held, data) = host.shared_buffer_private((SHOWN * PIECE) as u64)?;
     run(host, |list| {
         for (i, d) in shown.iter().enumerate() {
             // SAFETY: an open list; live buffers, the ranges in them.

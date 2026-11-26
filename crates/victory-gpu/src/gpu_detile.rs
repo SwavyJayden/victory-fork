@@ -44,8 +44,9 @@ pub(crate) const MIN_BYTES: usize = 4 << 10;
 
 /// Largest single VRAM linear staging buffer kept in [`VRAM_SPARE`].
 const VRAM_SPARE_MAX_SINGLE: u64 = 16 << 20;
-/// Maximum idle VRAM bytes kept in [`VRAM_SPARE`].
-const VRAM_SPARE_BUDGET: u64 = 128 << 20;
+/// Maximum idle VRAM bytes kept in [`VRAM_SPARE`] (trimmed back to
+/// `VRAM_SPARE_IDLE_KEEP` on idle and evicted immediately under VRAM pressure).
+const VRAM_SPARE_BUDGET: u64 = 256 << 20;
 /// Maximum idle VRAM bytes retained after an idle trim period.
 const VRAM_SPARE_IDLE_KEEP: u64 = 32 << 20;
 /// Standard size of one raw tiled `UPLOAD` slab in the async ring pool.
@@ -502,11 +503,11 @@ pub(crate) fn take_vram_buf(host: &Host, total: u64) -> Option<(ID3D12Resource, 
             return Some((buffer, alloc_size, pooled));
         }
     }
-    let buffer = match host.uav_buffer(alloc_size) {
+    let buffer = match host.uav_buffer_private(alloc_size) {
         Some(buf) => buf,
         None => {
             evict_completed_spares(alloc_size);
-            match host.uav_buffer(alloc_size) {
+            match host.uav_buffer_private(alloc_size) {
                 Some(buf) => buf,
                 None => {
                     ACTIVE_VRAM_BYTES.fetch_sub(alloc_size, Ordering::Relaxed);
@@ -779,7 +780,7 @@ fn trim_raw_pool_idle(idle_ms: u64, now: u64) {
 }
 
 fn alloc_dedicated_raw(host: &Host, aligned: u64) -> Option<RawSlice> {
-    let (buffer, data) = host.upload_buffer(aligned)?;
+    let (buffer, data) = host.upload_buffer_private(aligned)?;
     let id = NEXT_SLAB_ID.fetch_add(1, Ordering::Relaxed);
     crate::host::name(&buffer, || format!("gpu detile raw temp {aligned:#x}"));
     // SAFETY: live upload buffer.
@@ -825,7 +826,7 @@ fn alloc_raw_slice(host: &Host, len: usize) -> Option<RawSlice> {
         break;
     }
 
-    let Some((buffer, data)) = host.upload_buffer(RAW_SLAB_SIZE) else {
+    let Some((buffer, data)) = host.upload_buffer_private(RAW_SLAB_SIZE) else {
         return alloc_dedicated_raw(host, aligned);
     };
     let id = NEXT_SLAB_ID.fetch_add(1, Ordering::Relaxed);
@@ -1481,7 +1482,7 @@ impl DetileEngine {
         table[256..256 + pat[1].len()].copy_from_slice(&pat[1]);
 
         let (stage, stage_ptr) = host
-            .upload_buffer(2048)
+            .upload_buffer_private(2048)
             .ok_or_else(windows::core::Error::empty)?;
         // SAFETY: `stage_ptr` is a valid 2048-byte mapped upload buffer.
         unsafe {

@@ -246,7 +246,7 @@ impl Buffers {
         let (width, height) = size(scale);
         let pitch = (width * colours(format)?[0].len() as u32).next_multiple_of(256);
         let bytes = u64::from(pitch) * u64::from(height);
-        let uploads = (0..UPLOADS).map(|_| host.upload_buffer(bytes)).collect::<Option<Vec<_>>>()?;
+        let uploads = (0..UPLOADS).map(|_| host.upload_buffer_private(bytes)).collect::<Option<Vec<_>>>()?;
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_DEFAULT,
             ..Default::default()

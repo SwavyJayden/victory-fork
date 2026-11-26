@@ -241,13 +241,13 @@ fn memory(host: &Host, size: u64) -> Option<Memory> {
     }
     let size = size.max(8 << 20).next_power_of_two();
     let mapped = if on_card() {
-        host.mapped_card_buffer(size, false)
+        host.mapped_card_buffer_private(size, false)
     } else {
         None
     };
     let (buffer, data) = match mapped {
         Some(made) => made,
-        None => host.upload_buffer(size)?,
+        None => host.upload_buffer_private(size)?,
     };
     name(&buffer, || "bytes a submission sends up".into());
     Some(Memory {
