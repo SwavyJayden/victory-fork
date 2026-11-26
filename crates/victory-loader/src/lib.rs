@@ -24,8 +24,12 @@
 #[cfg(windows)]
 mod console_insn;
 mod crash;
+#[cfg(windows)]
+pub mod descriptor_sites;
+pub mod frame_rate;
 pub mod prepare;
 pub(crate) mod publish;
+pub mod resolution;
 pub mod resolve;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod profile;

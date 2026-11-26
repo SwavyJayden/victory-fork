@@ -168,6 +168,14 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     }
 }
 
+/// Something placed elsewhere (`crate::port`) in the same form: counted as
+/// [`place_for`] counts, so that [`gone`] takes it off again.
+pub(crate) fn counted(window: bool, bytes: u64) {
+    let at = if window { 0 } else { 2 };
+    STATS[at].fetch_add(1, Ordering::Relaxed);
+    STATS[at + 1].fetch_add(bytes, Ordering::Relaxed);
+}
+
 /// What [`place_for`] gave is gone.
 pub(crate) fn gone(window: bool, bytes: u64) {
     let at = if window { 0 } else { 2 };
@@ -182,6 +190,8 @@ pub(crate) fn gone(window: bool, bytes: u64) {
 /// the runtime to call before the title's own `VirtualFree` once it takes
 /// that call over.
 pub fn title_memory_freeing(at: usize, len: usize) {
+    // Renderer port 1's regions there: no longer what the title shows.
+    crate::port::forget(at, len);
     if STATS[0].load(Ordering::Relaxed) + STATS[2].load(Ordering::Relaxed) == 0 {
         return;
     }
@@ -551,6 +561,44 @@ pub(crate) fn cover(at: usize, len: usize) -> Cover {
     cover_in(&views().views, at, len)
 }
 
+/// The whole stretch of views around `[at, at + len)` that follow one
+/// another in memory and in one section alike, if the range is one run of a
+/// section ([`Cover::Run`]): its first address, its bytes, the section and
+/// the offset of its first byte in it.
+pub(crate) fn stretch(at: usize, len: usize) -> Option<(usize, usize, usize, u64)> {
+    let v = views();
+    stretch_in(&v.views, at, len)
+}
+
+fn stretch_in(
+    views: &BTreeMap<usize, (usize, usize, u64)>,
+    at: usize,
+    len: usize,
+) -> Option<(usize, usize, usize, u64)> {
+    let Cover::Run(section, offset) = cover_in(views, at, len) else {
+        return None;
+    };
+    // Every view of the stretch has the same address less section offset.
+    let delta = at as i128 - offset as i128;
+    let follows = |a: usize, s: usize, o: u64| s == section && a as i128 - o as i128 == delta;
+    let (&first, &(n, _, _)) = views.range(..=at).next_back()?;
+    let mut start = first;
+    for (&a, &(n, s, o)) in views.range(..first).rev() {
+        if a + n != start || !follows(a, s, o) {
+            break;
+        }
+        start = a;
+    }
+    let mut stop = first + n;
+    for (&a, &(n, s, o)) in views.range(first + 1..) {
+        if a != stop || !follows(a, s, o) {
+            break;
+        }
+        stop = a + n;
+    }
+    Some((start, stop - start, section, (start as i128 - delta) as u64))
+}
+
 /// Another address of the title memory `[at, at + len)`, if it is a view of
 /// the title's pages, all of it one run of a section: in a view of ours of
 /// the whole section, which is never guarded (`crate::watch`) nor changed.
@@ -660,7 +708,7 @@ fn hr<T>(result: &windows::core::Result<T>) -> String {
 
 /// A queue, a list and a fence of the probe's own on `device`: nothing of
 /// the host's submissions is touched.
-struct Rig {
+pub(crate) struct Rig {
     device: ID3D12Device,
     queue: ID3D12CommandQueue,
     allocator: ID3D12CommandAllocator,
@@ -680,7 +728,7 @@ impl Drop for Rig {
 }
 
 impl Rig {
-    fn new(device: &ID3D12Device) -> windows::core::Result<Rig> {
+    pub(crate) fn new(device: &ID3D12Device) -> windows::core::Result<Rig> {
         // SAFETY: plain creation of objects of our own.
         unsafe {
             let queue: ID3D12CommandQueue =
@@ -725,7 +773,7 @@ impl Rig {
     }
 
     /// What the GPU reads of `size` bytes of `resource` from `offset`.
-    fn fetch(&mut self, resource: &ID3D12Resource, offset: u64, size: usize) -> windows::core::Result<Vec<u8>> {
+    pub(crate) fn fetch(&mut self, resource: &ID3D12Resource, offset: u64, size: usize) -> windows::core::Result<Vec<u8>> {
         let back = self.committed(D3D12_HEAP_TYPE_READBACK, size as u64, D3D12_RESOURCE_STATE_COPY_DEST)?;
         // SAFETY: two live buffers, the range inside both.
         self.run(|list| unsafe { list.CopyBufferRegion(&back, 0, resource, offset, size as u64) })?;
@@ -740,7 +788,7 @@ impl Rig {
     }
 
     /// The GPU writes `bytes` at `offset` of `resource` (a copy).
-    fn store(&mut self, resource: &ID3D12Resource, offset: u64, bytes: &[u8]) -> windows::core::Result<()> {
+    pub(crate) fn store(&mut self, resource: &ID3D12Resource, offset: u64, bytes: &[u8]) -> windows::core::Result<()> {
         let up = self.committed(D3D12_HEAP_TYPE_UPLOAD, bytes.len() as u64, D3D12_RESOURCE_STATE_GENERIC_READ)?;
         let mut data = std::ptr::null_mut();
         // SAFETY: the mapping holds the buffer's bytes until unmapped.
@@ -1307,7 +1355,7 @@ pub(crate) fn tick() {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Views as the runtime tells them: a range inside one view, or over
@@ -1495,6 +1543,63 @@ mod tests {
             assert!(text.contains("census,   view memory, one run of a section (one placed buffer): 1 of"), "{text}");
             views_gone(view as usize, 3 * K64);
             mem::VirtualFree(base as *mut c_void, 0, mem::MEM_RELEASE);
+        }
+    }
+
+    /// Runs [`probe`] plus a mapped-section `OpenExistingHeapFromAddress1`
+    /// check (the exact opening `PORT_CONSTANTS` uses) on the system's
+    /// high-performance hardware D3D12 adapter (e.g. RTX 5070 Ti).
+    #[test]
+    #[ignore = "opens the host hardware GPU adapter"]
+    fn hardware_adapter_inplace_probe() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        let (name, device) = unsafe {
+            let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).expect("factory");
+            let adapter: IDXGIAdapter1 = factory
+                .EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)
+                .expect("high-perf adapter");
+            let desc = adapter.GetDesc1().expect("desc");
+            let end = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+            let name = String::from_utf16_lossy(&desc.Description[..end]);
+            let mut dev: Option<ID3D12Device> = None;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut dev).expect("device");
+            (name, dev.expect("device some"))
+        };
+        eprintln!("HARDWARE ADAPTER: {name}");
+        let p = probe(&device, &|| None, 32);
+        for line in &p.lines {
+            eprintln!("in place probe: {line}");
+        }
+        // Also test OpenExistingHeapFromAddress1 on a mapped view of a committed section (port.rs pattern).
+        unsafe {
+            let invalid = windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+            let bytes = 16 * K64;
+            let handle = mem::CreateFileMappingW(invalid, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_COMMIT, 0, bytes as u32, std::ptr::null());
+            assert!(!handle.is_null());
+            let view = mem::MapViewOfFile(handle, mem::FILE_MAP_ALL_ACCESS, 0, 0, bytes);
+            assert!(!view.Value.is_null());
+            let opened = open(&device, From::Part(view.Value as usize, bytes));
+            eprintln!("PORT_CONSTANTS pattern (OpenExistingHeapFromAddress1 on MapViewOfFile): {}", hr(&opened));
+            if let Ok(heap) = &opened {
+                eprintln!("  {}", describe(heap));
+                let placed = place(&device, heap, 0, bytes as u64);
+                eprintln!("  placed buffer: {}", hr(&placed));
+                if let (Ok(buf), Ok(mut rig)) = (&placed, Rig::new(&device)) {
+                    let mem_ptr = view.Value.cast::<u8>();
+                    fill(mem_ptr, K64, 42);
+                    let r1 = rig.fetch(buf, 0, K64).is_ok_and(|g| same(mem_ptr, &g));
+                    fill(mem_ptr, K64, 99);
+                    let r2 = rig.fetch(buf, 0, K64).is_ok_and(|g| same(mem_ptr, &g));
+                    mem_ptr.cast::<[u32; 3]>().write([100, 23, 0]);
+                    let sh = rig.shade(buf.GetGPUVirtualAddress());
+                    let s_ok = sh.is_ok() && mem_ptr.cast::<[u32; 3]>().read()[2] == 123;
+                    eprintln!("  reads={r1}/{r2}, shader_uav_write={s_ok} ({})", hr(&sh));
+                }
+            }
+            drop(opened);
+            mem::UnmapViewOfFile(view);
+            windows_sys::Win32::Foundation::CloseHandle(handle);
         }
     }
 }

@@ -167,6 +167,32 @@ pub fn run(
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped, and nothing of it has run yet.
         unsafe { victory_loader::write_sites::apply_asked(&image_name, image.base(), size) };
+        // Renderer port #2 (`VICTORY_PORT_DESCRIPTORS=1`): patch the title's
+        // descriptor-table stores to mark their slots.
+        #[cfg(windows)]
+        if victory_hle::port_descriptors::on() {
+            use victory_loader::descriptor_sites::{Hooked, SITES, apply};
+            // SAFETY: the image stays mapped and nothing of it has run yet;
+            // `marks_address()` is a `'static` `#[repr(C)]` struct.
+            let done = unsafe {
+                apply(
+                    image.base(),
+                    size,
+                    victory_hle::port_descriptors::marks_address(),
+                    &SITES,
+                )
+            };
+            let patched = done.iter().filter(|d| **d == Hooked::Done).count();
+            println!(
+                "renderer port 2: {patched} of {} descriptor record stores of the title patched",
+                SITES.len()
+            );
+            victory_hle::port_descriptors::hooked(image.base(), size, patched);
+        }
+        // Output size and render scale (`VICTORY_OUTPUT`, `VICTORY_RENDER_SCALE`,
+        // `VICTORY_UPSCALER`; each off without it).
+        // SAFETY: the image stays mapped and nothing of it has run yet.
+        unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
     }
     if !execute {
         println!("not executing (pass --execute to start the title)");
