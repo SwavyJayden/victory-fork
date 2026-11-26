@@ -115,6 +115,8 @@ struct Card {
     side: std::sync::RwLock<()>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
+    /// The copy itself, for [`CHANGED`]: set once it is shared.
+    me: std::sync::OnceLock<std::sync::Weak<Shadow>>,
 }
 
 /// Whether the host copies of big title buffers are in the card's own
@@ -291,6 +293,159 @@ pub(crate) fn card_room_kept() -> u64 {
 /// The copies in the card's memory.
 static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 
+/// The copies in the card's memory whose CPU side changed since
+/// [`card_dirty`] last took their ranges: each is put here when its list of
+/// changed offsets goes from empty to not empty (`Shadow::card_changed` /
+/// `Shadow::card_changed_runs`).
+static CHANGED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+
+fn parse_changed_list_mode(raw: Option<&str>) -> u8 {
+    match raw.map(str::trim) {
+        Some("1") => 1,
+        Some("alt") => 2,
+        _ => 0,
+    }
+}
+
+fn changed_list_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        let mode = parse_changed_list_mode(std::env::var("VICTORY_CARD_CHANGED_LIST").ok().as_deref());
+        if mode == 1 {
+            tracing::info!(
+                "changed card copies are taken from a dirty list instead of walking every card copy (VICTORY_CARD_CHANGED_LIST=1)"
+            );
+        }
+        mode
+    })
+}
+
+/// Whether [`card_dirty`] takes the changed copies from [`CHANGED`]
+/// (`VICTORY_CARD_CHANGED_LIST=1`; `alt`: twenty seconds so, twenty the walk
+/// over every copy, in turn, each change said in the log). Off by default.
+fn changed_list() -> bool {
+    match changed_list_mode() {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "the changed copies in the card's memory are taken from a list from now (VICTORY_CARD_CHANGED_LIST=alt): {}",
+                    if on { "ON" } else { "off, every copy is walked as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// Whether [`CHANGED`] is kept at all (`VICTORY_CARD_CHANGED_LIST=1|alt`).
+fn changed_kept() -> bool {
+    changed_list_mode() != 0
+}
+
+/// Whether per-copy CPU->GPU upload and GPU->CPU copy-back profiling is
+/// enabled (`VICTORY_COPY_PROFILE=1`; off by default, single `OnceLock<bool>`
+/// branch when unset).
+pub(crate) fn copy_profile_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_COPY_PROFILE").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("per-copy upload/copy-back top-10 profiler enabled (VICTORY_COPY_PROFILE=1)");
+        }
+        on
+    })
+}
+
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+struct CopyProfileEntry {
+    upload_bytes: u64,
+    upload_count: u64,
+    back_bytes: u64,
+    back_count: u64,
+}
+
+static COPY_PROFILE: Mutex<Option<std::collections::HashMap<(u64, u64), CopyProfileEntry>>> = Mutex::new(None);
+
+fn record_copy_profile_upload(start: u64, len: u64, bytes: u64) {
+    if !copy_profile_on() || bytes == 0 {
+        return;
+    }
+    let mut guard = COPY_PROFILE.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = guard.get_or_insert_with(Default::default).entry((start, len)).or_default();
+    entry.upload_bytes = entry.upload_bytes.saturating_add(bytes);
+    entry.upload_count = entry.upload_count.saturating_add(1);
+}
+
+fn record_copy_profile_back(start: u64, len: u64, bytes: u64) {
+    if !copy_profile_on() || bytes == 0 {
+        return;
+    }
+    let mut guard = COPY_PROFILE.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = guard.get_or_insert_with(Default::default).entry((start, len)).or_default();
+    entry.back_bytes = entry.back_bytes.saturating_add(bytes);
+    entry.back_count = entry.back_count.saturating_add(1);
+}
+
+fn format_copy_profile(entries: &std::collections::HashMap<(u64, u64), CopyProfileEntry>) -> Option<String> {
+    if entries.is_empty() {
+        return None;
+    }
+    let mut uploads: Vec<((u64, u64), u64, u64)> = entries
+        .iter()
+        .filter(|(_, e)| e.upload_bytes > 0)
+        .map(|(&k, e)| (k, e.upload_bytes, e.upload_count))
+        .collect();
+    uploads.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    let mut backs: Vec<((u64, u64), u64, u64)> = entries
+        .iter()
+        .filter(|(_, e)| e.back_bytes > 0)
+        .map(|(&k, e)| (k, e.back_bytes, e.back_count))
+        .collect();
+    backs.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    if uploads.is_empty() && backs.is_empty() {
+        return None;
+    }
+    let fmt = |list: Vec<((u64, u64), u64, u64)>| -> String {
+        list.into_iter()
+            .take(10)
+            .map(|((addr, size), bytes, count)| {
+                format!("{addr:#x}+{size:#x}:{:.2}MB/{count}", bytes as f64 / (1 << 20) as f64)
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    Some(format!(
+        "copy-profile: top-upload=[{}] top-back=[{}]",
+        fmt(uploads),
+        fmt(backs)
+    ))
+}
+
+/// Logs the top 10 CPU->GPU upload and GPU->CPU copy-back offenders accumulated
+/// over the last ~5-second reporting interval (`VICTORY_COPY_PROFILE=1`), and
+/// resets the interval accumulators.
+pub(crate) fn copy_profile_line() {
+    if !copy_profile_on() {
+        return;
+    }
+    let taken = {
+        let mut guard = COPY_PROFILE.lock().unwrap_or_else(|e| e.into_inner());
+        guard.as_mut().map(std::mem::take)
+    };
+    if let Some(entries) = taken
+        && let Some(line) = format_copy_profile(&entries)
+    {
+        tracing::info!("{line}");
+    }
+}
+
 /// Since the last frame line: bytes copied to card sides and the ranges
 /// they were; pieces compared on the card, pieces fetched and their
 /// bytes; the waits for the card the fetches added and their microseconds.
@@ -303,7 +458,14 @@ pub(crate) fn card_stats() -> [u64; 10] {
     for (i, stat) in CARD_STATS.iter().enumerate() {
         out[i] = stat.swap(0, Ordering::Relaxed);
     }
-    out[7] = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|w| w.strong_count() > 0).count() as u64;
+    out[7] = {
+        let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+        if changed_kept() {
+            // (The walk over every copy drops the ones that are gone.)
+            carded.retain(|w| w.strong_count() > 0);
+        }
+        carded.iter().filter(|w| w.strong_count() > 0).count() as u64
+    };
     out[8] = CARD_BYTES[0].load(Ordering::Relaxed) + WINDOW_CARD_BYTES.load(Ordering::Relaxed);
     out[9] = CARD_BYTES[1].load(Ordering::Relaxed);
     out
@@ -545,6 +707,14 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
 /// ([`Shadow::card_merge_relay`]). Notes of sends that every fetch still to
 /// be merged came after are dropped.
 pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
+    if changed_kept() {
+        // Taken either way: the walk takes every changed copy's ranges, so
+        // what the list holds then names copies with nothing left to take.
+        let changed = std::mem::take(&mut *CHANGED.lock().unwrap_or_else(|e| e.into_inner()));
+        if changed_list() {
+            return take_changed_from(changed, sent_as);
+        }
+    }
     let mut out = Vec::new();
     let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
@@ -552,26 +722,43 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
         let Some(shadow) = weak.upgrade() else {
             return false;
         };
-        let ranges = shadow
-            .card
-            .as_ref()
-            .map(|c| {
-                let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
-                let ranges = std::mem::take(&mut *dirty);
-                if relay() {
-                    let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
-                    sent.retain(|s| s.2 > fetched);
-                    sent.extend(ranges.iter().map(|&(a, b)| (a, b, sent_as)));
-                }
-                ranges
-            })
-            .unwrap_or_default();
+        let ranges = shadow.card.as_ref().map(|c| take_dirty(c, fetched, sent_as)).unwrap_or_default();
         if !ranges.is_empty() {
             out.push((shadow, joined(ranges)));
         }
         true
     });
     out
+}
+
+/// Drains dirty ranges for the card copies named in `changed` ([`card_dirty`]).
+fn take_changed_from(changed: Vec<std::sync::Weak<Shadow>>, sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
+    let mut out = Vec::new();
+    let fetched = RELAY_FETCHED.load(Ordering::Acquire);
+    for weak in changed {
+        let Some(shadow) = weak.upgrade() else {
+            continue;
+        };
+        let ranges = shadow.card.as_ref().map(|c| take_dirty(c, fetched, sent_as)).unwrap_or_default();
+        if !ranges.is_empty() {
+            out.push((shadow, joined(ranges)));
+        }
+    }
+    out
+}
+
+/// Takes a copy's changed offsets for the send numbered `sent_as`
+/// ([`card_dirty`]); with [`relay`] they are noted as sent, and the notes of
+/// sends that every fetch still to be merged came after (`fetched`) go.
+fn take_dirty(c: &Card, fetched: u64, sent_as: u64) -> Vec<(usize, usize)> {
+    let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
+    let ranges = std::mem::take(&mut *dirty);
+    if relay() {
+        let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
+        sent.retain(|s| s.2 > fetched);
+        sent.extend(ranges.iter().map(|&(a, b)| (a, b, sent_as)));
+    }
+    ranges
 }
 
 /// Ranges in order, those that overlap or touch as one.
@@ -3792,6 +3979,7 @@ impl Shadow {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::BackSyncUs, syncing.elapsed().as_micros() as u64);
         }
+        record_copy_profile_back(self.start, self.len, written as u64);
         written
     }
 
@@ -3860,6 +4048,10 @@ impl Shadow {
         let (now, held) = (&now[first..=last], &mut held[first..=last]);
         title.clear();
         title.resize(n, 0);
+        // Who touched the page since its last store is looked at before our
+        // own read of it (`VICTORY_BACK_READS`): counted only.
+        let _reads_as = crate::backreads::reading_as(crate::backreads::MERGE, self.id);
+        crate::backreads::before(start + at);
         // Title memory not there: looked at again when the next flight
         // that declared the range lands (the snapshot stays as it is).
         if !crate::host::read_into((start + at) as *const u8, title) {
@@ -3873,11 +4065,15 @@ impl Shadow {
         }
         crate::host::shaders_write(start + at, &title[..]);
         if self.put_back_own(start + at, &title[..]) {
+            crate::backreads::stored(self.id, (self.start, self.len), start + at, n, true);
+            record_copy_profile_back(self.start, self.len, n as u64);
             return n;
         }
         crate::watch::writing(start + at, n);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "pc relay");
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        crate::backreads::stored(self.id, (self.start, self.len), start + at, n, false);
+        record_copy_profile_back(self.start, self.len, n as u64);
         n
     }
 
@@ -4160,6 +4356,7 @@ impl Shadow {
     /// cannot say what was written, a snapshot is missing, or `runs_left`
     /// ran out. Pages done before that stay done.
     pub(crate) fn merge_under_writes(&self, address: usize, len: usize, runs_left: &mut usize) -> bool {
+        let _reads_as = crate::backreads::reading_as(crate::backreads::UNDER, self.id);
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -4312,6 +4509,7 @@ impl Shadow {
             let t = under_ns(3, t);
             MERGED[1].fetch_add(runs_in, Ordering::Relaxed);
             MERGED[2].fetch_add(bytes_in, Ordering::Relaxed);
+            record_copy_profile_upload(self.start, self.len, bytes_in);
             // Flush all modified runs into `card.dirty` in one call BEFORE
             // releasing `side` (even on `exceeded`), so `card_merge_relay`
             // skips every run whose bytes are already in `self.data`.
@@ -4356,7 +4554,7 @@ impl Shadow {
             .copied()
             .filter(|&(a, e)| a < to && e > from)
             .collect();
-        if !busy.is_empty() {
+        let copied = if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
             // gaps whole cost ~1 s per frame).
@@ -4371,15 +4569,31 @@ impl Shadow {
             if at < to {
                 bytes += self.update_free(at, to);
             }
-            return bytes;
-        }
-        self.update_free(from, to)
+            bytes
+        } else {
+            self.update_free(from, to)
+        };
+        record_copy_profile_upload(self.start, self.len, copied as u64);
+        copied
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
+            // The light refresh (`VICTORY_LIGHT_REFRESH`): nothing of the
+            // range was written that the copy does not hold, and the
+            // journal says so with nothing asked.
+            if crate::watch::light() && self.nothing_new(from, to) {
+                self.refresh_check(from, to);
+                #[cfg(feature = "diagnostics")]
+                {
+                    use crate::copystat::{C, add};
+                    add(C::Checked, (to - from) as u64);
+                    add(C::Unchanged, (to - from) as u64);
+                }
+                return 0;
+            }
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written);
@@ -4402,6 +4616,19 @@ impl Shadow {
         #[cfg(feature = "diagnostics")]
         crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);
         to - from
+    }
+
+    /// Whether [`Shadow::update_free`] of `[from, to)` would copy nothing,
+    /// known without asking the kernel or the guards
+    /// (`crate::watch::nothing_new`): the memory is watched, every page of
+    /// the range was taken, and none was noted written after it was.
+    /// `false` if the refresh would have to ask.
+    fn nothing_new(&self, from: usize, to: usize) -> bool {
+        if self.watched.load(Ordering::Relaxed) != 1 {
+            return false;
+        }
+        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        crate::watch::nothing_new(from, to, self.start as usize / PAGE, &copied)
     }
 
     /// Diagnostic (`VICTORY_REFRESH_CHECK=1`; off by default): after a
@@ -4618,6 +4845,7 @@ impl Shadow {
 
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
     fn copy(&self, from: usize, to: usize) -> usize {
+        let _reads_as = crate::backreads::reading_as(crate::backreads::REFRESH, self.id);
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
         if self.card.is_some() && from < to {
@@ -4701,9 +4929,18 @@ impl Shadow {
             return;
         }
         let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        let first = dirty.is_empty();
         match dirty.last_mut() {
             Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
             _ => dirty.push((from, to)),
+        }
+        drop(dirty);
+        // From none to some: [`card_dirty`] finds the copy in the list.
+        if first
+            && changed_kept()
+            && let Some(me) = card.me.get()
+        {
+            CHANGED.lock().unwrap_or_else(|e| e.into_inner()).push(me.clone());
         }
     }
 
@@ -4720,12 +4957,20 @@ impl Shadow {
             return;
         }
         let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        let first = dirty.is_empty();
         dirty.reserve(most);
         for (from, to) in runs {
             match dirty.last_mut() {
                 Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
                 _ => dirty.push((from, to)),
             }
+        }
+        drop(dirty);
+        if first
+            && changed_kept()
+            && let Some(me) = card.me.get()
+        {
+            CHANGED.lock().unwrap_or_else(|e| e.into_inner()).push(me.clone());
         }
     }
 
@@ -4910,6 +5155,7 @@ impl Shadow {
         }
         // The card's side and its "before" take the result.
         self.card_changed(at, at + n);
+        record_copy_profile_back(self.start, self.len, written as u64);
         written
     }
 
@@ -4963,6 +5209,10 @@ impl Shadow {
         };
         title.clear();
         title.resize(n, 0);
+        // Who touched the page since its last store is looked at before our
+        // own read of it (`VICTORY_BACK_READS`): counted only.
+        let _reads_as = crate::backreads::reading_as(crate::backreads::MERGE, self.id);
+        crate::backreads::before(start + at);
         let mapped = crate::host::read_into((start + at) as *const u8, title);
         // The stretch as read: what the card did not change is the
         // title's, and may have been written again since.
@@ -4979,12 +5229,16 @@ impl Shadow {
         }
         crate::host::shaders_write(start + at, &title[..]);
         if self.put_back_own(start + at, &title[..]) {
+            crate::backreads::stored(self.id, (self.start, self.len), start + at, n, true);
+            record_copy_profile_back(self.start, self.len, n as u64);
             self.note_landing(at, at + n);
             return n;
         }
         crate::watch::writing(start + at, n);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card relay");
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        crate::backreads::stored(self.id, (self.start, self.len), start + at, n, false);
+        record_copy_profile_back(self.start, self.len, n as u64);
         self.note_landing(at, at + n);
         n
     }
@@ -5446,6 +5700,7 @@ fn lookup_tables(address: u64, len: u64, any: bool, quick: bool) -> Option<Arc<S
                     sent: Mutex::default(),
                     side: std::sync::RwLock::new(()),
                     size,
+                    me: std::sync::OnceLock::new(),
                 };
                 (on_card, data, Some(card), None)
             }
@@ -5482,7 +5737,8 @@ fn lookup_tables(address: u64, len: u64, any: bool, quick: bool) -> Option<Arc<S
         shadow.card = card;
         shadow.bar = bar;
         let shadow = Arc::new(shadow);
-        if shadow.card.is_some() {
+        if let Some(card) = &shadow.card {
+            let _ = card.me.set(Arc::downgrade(&shadow));
             CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
         }
         entry.shadow = Some(shadow);
@@ -5702,6 +5958,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                     sent: Mutex::default(),
                     side: std::sync::RwLock::new(()),
                     size: len,
+                    me: std::sync::OnceLock::new(),
                 };
                 (on_card, data, Some(card), None)
             }
@@ -5724,7 +5981,8 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     shadow.card = card;
     shadow.bar = bar;
     let shadow = Arc::new(shadow);
-    if shadow.card.is_some() {
+    if let Some(card) = &shadow.card {
+        let _ = card.me.set(Arc::downgrade(&shadow));
         CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
     }
     note(&shadow);
@@ -6016,6 +6274,7 @@ mod card_merge_tests {
                 side: std::sync::RwLock::new(()),
                 // 0: no card bytes counted (`Drop` takes them off again).
                 size: 0,
+                me: std::sync::OnceLock::new(),
             });
             // As `card_dirty` with the mark set by the old-way fetch.
             if let Some(card) = &shadow.card {
@@ -6132,6 +6391,7 @@ mod card_merge_tests {
             sent: Mutex::default(),
             side: std::sync::RwLock::new(()),
             size: 64 << 10,
+            me: std::sync::OnceLock::new(),
         });
         assert_eq!(s.card_hash_size(), 304);
         assert_eq!(s.card_hashed(0), (0, 304));
@@ -6326,6 +6586,7 @@ mod card_merge_tests {
             sent: Mutex::default(),
             side: std::sync::RwLock::new(()),
             size: 0,
+            me: std::sync::OnceLock::new(),
         });
         // Initial refresh copies both 64 KiB pages whole.
         let addr = title as usize;
@@ -6423,6 +6684,7 @@ mod card_merge_tests {
             sent: Mutex::default(),
             side: std::sync::RwLock::new(()),
             size: 0,
+            me: std::sync::OnceLock::new(),
         });
         let mut alloc_called = false;
         assert!(!card_shadow.card_make_before(|_| {
@@ -6473,6 +6735,112 @@ mod card_merge_tests {
         drop(card_shadow);
         drop(pc_shadow);
         crate::title_hints::clear_gpu_readonly_ranges();
+    }
+
+    #[test]
+    fn changed_list_collects_dirty_card_copies_from_single_and_batch_runs() {
+        assert_eq!(super::parse_changed_list_mode(None), 0);
+        assert_eq!(super::parse_changed_list_mode(Some("0")), 0);
+        assert_eq!(super::parse_changed_list_mode(Some("1")), 1);
+        assert_eq!(super::parse_changed_list_mode(Some(" 1 ")), 1);
+        assert_eq!(super::parse_changed_list_mode(Some("alt")), 2);
+        assert_eq!(super::parse_changed_list_mode(Some(" alt ")), 2);
+        assert_eq!(super::parse_changed_list_mode(Some("bogus")), 0);
+
+        let (Some(buffer), Some(staging)) = (warp_buffer(), warp_buffer()) else {
+            return;
+        };
+        let mut backing_a = vec![0u8; 64 << 10];
+        let mut backing_b = vec![0u8; 64 << 10];
+        let mut sa = Shadow::new(buffer.clone(), backing_a.as_mut_ptr(), 0, 0x1000_0000, 64 << 10);
+        sa.card = Some(Card {
+            staging: staging.clone(),
+            before: Mutex::new(None),
+            dirty: Mutex::default(),
+            sent: Mutex::default(),
+            side: std::sync::RwLock::new(()),
+            size: 0,
+            me: std::sync::OnceLock::new(),
+        });
+        let sa = std::sync::Arc::new(sa);
+        let _ = sa.card.as_ref().unwrap().me.set(std::sync::Arc::downgrade(&sa));
+
+        let mut sb = Shadow::new(buffer, backing_b.as_mut_ptr(), 0, 0x2000_0000, 64 << 10);
+        sb.card = Some(Card {
+            staging,
+            before: Mutex::new(None),
+            dirty: Mutex::default(),
+            sent: Mutex::default(),
+            side: std::sync::RwLock::new(()),
+            size: 0,
+            me: std::sync::OnceLock::new(),
+        });
+        let sb = std::sync::Arc::new(sb);
+        let _ = sb.card.as_ref().unwrap().me.set(std::sync::Arc::downgrade(&sb));
+
+        // Dirty `sa` via `card_changed` (overlapping + disjoint) and `sb` via `card_changed_runs`.
+        sa.card_changed(0x100, 0x300);
+        sa.card_changed(0x200, 0x500);
+        sa.card_changed(0x1000, 0x1200);
+        sb.card_changed_runs([(0x400, 0x600), (0x600, 0x800), (0x2000, 0x2100)]);
+
+        let taken = super::take_changed_from(
+            vec![
+                std::sync::Arc::downgrade(&sa),
+                std::sync::Arc::downgrade(&sb),
+                std::sync::Arc::downgrade(&sa), // duplicate entry yields empty on second visit
+            ],
+            1,
+        );
+        assert_eq!(taken.len(), 2);
+        assert!(std::sync::Arc::ptr_eq(&taken[0].0, &sa));
+        assert_eq!(taken[0].1, vec![(0x100, 0x500), (0x1000, 0x1200)]);
+        assert!(std::sync::Arc::ptr_eq(&taken[1].0, &sb));
+        assert_eq!(taken[1].1, vec![(0x400, 0x800), (0x2000, 0x2100)]);
+
+        // Draining again finds nothing left.
+        assert!(super::take_changed_from(vec![std::sync::Arc::downgrade(&sa)], 2).is_empty());
+    }
+
+    #[test]
+    fn copy_profile_ranks_top_10_uploads_and_copy_backs_concisely() {
+        let mut entries = std::collections::HashMap::new();
+        assert!(super::format_copy_profile(&entries).is_none());
+
+        for i in 1u64..=12 {
+            entries.insert(
+                (0x1000_0000 + i * 0x10_0000, i * 0x1_0000),
+                super::CopyProfileEntry {
+                    upload_bytes: i * (1 << 20),
+                    upload_count: i * 2,
+                    back_bytes: (13 - i) * (512 << 10),
+                    back_count: 13 - i,
+                },
+            );
+        }
+        let line = super::format_copy_profile(&entries).expect("non-empty summary");
+        assert!(line.starts_with("copy-profile: top-upload=["), "{line}");
+        assert!(line.contains("] top-back=["), "{line}");
+        assert!(line.ends_with(']'), "{line}");
+
+        let (up_part, back_part) = line
+            .strip_prefix("copy-profile: top-upload=[")
+            .unwrap()
+            .split_once("] top-back=[")
+            .unwrap();
+        let back_part = back_part.strip_suffix(']').unwrap();
+        let up_items: Vec<&str> = up_part.split(", ").collect();
+        let back_items: Vec<&str> = back_part.split(", ").collect();
+        assert_eq!(up_items.len(), 10, "top-upload capped at 10");
+        assert_eq!(back_items.len(), 10, "top-back capped at 10");
+        // Highest upload offender is i=12 (12.00MB/24); lowest two (i=1, i=2) are omitted.
+        assert_eq!(up_items[0], "0x10c00000+0xc0000:12.00MB/24");
+        assert!(!up_part.contains("0x10100000+"));
+        assert!(!up_part.contains("0x10200000+"));
+        // Highest copy-back offender is i=1 (6.00MB/12); lowest two (i=11, i=12) are omitted.
+        assert_eq!(back_items[0], "0x10100000+0x10000:6.00MB/12");
+        assert!(!back_part.contains("0x10b00000+"));
+        assert!(!back_part.contains("0x10c00000+"));
     }
 }
 

@@ -2652,6 +2652,83 @@ void main() {
         card_compare_stores(crate::host::CARD_COMPARE_WIDE, 1);
     }
 
+    /// Every one-byte change is found, in the piece it is in, with a copy
+    /// that does not start on a piece boundary (`skew`), a span that does not
+    /// start at piece 0, and a short hashed length (`VICTORY_CARD_HASH_LEN`):
+    /// both forms of the compare.
+    #[test]
+    fn warp_card_compare_finds_every_byte_with_skew() {
+        for (source, groups) in [
+            (crate::host::CARD_COMPARE, (|p: u32| p.div_ceil(64)) as fn(u32) -> u32),
+            (crate::host::CARD_COMPARE_WIDE, |p| p),
+        ] {
+            let Some(mut warp) = WarpHarness::new() else {
+                return;
+            };
+            let compare = compile_cs(&warp.device, source).expect("the card compare must compile on WARP");
+            const PIECE: usize = 64 << 10;
+            const SKEW: u32 = 0x3450;
+            const FIRST: u32 = 1;
+            const PIECES: u32 = 4;
+            let size = PIECE * 6;
+            let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
+            let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * 8);
+            let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
+            let content: Vec<u8> = (0..size).map(|i| (i * 131 + i / 7) as u8).collect();
+            // SAFETY: the mapping holds `size` bytes.
+            unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
+            let run = |warp: &mut WarpHarness, first: u32, skew: u32, hashed: u32, pieces: u32, mode: u32| -> Vec<u32> {
+                // SAFETY: as in `card_compare_stores`.
+                unsafe {
+                    for i in 0..pieces as usize {
+                        differs_ptr.cast::<u32>().add(i).write_volatile(7);
+                    }
+                    warp.list.SetComputeRootSignature(&compare.root);
+                    warp.list.SetPipelineState(&compare.pso);
+                    let constants = [first, skew, hashed, pieces, 0, mode];
+                    warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                    warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                    warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                    warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                    warp.list.Dispatch(groups(pieces), 1, 1);
+                }
+                warp.submit_and_wait();
+                // SAFETY: as above.
+                (0..pieces as usize).map(|i| unsafe { differs_ptr.cast::<u32>().add(i).read_volatile() }).collect()
+            };
+            run(&mut warp, FIRST, SKEW, size as u32, PIECES, 0);
+            assert_eq!(run(&mut warp, FIRST, SKEW, size as u32, PIECES, 1), vec![0; PIECES as usize]);
+            // Piece `FIRST + i` of the copy covers offsets [lo, hi) as the
+            // compare cuts them; a byte there changed flags that piece alone.
+            for (k, step) in [0usize, 1, 15, 16, 1023, 1024, 4095, 30001, 65535].iter().enumerate() {
+                let i = (k % PIECES as usize) as u32;
+                let lo = ((FIRST + i) as usize * PIECE).saturating_sub(SKEW as usize);
+                let at = lo + step % (PIECE - 16);
+                // SAFETY: inside the mapping.
+                unsafe { now_ptr.add(at).write_volatile(content[at] ^ 0x5a) };
+                let flagged = run(&mut warp, FIRST, SKEW, size as u32, PIECES, 1);
+                let mut expected = vec![0u32; PIECES as usize];
+                expected[i as usize] = 1;
+                assert_eq!(flagged, expected, "{source:.20}: byte {at:#x} of piece {i} not found uniquely");
+                // SAFETY: inside the mapping.
+                unsafe { now_ptr.add(at).write_volatile(content[at]) };
+                assert_eq!(run(&mut warp, FIRST, SKEW, size as u32, PIECES, 1), vec![0; PIECES as usize]);
+            }
+            // Short hashed length (`VICTORY_CARD_HASH_LEN=1`, e.g. 304 bytes):
+            // changes inside `[0, 304)` are flagged; bytes past 304 are ignored.
+            run(&mut warp, 0, 0, 304, 1, 0);
+            assert_eq!(run(&mut warp, 0, 0, 304, 1, 1), vec![0]);
+            // SAFETY: inside the mapping.
+            unsafe { now_ptr.add(295).write_volatile(content[295] ^ 0x33) };
+            assert_eq!(run(&mut warp, 0, 0, 304, 1, 1), vec![1]);
+            // SAFETY: inside the mapping.
+            unsafe { now_ptr.add(295).write_volatile(content[295]) };
+            // SAFETY: inside the mapping, past the 304-byte hashed slice.
+            unsafe { now_ptr.add(512).write_volatile(content[512] ^ 0x33) };
+            assert_eq!(run(&mut warp, 0, 0, 304, 1, 1), vec![0]);
+        }
+    }
+
     /// `source` hashes `per_group` pieces with a group.
     fn card_compare_stores(source: &str, per_group: u32) {
         let Some(mut warp) = WarpHarness::new() else {

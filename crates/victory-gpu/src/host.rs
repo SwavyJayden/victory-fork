@@ -1928,10 +1928,10 @@ void main(uint3 id : SV_DispatchThreadID) {
 "#;
 
 /// As [`CARD_COMPARE`] (the same constants, cuts and results; another
-/// hash), with a group of 64 threads per piece: the threads take the
-/// piece's 16-byte steps in turn, 64 each, and their hashes are summed.
-/// One thread per piece made 4,096 loads one after the other, so a pass
-/// took milliseconds however few its pieces, and a wide one left the
+/// hash), with a group of 256 threads per piece (8 loads unrolled per loop
+/// iteration and an atomic-free parallel tree reduction across all 256
+/// threads). One thread per piece made 4,096 loads one after the other, so a
+/// pass took milliseconds however few its pieces, and a wide one left the
 /// card's load units waiting. A change in the steps of one thread always
 /// changes that thread's hash, as before; the last mixing keeps changes in
 /// several threads from cancelling out in the sum.
@@ -2026,7 +2026,15 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
 /// a thread per piece, copies and passes in turn, as before).
 fn hash_wide() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_HASH_WIDE").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_CARD_HASH_WIDE").is_none_or(|v| v != "0");
+        if on {
+            tracing::info!(
+                "the card's hashes of copies' pieces are made by a group of 256 threads a piece, behind one barrier (VICTORY_CARD_HASH_WIDE=0 for 1 thread/piece)"
+            );
+        }
+        on
+    })
 }
 
 /// The groups that hash `pieces` pieces.
@@ -4186,25 +4194,274 @@ mod fill_check {
 /// copies shaders may be writing (`stale_under_flights`).
 static UNDER_SCAN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+fn parse_step_index_mode(raw: Option<&str>) -> u8 {
+    match raw.map(str::trim) {
+        Some("1") => 1,
+        Some("alt") => 2,
+        _ => 0,
+    }
+}
+
+/// Whether a submission's passes over its lists' steps index each copy once
+/// per submission instead of re-checking locks / searching per step
+/// (`VICTORY_STEP_INDEX=1`; off by default; `alt`: twenty seconds with,
+/// twenty without, in turn, each change said in the log).
+fn step_index() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: OnceLock<u8> = OnceLock::new();
+    match *MODE.get_or_init(|| {
+        let mode = parse_step_index_mode(std::env::var("VICTORY_STEP_INDEX").ok().as_deref());
+        if mode == 1 {
+            tracing::info!("a submission's steps find their copy by an index (VICTORY_STEP_INDEX=1)");
+        }
+        mode
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "a submission's steps find their copy by an index from now (VICTORY_STEP_INDEX=alt): {}",
+                    if on { "ON" } else { "off, by a search as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// `given` (a key, what the key stands for, a range) as one entry per key,
+/// in the order the keys first come, each with its ranges, every range
+/// once, in the order it first comes.
+#[cfg_attr(not(test), allow(dead_code))]
+fn grouped<T>(given: impl Iterator<Item = (usize, T, (usize, usize))>) -> Vec<(T, Vec<(usize, usize)>)> {
+    let mut out: Vec<(T, Vec<(usize, usize)>)> = Vec::new();
+    let mut place: std::collections::HashMap<usize, usize, std::hash::BuildHasherDefault<AddressHash>> =
+        std::collections::HashMap::default();
+    let mut seen: std::collections::HashSet<(usize, usize, usize)> = std::collections::HashSet::new();
+    for (key, of, range) in given {
+        if !seen.insert((key, range.0, range.1)) {
+            continue;
+        }
+        let at = *place.entry(key).or_insert_with(|| {
+            out.push((of, Vec::new()));
+            out.len() - 1
+        });
+        out[at].1.push(range);
+    }
+    out
+}
+
+/// Collects refresh spans across `runs` for `ask_once` (`all_spans`) and, when
+/// `behind` is true, for copies with pending shader writes (`pending_spans`).
+/// With `indexed` (`VICTORY_STEP_INDEX`), `shadow.unwatched()` and
+/// `shadow.writes_pending()` are queried at most once per unique shadow and
+/// consecutive steps of the same copy hit a one-slot last-copy cache in O(1),
+/// producing the exact same copies, disjoint [`Spans`], and order as the
+/// linear scan.
+fn collect_submission_refresh_spans(runs: &[&HostList], behind: bool, indexed: bool) -> (Batch, Batch) {
+    let mut spans = Batch::default();
+    let mut pending_spans = Batch::default();
+    if indexed {
+        let mut known_all: std::collections::HashMap<
+            usize,
+            Option<usize>,
+            std::hash::BuildHasherDefault<AddressHash>,
+        > = std::collections::HashMap::default();
+        let mut last_all: (usize, Option<usize>) = (0, None);
+        let mut known_pending: std::collections::HashMap<
+            usize,
+            Option<usize>,
+            std::hash::BuildHasherDefault<AddressHash>,
+        > = std::collections::HashMap::default();
+        let mut last_pending: (usize, Option<usize>) = (0, None);
+        for list in runs {
+            for step in &list.deferred().copies {
+                if let Step::Refresh(shadow, address, len) = step {
+                    let Some(end) = address.checked_add(*len).filter(|&e| e > *address) else {
+                        continue;
+                    };
+                    let key = std::sync::Arc::as_ptr(shadow) as usize;
+                    let at_all = if last_all.0 == key {
+                        last_all.1
+                    } else {
+                        let at = *known_all.entry(key).or_insert_with(|| {
+                            (!shadow.unwatched()).then(|| {
+                                let idx = spans.refreshes.len();
+                                spans.index.insert(key, idx);
+                                spans.refreshes.push((shadow.clone(), Spans::One((*address, end))));
+                                idx
+                            })
+                        });
+                        last_all = (key, at);
+                        at
+                    };
+                    if let Some(at) = at_all {
+                        spans.refreshes[at].1.add(*address, end);
+                    }
+                    if behind {
+                        let at_pending = if last_pending.0 == key {
+                            last_pending.1
+                        } else {
+                            let at = *known_pending.entry(key).or_insert_with(|| {
+                                shadow.writes_pending().then(|| {
+                                    let idx = pending_spans.refreshes.len();
+                                    pending_spans.index.insert(key, idx);
+                                    pending_spans
+                                        .refreshes
+                                        .push((shadow.clone(), Spans::One((*address, end))));
+                                    idx
+                                })
+                            });
+                            last_pending = (key, at);
+                            at
+                        };
+                        if let Some(at) = at_pending {
+                            pending_spans.refreshes[at].1.add(*address, end);
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        for list in runs {
+            for step in &list.deferred().copies {
+                if let Step::Refresh(shadow, address, len) = step {
+                    if !shadow.unwatched() {
+                        spans.add(shadow, *address, *len);
+                    }
+                    if behind && shadow.writes_pending() {
+                        pending_spans.add(shadow, *address, *len);
+                    }
+                }
+            }
+        }
+    }
+    (spans, pending_spans)
+}
+
+/// Collects disjoint refresh spans for copies with pending shader writes
+/// across `runs`, either indexed (`VICTORY_STEP_INDEX`) or linearly.
+fn collect_pending_refresh_spans(runs: &[&HostList], indexed: bool) -> Batch {
+    let mut spans = Batch::default();
+    if indexed {
+        let mut known: std::collections::HashMap<
+            usize,
+            Option<usize>,
+            std::hash::BuildHasherDefault<AddressHash>,
+        > = std::collections::HashMap::default();
+        let mut last: (usize, Option<usize>) = (0, None);
+        for list in runs {
+            for step in &list.deferred().copies {
+                if let Step::Refresh(shadow, address, len) = step {
+                    let Some(end) = address.checked_add(*len).filter(|&e| e > *address) else {
+                        continue;
+                    };
+                    let key = std::sync::Arc::as_ptr(shadow) as usize;
+                    let at = if last.0 == key {
+                        last.1
+                    } else {
+                        let at = *known.entry(key).or_insert_with(|| {
+                            shadow.writes_pending().then(|| {
+                                let idx = spans.refreshes.len();
+                                spans.index.insert(key, idx);
+                                spans.refreshes.push((shadow.clone(), Spans::One((*address, end))));
+                                idx
+                            })
+                        });
+                        last = (key, at);
+                        at
+                    };
+                    if let Some(at) = at {
+                        spans.refreshes[at].1.add(*address, end);
+                    }
+                }
+            }
+        }
+    } else {
+        for list in runs {
+            for step in &list.deferred().copies {
+                if let Step::Refresh(shadow, address, len) = step
+                    && shadow.writes_pending()
+                {
+                    spans.add(shadow, *address, *len);
+                }
+            }
+        }
+    }
+    spans
+}
+
+#[cfg(test)]
+mod grouped_tests {
+    /// What the search per step gives (`declared_writes` without the
+    /// switch), for keys that stand for themselves.
+    fn searched(given: &[(usize, (usize, usize))]) -> Vec<(usize, Vec<(usize, usize)>)> {
+        let mut back: Vec<(usize, Vec<(usize, usize)>)> = Vec::new();
+        for &(key, range) in given {
+            match back.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, ranges)) => {
+                    if !ranges.contains(&range) {
+                        ranges.push(range);
+                    }
+                }
+                None => back.push((key, vec![range])),
+            }
+        }
+        back
+    }
+
+    /// The index gives what the search gives: the same keys in the same
+    /// order, each with the same ranges in the same order, whatever comes
+    /// twice and however the keys take turns.
+    #[test]
+    fn the_index_gives_what_the_search_gives() {
+        assert_eq!(super::parse_step_index_mode(None), 0);
+        assert_eq!(super::parse_step_index_mode(Some("0")), 0);
+        assert_eq!(super::parse_step_index_mode(Some("1")), 1);
+        assert_eq!(super::parse_step_index_mode(Some(" 1 ")), 1);
+        assert_eq!(super::parse_step_index_mode(Some("alt")), 2);
+        assert_eq!(super::parse_step_index_mode(Some(" alt ")), 2);
+        assert_eq!(super::parse_step_index_mode(Some("bogus")), 0);
+
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |below: usize| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as usize % below
+        };
+        assert!(super::grouped(std::iter::empty::<(usize, usize, (usize, usize))>()).is_empty());
+        for (keys, ranges, steps) in [(1, 1, 5), (3, 4, 200), (40, 6, 3000), (500, 50, 3000)] {
+            for _ in 0..20 {
+                let given: Vec<(usize, (usize, usize))> = (0..steps)
+                    .map(|_| {
+                        let from = next(ranges) * 64;
+                        (0x1000 + next(keys) * 8, (from, from + 16 + next(2) * 16))
+                    })
+                    .collect();
+                let by_index = super::grouped(given.iter().map(|&(key, range)| (key, key, range)));
+                assert_eq!(by_index, searched(&given), "{keys} keys, {ranges} ranges, {steps} steps");
+            }
+        }
+    }
+}
+
 /// With flights in the air, after the submission's write-watch asking:
 /// whether `runs` refresh a range of a host copy that a flight's shaders
 /// may write and that the title wrote since it was last copied. The
 /// refresh leaves ranges shaders are writing alone (`Shadow::update`), so
 /// the title's bytes there would reach the card a submission late.
 fn stale_under_flights(runs: &[&HostList]) -> bool {
+    stale_under_flights_with(runs, step_index())
+}
+
+fn stale_under_flights_with(runs: &[&HostList], indexed: bool) -> bool {
     // Per copy, the disjoint refreshed spans (a flush brings those ranges up
     // to date without spanning unrelated gaps between them).
     let scanning = std::time::Instant::now();
-    let mut spans = Batch::default();
-    for list in runs {
-        for step in &list.deferred().copies {
-            if let Step::Refresh(shadow, address, len) = step
-                && shadow.writes_pending()
-            {
-                spans.add(shadow, *address, *len);
-            }
-        }
-    }
+    let spans = collect_pending_refresh_spans(runs, indexed);
     UNDER_SCAN.fetch_add(scanning.elapsed().as_nanos() as u64, Ordering::Relaxed);
     stale_under_flights_spans(&spans)
 }
@@ -7149,20 +7406,7 @@ impl Host {
         // Also collect pending-write spans in the same single pass when behind flights.
         if crate::watch::once() {
             let scanning = behind.then(std::time::Instant::now);
-            let mut spans = Batch::default();
-            let mut pending_spans = Batch::default();
-            for list in runs {
-                for step in &list.deferred().copies {
-                    if let Step::Refresh(shadow, address, len) = step {
-                        if !shadow.unwatched() {
-                            spans.add(shadow, *address, *len);
-                        }
-                        if behind && shadow.writes_pending() {
-                            pending_spans.add(shadow, *address, *len);
-                        }
-                    }
-                }
-            }
+            let (spans, pending_spans) = collect_submission_refresh_spans(runs, behind, step_index());
             if let Some(scanning) = scanning {
                 UNDER_SCAN.fetch_add(scanning.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
@@ -8881,6 +9125,7 @@ impl HostList {
                     batch.title_wrote(dst, len);
                     #[cfg(feature = "diagnostics")]
                     fill_check::copy_runs(dst, src, len);
+                    let _reads_as = crate::backreads::reading_as(crate::backreads::TITLE_COPY, 0);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
@@ -9175,6 +9420,7 @@ fn flush_fills(fills: &mut Vec<(usize, usize, usize)>) {
                 .into_iter()
                 .map(|chunk| {
                     Box::new(move || {
+                        let _reads_as = crate::backreads::reading_as(crate::backreads::TITLE_COPY, 0);
                         for (dst, src, len) in chunk {
                             copy_mapped(dst as *mut u8, src as *const u8, len, false);
                         }
@@ -9183,11 +9429,13 @@ fn flush_fills(fills: &mut Vec<(usize, usize, usize)>) {
                 .collect();
             crate::shadow::wide_run(jobs);
         } else {
+            let _reads_as = crate::backreads::reading_as(crate::backreads::TITLE_COPY, 0);
             for &(dst, src, len) in fills.iter() {
                 copy_mapped(dst as *mut u8, src as *const u8, len, false);
             }
         }
     } else {
+        let _reads_as = crate::backreads::reading_as(crate::backreads::TITLE_COPY, 0);
         for &(dst, src, len) in fills.iter() {
             copy_mapped(dst as *mut u8, src as *const u8, len, false);
         }
@@ -9381,12 +9629,18 @@ struct Batch {
     /// deduplicated per copy when taken via [`Batch::take_declared`].
     declared: Vec<Declared>,
     declared_index: std::collections::HashMap<usize, usize, std::hash::BuildHasherDefault<AddressHash>>,
+    /// With [`step_index`]: deduplicates `(shadow_ptr, from, to)` in O(1) as
+    /// ranges are noted so repeated draws do not accumulate duplicate ranges.
+    declared_seen: std::collections::HashSet<(usize, usize, usize)>,
 }
 
 impl Batch {
     fn note_gpu_write(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let range = (address, address + len);
         let key = std::sync::Arc::as_ptr(shadow) as usize;
+        if step_index() && !self.declared_seen.insert((key, range.0, range.1)) {
+            return;
+        }
         match self.declared_index.get(&key) {
             Some(&at) => self.declared[at].1.push(range),
             None => {
@@ -9398,6 +9652,7 @@ impl Batch {
 
     fn take_declared(&mut self) -> Vec<Declared> {
         self.declared_index.clear();
+        self.declared_seen.clear();
         let mut back = std::mem::take(&mut self.declared);
         for (_, ranges) in &mut back {
             if ranges.len() > 1 {
@@ -9636,6 +9891,10 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if len == 0 {
         return;
     }
+    crate::backreads::touched(src as usize, len, false);
+    if title_dst {
+        crate::backreads::touched(dst as usize, len, false);
+    }
     // A title destination that is not all mapped is left alone. Asking
     // Windows first (`VirtualQuery`) walks the page tables to the end of
     // the destination's region: in the title's big blocks that is
@@ -9740,6 +9999,7 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize, title_dst: bool) {
 /// Reads title memory at `src` into `dst`; false if a page of it is not
 /// readable.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
+    crate::backreads::touched(src as usize, dst.len(), false);
     // In place first, if asked for (`crate::plaincopy`): the destination is
     // memory of ours, as in `copy_mapped`.
     crate::plaincopy::copy(dst.as_mut_ptr(), src, dst.len()) || read(src, dst.as_mut_ptr(), dst.len())
@@ -9786,6 +10046,7 @@ fn direct_writes() -> bool {
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    crate::backreads::touched(dst as usize, len, true);
     let direct = direct_writes();
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
@@ -10037,6 +10298,7 @@ impl Meter {
         card_clock_line(frames, ms);
         crate::queue2::line(frames);
         crate::plaincopy::line(frames);
+        crate::backreads::line(frames);
         if let Some(host) = host() {
             host.drain_messages();
         }
@@ -10212,6 +10474,7 @@ impl Meter {
                     readonly[1] as f64 / (1 << 20) as f64 / frames,
                 );
             }
+            crate::shadow::copy_profile_line();
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
@@ -11414,9 +11677,23 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         list3.defer_refresh(&shadow, start + PAGE, 64);
 
         // Disjoint refreshes on pages 0 and 3 do not intersect page 1's pending write.
-        assert!(!super::stale_under_flights(&[&list1, &list2]));
-        // A refresh covering page 1 itself does trigger stale detection.
-        assert!(super::stale_under_flights(&[&list1, &list3]));
+        assert!(!super::stale_under_flights_with(&[&list1, &list2], false));
+        assert!(!super::stale_under_flights_with(&[&list1, &list2], true));
+        // A refresh covering page 1 itself does trigger stale detection in both modes.
+        assert!(super::stale_under_flights_with(&[&list1, &list3], false));
+        assert!(super::stale_under_flights_with(&[&list1, &list3], true));
+
+        // Indexed and linear submission span collection match identically in copies, spans, and order.
+        let (all_lin, pend_lin) = super::collect_submission_refresh_spans(&[&list1, &list2, &list3, &list1], true, false);
+        let (all_idx, pend_idx) = super::collect_submission_refresh_spans(&[&list1, &list2, &list3, &list1], true, true);
+        let extract = |b: &Batch| -> Vec<(usize, Vec<(usize, usize)>)> {
+            b.refreshes
+                .iter()
+                .map(|(s, sp)| (std::sync::Arc::as_ptr(s) as usize, sp.as_slice().to_vec()))
+                .collect()
+        };
+        assert_eq!(extract(&all_idx), extract(&all_lin));
+        assert_eq!(extract(&pend_idx), extract(&pend_lin));
 
         // Flushing disjoint spans on pages 0 and 3 copies those endpoints without copying page 2.
         let mut batch = Batch::default();
