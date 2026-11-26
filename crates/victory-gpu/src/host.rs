@@ -1140,6 +1140,9 @@ struct Gather {
     /// gathered from here on (the ones gathered before are read before
     /// the list runs, which is before that).
     closed: bool,
+    /// Host copy IDs whose bytes a shader recorded in this list was declared
+    /// to write (`VICTORY_GATHER_BY_COPY`).
+    written: std::collections::HashSet<u64>,
     /// One set per argument buffer, kind and stride.
     sets: Vec<crate::indirect::GatherSet>,
     /// The budget words the gathered records are charged to.
@@ -4561,14 +4564,21 @@ fn late_line(frames: f64) {
     }
     if late_exact() {
         let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
-        // Merge hookup (ac255498): once W11-B adds `crate::shadow::merge_gave_up()`,
-        // append its four give-up counts to this log line.
+        let gave_up = crate::shadow::merge_gave_up();
         tracing::info!(
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
-             {runs:.0} changed runs, {:.2} MB",
-            bytes / (1 << 20) as f64
+             {runs:.0} changed runs, {:.2} MB; in these frames the merge gave up (the flights are then settled whole): {} times \
+             because the copy's memory is not watched, {} because the write tracking had no answer, {} for more changed runs than \
+             VICTORY_MERGE_RUNS leaves, {} for a copy in PC memory without its snapshot",
+            bytes / (1 << 20) as f64,
+            gave_up[0],
+            gave_up[1],
+            gave_up[2],
+            gave_up[3]
         );
     }
+    crate::shadow::lookup_cache_line(frames);
+    crate::gpu_detile::line(frames);
     {
         let parts = [0, 1, 2, 3, 4, 5].map(|i| PREP_PARTS[i].swap(0, Ordering::Relaxed) as f64 / 1e3 / frames);
         tracing::info!(
@@ -7650,8 +7660,9 @@ impl HostList {
         }
         {
             let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
-            let Gather { closed, sets, spare, .. } = &mut *gather;
+            let Gather { closed, written, sets, spare, .. } = &mut *gather;
             *closed = false;
+            written.clear();
             for set in sets.drain(..) {
                 if spare.len() < GATHER_SETS {
                     spare.push(set.into_scratch());
@@ -8053,6 +8064,15 @@ impl HostList {
         self.gather.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
     }
 
+    /// Notes that a shader recorded in this list may write host copy `copy`
+    /// (`VICTORY_GATHER_BY_COPY`): further indirect records from `copy` are
+    /// not gathered.
+    pub(crate) fn gather_wrote(&self, copy: u64) {
+        if crate::indirect::gather_by_copy_kept() {
+            self.gather.lock().unwrap_or_else(|e| e.into_inner()).written.insert(copy);
+        }
+    }
+
     /// A slot for the record at `offset` of the host copy `src` in the
     /// scratch buffer the list's prelude fills (`crate::indirect::gather`,
     /// which checked the record): the buffer and the slot's place in it.
@@ -8062,7 +8082,7 @@ impl HostList {
             None
         };
         let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
-        if gather.closed {
+        if gather.closed || gather.written.contains(&src_id) {
             return none(1);
         }
         let found = gather
