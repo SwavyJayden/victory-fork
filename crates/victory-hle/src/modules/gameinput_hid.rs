@@ -987,6 +987,24 @@ mod win {
 #[cfg(windows)]
 pub(super) use win::HidManager;
 
+/// Returns `true` if at least one Sony PlayStation HID gamepad (DualSense,
+/// DualSense Edge, or DualShock 4) is currently connected to the host (unless
+/// disabled via `VICTORY_HID_GAMEPAD=0`).
+pub(crate) fn has_sony_gamepad() -> bool {
+    #[cfg(windows)]
+    {
+        let env_val = std::env::var("VICTORY_HID_GAMEPAD").ok();
+        if !hid_enabled_env(env_val.as_deref()) {
+            return false;
+        }
+        !win::enumerate_sony_gamepads().is_empty()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

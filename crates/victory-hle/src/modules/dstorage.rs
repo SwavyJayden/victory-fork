@@ -142,10 +142,14 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         return from_win32(&error);
     }
     let kept = name.clone();
+    let is_data_rpf = super::prompts::is_data_rpf_path(&name);
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
+    let file = Instance::create(
+        Object::new("dstorage file", &FILE_VTABLE),
+        File { file, is_data_rpf },
+    );
     WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).push((file as usize, kept));
     put(out, file)
 }
@@ -260,6 +264,7 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 
 struct File {
     file: std::fs::File,
+    is_data_rpf: bool,
 }
 
 static FILE_VTABLE: Methods<8> = Methods([
@@ -963,13 +968,25 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         // at the failed request (runs amd-C and amd-C2, seconds after the
         // world's first frame). It is read beside and copied in: our copy
         // faults into the guard like the title's own writes.
+        let is_data_rpf = request_is_data_rpf(request);
         let bounce = options & (PAGE_DESTINATION | MEMORY_SOURCE) == 0;
         return into_destination(request, size, |out| {
             if !bounce {
-                return read_into(request, out).map(|()| size);
+                read_into(request, out)?;
+                if is_data_rpf
+                    && super::prompts::patch_data_rpf_compressed_region(request.offset, out)
+                {
+                    super::prompts::log_patched_once("DirectStorage raw");
+                }
+                return Ok(size);
             }
             let mut data = vec![0; size];
             read_into(request, &mut data)?;
+            if is_data_rpf
+                && super::prompts::patch_data_rpf_compressed_region(request.offset, &mut data)
+            {
+                super::prompts::log_patched_once("DirectStorage raw");
+            }
             out.copy_from_slice(&data);
             Ok(size)
         })
@@ -986,11 +1003,23 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     } else {
         source
     };
+    let check_prompts = request_is_data_rpf(request) || (options & MEMORY_SOURCE != 0);
     into_destination(request, size, |out| match tables {
         Some(tables) => bcpack::decode(bc, &source, out, tables)
             .map(|()| out.len())
             .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
+        None => {
+            let n = inflate(&source, out).map_err(|hr| fail(hr, "zlib"))?;
+            if check_prompts
+                && n == super::prompts::INPUT_ICONS_INFLATED_LEN
+                && out[..n].starts_with(b"GFX")
+                && super::prompts::ps5_enabled()
+                && super::prompts::patch_input_icons_gfx(&mut out[..n])
+            {
+                super::prompts::log_patched_once("DirectStorage");
+            }
+            Ok(n)
+        }
     })?;
     tracing::trace!(
         options = format_args!("{options:#x}"),
@@ -1104,6 +1133,17 @@ fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
 
 /// Nanoseconds workers spent reading files, for the debug summary.
 static READING: AtomicU64 = AtomicU64::new(0);
+
+/// Returns `true` if `request` reads from a file object whose path ends with `data.rpf`.
+fn request_is_data_rpf(request: &Request) -> bool {
+    if request.options & MEMORY_SOURCE != 0 || request.source.is_null() {
+        return false;
+    }
+    // SAFETY: a file object we created; the title keeps it open until completion.
+    unsafe { &*request.source.cast::<Instance<File>>() }
+        .state
+        .is_data_rpf
+}
 
 /// Fills `out` (the source size) from the request's file or memory.
 fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
