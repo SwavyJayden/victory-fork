@@ -1137,6 +1137,61 @@ pub(crate) struct HostTexture {
     /// Submission number when this host texture was created, for
     /// `VICTORY_SHOW_AFTER=1` ([`host_fresh`]).
     created: u64,
+    /// The texture's flags (asked once: the runtime takes ~100 ns to say, and
+    /// every texture of every draw is asked about).
+    flags: u32,
+}
+
+thread_local! {
+    /// Nesting depth of descriptor/draw calls that read resources without
+    /// mutating a `HostList` directly. While 0, resource/descriptor lookups
+    /// from `list.rs` (barriers, copies, clears, resolves) increment
+    /// [`OUTSIDE_LIST_MUTATION`] so `draw::State` knows the list may have
+    /// changed state between draws.
+    static NON_LIST_CALL: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static OUTSIDE_LIST_MUTATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static DRAW_EPOCH_BUMPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// RAII guard suppressing [`note_outside_list_mutation`] while inside draw or
+/// descriptor code that handles its own list-epoch tracking.
+pub(crate) struct NonListGuard(());
+
+impl NonListGuard {
+    pub(crate) fn new() -> Self {
+        NON_LIST_CALL.with(|d| d.set(d.get().saturating_add(1)));
+        Self(())
+    }
+}
+
+impl Drop for NonListGuard {
+    fn drop(&mut self) {
+        NON_LIST_CALL.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+#[inline]
+pub(crate) fn note_outside_list_mutation() {
+    NON_LIST_CALL.with(|d| {
+        if d.get() == 0 {
+            OUTSIDE_LIST_MUTATION.with(|c| c.set(c.get().wrapping_add(1)));
+        }
+    });
+}
+
+#[inline]
+pub(crate) fn outside_list_mutations() -> u64 {
+    OUTSIDE_LIST_MUTATION.with(std::cell::Cell::get)
+}
+
+#[inline]
+pub(crate) fn note_draw_epoch_bump() {
+    DRAW_EPOCH_BUMPS.with(|c| c.set(c.get().wrapping_add(1)));
+}
+
+#[inline]
+pub(crate) fn draw_epoch_bumps() -> u64 {
+    DRAW_EPOCH_BUMPS.with(std::cell::Cell::get)
 }
 
 /// What a title texture has on the host: its host copy and, for a depth
@@ -1393,7 +1448,10 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         // are made before the next submission runs.
         crate::descriptor::texture_made(this as usize);
     }
-    r.host.used.store(crate::host::moment(), Relaxed);
+    let now = crate::host::moment();
+    if r.host.used.load(Relaxed) != now {
+        r.host.used.store(now, Relaxed);
+    }
     made.clone()
 }
 
@@ -1777,15 +1835,43 @@ pub(crate) fn let_go_idle() {
         return;
     }
     let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
+    // Without VRAM pressure, sweep a part of the table per pass and continue
+    // from where the previous pass stopped: a long play has over 100,000
+    // textures (`VICTORY_TEXTURE_SWEEP=whole`: all each time, as before).
+    const PART: usize = 8192;
+    static FROM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static WHOLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let whole = *WHOLE.get_or_init(|| {
+        std::env::var_os("VICTORY_TEXTURE_SWEEP").is_some_and(|v| v == "whole")
+    });
+    let part = if whole || idle_ms <= 2_500 {
+        usize::MAX
+    } else {
+        PART
+    };
+    let from = if part == PART { FROM.load(Relaxed) } else { 0 };
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
+    let mut looked = 0usize;
+    let mut next_from = 0usize;
+    let began = std::time::Instant::now();
     let all = textures();
-    for &at in all.iter() {
+    for &at in all.range(from..).take(part) {
+        looked += 1;
+        if part == PART {
+            next_from = if looked == PART { at.saturating_add(1) } else { 0 };
+        }
         // SAFETY: a texture leaves the table before it is freed, under the
         // lock held here (`Drop for Resource`).
         let r = unsafe { &*(at as *const Resource) };
-        if !fills(&r.desc) || crate::texture::host_wrote(at) {
+        // (Without its lock first: most were used lately or have none.)
+        let used = r.host.used.load(Relaxed);
+        if used == 0
+            || !fills(&r.desc)
+            || !crate::host::long_ago(used, idle_ms, IDLE_FRAMES)
+            || crate::texture::host_wrote(at)
+        {
             continue;
         }
         let gone = {
@@ -1816,6 +1902,13 @@ pub(crate) fn let_go_idle() {
             crate::host::retire(host);
         }
     }
+    if part == PART {
+        FROM.store(next_from, Relaxed);
+    }
+    let us = began.elapsed().as_micros() as u64;
+    SWEPT_US[0].fetch_add(1, Relaxed);
+    SWEPT_US[1].fetch_add(us, Relaxed);
+    SWEPT_US[2].fetch_max(us, Relaxed);
     if went > 0 {
         crate::host::trail(|| {
             format!(
@@ -1826,6 +1919,13 @@ pub(crate) fn let_go_idle() {
         });
     }
 }
+
+/// Since the start: looks of [`let_go_idle`], their microseconds, and the
+/// longest one's.
+#[cfg(windows)]
+#[allow(dead_code)]
+pub(crate) static SWEPT_US: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// For the memory line: the host copies the sweep never lets go
 /// ([`let_go_idle`] takes only copies of textures the title fills that the
@@ -1961,9 +2061,15 @@ fn host_bytes(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) ->
 
 #[cfg(windows)]
 impl HostTexture {
+    pub(crate) fn flags(&self) -> u32 {
+        self.flags
+    }
+
     fn new(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) -> HostTexture {
         use std::sync::atomic::Ordering::Relaxed;
         let bytes = host_bytes(&texture);
+        // SAFETY: a live texture.
+        let flags = unsafe { texture.GetDesc() }.Flags.0 as u32;
         HOST_TEXTURES[0].fetch_add(1, Relaxed);
         HOST_TEXTURES[1].fetch_add(bytes, Relaxed);
         HostTexture {
@@ -1973,6 +2079,7 @@ impl HostTexture {
             filled: false,
             tiled: None,
             created: crate::host::submissions().0,
+            flags,
         }
     }
 
@@ -1983,6 +2090,8 @@ impl HostTexture {
         state: u32,
         tiled: crate::tiles::Tiled,
     ) -> HostTexture {
+        // SAFETY: a live texture.
+        let flags = unsafe { texture.GetDesc() }.Flags.0 as u32;
         HOST_TEXTURES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         HostTexture {
             texture,
@@ -1991,6 +2100,7 @@ impl HostTexture {
             filled: false,
             tiled: Some(tiled),
             created: crate::host::submissions().0,
+            flags,
         }
     }
 }
@@ -2051,6 +2161,7 @@ pub(crate) fn host_resource<'a>(
     if this.is_null() {
         return None;
     }
+    note_outside_list_mutation();
     let (host, _) = hosted(this, true)?;
     // SAFETY: the resource holds the host copy until the title releases it
     // (lists and slots that name the texture hold it past that), or until
@@ -2066,6 +2177,7 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     if this.is_null() {
         return None;
     }
+    note_outside_list_mutation();
     hosted(this, true).map(|made| made.0)
 }
 
@@ -2279,6 +2391,7 @@ pub(crate) fn buffer_bytes(this: This) -> Option<(*mut u8, u64)> {
     if this.is_null() {
         return None;
     }
+    note_outside_list_mutation();
     let r = resource(this);
     (r.desc.dimension == BUFFER).then(|| (r.data(), r.desc.width))
 }
