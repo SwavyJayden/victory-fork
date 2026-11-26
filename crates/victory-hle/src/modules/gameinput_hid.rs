@@ -369,6 +369,7 @@ mod win {
             bytes_written: *mut u32,
             overlapped: *mut c_void,
         ) -> i32;
+        fn CancelIoEx(file: HANDLE, overlapped: *mut c_void) -> i32;
     }
 
     #[link(name = "user32")]
@@ -642,13 +643,23 @@ mod win {
         slot: Option<usize>,
         shared: Arc<Mutex<HidPadState>>,
         stop: Arc<AtomicBool>,
+        read_handle_raw: usize,
         write_handle: Option<HidHandle>,
         last_rumble: (u8, u8),
     }
 
     impl Drop for HidDevice {
         fn drop(&mut self) {
-            self.stop.store(true, Ordering::Relaxed);
+            self.stop.store(true, Ordering::Release);
+            if self.read_handle_raw != 0 {
+                // Wake the blocking `ReadFile` on the HID reader thread so it
+                // exits promptly instead of leaking until physical unplug.
+                // SAFETY: cancelling I/O on a possibly-closed handle is benign
+                // (returns `ERROR_INVALID_HANDLE` if already closed).
+                unsafe {
+                    CancelIoEx(self.read_handle_raw as HANDLE, std::ptr::null_mut());
+                }
+            }
         }
     }
 
@@ -733,6 +744,7 @@ mod win {
 
             let thread_shared = Arc::clone(&shared);
             let thread_stop = Arc::clone(&stop);
+            let read_handle_raw = read_handle.0 as usize;
             let kind = dev.kind;
             let _ = std::thread::Builder::new()
                 .name(format!("victory-hid-{}", kind.name()))
@@ -748,6 +760,7 @@ mod win {
                 slot: None,
                 shared,
                 stop,
+                read_handle_raw,
                 write_handle,
                 last_rumble: (0, 0),
             })
@@ -957,6 +970,13 @@ mod win {
                     taken[free] = true;
                 }
             }
+        }
+
+        /// Side-effect-free check whether a connected Sony HID pad occupies `slot`.
+        pub(crate) fn has_slot(&self, slot: usize) -> bool {
+            self.devices
+                .iter()
+                .any(|d| d.slot == Some(slot) && d.is_connected())
         }
 
         /// Returns the latest non-blocking `PadState` for `slot`, if a Sony HID pad occupies it.

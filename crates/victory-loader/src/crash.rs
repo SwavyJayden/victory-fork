@@ -152,6 +152,10 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
             return false;
         }
         let code = context.Rip as *const u8;
+        let room = 0x1000 - (context.Rip as usize & 0xfff);
+        if room < 3 {
+            return false;
+        }
         match code.cast::<[u8; 3]>().read_unaligned() {
             [0x0f, 0x01, 0xfc] => return clzero(context),
             [0x0f, 0x01, 0xfa] => {}
@@ -298,31 +302,22 @@ fn clwb_loop(code: &[u8]) -> Option<ClwbLoop> {
     (limit != base).then_some(ClwbLoop { base, limit, len })
 }
 
-/// `clzero` at `context.Rip`. An exception costs about a microsecond and
-/// titles clear tens of kilobytes at a time, a line per pass, so the two
-/// loops compilers build around the instruction are done whole in one
-/// exception, leaving registers and flags as their last pass would (`a`
-/// and `b` any registers but `rax`):
-///
-/// ```text
-/// top: clzero                 top: mov rax, a
-///      add rax, 0x40               add a, 0x40
-///      cmp rax, b                  clzero
-///      jb  top                     cmp a, b
-///                                  jb  top
-/// ```
-///
-/// Anything else around it is one line and the next instruction.
+/// `clzero` at `context.Rip`, checking writability before writing every cache line
+/// so an unwritable address returns `false` instead of nesting an AV inside the VEH.
 ///
 /// # Safety
-/// `context` is the state of a thread that faulted at a `clzero`; the
-/// lines its registers name are the title's to zero.
+/// `context` is the state of a thread that faulted at a `clzero`.
 unsafe fn clzero(context: &mut CONTEXT) -> bool {
-    // SAFETY: (every use) a line the title asked to zero.
-    let zero = |rax: u64| unsafe { ((rax & !63) as *mut u8).write_bytes(0, 64) };
+    let zero = |rax: u64| -> bool {
+        let line = (rax & !63) as usize;
+        if !crate::console_insn::writable(line, 64) {
+            return false;
+        }
+        // SAFETY: `line..line + 64` is verified committed and writable.
+        unsafe { (line as *mut u8).write_bytes(0, 64) };
+        true
+    };
     let at = context.Rip as usize;
-    // The loops' other instructions are read only where that stays inside
-    // the faulting instruction's page (the next one may not be mapped).
     let page = at & 0xfff;
     if page + 12 <= 0x1000 {
         // SAFETY: inside the page the CPU fetched the instruction from.
@@ -332,8 +327,12 @@ unsafe fn clzero(context: &mut CONTEXT) -> bool {
             && limit != 0
         {
             let limit = *gpr(context, limit);
+            let mut ran = false;
             loop {
-                zero(context.Rax);
+                if !zero(context.Rax) {
+                    return ran;
+                }
+                ran = true;
                 context.Rax = context.Rax.wrapping_add(0x40);
                 if context.Rax >= limit {
                     break;
@@ -359,8 +358,12 @@ unsafe fn clzero(context: &mut CONTEXT) -> bool {
             && b != 0
         {
             let limit = *gpr(context, b);
+            let mut ran = false;
             loop {
-                zero(context.Rax);
+                if !zero(context.Rax) {
+                    return ran;
+                }
+                ran = true;
                 let next = *gpr(context, a);
                 if next >= limit {
                     break;
@@ -374,7 +377,9 @@ unsafe fn clzero(context: &mut CONTEXT) -> bool {
             return true;
         }
     }
-    zero(context.Rax);
+    if !zero(context.Rax) {
+        return false;
+    }
     context.Rip += 3;
     true
 }

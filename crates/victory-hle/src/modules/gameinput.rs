@@ -109,6 +109,12 @@ const _: () = assert!(size_of::<KeyState>() == 12 && size_of::<PadState>() == 28
 trait Source: Send {
     /// The pad in host slot `slot`, `None` when the slot is empty.
     fn pad(&mut self, slot: usize) -> Option<PadState>;
+    /// Side-effect-free connectivity query for `slot` (must NOT drain latched
+    /// HID button presses or perform synchronous driver I/O).
+    fn is_connected(&self, slot: usize) -> bool {
+        let _ = slot;
+        false
+    }
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
     /// Motor speeds: low frequency (left), high frequency (right).
@@ -964,9 +970,10 @@ extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     let speed = |level: f32| (level.clamp(0.0, 1.0) * f32::from(u16::MAX)) as u16;
     let mut source = lock(&device.hub().source);
     if one_pad {
-        // The one pad is every host pad.
+        // The one pad is every host pad: check connectivity without consuming
+        // latched button presses or polling XInput synchronously.
         for slot in 0..PADS {
-            if source.pad(slot).is_some() {
+            if source.is_connected(slot) {
                 source.rumble(slot, speed(low), speed(high));
             }
         }
@@ -1248,6 +1255,10 @@ mod host {
                 .collect()
         }
 
+        fn is_connected(&self, slot: usize) -> bool {
+            slot < PADS && (self.xinput_connected[slot] || self.hid.has_slot(slot))
+        }
+
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
             if self.xinput_connected[slot] {
                 let speeds = XINPUT_VIBRATION {
@@ -1358,6 +1369,9 @@ mod tests {
     impl Source for Fake {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
             self.0.lock().unwrap().pads[slot]
+        }
+        fn is_connected(&self, slot: usize) -> bool {
+            self.0.lock().unwrap().pads[slot].is_some()
         }
         fn keys(&mut self) -> Vec<KeyState> {
             self.0.lock().unwrap().keys.clone()

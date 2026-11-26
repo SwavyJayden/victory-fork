@@ -351,9 +351,19 @@ fn copy_args(
     let l = &p.layout;
     let (mip, slice) = (subresource % c.mips, subresource / c.mips);
     let m = l.mips.get(mip as usize)?;
-    let bytes = m.width as usize * l.desc.element_bytes as usize;
+    let bytes = (m.width as usize).checked_mul(l.desc.element_bytes as usize)?;
     let depths = l.subresource_depth(mip) as usize;
-    let linear = (depths - 1) * depth as usize + (m.height as usize - 1) * row as usize + bytes;
+    let rows = m.height as usize;
+    if rows == 0 || depths == 0 || (row as usize) < bytes {
+        return None;
+    }
+    let slice_bytes = (rows - 1).checked_mul(row as usize)?.checked_add(bytes)?;
+    if depths > 1 && (depth as usize) < slice_bytes {
+        return None;
+    }
+    let linear = (depths - 1)
+        .checked_mul(depth as usize)?
+        .checked_add(slice_bytes)?;
     Some(CopyArgs {
         layout: l,
         mip,
@@ -511,28 +521,33 @@ extern "system" fn tiling(
         }
         if let Some(n) = count.as_mut() {
             let slices = if tail { l.slices.min(2) } else { l.slices };
-            let wanted = (standard * slices).saturating_sub(first).min(*n);
-            for i in 0..wanted {
-                let (slice, mip) = ((first + i) / standard, (first + i) % standard);
-                let m = &l.mips[mip as usize];
-                let entry = if tail && slice > 0 {
-                    SubresourceTiling {
-                        width: 0,
-                        height: 0,
-                        depth: 0,
-                        start: 0,
-                    }
-                } else {
-                    SubresourceTiling {
-                        width: m.pitch / l.block[0],
-                        height: (m.rows / l.block[1]) as u16,
-                        depth: 1,
-                        start: ((u64::from(slice) * l.slice_size + m.offset) / TILE) as u32,
-                    }
-                };
-                out.add(i as usize).write(entry);
+            let available = (standard * slices).saturating_sub(first);
+            if out.is_null() {
+                *n = available;
+            } else {
+                let wanted = available.min(*n);
+                for i in 0..wanted {
+                    let (slice, mip) = ((first + i) / standard, (first + i) % standard);
+                    let m = &l.mips[mip as usize];
+                    let entry = if tail && slice > 0 {
+                        SubresourceTiling {
+                            width: 0,
+                            height: 0,
+                            depth: 0,
+                            start: 0,
+                        }
+                    } else {
+                        SubresourceTiling {
+                            width: m.pitch / l.block[0],
+                            height: (m.rows / l.block[1]) as u16,
+                            depth: 1,
+                            start: ((u64::from(slice) * l.slice_size + m.offset) / TILE) as u32,
+                        }
+                    };
+                    out.add(i as usize).write(entry);
+                }
+                *n = wanted;
             }
-            *n = wanted;
         }
     }
     S_OK
@@ -752,6 +767,21 @@ mod tests {
             (2, 1, 8, 1)
         );
         assert_eq!((shape, n, subs[0].start), ([256, 256, 1], 1, 1));
+        // Querying count with `out == null` must report available count without crashing.
+        let mut query_n = 4u32;
+        assert_eq!(
+            tiling(
+                c,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut query_n,
+                0,
+                std::ptr::null_mut()
+            ),
+            S_OK
+        );
+        assert_eq!(query_n, 1);
         assert_eq!(release(c), 0);
 
         // 4 KiB modes have no 64 KiB tiling.

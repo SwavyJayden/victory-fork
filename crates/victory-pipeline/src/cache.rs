@@ -63,11 +63,19 @@ impl Cache {
         let (tmp, mut file) = tempfile_in(dir)?;
         let written = file.write_all(&output);
         drop(file);
-        let published = written.and_then(|()| std::fs::rename(&tmp, &path));
-        if published.is_err() {
+        if let Err(error) = written {
             let _ = std::fs::remove_file(&tmp);
+            return Err(error.into());
         }
-        published?;
+        if let Err(error) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
+            // Content-addressed cache: if another worker published `path`
+            // concurrently (Windows rejects atomic overwrite when open), reuse it.
+            if path.is_file() {
+                return Ok(path);
+            }
+            return Err(error.into());
+        }
         Ok(path)
     }
 }

@@ -19,6 +19,7 @@
 use std::alloc::Layout;
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard};
 use std::time::Instant;
 
@@ -384,6 +385,7 @@ impl Context {
         unsafe { self.0.add(word).read_volatile() }
     }
 
+    #[cfg(test)]
     fn set(self, word: usize, value: u32) {
         // SAFETY: as above.
         unsafe { self.0.add(word).write_volatile(value) }
@@ -395,7 +397,14 @@ impl Context {
 
     fn set_field(self, word: usize, shift: u32, bits: u32, value: u32) {
         let mask = ((1u32 << bits) - 1) << shift;
-        self.set(word, (self.get(word) & !mask) | ((value << shift) & mask));
+        let bits_val = (value << shift) & mask;
+        // SAFETY: 4-byte-aligned word inside the live XMA context array; atomic
+        // RMW prevents concurrent title writes to sibling fields (e.g.
+        // `valid_inputs` in word 0) from being clobbered.
+        let atomic = unsafe { AtomicU32::from_ptr(self.0.add(word)) };
+        let _ = atomic.fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+            Some((cur & !mask) | bits_val)
+        });
     }
 
     fn channels(self) -> usize {
@@ -532,8 +541,13 @@ fn pump(context: Context, voice: &mut Voice) {
         // The write block is the title's too: taken modulo the ring before
         // the first write, which would otherwise land past the ring's end.
         let write = context.field(0, 27, 5) % size;
-        let address = context.get(7) as usize + write as usize * BLOCK_BYTES;
-        let Some(out) = heap_bytes(address as u32, BLOCK_BYTES) else {
+        let Some(address) = context
+            .get(7)
+            .checked_add(write.saturating_mul(BLOCK_BYTES as u32))
+        else {
+            return;
+        };
+        let Some(out) = heap_bytes(address, BLOCK_BYTES) else {
             return;
         };
         for pair in out.as_chunks_mut::<2>().0 {

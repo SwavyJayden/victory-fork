@@ -174,39 +174,51 @@ fn with_patch(word: u128, at: usize, patch: &[u8]) -> Option<u128> {
 /// protection for the page's own.
 static PATCHING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Replaces the bytes at `at`, which are `was`, by `patch`, in one store that other threads
-/// see whole: whether they are replaced now (not where they cross 16 aligned bytes, or the page
-/// cannot be written).
+/// RIPs already live-patched by another thread: a concurrent thread that hit `#UD`
+/// at `rip` right before the patch landed sees the replacement bytes instead of the
+/// console opcode and must retry execution at `rip` rather than crashing.
+static PATCHED_RIPS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<usize>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+fn mark_patched(rip: usize) {
+    PATCHED_RIPS.lock().unwrap_or_else(|e| e.into_inner()).insert(rip);
+}
+
+fn was_patched(rip: usize) -> bool {
+    PATCHED_RIPS.lock().unwrap_or_else(|e| e.into_inner()).contains(&rip)
+}
+
+/// Replaces `was` bytes at `at` with `replacement` atomically via `cmpxchg16b`
+/// (up to 15 bytes within one aligned 16-byte line) and flushes the instruction cache.
 ///
 /// # Safety
-/// `at` is in code that stays mapped, and `patch` does for it what `was` does.
-unsafe fn patch<const N: usize>(at: usize, was: [u8; N], patch: [u8; N]) -> bool {
+/// `at` is in mapped code, `was.len() == replacement.len()`, and `replacement` is
+/// semantically equivalent to `was`.
+unsafe fn patch_slice(at: usize, was: &[u8], replacement: &[u8]) -> bool {
     use std::sync::atomic::Ordering::SeqCst;
     use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
     use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    if (at & 15) + N > 16 || !std::is_x86_feature_detected!("cmpxchg16b") {
+    let n = was.len();
+    if n == 0 || n != replacement.len() || (at & 15) + n > 16 || !std::is_x86_feature_detected!("cmpxchg16b") {
         return false;
     }
     let _one = PATCHING.lock().unwrap_or_else(|e| e.into_inner());
     let word = (at & !15) as *mut u128;
-    let here = (at & 15)..(at & 15) + N;
+    let here = (at & 15)..(at & 15) + n;
     let mut old = 0u32;
-    // SAFETY: the aligned 16 bytes around the instruction lie in one page of mapped code, made
-    // writable for the store and put back; the processor has the instruction (asked above).
+    // SAFETY: the aligned 16 bytes around the instruction lie in one page of mapped code.
     unsafe {
         if VirtualProtect(word.cast(), 16, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
             return false;
         }
-        // What is there (zeros are replaced by zeros).
         let mut now = std::arch::x86_64::cmpxchg16b(word, 0, 0, SeqCst, SeqCst);
         let done = loop {
             let bytes = &now.to_le_bytes()[here.clone()];
-            if bytes == patch {
-                // (Another thread's fault at the same place: done already.)
+            if bytes == replacement {
                 break true;
             }
-            let Some(new) = (bytes == was).then(|| with_patch(now, at, &patch)).flatten() else {
+            let Some(new) = (bytes == was).then(|| with_patch(now, at, replacement)).flatten() else {
                 break false;
             };
             let there = std::arch::x86_64::cmpxchg16b(word, now, new, SeqCst, SeqCst);
@@ -219,6 +231,17 @@ unsafe fn patch<const N: usize>(at: usize, was: [u8; N], patch: [u8; N]) -> bool
         FlushInstructionCache(GetCurrentProcess(), word.cast(), 16);
         done
     }
+}
+
+/// Replaces the bytes at `at`, which are `was`, by `patch`, in one store that other threads
+/// see whole: whether they are replaced now (not where they cross 16 aligned bytes, or the page
+/// cannot be written).
+///
+/// # Safety
+/// `at` is in code that stays mapped, and `patch` does for it what `was` does.
+unsafe fn patch<const N: usize>(at: usize, was: [u8; N], patch: [u8; N]) -> bool {
+    // SAFETY: forwarded to `patch_slice`.
+    unsafe { patch_slice(at, &was, &patch) }
 }
 
 /// Diagnostics: how often each place in the title's code raises one of these exceptions, the
@@ -309,7 +332,7 @@ fn readable(va: usize, bytes: usize) -> bool {
     found && m.State == MEM_COMMIT && m.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 && m.BaseAddress as usize + m.RegionSize >= va + bytes
 }
 
-fn writable(va: usize, bytes: usize) -> bool {
+pub(crate) fn writable(va: usize, bytes: usize) -> bool {
     writable_to(va, va + bytes) == Some(va + bytes)
 }
 
@@ -378,7 +401,12 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
     };
     // SAFETY: `n` bytes at `rip` are readable.
     let code = unsafe { std::slice::from_raw_parts(rip as *const u8, n) };
-    let Some((what, len)) = decode::decode(code) else { return 0 };
+    let Some((what, len)) = decode::decode(code) else {
+        // Another thread may have concurrently live-patched `rip` to NOP/JMP
+        // while we were entering the VEH. Retry at the same `rip` so the CPU
+        // executes the valid replacement instead of crashing with #UD.
+        return if was_patched(rip) { CONTINUE_EXECUTION } else { 0 };
+    };
     static SEEN: std::sync::Mutex<Vec<std::mem::Discriminant<ConsoleOnly>>> = std::sync::Mutex::new(Vec::new());
     if let Ok(mut seen) = SEEN.lock()
         && !seen.contains(&std::mem::discriminant(&what))
@@ -395,16 +423,13 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
     match what {
         ConsoleOnly::Ud2 => return 0,
         ConsoleOnly::Clwb => {
-            // nothing to write back on the PC: patched to NOPs, no exception next time
-            use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
-            let mut old = 0u32;
-            let _one = PATCHING.lock().unwrap_or_else(|e| e.into_inner());
-            // SAFETY: the instruction's own bytes, made writable for the patch and restored.
-            unsafe {
-                if VirtualProtect(rip as *const _, len, PAGE_EXECUTE_READWRITE, &mut old) != 0 {
-                    std::slice::from_raw_parts_mut(rip as *mut u8, len).fill(0x90);
-                    VirtualProtect(rip as *const _, len, old, &mut old);
-                }
+            // Atomically patch `clwb` to NOPs via `cmpxchg16b` + icache flush
+            // when it fits in one 16-byte line; otherwise skip by advancing RIP
+            // so concurrent cores never fetch torn instruction bytes.
+            let nops = [0x90u8; 15];
+            // SAFETY: `rip` is mapped title code; `len <= n <= 15`.
+            if len <= nops.len() && unsafe { patch_slice(rip, &code[..len], &nops[..len]) } {
+                mark_patched(rip);
             }
         }
         ConsoleOnly::Monitorx | ConsoleOnly::Mwaitx => {
@@ -416,6 +441,7 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
                 // replacements are waits that wait for nothing, as the emulation is.
                 && unsafe { patch(rip, [code[0], code[1], code[2]], new) }
             {
+                mark_patched(rip);
                 #[cfg(feature = "diagnostics")]
                 sites::patched();
             }
@@ -439,6 +465,7 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
                 // SAFETY: the title's code, where the loop's first instruction just faulted.
                 && unsafe { patch_clzero(rip, &code[..12]) }
             {
+                mark_patched(rip);
                 #[cfg(feature = "diagnostics")]
                 sites::patched();
             }

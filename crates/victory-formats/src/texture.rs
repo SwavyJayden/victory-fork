@@ -440,7 +440,11 @@ impl Layout {
                     depth: depth_of(i),
                     pitch,
                     rows,
-                    depth_pitch: if three_d { depth } else { 1 },
+                    depth_pitch: if three_d {
+                        if thick { depth } else { slices }
+                    } else {
+                        1
+                    },
                     offset: 0,
                     tail: None,
                 });
@@ -483,6 +487,8 @@ impl Layout {
                     rows,
                     depth_pitch: if thick {
                         mip_depth(i).next_multiple_of(BLOCK_256_3D[element_log2 as usize][2])
+                    } else if three_d {
+                        slices
                     } else {
                         1
                     },
@@ -1520,5 +1526,26 @@ mod tests {
             Err(Error::TooSmall)
         );
         assert_eq!(l.offset(0, 64, 0, 0), Err(Error::Invalid));
+    }
+
+    #[test]
+    fn thin_3d_mipmapped_depth_pitch_tracks_slices() {
+        let l = Layout::new(&Desc {
+            dimension: Dimension::Tex3d,
+            width: 64,
+            height: 64,
+            depth: 8,
+            mips: 4,
+            element_bytes: 4,
+            block: 1,
+            samples: 1,
+            swizzle: Swizzle::SW_64KB_R_X,
+        })
+        .unwrap();
+        assert!(!l.thick);
+        assert_eq!(l.slices, 8);
+        for m in &l.mips {
+            assert_eq!(m.depth_pitch, 8);
+        }
     }
 }

@@ -160,21 +160,16 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
     let Some(m) = registry().iter().find(|m| handle(m) == module) else {
         return host_override(module, name).unwrap_or_else(|| host::get_proc_address(module, name));
     };
-    // Values below 0x10000 are ordinals; we export by name only.
-    if (name as usize) < 0x1_0000 {
-        tracing::warn!(
-            module = m.name,
-            ordinal = name as usize,
-            "GetProcAddress by ordinal"
-        );
-        return std::ptr::null_mut();
-    }
-    // SAFETY: not an ordinal, so the title passes a NUL-terminated name.
-    let name = unsafe { CStr::from_ptr(name.cast()) }.to_string_lossy();
-    match m.exports.iter().find(|e| e.name == name) {
+    let lookup: std::borrow::Cow<'_, str> = if (name as usize) < 0x1_0000 {
+        std::borrow::Cow::Owned(format!("#{}", name as usize))
+    } else {
+        // SAFETY: not an ordinal, so the title passes a NUL-terminated name.
+        unsafe { CStr::from_ptr(name.cast()) }.to_string_lossy()
+    };
+    match m.exports.iter().find(|e| e.name == lookup.as_ref()) {
         Some(e) => e.address as *mut c_void,
         None => {
-            tracing::warn!(module = m.name, %name, "GetProcAddress: not implemented");
+            tracing::warn!(module = m.name, name = %lookup, "GetProcAddress: not implemented");
             std::ptr::null_mut()
         }
     }

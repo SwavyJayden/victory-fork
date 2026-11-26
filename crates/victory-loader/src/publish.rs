@@ -26,9 +26,18 @@ pub fn write_if_changed(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         ".{name}.{}.{sequence}.tmp",
         std::process::id()
     ));
-    std::fs::write(&staging, bytes)?;
+    if let Err(error) = std::fs::write(&staging, bytes) {
+        let _ = std::fs::remove_file(&staging);
+        return Err(error);
+    }
     if let Err(error) = std::fs::rename(&staging, path) {
         let _ = std::fs::remove_file(&staging);
+        // On Windows, concurrent publishers racing on `rename` (or a reader
+        // mapping `path`) can fail with ACCESS_DENIED / SHARING_VIOLATION even
+        // when the exact content is already published.
+        if std::fs::read(path).is_ok_and(|existing| existing == bytes) {
+            return Ok(());
+        }
         return Err(error);
     }
     Ok(())

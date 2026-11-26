@@ -127,7 +127,11 @@ pub fn decode(code: &[u8]) -> Option<(ConsoleOnly, usize)> {
                 let rex_r = code[i + 7] == 0x4C;
                 let modrm = code[i + 9];
                 let reg_idx = ((modrm >> 3) & 7) | if rex_r { 8 } else { 0 };
-                Some((ConsoleOnly::ClzeroLoop { end_reg: reg_idx }, i + 12))
+                if (modrm & 0xC7) == 0xC0 && reg_idx != 0 {
+                    Some((ConsoleOnly::ClzeroLoop { end_reg: reg_idx }, i + 12))
+                } else {
+                    Some((ConsoleOnly::Clzero, i + 3))
+                }
             } else {
                 Some((ConsoleOnly::Clzero, i + 3))
             }

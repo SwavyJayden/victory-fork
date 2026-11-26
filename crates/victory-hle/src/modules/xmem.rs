@@ -360,7 +360,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
-            VirtualFree(address, 0, MEM_RELEASE);
+            title_virtual_free(address, 0, MEM_RELEASE);
             return;
         }
         let user = address.cast::<u8>();
@@ -1231,7 +1231,11 @@ pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
                 break;
             }
             let slice = from.map(|from| physical.slice_at(from));
-            ok &= !matches!(slice, Some(None));
+            if matches!(slice, Some(None)) {
+                ok = false;
+                at += 1;
+                continue;
+            }
             touched.insert(to);
             ops.push(Op::new(to, slice.flatten()));
             at += 1;
@@ -1266,6 +1270,8 @@ fn scatter(wanted: &[(usize, usize)]) -> bool {
                 if page != 0 && slice.is_none() {
                     tracing::warn!(page, "XMemMapPhysicalPagesScatter: unknown page");
                     ok = false;
+                    at += 1;
+                    continue;
                 }
                 ops.push(Op::new(to, slice));
                 at += 1;
@@ -1869,9 +1875,54 @@ pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
 }
 
 /// The title's own `VirtualFree`. What the GPU side noted of the memory goes
-/// first: the address may be other memory's the moment it is free.
+/// first: the address may be other memory's the moment it is free. Also purges
+/// any stale placeholder-hole / view records under `PHYSICAL` when placeholders
+/// are coalesced or a reservation is released so parallel scatter mappings never
+/// mistake a coalesced placeholder for an already-split 64 KiB hole.
 extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u32) -> BOOL {
     const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
+    let plain_release =
+        kind & MEM_RELEASE != 0 && kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0;
+    if !address.is_null() && kind & (MEM_COALESCE_PLACEHOLDERS | MEM_RELEASE) != 0 {
+        let start = address as usize;
+        let span = if size > 0 {
+            size
+        } else if plain_release {
+            let mut info = MEMORY_BASIC_INFORMATION::default();
+            // SAFETY: querying our own process for the region size before release.
+            let got = unsafe {
+                VirtualQueryEx(
+                    GetCurrentProcess(),
+                    address,
+                    &mut info,
+                    size_of::<MEMORY_BASIC_INFORMATION>(),
+                )
+            };
+            if got != 0 { info.RegionSize } else { 0 }
+        } else {
+            0
+        };
+        if span > 0 {
+            let end = start.saturating_add(span);
+            let mut physical = physical();
+            // Remove all cached 64 KiB placeholder holes overlapping `[start, end)`.
+            physical
+                .holes
+                .retain(|&at, &mut len| at >= end || at.saturating_add(len) <= start);
+            if plain_release {
+                let stale_views: Vec<usize> = physical
+                    .views
+                    .range(..end)
+                    .filter_map(|(&at, &(len, _))| (at.saturating_add(len) > start).then_some(at))
+                    .collect();
+                for at in stale_views {
+                    if let Some((len, slice)) = physical.views.remove(&at) {
+                        shown_mut().forget(at, len, &slice);
+                    }
+                }
+            }
+        }
+    }
     // Splitting and joining placeholders changes nothing they show.
     if kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0 {
         victory_gpu::title_memory_freed(address as usize, size);
