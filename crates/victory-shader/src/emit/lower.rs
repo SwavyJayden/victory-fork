@@ -541,71 +541,6 @@ fn need(block: usize) {
     });
 }
 
-/// VGPR values that are the same in every lane holding them (`all` is [`all_lane_blocks`]):
-/// written by an instruction every arriving lane runs (no guard), lane by lane, from scalars,
-/// constants and such values; or loaded from an address made of them. The compiler keeps
-/// wave-uniform data in VGPRs and fetches it with `v_readfirstlane`.
-/// shortcut: a value joined by a phi counts only where every predecessor is a block all lanes
-/// run (no lane branch can have split the arriving lanes); loop-carried values never do.
-fn lane_uniform(p: &Program, st: &Structured, all: &[bool], ordered_lds: bool) -> HashSet<Value> {
-    let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
-    let mut same: HashSet<Value> = HashSet::new();
-    for b in crate::ir::reverse_postorder(&p.blocks) {
-        let block = &p.blocks[b];
-        let whole = block.preds.iter().all(|&q| all.get(q).copied().unwrap_or(false));
-        for phi in &block.phis {
-            if matches!(phi.reg, Reg::V(_)) && whole && phi.args.iter().all(|a| same.contains(a)) {
-                same.insert(phi.value);
-            }
-        }
-        for (i, inst) in block.insts.iter().enumerate() {
-            let name = inst.name();
-            if st.guards[b][i].is_some() {
-                continue; // lanes outside EXEC keep another value
-            }
-            let ops: Vec<Operand> = match &inst.fields {
-                Fields::Valu(v)
-                    if v.dpp.is_none()
-                        && v.sdwa.is_none()
-                        && !name.starts_with("v_mbcnt")
-                        && !name.starts_with("v_cmpx")
-                        && !name.contains("lane") =>
-                {
-                    v.src.clone()
-                }
-                Fields::Ds {
-                    addr: Some(Operand::Vector { reg, dwords: 1 }),
-                    gds: false,
-                    ..
-                } if ordered_lds && name == "ds_read_b32" => {
-                    if inst.read(Reg::V(*reg)).is_some_and(|a| same.contains(&a)) {
-                        same.extend(inst.writes.iter().map(|w| w.1));
-                    }
-                    continue;
-                }
-                _ => continue,
-            };
-            let alike = ops.iter().all(|op| match *op {
-                Operand::Vector { reg, .. } => {
-                    // every dword of the operand the instruction reads from that register on
-                    let read: Vec<Value> =
-                        inst.reads.iter().filter(|r| matches!(r.0, Reg::V(x) if x >= reg)).map(|r| r.1).collect();
-                    !read.is_empty() && read.iter().all(|x| same.contains(x))
-                }
-                // a scalar is one value; a lane mask is not, unless a compare of such values made it
-                Operand::Scalar { code, .. } if code != NULL => {
-                    inst.read(Reg::S(code)).is_none_or(|x| !is_mask(x) || same.contains(&x))
-                }
-                _ => true,
-            });
-            if alike {
-                same.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
-            }
-        }
-    }
-    same
-}
-
 /// What a register value holds, for [`wave_local`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Wave {
@@ -1625,7 +1560,7 @@ impl<'a> Lower<'a> {
                 }
             }
         }
-        Lower {
+        let mut l = Lower {
             s,
             x,
             bad,
@@ -1695,12 +1630,7 @@ impl<'a> Lower<'a> {
             local: exchange.is_some() && LOCAL_WAVES.get(),
             local_ok: false,
             local_any: LOCAL_ANY.get(),
-            uniform: match &exchange {
-                Some((_, false, all)) if !LOCAL_WAVES.get() => {
-                    lane_uniform(p, x.st, all, split_lds && super::group_sync() != 0)
-                }
-                _ => HashSet::new(),
-            },
+            uniform: HashSet::new(),
             own_bits: match &exchange {
                 Some((_, false, _)) if !LOCAL_WAVES.get() && own_bits_on() => {
                     super::own_bits::find(p, x.st, std::env::var_os("VICTORY_WAVE_WHY").is_some())
@@ -1742,7 +1672,28 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+        };
+        if let Some((_, false, all)) = &l.exchange
+            && !LOCAL_WAVES.get()
+        {
+            let ordered_lds = l.split_lds && super::group_sync() != 0;
+            let waits = |b: usize| {
+                !l.no_barrier.contains(&b)
+                    && match super::group_sync() {
+                        0 => false,
+                        1 => !l.fence_only.contains(&b),
+                        _ => true,
+                    }
+            };
+            let read_only = |site: Site| {
+                l.descriptors
+                    .get(&(site, false))
+                    .and_then(|src| l.used_kind(src))
+                    .is_some_and(|u| matches!(u.kind, ResourceType::Srv | ResourceType::Cbv))
+            };
+            l.uniform = super::lean::lane_uniform(p, x.st, all, ordered_lds, &waits, &read_only);
         }
+        l
     }
 
     /// The dword of the program's code at byte `byte` (a constant table
@@ -3730,7 +3681,8 @@ impl<'a> Lower<'a> {
     fn max_min(&mut self, max: bool, a: V, b: V) -> V {
         let c = self.cur;
         let r = self.binary(if max { 35 } else { 36 }, a, b);
-        if host_rdna() & super::rdna::MAX_MIN != 0 {
+        let nonzero = |v: V| self.s.m.float_k(v).is_some_and(|k| k.to_bits() & 0x7FFF_FFFF != 0);
+        if host_rdna() & super::rdna::MAX_MIN != 0 || a == b || nonzero(a) || nonzero(b) {
             return r;
         }
         let (ia, ib) = (self.as_int(a), self.as_int(b));
@@ -3867,7 +3819,9 @@ impl<'a> Lower<'a> {
     fn med3(&mut self, a: V, b: V, third: V) -> V {
         let c = self.cur;
         // Between two constants in order: the lower one for a NaN either way.
-        if host_rdna() & super::rdna::MED3 != 0 {
+        // Non-zero distinct constants have no signed-zero ambiguity on any
+        // SM 6.6 GPU (including NVIDIA Blackwell).
+        {
             let k = [a, b, third].map(|x| self.s.m.float_k(x));
             let ordered = match k {
                 [None, Some(x), Some(y)] => Some((a, b, third, x, y)),
@@ -3879,6 +3833,7 @@ impl<'a> Lower<'a> {
                 && !x.is_nan()
                 && !y.is_nan()
                 && x != y
+                && (host_rdna() & super::rdna::MED3 != 0 || (x != 0.0 && y != 0.0))
             {
                 let (low, high) = if x < y { (p, q) } else { (q, p) };
                 let t = self.binary(35, v, low);
@@ -3983,6 +3938,12 @@ impl<'a> Lower<'a> {
         }
         let m = self.s.m.bin(c, Bin::Mul, a, b);
         let zero = self.s.m.f32(0);
+        if self.s.m.float_k(a) == Some(0.0) || self.s.m.float_k(b) == Some(0.0) {
+            return zero;
+        }
+        if a == b {
+            return m;
+        }
         let az = self.s.m.cmp(c, pred::OEQ, a, zero);
         let bz = self.s.m.cmp(c, pred::OEQ, b, zero);
         let z = self.s.m.bin(c, Bin::Or, az, bz);
@@ -10223,6 +10184,11 @@ impl<'a> Lower<'a> {
                     self.as_int(x)
                 };
                 let mask = self.src(inst, 1)?;
+                if super::lean::class_ranges_on()
+                    && let Some((_, m)) = self.s.m.int_k(mask)
+                {
+                    super::lean::class_test(&mut self.s.m, c, x, m as u32, f16)
+                } else {
                 let k = |l: &mut Self, v: u32| l.s.m.i32(v);
                 let (exp_sh, sign_sh, exp_mask, mant_mask, quiet_bit) = if f16 {
                     (10, 15, 0x1F, 0x03FF, 0x0200)
@@ -10267,6 +10233,7 @@ impl<'a> Lower<'a> {
                 let bit = self.s.m.bin(c, Bin::LShr, mask, t);
                 let bit = self.s.m.bin(c, Bin::And, bit, one);
                 self.s.m.cmp(c, pred::NE, bit, zero)
+                }
             }
             "f32" | "f16" => {
                 let (a, b) = if ty == "f16" {

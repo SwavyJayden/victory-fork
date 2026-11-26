@@ -123,6 +123,36 @@ impl Host {
         }
     }
 
+    /// Queries the hardware adapter's maximum wave lane width and whether it
+    /// is an AMD RDNA device (`WaveLaneCountMin == 32 && WaveLaneCountMax == 64`).
+    pub fn wave_and_rdna(&self) -> (u32, bool) {
+        let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: valid device and sized output structure.
+        let ok = unsafe {
+            self.device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut o1).cast(),
+                    size_of_val(&o1) as u32,
+                )
+                .is_ok()
+        };
+        if !ok {
+            return (0, false);
+        }
+        // SAFETY: plain DXGI adapter query on the device's LUID.
+        let amd = unsafe {
+            CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(self.device.GetAdapterLuid()))
+                .and_then(|a| a.GetDesc1())
+                .is_ok_and(|d| d.VendorId == 0x1002)
+        };
+        (
+            o1.WaveLaneCountMax,
+            amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64,
+        )
+    }
+
     /// The root signature translated shaders expect: user data per stage
     /// at `b0`, immediate samplers per stage at `s<n>`, heaps directly
     /// indexed.

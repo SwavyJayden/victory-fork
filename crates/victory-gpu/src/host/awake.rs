@@ -22,11 +22,12 @@ use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObj
 use windows::core::Interface;
 
 /// About 2 ms at full clocks: 500 sends a second.
+/// Uses one 32-thread warp (minimum SM occupancy on NVIDIA Wave32 and RDNA Wave32).
 const COUNT: &str = r#"
 #define RS "UAV(u0)"
 RWByteAddressBuffer sum : register(u0);
 [RootSignature(RS)]
-[numthreads(64, 1, 1)]
+[numthreads(32, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     uint x = id.x;
     [loop] for (uint i = 0; i < 400000u; i++) x = x * 1664525u + 1013904223u;

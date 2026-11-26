@@ -685,7 +685,7 @@ impl<'a> Lanes<'a> {
             if let Exit::Branch { .. } = p.blocks[b].exit
                 && let Some(last) = p.blocks[b].insts.last()
             {
-                self.when[b] = Some(self.branch(last));
+                self.when[b] = Some(self.branch(b, last, now));
                 self.wave_any[b] = self.wave_kind(last);
             }
         }
@@ -1334,7 +1334,7 @@ impl<'a> Lanes<'a> {
         }
     }
 
-    fn branch(&mut self, inst: &Inst) -> Bool {
+    fn branch(&mut self, b: usize, inst: &Inst, now: Option<Bool>) -> Bool {
         let exec = self.exec(inst);
         match inst.name() {
             "s_cbranch_execz" => self.b.not(exec),
@@ -1344,7 +1344,29 @@ impl<'a> Lanes<'a> {
                     Some(k) => self.mask(k).0,
                     None => Bool::FALSE,
                 };
-                let any = self.b.and(vcc, exec);
+                // A forward branch on `exec & U` where `U` is a non-constant uniform
+                // condition stays uniform instead of creating spurious per-lane
+                // divergence after `without_skips`.
+                let forward = match self.p.blocks[b].exit {
+                    Exit::Branch { taken, not_taken } => {
+                        self.index[taken] > self.index[b] && self.index[not_taken] > self.index[b]
+                    }
+                    _ => false,
+                };
+                let any = if forward
+                    && let Some(e) = now
+                    && self.b.implies(vcc, e)
+                {
+                    let own = self.b.given(vcc, e);
+                    let atoms = self.b.support(own);
+                    if !atoms.is_empty() && atoms.iter().all(|a| matches!(a, Atom::Uniform(_))) {
+                        own
+                    } else {
+                        self.b.and(vcc, exec)
+                    }
+                } else {
+                    self.b.and(vcc, exec)
+                };
                 if n.ends_with("nz") {
                     any
                 } else {
@@ -1886,5 +1908,34 @@ mod tests {
                 .any(|&e| matches!(s.bools.support(e)[..], [Atom::Lane(_)])),
             "{edges:?}"
         );
+    }
+
+    #[test]
+    fn forward_uniform_masked_vcc_branch_stays_uniform() {
+        let p = build(
+            &[
+                0x7D84_0080, // 0: v_cmp_eq_u32 vcc_lo, 0, v0
+                0xBE84_3C6A, // 4: s_and_saveexec_b32 s4, vcc_lo
+                0xBF06_8000, // 8: s_cmp_eq_u32 s0, 0
+                0x8502_807E, // 12: s_cselect_b32 s2, exec_lo, 0
+                0x876A_027E, // 16: s_and_b32 vcc_lo, exec_lo, s2
+                0xBF87_0001, // 20: s_cbranch_vccnz -> 28
+                0x8703_7E02, // 24: s_and_b32 s3, s2, exec_lo
+                S_ENDPGM,    // 28: s_endpgm
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        let LaneExit::Branch { when, .. } = s.exits[0] else {
+            panic!("{:?}", s.exits);
+        };
+        let atoms = s.bools.support(when);
+        assert!(
+            !atoms.is_empty() && atoms.iter().all(|a| matches!(a, Atom::Uniform(_))),
+            "expected uniform branch condition, got {atoms:?}"
+        );
+        let b_fall = p.blocks.iter().position(|b| b.offset == 24).unwrap();
+        let s3 = p.blocks[b_fall].insts[0].write(Reg::S(3)).unwrap();
+        assert!(s.active.contains(&s3));
     }
 }
