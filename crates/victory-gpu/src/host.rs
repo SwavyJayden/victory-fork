@@ -49,6 +49,7 @@ pub(crate) fn adv_log() -> bool {
 
 #[allow(clippy::too_many_arguments)]
 fn adv_log_line(
+    frames: f64,
     fps: f64,
     ms: f64,
     prep_ms: f64,
@@ -74,6 +75,9 @@ fn adv_log_line(
         .map_or((0, 0), |[budget, used, ..]| (used >> 20, budget >> 20));
     let detile_vram_mb = crate::gpu_detile::active_vram_bytes() >> 20;
     let host_staging_mb = crate::texture::live_staging_bytes() >> 20;
+    let ps = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+        .map(|i| PREP_SPLIT[i].swap(0, Ordering::Relaxed) as f64 / 1e6 / frames);
+    let [mp_pool, mp_tex] = [0, 1].map(|i| MAPPED_SRC[i].swap(0, Ordering::Relaxed));
     tracing::info!(
         "adv-log: fps={fps:.1} frame={ms:.2}ms prep={prep_ms:.2}ms \
          (copy={copy_ms:.2}ms/{copy_mb:.1}MB tex={tex_ms:.2}ms/{tex_mb:.1}MB) \
@@ -81,6 +85,11 @@ fn adv_log_line(
          vram={vram_used_mb}/{vram_budget_mb}MB detile_vram={detile_vram_mb}MB \
          host_stage={host_staging_mb}MB ram_tier={ram_tier} pressured={}",
         u8::from(crate::residency::pressured()),
+    );
+    tracing::info!(
+        "prep-split: lock={:.2}ms steps={:.2}ms sweep={:.2}ms ask={:.2}ms stale={:.2}ms \
+         front={:.2}ms def={:.2}ms card={:.2}ms heap={:.2}ms exec={:.2}ms | mapped={mp_pool}/{mp_tex}",
+        ps[0], ps[1], ps[2], ps[3], ps[4], ps[5], ps[6], ps[7], ps[8], ps[9],
     );
 }
 
@@ -372,6 +381,33 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
 
 /// Times, microseconds and the longest of [`mapped`].
 static MAPPED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+/// Calls to [`mapped`] since the last `adv-log` line: `[0]` from `pool::texture`
+/// 64 MiB blocks, `[1]` from standalone committed textures in `resource::host_texture_as`.
+static MAPPED_SRC: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+pub(crate) fn note_mapped_source(from_pool: bool) {
+    MAPPED_SRC[usize::from(!from_pool)].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Release-mode per-phase submit breakdown (nanoseconds, gated on `VICTORY_ADV_LOG=1`):
+/// `[0]` submission lock, `[1]` `card_steps`, `[2]` `sweep`, `[3]` `ask_once`,
+/// `[4]` `stale_under_flights`, `[5]` `refresh_front`, `[6]` `run_deferred` + `fill` + `flush`,
+/// `[7]` `card_before` + snapshots, `[8]` `heaps_synced` + `make_waiting`, `[9]` `detile` + `ExecuteCommandLists`.
+static PREP_SPLIT: [std::sync::atomic::AtomicU64; 10] = [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+
+#[inline]
+fn prep_tick(on: bool) -> Option<std::time::Instant> {
+    on.then(std::time::Instant::now)
+}
+
+#[inline]
+fn prep_mark(t: &mut Option<std::time::Instant>, slot: usize) {
+    if let Some(prev) = t {
+        let now = std::time::Instant::now();
+        PREP_SPLIT[slot].fetch_add((now - *prev).as_nanos() as u64, Ordering::Relaxed);
+        *prev = now;
+    }
+}
 
 /// New memory (made with [`not_resident`]) is resident when this returns.
 pub(crate) fn resident(device: &ID3D12Device, object: &impl Interface) -> windows::core::Result<()> {
@@ -4541,12 +4577,21 @@ impl Host {
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                    let (mut last_srv, mut last_uav) = (0u64, 0u64);
                     for r in plan.ranges.iter().filter(|r| r.compared) {
                         let (Some((_, Some(before), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) else {
                             continue;
                         };
-                        list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+                        let srv = r.shadow.buffer.GetGPUVirtualAddress();
+                        let uav = before.GetGPUVirtualAddress();
+                        if srv != last_srv {
+                            list.SetComputeRootShaderResourceView(1, srv);
+                            last_srv = srv;
+                        }
+                        if uav != last_uav {
+                            list.SetComputeRootUnorderedAccessView(2, uav);
+                            last_uav = uav;
+                        }
                         // (What is only looked at keeps its hashes: what
                         // changed there is the next declared range's to land.)
                         card_pass(list, &r.span, size as u32, r.at, if flown && !r.picked { 2 } else { 1 });
@@ -5539,8 +5584,10 @@ impl Host {
         crate::copystat::submission_begins();
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
+        let mut p_split = prep_tick(adv_log());
         let mut stage = crate::timeline::span("submit: the submission lock");
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        prep_mark(&mut p_split, 0);
         let was_working = working(true);
         submitting(1, runs.len());
         #[cfg(feature = "diagnostics")]
@@ -5553,6 +5600,7 @@ impl Host {
         // what they write.
         // Or the reads are done on the card, behind the flights.
         let own = if late { self.card_steps(runs) } else { None };
+        prep_mark(&mut p_split, 1);
         #[cfg(feature = "diagnostics")]
         ahead.part(12);
         stage.next("submit: waiting for flights it reads from");
@@ -5615,6 +5663,7 @@ impl Host {
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
         let started = std::time::Instant::now();
+        prep_mark(&mut p_split, 2);
         #[cfg(feature = "diagnostics")]
         ahead.part(14);
         #[cfg(feature = "diagnostics")]
@@ -5653,6 +5702,7 @@ impl Host {
             SPLIT[8].fetch_add(split.so_far(), Ordering::Relaxed);
             stage.next("submit: asking the write watch");
             crate::watch::ask_once(&ranges);
+            prep_mark(&mut p_split, 3);
             #[cfg(feature = "diagnostics")]
             split.part(0);
             stage.next("submit: title bytes under flights' writes");
@@ -5679,6 +5729,7 @@ impl Host {
         }
         #[cfg(feature = "diagnostics")]
         split.part(1);
+        prep_mark(&mut p_split, 4);
         // What flights in the air may write.
         let air = line().written.clone();
         stage.next("submit: refreshes ahead of writes");
@@ -5687,6 +5738,7 @@ impl Host {
         } else if ahead_of_writes() {
             batch.refresh_ahead(runs, |list, i| own.as_ref().is_some_and(|own| own.takes(list, i)));
         }
+        prep_mark(&mut p_split, 5);
         stage.next("submit: the lists' steps");
         for list in runs {
             list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
@@ -5700,6 +5752,7 @@ impl Host {
         stage.next("submit: the last refreshes");
         batch.flush();
         crate::watch::ask_once_end();
+        prep_mark(&mut p_split, 6);
         #[cfg(feature = "diagnostics")]
         split.part(2);
         stage.next("submit: snapshots");
@@ -5743,11 +5796,13 @@ impl Host {
         }
         #[cfg(feature = "diagnostics")]
         split.part(4);
+        prep_mark(&mut p_split, 7);
         stage.next("submit: waiting for the heaps' records");
         drop(heaps_synced);
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
+        prep_mark(&mut p_split, 8);
         #[cfg(feature = "diagnostics")]
         split.part(15);
         let prepared = std::time::Instant::now();
@@ -5793,6 +5848,7 @@ impl Host {
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
+            prep_mark(&mut p_split, 9);
             #[cfg(feature = "diagnostics")]
             split.part(5);
             let back = crate::picked::with(declared, &picked.written);
@@ -8804,7 +8860,7 @@ impl Meter {
         crate::queue::behind_line(frames);
         card_clock_line(frames, ms);
         crate::gpu_detile::line(frames);
-        adv_log_line(fps, ms, cpu, copy_ms, copy_mb, texture_ms, texture_mb, gpu, back_ms, back_mb, draws);
+        adv_log_line(frames, fps, ms, cpu, copy_ms, copy_mb, texture_ms, texture_mb, gpu, back_ms, back_mb, draws);
         #[cfg(feature = "diagnostics")]
         spans::line(frames);
         crate::shadow::back_line(frames);

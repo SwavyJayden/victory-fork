@@ -271,7 +271,13 @@ impl<B: Clone> Pool<B> {
                 }
             }
             let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count();
-            if empty < ripe.ahead
+            // Never pre-allocate past the current `reclaim` spare limit (`self.spare`):
+            // when VRAM >= 85% (`SPARES = 2`), growing toward `ripe.ahead = 12`
+            // caused `reclaim()` to destroy those empty blocks right back down to 2
+            // on the very next allocation, triggering tens of thousands of `CreateHeap`
+            // + synchronous `mapped()` GPU fence stalls.
+            let keep_ahead = ripe.ahead.min(self.spare.max(SPARE));
+            if empty < keep_ahead
                 && let Some(memory) = self.grow(now, &mut make)
             {
                 self.add(memory, ripe.started);
@@ -559,7 +565,10 @@ pub(crate) unsafe fn texture(
             tracing::warn!(error = %e, "no block of texture memory");
         }
         if let Some(h) = &heap
-            && let Err(e) = crate::host::resident(device, h).and_then(|()| crate::host::mapped(device))
+            && let Err(e) = crate::host::resident(device, h).and_then(|()| {
+                crate::host::note_mapped_source(true);
+                crate::host::mapped(device)
+            })
         {
             tracing::warn!(error = %e, "a block of texture memory is not resident");
             return None;
@@ -618,6 +627,46 @@ mod tests {
         assert!(!r.whole(1024));
         r.give(100, 28);
         assert!(r.whole(1024));
+    }
+
+    #[test]
+    fn take_ripe_does_not_thrash_when_spare_limit_below_ahead() {
+        let mut pool: Pool<u32> = Pool::new(SPARE_KEPT);
+        let mut made = 0u32;
+        let ripe = Ripe { started: 10, finished: 10, ahead: 12 };
+        // Simulate VRAM >= 85% (`SPARES = 2`): reclaim sets `pool.spare = 2`.
+        pool.reclaim(0, SPARE, true);
+        let mut pieces = Vec::new();
+        for step in 0..40u64 {
+            let (p, _, _) = pool
+                .take_ripe(4096, 4096, step * 100, ripe, || {
+                    made += 1;
+                    Some(made)
+                })
+                .expect("take_ripe must succeed");
+            pieces.push(p);
+        }
+        // Only 1 active block + at most `SPARE` (2) empty blocks ahead — never 12!
+        assert!(made <= (SPARE + 1) as u32, "expected <= {} blocks, got {made}", SPARE + 1);
+        for p in pieces {
+            pool.give(p, 5000);
+        }
+        pool.reclaim(10_000, SPARE, true);
+        let after_reclaim = made;
+        // Another round of allocations + reclaims must not trigger new `CreateHeap` calls.
+        let (p, _, _) = pool
+            .take_ripe(4096, 4096, 11_000, ripe, || {
+                made += 1;
+                Some(made)
+            })
+            .expect("reuse must succeed");
+        pool.give(p, 11_000);
+        pool.reclaim(15_000, SPARE, true);
+        assert!(
+            made <= after_reclaim + 1,
+            "spare limit ({SPARE}) and ahead ({}) must not thrash (before={after_reclaim}, after={made})",
+            ripe.ahead
+        );
     }
 
     #[test]

@@ -770,19 +770,35 @@ pub(crate) fn read_all(start: u64) {
 /// three read by the same frame's draws, run 188). What is there of a
 /// texture ends where the next one starts.
 /// No host heap is needed, so it is tested without one.
+type FastMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<crate::host::AddressHash>>;
+
+/// Thread-local cache of `crate::resource::placed_bytes` so `note_buffer`
+/// resolves full placed-texture spans without locking `HostHeap::placed`.
+fn placed_bytes_cached(desc: &[u32; 14]) -> Option<u64> {
+    thread_local! {
+        static SIZES: std::cell::RefCell<FastMap<[u32; 14], Option<u64>>> =
+            std::cell::RefCell::new(FastMap::default());
+    }
+    SIZES.with(|sizes| {
+        let mut sizes = sizes.borrow_mut();
+        if let Some(&known) = sizes.get(desc) {
+            return known;
+        }
+        let bytes = crate::resource::placed_bytes(desc);
+        sizes.insert(*desc, bytes);
+        bytes
+    })
+}
+
 #[derive(Default)]
 pub(crate) struct Spans {
     /// When a newer view makes an older one stale.
     rule: Rule,
     by_start: std::collections::BTreeMap<u64, (u64, std::collections::BTreeSet<u32>)>,
-    by_slot: std::collections::HashMap<u32, u64>,
+    by_slot: FastMap<u32, u64>,
     /// The level each slot's view starts at, and where what it is read from
     /// ends ([`Spans::shows`]).
-    first: std::collections::HashMap<u32, (u32, u64)>,
-    /// The bytes a placed texture takes, by resource description: worked
-    /// out once for each (a title writes the views of a few thousand
-    /// descriptions, thousands of times a frame).
-    sizes: std::collections::HashMap<[u32; 14], Option<u64>>,
+    first: FastMap<u32, (u32, u64)>,
 }
 
 /// When a view the title writes makes an older view of other memory stale.
@@ -812,17 +828,6 @@ pub(crate) enum Rule {
 const HEAD: u64 = 4096;
 
 impl Spans {
-    /// The bytes of title memory a placed texture with the resource
-    /// description `desc` takes (`crate::resource::placed_bytes`).
-    fn bytes(&mut self, desc: &[u32; 14]) -> Option<u64> {
-        if let Some(&known) = self.sizes.get(desc) {
-            return known;
-        }
-        let bytes = crate::resource::placed_bytes(desc);
-        self.sizes.insert(*desc, bytes);
-        bytes
-    }
-
     /// The starts of the spans that overlap `[start, end)`, each taken to
     /// end where the next one starts: the last span that starts before
     /// `start`, if it reaches past it at full size, and every span that
@@ -1172,12 +1177,12 @@ struct Waiting {
 /// which order (no host heap needed, so it is tested without one).
 #[derive(Default)]
 pub(crate) struct TextureQueue {
-    slots: std::collections::BTreeMap<u32, Waiting>,
+    slots: FastMap<u32, Waiting>,
     writes: u64,
     /// Slots held back because the card had no room for the host copy
     /// they need ([`TextureQueue::hold`]), each with the write it was
     /// held as.
-    held: std::collections::BTreeMap<u32, u64>,
+    held: FastMap<u32, u64>,
 }
 
 impl TextureQueue {
@@ -2939,7 +2944,8 @@ impl HostHeap {
                 // and a pad.)
                 let at = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 let held = crate::resource::placed_bytes_from(resource, crate::resource::first_mip(desc));
-                Some((resource, at, desc[4], held.map_or(u64::MAX, |held| at.saturating_add(held))))
+                let full_bytes = placed_bytes_cached(resource);
+                Some((full_bytes, at, desc[4], held.map_or(u64::MAX, |held| at.saturating_add(held))))
             }
             _ => None,
         };
@@ -2947,10 +2953,10 @@ impl HostHeap {
             Vec::new()
         } else {
             use std::sync::atomic::Ordering::Relaxed;
-            let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
-            let span = placed_view.and_then(|(resource, start, first, held)| {
-                Some((start, start.saturating_add(placed.bytes(resource)?), first, held))
+            let span = placed_view.and_then(|(full_bytes, start, first, held)| {
+                Some((start, start.saturating_add(full_bytes?), first, held))
             });
+            let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
             match span {
                 Some((start, end, first, held)) => {
                     SPANNED[0].fetch_min(start, Relaxed);
@@ -3034,9 +3040,15 @@ impl HostHeap {
     pub(crate) fn make_at(&self, index: u32, view: &View) {
         let kept = make_twinned(view, self.at(index), self.twin(index));
         if kept.is_none() {
-            null_for(view, self.at(index));
+            if let Some(src) = null_handle_for(view) {
+                self.copy_from(index, src);
+            } else {
+                null_for(view, self.at(index));
+                self.put(index);
+            }
+        } else {
+            self.put(index);
         }
-        self.put(index);
         self.twin_made(index, kept.is_some() && twinned(view));
         self.write_stride(index, if kept.is_some() { view_stride_word(view) } else { 0 });
         self.keep(index, kept.flatten());
@@ -3148,8 +3160,12 @@ impl HostHeap {
         if self.sampler {
             self.null_sampler(index);
         } else {
-            null_view(self.at(index));
-            self.put(index);
+            if let Some(src) = null_view_handle() {
+                self.copy_from(index, src);
+            } else {
+                null_view(self.at(index));
+                self.put(index);
+            }
             self.write_stride(index, 0);
         }
         self.clear_twin(index);
@@ -3178,8 +3194,12 @@ impl HostHeap {
         if let Some(made) = self.twins.get(index as usize)
             && made.swap(false, std::sync::atomic::Ordering::Relaxed)
         {
-            null_buffer_view(self.at(self.raw + index));
-            self.put(self.raw + index);
+            if let Some(src) = null_buffer_handle() {
+                self.copy_from(self.raw + index, src);
+            } else {
+                null_buffer_view(self.at(self.raw + index));
+                self.put(self.raw + index);
+            }
         }
     }
 
@@ -3639,9 +3659,13 @@ impl HostHeap {
                 make_twinned(&view, self.at(index), self.twin(index))
             };
             if kept.is_none() && !self.sampler {
-                null_for(&view, self.at(index));
-            }
-            if kept.is_some() || !self.sampler {
+                if let Some(src) = null_handle_for(&view) {
+                    self.copy_from(index, src);
+                } else {
+                    null_for(&view, self.at(index));
+                    self.put(index);
+                }
+            } else if kept.is_some() || !self.sampler {
                 self.put(index);
             }
             self.twin_made(index, kept.is_some() && twinned(&view));
@@ -5087,6 +5111,168 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
 
 /// A null view of the kind `view` is, for a slot whose view the host
 /// cannot make: unordered access (to a buffer or a 2D texture) or a shader
+/// Pre-created CPU-only descriptor heap holding all 17 fixed typed null
+/// descriptors (SRV buffer, SRV texture dimensions 2..=10, CBV, UAV buffer,
+/// UAV texture 1D/1DArray/2D/2DArray/3D). Copying from this cache eliminates
+/// ~10,000–15,000 `ID3D12Device::Create*View` calls/frame in `sync_heaps`
+/// and removes the extra `staged()` hop while remaining atomic under
+/// `HostHeap::made.lock(index)`.
+struct NullCache {
+    _heap: ID3D12DescriptorHeap,
+    start: usize,
+    step: usize,
+}
+
+// SAFETY: CPU-only descriptor heap written once during `OnceLock` init and
+// thereafter read-only via `CopyDescriptorsSimple` from any thread.
+unsafe impl Send for NullCache {}
+// SAFETY: as above.
+unsafe impl Sync for NullCache {}
+
+impl NullCache {
+    const SRV_BUFFER: usize = 0;
+    const SRV_TEX_BASE: usize = 1; // dimensions 2..=10 -> slots 1..=9 (2D = slot 3)
+    const CBV: usize = 10;
+    const UAV_BUFFER: usize = 11;
+    const UAV_1D: usize = 12;
+    const UAV_1D_ARRAY: usize = 13;
+    const UAV_2D: usize = 14;
+    const UAV_2D_ARRAY: usize = 15;
+    const UAV_3D: usize = 16;
+    const COUNT: u32 = 17;
+
+    fn get() -> Option<&'static NullCache> {
+        static CACHE: std::sync::OnceLock<Option<NullCache>> = std::sync::OnceLock::new();
+        CACHE
+            .get_or_init(|| {
+                let host = host()?;
+                // SAFETY: plain non-shader-visible CPU descriptor heap creation.
+                let heap: ID3D12DescriptorHeap = unsafe {
+                    host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        NumDescriptors: Self::COUNT,
+                        ..Default::default()
+                    })
+                }
+                .ok()?;
+                // SAFETY: live heap; querying start handle and stride.
+                let (start, step) = unsafe {
+                    (
+                        heap.GetCPUDescriptorHandleForHeapStart().ptr,
+                        host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize,
+                    )
+                };
+                let at = |slot: usize| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start + slot * step };
+                null_buffer_view(at(Self::SRV_BUFFER));
+                for dim in 2u32..=10u32 {
+                    let mut w = [0u32; 10];
+                    w[1] = dim;
+                    null_like(&w, at(Self::SRV_TEX_BASE + (dim - 2) as usize));
+                }
+                let cbv = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
+                // SAFETY: valid CPU descriptor handle in `heap`.
+                unsafe { host.device.CreateConstantBufferView(Some(&cbv), at(Self::CBV)) };
+                let uav_buf = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: DXGI_FORMAT_R32_UINT,
+                    ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                    ..Default::default()
+                };
+                // SAFETY: valid CPU descriptor handle in `heap`.
+                unsafe {
+                    host.device.CreateUnorderedAccessView(
+                        None::<&ID3D12Resource>,
+                        None::<&ID3D12Resource>,
+                        Some(&uav_buf),
+                        at(Self::UAV_BUFFER),
+                    );
+                }
+                for (slot, dim) in [
+                    (Self::UAV_1D, Some(D3D12_UAV_DIMENSION_TEXTURE1D.0 as u32)),
+                    (Self::UAV_1D_ARRAY, Some(D3D12_UAV_DIMENSION_TEXTURE1DARRAY.0 as u32)),
+                    (Self::UAV_2D, Some(D3D12_UAV_DIMENSION_TEXTURE2D.0 as u32)),
+                    (Self::UAV_2D_ARRAY, Some(D3D12_UAV_DIMENSION_TEXTURE2DARRAY.0 as u32)),
+                    (Self::UAV_3D, Some(D3D12_UAV_DIMENSION_TEXTURE3D.0 as u32)),
+                ] {
+                    let desc = null_uav_desc(dim);
+                    // SAFETY: valid CPU descriptor handle in `heap`.
+                    unsafe {
+                        host.device.CreateUnorderedAccessView(
+                            None::<&ID3D12Resource>,
+                            None::<&ID3D12Resource>,
+                            Some(&desc),
+                            at(slot),
+                        );
+                    }
+                }
+                Some(NullCache { _heap: heap, start, step })
+            })
+            .as_ref()
+    }
+
+    #[inline]
+    fn slot(&self, i: usize) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        D3D12_CPU_DESCRIPTOR_HANDLE { ptr: self.start + i * self.step }
+    }
+}
+
+#[inline]
+fn null_view_handle() -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+    // Dimension 4 (`TEXTURE2D`) sits at `SRV_TEX_BASE + (4 - 2) = 3`.
+    Some(NullCache::get()?.slot(NullCache::SRV_TEX_BASE + 2))
+}
+
+#[inline]
+fn null_buffer_handle() -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+    Some(NullCache::get()?.slot(NullCache::SRV_BUFFER))
+}
+
+fn null_handle_for(view: &View) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+    let cache = NullCache::get()?;
+    let is_buffer = |r: &usize| crate::resource::buffer_bytes(*r as crate::object::This).is_some();
+    let tex_slot = |dim: u32| -> usize {
+        if (2..=10).contains(&dim) {
+            NullCache::SRV_TEX_BASE + (dim - 2) as usize
+        } else {
+            NullCache::SRV_TEX_BASE + 2
+        }
+    };
+    let slot = match view {
+        View::Unordered(r, _, desc) => {
+            if is_buffer(r) || desc.is_some_and(|d| d[1] == 1) {
+                NullCache::UAV_BUFFER
+            } else {
+                match desc.map(|d| D3D12_UAV_DIMENSION(d[1] as i32)) {
+                    Some(D3D12_UAV_DIMENSION_TEXTURE1D) => NullCache::UAV_1D,
+                    Some(D3D12_UAV_DIMENSION_TEXTURE1DARRAY) => NullCache::UAV_1D_ARRAY,
+                    Some(D3D12_UAV_DIMENSION_TEXTURE2DARRAY) => NullCache::UAV_2D_ARRAY,
+                    Some(D3D12_UAV_DIMENSION_TEXTURE3D) => NullCache::UAV_3D,
+                    _ => NullCache::UAV_2D,
+                }
+            }
+        }
+        View::Placed(true, resource, desc) => {
+            if resource[0] == 1 {
+                NullCache::UAV_BUFFER
+            } else {
+                match D3D12_UAV_DIMENSION(desc[1] as i32) {
+                    D3D12_UAV_DIMENSION_TEXTURE1D => NullCache::UAV_1D,
+                    D3D12_UAV_DIMENSION_TEXTURE1DARRAY => NullCache::UAV_1D_ARRAY,
+                    D3D12_UAV_DIMENSION_TEXTURE2DARRAY => NullCache::UAV_2D_ARRAY,
+                    D3D12_UAV_DIMENSION_TEXTURE3D => NullCache::UAV_3D,
+                    _ => NullCache::UAV_2D,
+                }
+            }
+        }
+        View::Shader(r, desc) if is_buffer(r) || desc.is_some_and(|d| d[1] == 1) => NullCache::SRV_BUFFER,
+        View::Placed(false, resource, _) if resource[0] == 1 => NullCache::SRV_BUFFER,
+        View::Shader(_, Some(desc)) => tex_slot(desc[1]),
+        View::Placed(false, _, desc) => tex_slot(desc[1]),
+        View::Constant(..) => NullCache::CBV,
+        _ => NullCache::SRV_TEX_BASE + 2,
+    };
+    Some(cache.slot(slot))
+}
+
 /// view. Writes to it are dropped, reads give zeros.
 fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
@@ -6217,6 +6403,45 @@ mod tests {
         assert_eq!(ds.alloc(1), Some(199));
         assert_eq!(ds.alloc(1), Some(0));
         assert_eq!(ds.alloc(1), None);
+    }
+
+    #[test]
+    fn null_cache_covers_all_null_view_kinds() {
+        let Some(heap) = HostHeap::new(false, 32) else {
+            return;
+        };
+        let cache = NullCache::get().expect("NullCache must initialize on live D3D12 device");
+        assert_eq!(null_view_handle().unwrap().ptr, cache.slot(NullCache::SRV_TEX_BASE + 2).ptr);
+        assert_eq!(null_buffer_handle().unwrap().ptr, cache.slot(NullCache::SRV_BUFFER).ptr);
+        assert_eq!(
+            null_handle_for(&View::Constant(0x1000, 256)).unwrap().ptr,
+            cache.slot(NullCache::CBV).ptr
+        );
+        // Placed buffer SRV & UAV, plus texture SRV (3D = dim 8) & UAV (3D = dim 8).
+        let buf_res = [1u32; 14];
+        let tex_res = [3u32; 14];
+        let mut d3d = [0u32; 16];
+        d3d[1] = 8; // TEXTURE3D
+        assert_eq!(
+            null_handle_for(&View::Placed(false, buf_res, d3d)).unwrap().ptr,
+            cache.slot(NullCache::SRV_BUFFER).ptr
+        );
+        assert_eq!(
+            null_handle_for(&View::Placed(true, buf_res, d3d)).unwrap().ptr,
+            cache.slot(NullCache::UAV_BUFFER).ptr
+        );
+        assert_eq!(
+            null_handle_for(&View::Placed(false, tex_res, d3d)).unwrap().ptr,
+            cache.slot(NullCache::SRV_TEX_BASE + 6).ptr
+        );
+        assert_eq!(
+            null_handle_for(&View::Placed(true, tex_res, d3d)).unwrap().ptr,
+            cache.slot(NullCache::UAV_3D).ptr
+        );
+        // Copying cached null descriptors into live heap must succeed with D3D12 debug active.
+        heap.make_null(0);
+        heap.make_at(1, &View::Constant(0x1000, 256));
+        heap.make_at(2, &View::Placed(true, tex_res, d3d));
     }
 }
 
