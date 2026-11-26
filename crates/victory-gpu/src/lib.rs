@@ -85,6 +85,7 @@ pub mod signature;
 mod texture;
 #[cfg(windows)]
 mod texback;
+pub mod title_hints;
 #[cfg(windows)]
 mod watch;
 
