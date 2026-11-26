@@ -120,9 +120,9 @@ pub(crate) struct HostHeap {
     /// Slots mirroring the title's; view heaps have `dynamic` more starting at
     /// `dynamic_base`.
     count: u32,
-    /// First dynamic slot in the host heap: equals `count` on uncapped heaps,
-    /// or `PORTABLE_VIEWS - DYNAMIC` (`null + 1`) on 1M-capped NVIDIA heaps so
-    /// bindless `UMin(idx, null)` clamping never aliases live dynamic tables.
+    /// First dynamic slot in the host heap (equals `count`; lies strictly below
+    /// `view_heap_limit()` so dynamic per-draw tables indexed via
+    /// `UMin(idx, limit)` are never clamped to the permanent null slot).
     dynamic_base: u32,
     /// Dynamic slots past `dynamic_base`: [`DYNAMIC`] in view heaps, none in
     /// sampler heaps. (Upstream falls back to 2^16 on a capped host heap;
@@ -1467,23 +1467,23 @@ pub(crate) fn probe_view_limit() {
         if twins {
             victory_shader::emit::set_raw_views(RAW_TWINS);
         }
-        // (The twins lie past the null slot. On 1M-capped hosts like NVIDIA,
-        // reserve the permanent null clamp slot BEFORE `DYNAMIC` so bindless
-        // `UMin(idx, limit)` never aliases live dynamic per-draw tables:
-        // `[0..fitted)` title <= `737_855`, `[737_855]` permanent null,
-        // `[737_856..1_000_000)` dynamic tables.)
-        let (views, limit) = if twins {
-            (RAW_TWINS, RAW_TWINS - 1)
+        // (The twins lie past the null slot. Dynamic per-draw descriptor tables
+        // are also indexed through `UMin(idx, limit)` in `Shader::heap_handle_at`,
+        // so `limit` MUST be the last slot `views - 1` strictly past every
+        // dynamic slot.)
+        let views = if twins {
+            RAW_TWINS
         } else if fits(UNCAPPED_VIEWS) {
-            (UNCAPPED_VIEWS, UNCAPPED_VIEWS - 1)
+            UNCAPPED_VIEWS
         } else {
-            (PORTABLE_VIEWS, PORTABLE_VIEWS - 1 - DYNAMIC)
+            PORTABLE_VIEWS
         };
+        let limit = views - 1;
         tracing::info!(
             views,
             limit,
             raw_twins = twins,
-            "host view heaps hold {views} views; bindless indices clamp to null slot {limit} from the first shader on"
+            "host view heaps hold {views} views; view indices clamp to null slot {limit} at the end from the first shader on"
         );
         victory_shader::emit::set_view_heap_limit(limit);
     });
@@ -1563,24 +1563,6 @@ impl HostHeap {
                     return None;
                 }
             }
-        } else if raw == 0 && null == PORTABLE_VIEWS - 1 - DYNAMIC {
-            // 1M-capped host (NVIDIA): `[0..fitted)` title slots, `[fitted..=null]`
-            // permanent null slots (bindless clamp target `null`), and
-            // `[null + 1..PORTABLE_VIEWS)` dynamic per-draw tables.
-            let size = PORTABLE_VIEWS;
-            let fitted = if count <= null {
-                count
-            } else {
-                tracing::warn!(count, null, size, "host view heap capped at {size}; views past {null} read the null slot");
-                null
-            };
-            match make(size) {
-                Ok(heap) => (heap, fitted, null + 1, size),
-                Err(e) => {
-                    tracing::warn!(error = %e, count, size, "no host view heap");
-                    return None;
-                }
-            }
         } else {
             let size = if raw == 0 { null + 1 } else { 2 * raw };
             let fitted = if count + extra <= null {
@@ -1588,7 +1570,7 @@ impl HostHeap {
             } else {
                 // shortcut: descriptors past the host's limit are left out; a title that reaches
                 // them needs remapping. They read the null slot instead.
-                tracing::warn!(count, "host view heap capped at {size}; views past it read a null slot");
+                tracing::warn!(count, null, size, "host view heap capped at {size}; views past it read a null slot");
                 null - extra
             };
             match make(size) {
@@ -5747,13 +5729,11 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(base));
         assert_eq!(heap.dynamic(40), Some(base + heap.dynamic - 40));
-        // On 1M-capped NVIDIA heaps, dynamic slots must sit strictly past the
-        // shader bindless clamp slot so OOB bindless indexing never aliases live tables.
+        // Every dynamic slot must lie strictly below `view_heap_limit()` so
+        // dynamic per-draw tables indexed via `UMin(idx, limit)` are never clamped to NULL.
         let limit = victory_shader::emit::view_heap_limit();
-        if victory_shader::emit::raw_views() == 0 && limit == PORTABLE_VIEWS - 1 - DYNAMIC {
-            assert!(heap.count <= limit);
-            assert_eq!(heap.dynamic_base, limit + 1);
-            assert_eq!(heap.dynamic_base + heap.dynamic, PORTABLE_VIEWS);
+        if limit != 0 {
+            assert!(heap.dynamic_base + heap.dynamic <= limit);
         }
     }
 

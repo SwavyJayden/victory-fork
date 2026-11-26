@@ -490,7 +490,7 @@ fn retranslate(
         if raw_views > 0 {
             raw_views - 1
         } else {
-            1_000_000 - 1 - (1 << 18)
+            1_000_000 - 1
         }
     });
     victory_shader::emit::set_view_heap_limit(limit);
