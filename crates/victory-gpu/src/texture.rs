@@ -1529,7 +1529,10 @@ impl Staging {
         if read {
             UNLOCKED[0].fetch_add(1, Relaxed);
             size
-        } else if last.hash.is_none() && fill_unlocked() {
+        } else if last.hash.is_none() && (fill_unlocked() || self.on_demand) {
+            // Unmapped mip levels are expected in a sparse texture. Its
+            // first upload must fill the mapped pages even when ordinary
+            // committed textures wait for a complete source snapshot.
             self.fill(last, size)
         } else {
             UNLOCKED[1].fetch_add(1, Relaxed);
@@ -1580,10 +1583,10 @@ impl Staging {
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
-        self.dirty.store(true, std::sync::atomic::Ordering::Release);
         // Levels on demand: which levels are the title's is judged here,
-        // once, for what the staging buffer holds from now on. The step
-        // that gives levels their memory goes by this answer.
+        // once, for what the staging buffer holds from now on. Stored before
+        // the Release store on `dirty` so `PreludeUpload::finish_refresh`
+        // always observes the updated mask after `claim_upload`.
         let held = if self.on_demand {
             use std::sync::atomic::Ordering::Relaxed;
             let judged = self.judgement();
@@ -1595,6 +1598,7 @@ impl Staging {
         } else {
             u32::MAX
         };
+        self.dirty.store(true, std::sync::atomic::Ordering::Release);
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(

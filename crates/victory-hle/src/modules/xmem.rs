@@ -180,10 +180,11 @@ pub extern "system" fn XMemVirtualAlloc(
     if !at.is_null() && !placeholder {
         victory_gpu::title_memory_allocated(at as usize, size);
     }
-    // (Grand Theft Auto VI asks for its 32-bit heap with kind 0x42000,
-    // without the 64 KiB page bits: not `placeholder` above, though the host
-    // makes a placeholder of it all the same.)
-    if !at.is_null() && constrained && kind & MEM_COMMIT == 0 && flags & ADDRESS_32BIT != 0 {
+    // The title may pass MEM_RESERVE_PLACEHOLDER directly, without the
+    // console's PAGES_64K bits (Grand Theft Auto VI asks for its 32-bit heap
+    // with kind 0x42000). Track the actual reservation made above so arrange
+    // can give either form consecutive physical-page slices.
+    if !at.is_null() && kind & MEM_RESERVE_PLACEHOLDER != 0 && constrained && flags & ADDRESS_32BIT != 0 {
         LOW_RESERVATIONS
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -2197,6 +2198,37 @@ mod tests {
             assert!(report.contains("Windows paging file size"));
         }
         assert!(!fallback.contains("System commit:"));
+    }
+
+    #[test]
+    fn native_placeholder_heap_gets_its_slices_in_address_order() {
+        // Callers can request a host-compatible placeholder directly,
+        // without the console's PAGES_64K bits. Both forms reserve the
+        // same physical-page address space and must participate in arrange.
+        let base = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            4 * PAGE,
+            MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+            GRAPHICS | ADDRESS_32BIT,
+            PAGE_NOACCESS,
+        );
+        assert!(!base.is_null() && (base as usize) < 1 << 32);
+        let pages = allocate(4);
+        arrange(base.wrapping_byte_add(2 * PAGE) as usize, &pages[..2]);
+        let indices: Vec<_> = pages
+            .iter()
+            .map(|number| page_table().pages.get(number).unwrap().index)
+            .collect();
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+        LOW_RESERVATIONS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|&(at, _)| at != base as usize);
+        // SAFETY: release the placeholder reserved by this test.
+        unsafe {
+            VirtualFree(base, 0, MEM_RELEASE);
+        }
+        assert_eq!(indices, [2, 3, 0, 1]);
     }
 
     #[test]
