@@ -2014,4 +2014,46 @@ mod tests {
         // scaled proportionally to preserve phase ratios within wall_us.
         assert_eq!(scale_sync_parts([1000, 2000, 1000], 1000), [250, 500, 250]);
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn rtv_record_key_distinguishes_resource_described_and_desc_fields() {
+        let null = std::ptr::null();
+        let mut slot = [0u64; 16];
+        let handle = slot.as_mut_ptr() as u64;
+        let res_a = 0x1000_0000usize as This;
+        let res_b = 0x2000_0000usize as This;
+        let desc_mip0 = [28u32, 4, 0, 0, 0, 0];
+        let desc_mip1 = [28u32, 4, 1, 0, 0, 0];
+
+        // Same resource and desc written to the same handle yields equal keys.
+        create_rtv(null, res_a, &desc_mip0, handle);
+        let k0 = rtv_record(handle).expect("rtv record").key();
+        create_rtv(null, res_a, &desc_mip0, handle);
+        assert_eq!(rtv_record(handle).expect("rtv record").key(), k0);
+
+        // Overwriting the same handle with a different mip slice invalidates the key.
+        create_rtv(null, res_a, &desc_mip1, handle);
+        let k_mip1 = rtv_record(handle).expect("rtv record").key();
+        assert_ne!(k_mip1, k0);
+
+        // Overwriting the same handle with a null description invalidates the key.
+        create_rtv(null, res_a, std::ptr::null(), handle);
+        let k_null_desc = rtv_record(handle).expect("rtv record").key();
+        assert_ne!(k_null_desc, k0);
+        assert_ne!(k_null_desc, k_mip1);
+
+        // Overwriting the same handle with another resource invalidates the key.
+        create_rtv(null, res_b, &desc_mip0, handle);
+        let k_res_b = rtv_record(handle).expect("rtv record").key();
+        assert_ne!(k_res_b, k0);
+
+        // DSV records use the same key layout and also track descriptor edits.
+        let dsv_desc_a = [45u32, 3, 0, 0, 0, 0];
+        let dsv_desc_b = [45u32, 3, 1, 0, 0, 0];
+        create_dsv(null, res_a, &dsv_desc_a, handle);
+        let kd0 = dsv_record(handle).expect("dsv record").key();
+        create_dsv(null, res_a, &dsv_desc_b, handle);
+        assert_ne!(dsv_record(handle).expect("dsv record").key(), kd0);
+    }
 }
