@@ -614,43 +614,6 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
     }
 }
 
-/// Drains pending `levels_on_demand` texture view remakes across all live
-/// shader-visible view heaps when the GPU is quiet (`flying == 0`), called
-/// from [`host::finish_flips`] as submissions complete. Prevents
-/// `VICTORY_VIEWS_REMADE_QUIET=1` starvation under `VICTORY_LATE_WAIT=3` +
-/// `VICTORY_ASYNC_PRESENT=1` + `VICTORY_RELAY=2` and reduces in-flight
-/// descriptor rewrites even when quiet mode is off.
-#[cfg(windows)]
-pub(crate) fn drain_quiet_remade_views(finished: u64) {
-    if !host::has_reshown() {
-        return;
-    }
-    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
-    let view_heaps: Vec<&host::HostHeap> = heaps
-        .iter()
-        .filter_map(|&(_, _, at)| {
-            // SAFETY: registered heaps stay alive while `SHADER_HEAPS` is read-locked.
-            let heap = unsafe { &*(at as *const Heap) };
-            (!heap.samplers())
-                .then(|| heap.host.get().and_then(Option::as_ref))
-                .flatten()
-        })
-        .collect();
-    if view_heaps.is_empty() {
-        return;
-    }
-    let Some(starts) = host::take_quiet_reshown(finished) else {
-        return;
-    };
-    let mut remade = 0usize;
-    for h in view_heaps {
-        remade += h.remake_starts(&starts);
-    }
-    if remade > 0 {
-        host::record_views_remade(remade, 0, true);
-    }
-}
-
 #[cfg(windows)]
 impl Drop for Heap {
     fn drop(&mut self) {

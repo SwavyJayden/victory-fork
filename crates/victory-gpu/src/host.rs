@@ -7214,6 +7214,7 @@ impl Host {
             settled += settling.elapsed();
         }
         part = prep_part(0, part);
+        let detile_batch = crate::gpu_detile::BatchGuard::begin();
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -7253,6 +7254,7 @@ impl Host {
             lists.push(Some(check));
         }
         prep_part(4, part);
+        detile_batch.flush(&self.queue);
         let prepared = std::time::Instant::now();
         if late {
             *submitted += 1;

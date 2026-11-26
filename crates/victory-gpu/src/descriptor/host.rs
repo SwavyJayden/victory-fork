@@ -359,9 +359,6 @@ fn neutral_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Res
 /// Reveals texture slots queued by [`HostHeap::texture_slot_show_after`] whose
 /// upload submission (`after <= finished`) has completed on the GPU.
 pub(crate) fn finish_flips(finished: u64) {
-    // Keep `descriptor::drain_quiet_remade_views` referenced until post-merge
-    // cleanup removes it from `descriptor.rs` (owned by W12-C).
-    let _ = super::drain_quiet_remade_views as fn(u64);
     let mut flips = FLIPS.lock().unwrap_or_else(|e| e.into_inner());
     if flips.is_empty() {
         return;
@@ -595,18 +592,6 @@ fn views_remade_quiet() -> bool {
 pub(crate) fn levels_changed(start: u64) {
     RESHOWN.lock().unwrap_or_else(|e| e.into_inner()).push(start);
 }
-
-/// Compatibility no-op stubs while `descriptor::drain_quiet_remade_views`
-/// awaits post-merge removal from `descriptor.rs` (owned by W12-C).
-pub(super) fn has_reshown() -> bool {
-    false
-}
-
-pub(super) fn take_quiet_reshown(_finished: u64) -> Option<Vec<u64>> {
-    None
-}
-
-pub(super) fn record_views_remade(_remade: usize, _flying: u64, _from_quiet_finish: bool) {}
 
 /// Levels on demand (`crate::tiles`): where the placed textures start
 /// whose last upload left a held level without tiles (the card had no
@@ -2099,12 +2084,6 @@ impl HostHeap {
     /// may take the room the others were asked for, and an upload that
     /// gives nothing is a whole texture staged and copied for nothing.
     const WAITING_A_PASS: usize = 128;
-
-    /// Compatibility no-op stub while `descriptor::drain_quiet_remade_views`
-    /// awaits post-merge removal from `descriptor.rs` (owned by W12-C).
-    pub(super) fn remake_starts(&self, _starts: &[u64]) -> usize {
-        0
-    }
 
     pub(crate) fn texture_views_remade(&self) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
