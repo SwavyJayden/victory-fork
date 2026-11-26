@@ -519,6 +519,17 @@ impl Layout {
         self.desc.swizzle == Swizzle::LINEAR || !self.pattern[0].is_empty()
     }
 
+    /// Byte offsets inside a block for coordinates `0..block[axis]` along each
+    /// axis (`[x, y, z]`); empty for linear and unsupported modes.
+    pub fn pattern(&self) -> &[Vec<u32>; 3] {
+        &self.pattern
+    }
+
+    /// Base-2 logarithm of the tile block size in bytes.
+    pub fn block_log2(&self) -> u32 {
+        self.alignment.trailing_zeros()
+    }
+
     /// The slice and the depth inside it for `z` (an array slice or a 3D
     /// depth slice).
     fn split(&self, z: u32) -> (u32, u32) {

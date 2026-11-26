@@ -41,6 +41,8 @@ mod draw;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
+#[cfg(windows)]
+mod gpu_detile;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod heap_pass;
 #[cfg(windows)]

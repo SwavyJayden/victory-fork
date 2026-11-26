@@ -30,25 +30,37 @@ macro_rules! once {
     }};
 }
 
-/// Mapped `D3D12_HEAP_TYPE_UPLOAD` staging buffer held by a [`Staging`] entry
-/// while needed for an upload and detached once the texture settles in VRAM.
+/// Mapped `D3D12_HEAP_TYPE_UPLOAD` (or pooled `DEFAULT` UAV for GPU detiling)
+/// staging buffer held by a [`Staging`] entry while needed for an upload and
+/// detached once the texture settles in VRAM.
 struct UploadBuf {
     buffer: ID3D12Resource,
+    /// Persistent CPU mapping for `UPLOAD`-heap staging, or null when `vram`.
     data: *mut u8,
     /// Offset in `buffer` of what `data` points at (non-zero only for a
     /// sub-allocated [`Piece`] of a staging block); copy footprints add this.
     base: u64,
-    /// Pool bucket size if taken from [`SPARE`], or 0 if unpooled / block-backed.
+    /// Pool bucket size if taken from [`SPARE`] (or `gpu_detile` VRAM pool),
+    /// or 0 if unpooled / block-backed.
     pooled: u64,
     /// Staging footprint size counted in [`STAGED`].
     bytes: u64,
+    /// Whether `buffer` is a `DEFAULT`-heap UAV buffer filled by
+    /// [`crate::gpu_detile`].
+    vram: bool,
+    /// Committed VRAM bytes tracked by `gpu_detile` (0 when `!vram`).
+    vram_alloc: u64,
+    /// For `vram`: whether a recycled buffer still holds previous contents
+    /// until detiled or explicitly zeroed on the GPU.
+    needs_zero: bool,
     /// Sub-allocated range of a [`BLOCKS`] upload block (`VICTORY_STAGING_BLOCKS=1`).
     /// Declared after `buffer` so `buffer` releases before `piece` returns its range.
     piece: Option<Piece>,
 }
 
-// SAFETY: a D3D12 upload buffer and its persistent mapping; mutated only under
-// `Staging::upload` (and `Staging::last`) while no GPU copy reads it.
+// SAFETY: a D3D12 upload or VRAM staging buffer and its persistent mapping;
+// mutated only under `Staging::upload` (and `Staging::last`) while no GPU copy
+// reads it.
 unsafe impl Send for UploadBuf {}
 
 impl UploadBuf {
@@ -64,8 +76,38 @@ impl UploadBuf {
             base,
             pooled,
             bytes: total,
+            vram: false,
+            vram_alloc: 0,
+            needs_zero: false,
             piece,
         })
+    }
+
+    fn new_for(host: &crate::host::Host, total: u64, try_vram: bool) -> Option<Self> {
+        if try_vram
+            && let Some((buffer, vram_alloc, pooled)) =
+                crate::gpu_detile::take_vram_buf(host, total)
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            STAGED[0].fetch_add(1, Relaxed);
+            STAGED[1].fetch_add(total, Relaxed);
+            return Some(Self {
+                buffer,
+                data: std::ptr::null_mut(),
+                base: 0,
+                pooled,
+                bytes: total,
+                vram: true,
+                vram_alloc,
+                // Always mark `needs_zero` until GPU detile or explicit GPU
+                // zero-fill runs: both recycled pool buffers and WARP's
+                // freshly created default-heap allocations can contain prior
+                // contents if `refresh_timed` exits early without detiling.
+                needs_zero: true,
+                piece: None,
+            });
+        }
+        Self::new(host, total)
     }
 }
 
@@ -76,6 +118,14 @@ impl Drop for UploadBuf {
         STAGED[1].fetch_sub(self.bytes, Relaxed);
         // Nothing holds the upload buffer any more (command lists keep the COM
         // resource until reset, and sweeps retire after GPU completion).
+        if self.vram {
+            crate::gpu_detile::release_vram_buf(
+                self.buffer.clone(),
+                self.vram_alloc,
+                self.pooled,
+            );
+            return;
+        }
         if self.pooled != 0 {
             let cap = spare_budget();
             let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
@@ -161,6 +211,12 @@ pub(crate) struct Staging {
     /// recorded again about a second later if the card has room by then
     /// ([`upload`]).
     waiting: std::sync::atomic::AtomicU64,
+    /// Whether this staging entry qualifies for GPU compute detiling
+    /// ([`crate::gpu_detile`]).
+    gpu_detile: bool,
+    /// Fast-path mirror of whether a recycled VRAM `UploadBuf` still needs
+    /// GPU zeroing if a refresh exits without detiling.
+    vram_needs_zero: std::sync::atomic::AtomicBool,
 }
 
 impl Drop for Staging {
@@ -1001,6 +1057,7 @@ pub(crate) fn let_go_idle() {
     const RELEASE_IDLE_FRAMES: u64 = 4;
     let idle_ms = crate::host::effective_ram_idle_ms();
     trim_spare_idle(idle_ms);
+    crate::gpu_detile::trim_idle(idle_ms);
     let release_on = staging_release_on();
     let host = host();
     let (mut went, mut bytes) = (0u64, 0u64);
@@ -1327,14 +1384,17 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
             let Some(host) = host() else {
                 return;
             };
-            let Some(upload) = UploadBuf::new(host, staging.bytes) else {
+            let Some(upload) = UploadBuf::new_for(host, staging.bytes, staging.gpu_detile) else {
                 return;
             };
-            if upload.piece.is_none() {
+            if !upload.vram && upload.piece.is_none() {
                 crate::host::name(&upload.buffer, || {
                     format!("staging reallocated of {resource:?} ({} B)", staging.bytes)
                 });
             }
+            staging
+                .vram_needs_zero
+                .store(upload.vram && upload.needs_zero, Release);
             *guard = Some(upload);
             staging.has_upload.store(true, Release);
             reallocated = true;
@@ -1685,10 +1745,33 @@ impl Staging {
     fn refresh_now(&self) -> usize {
         let whole = std::time::Instant::now();
         let read = self.refresh_timed();
+        if self
+            .vram_needs_zero
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.ensure_vram_zeroed();
+        }
         let us = whole.elapsed().as_micros() as u64;
         REFRESH_WAITS[3].fetch_add(us, std::sync::atomic::Ordering::Relaxed);
         crate::framelog::add(crate::framelog::T::RefreshUs, us);
         read
+    }
+
+    /// Ensures a recycled VRAM linear buffer is zero-filled if `refresh_timed`
+    /// returned early without calling `detile` (e.g., all-zero uncommitted
+    /// title memory).
+    fn ensure_vram_zeroed(&self) {
+        let mut guard = self.upload.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(upload) = guard.as_mut()
+            && upload.vram
+            && upload.needs_zero
+            && let Some(host) = host()
+        {
+            crate::gpu_detile::zero_buffer(host, &upload.buffer, upload.base, self.bytes);
+            upload.needs_zero = false;
+        }
+        self.vram_needs_zero
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 
     fn refresh_timed(&self) -> usize {
@@ -1920,13 +2003,15 @@ impl Staging {
             let Some(host) = host() else {
                 return;
             };
-            let Some(upload) = UploadBuf::new(host, self.bytes) else {
+            let Some(upload) = UploadBuf::new_for(host, self.bytes, self.gpu_detile) else {
                 return;
             };
+            self.vram_needs_zero
+                .store(upload.vram && upload.needs_zero, Release);
             *guard = Some(upload);
             self.has_upload.store(true, Release);
         }
-        let data = guard.as_ref().expect("upload buffer ensured above").data;
+        let upload = guard.as_mut().expect("upload buffer ensured above");
         self.dirty.store(true, Release);
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
@@ -1949,6 +2034,31 @@ impl Staging {
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
         }
+        if upload.vram {
+            let Some(host) = host() else {
+                return;
+            };
+            if crate::gpu_detile::detile(
+                host,
+                &upload.buffer,
+                upload.base,
+                self.bytes,
+                &self.layout,
+                tiled,
+                &self.footprints,
+                &self.rows,
+                &self.row_sizes,
+                self.first,
+                self.mips,
+                held,
+            ) {
+                upload.needs_zero = false;
+                self.vram_needs_zero.store(false, Release);
+            }
+            return;
+        }
+        crate::gpu_detile::note_cpu_detile();
+        let data = upload.data;
         for (i, ((footprint, &rows), &row_size)) in self
             .footprints
             .iter()
@@ -2469,8 +2579,20 @@ fn new_staging(
             Some(&mut total),
         );
     }
-    let upload = UploadBuf::new(host, total)?;
-    if upload.piece.is_none() {
+    let gpu_detile = d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D
+        && crate::gpu_detile::eligible(
+            &layout,
+            size,
+            total,
+            &footprints,
+            &rows,
+            &row_sizes,
+            first,
+            u32::from(d.MipLevels),
+        );
+    let upload = UploadBuf::new_for(host, total, gpu_detile)?;
+    let vram_needs_zero = upload.vram && upload.needs_zero;
+    if !upload.vram && upload.piece.is_none() {
         crate::host::name(&upload.buffer, || {
             format!(
                 "staging of {resource:?} {}x{}x{} f{}",
@@ -2478,7 +2600,7 @@ fn new_staging(
             )
         });
     }
-    tracing::debug!(?desc, total, first, "texture contents uploaded from title memory");
+    tracing::debug!(?desc, total, first, gpu_detile, vram = upload.vram, "texture contents uploaded from title memory");
     let s = Arc::new(Staging {
         upload: Mutex::new(Some(upload)),
         has_upload: std::sync::atomic::AtomicBool::new(true),
@@ -2505,6 +2627,8 @@ fn new_staging(
         detiled: std::sync::atomic::AtomicU32::new(0),
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
+        gpu_detile,
+        vram_needs_zero: std::sync::atomic::AtomicBool::new(vram_needs_zero),
     });
     Some(s)
 }
@@ -2586,6 +2710,9 @@ mod staging_tests {
             base: piece.offset,
             pooled: 0,
             bytes: BYTES,
+            vram: false,
+            vram_alloc: 0,
+            needs_zero: false,
             piece: Some(piece),
         };
         let staging = Arc::new(super::Staging {
@@ -2614,6 +2741,8 @@ mod staging_tests {
             detiled: AtomicU32::new(0),
             judged: [const { AtomicU64::new(0) }; 2],
             waiting: AtomicU64::new(0),
+            gpu_detile: false,
+            vram_needs_zero: AtomicBool::new(false),
         });
         let hold = staging.acquire_upload_hold();
         assert!(staging.release_upload().is_none());
@@ -2625,6 +2754,229 @@ mod staging_tests {
         assert_eq!(super::STAGED[1].load(Relaxed), before_bytes);
         let (_, _, reused) = super::cut_from_blocks(host, BYTES).expect("reused range");
         assert_eq!((reused.block, reused.offset), expected);
+    }
+
+    /// End-to-end `Staging` integration test comparing `VICTORY_GPU_DETILE=1`
+    /// vs `=0` across a full mip chain (including mip tails), Wave 6 upload
+    /// buffer release + reallocation, and content mutation re-upload.
+    #[test]
+    fn gpu_detile_staging_end_to_end_matches_cpu() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let res_iid = crate::object::guid(
+            0x6964_42be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+
+        let read_all_mips = |tex: &ID3D12Resource| -> Vec<u8> {
+            // SAFETY: live D3D12 texture.
+            let d = unsafe { tex.GetDesc() };
+            let count = u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize);
+            let mut fps = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
+            let mut sub_rows = vec![0u32; count as usize];
+            let mut sub_row_sizes = vec![0u64; count as usize];
+            let mut total = 0u64;
+            // SAFETY: plain footprint query.
+            unsafe {
+                host.device.GetCopyableFootprints(
+                    &d,
+                    0,
+                    count,
+                    0,
+                    Some(fps.as_mut_ptr()),
+                    Some(sub_rows.as_mut_ptr()),
+                    Some(sub_row_sizes.as_mut_ptr()),
+                    Some(&mut total),
+                );
+            }
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_READBACK,
+                ..Default::default()
+            };
+            let buf_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: total.max(4),
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut rb: Option<ID3D12Resource> = None;
+            // SAFETY: plain readback buffer creation.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &buf_desc,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        None,
+                        &mut rb,
+                    )
+                    .unwrap();
+            }
+            let rb = rb.unwrap();
+            let list = host.new_list().unwrap();
+            for (sub, fp) in fps.iter().enumerate() {
+                let src = D3D12_TEXTURE_COPY_LOCATION {
+                    // SAFETY: borrowed COM pointer.
+                    pResource: unsafe { std::mem::transmute_copy(tex) },
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        SubresourceIndex: sub as u32,
+                    },
+                };
+                let dst = D3D12_TEXTURE_COPY_LOCATION {
+                    // SAFETY: borrowed COM pointer.
+                    pResource: unsafe { std::mem::transmute_copy(&rb) },
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *fp },
+                };
+                // SAFETY: open list; `tex` was left in COPY_SOURCE by caller.
+                unsafe { list.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None) };
+            }
+            list.close();
+            host.execute(&[&list]);
+            let mut ptr = std::ptr::null_mut();
+            // SAFETY: readback completed via `host.execute`. Extract only
+            // active row bytes so uninitialized readback row-pitch padding
+            // never causes false mismatches.
+            unsafe {
+                rb.Map(0, None, Some(&mut ptr)).unwrap();
+                let raw = std::slice::from_raw_parts(ptr.cast::<u8>(), total as usize);
+                let mut out = Vec::new();
+                for ((fp, &rows), &row_size) in
+                    fps.iter().zip(&sub_rows).zip(&sub_row_sizes)
+                {
+                    let base = fp.Offset as usize;
+                    let pitch = fp.Footprint.RowPitch as usize;
+                    let active = row_size as usize;
+                    for y in 0..rows as usize {
+                        out.extend_from_slice(&raw[base + y * pitch..base + y * pitch + active]);
+                    }
+                }
+                rb.Unmap(0, None);
+                out
+            }
+        };
+
+        let run_case = |words: [u32; 14], mutate: bool| {
+            // SAFETY: 14 u32 words = 56-byte ResourceDesc.
+            let desc: crate::resource::ResourceDesc = unsafe { std::mem::transmute(words) };
+            let layout = crate::resource::texture_layout(&desc)
+                .expect("valid console layout")
+                .planes[0]
+                .layout
+                .clone();
+            let initial: Vec<u8> = (0..layout.size as usize)
+                .map(|i| ((i.wrapping_mul(131) ^ (i >> 7)) & 0xff) as u8)
+                .collect();
+            let updated: Vec<u8> = (0..layout.size as usize)
+                .map(|i| ((i.wrapping_mul(197).wrapping_add(41) ^ (i >> 5)) & 0xff) as u8)
+                .collect();
+
+            let run_mode = |use_gpu: bool| -> (Vec<u8>, Option<Vec<u8>>) {
+                let _guard = crate::gpu_detile::OverrideGuard::set(use_gpu);
+                let mut backing = initial.clone();
+                let mut res: crate::object::This = std::ptr::null();
+                let hr = crate::resource::create_at_address(
+                    std::ptr::null(),
+                    backing.as_ptr() as u64,
+                    &desc,
+                    0,
+                    std::ptr::null(),
+                    &res_iid,
+                    &mut res,
+                );
+                assert_eq!(hr, 0, "create_at_address failed");
+                let tex = crate::resource::host_resource(res).expect("host texture");
+
+                let list = host.new_list().unwrap();
+                super::upload(&list, res, tex);
+                crate::list::ensure_state(&list, res, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+                list.close();
+                host.execute(&[&list]);
+                if let Some(err) = host.log_messages() {
+                    panic!("D3D12 debug layer error (use_gpu={use_gpu}, initial): {err}");
+                }
+
+                // Verify Staging used the expected mode (VRAM when GPU detile is on).
+                let staging = {
+                    let map = super::STAGING.read().unwrap_or_else(|e| e.into_inner());
+                    map.as_ref().unwrap().get(&(res as usize)).unwrap().clone()
+                };
+                assert_eq!(staging.gpu_detile, use_gpu);
+                {
+                    let guard = staging.upload.lock().unwrap_or_else(|e| e.into_inner());
+                    assert_eq!(guard.as_ref().unwrap().vram, use_gpu);
+                }
+
+                let first_read = read_all_mips(tex);
+                drop(list);
+
+                let second_read = if mutate {
+                    // First upload's `refresh()` runs after `note_upload()` and
+                    // marks `dirty = true`; settle it cleanly before testing
+                    // Wave 6 upload buffer release and pool reallocation.
+                    staging.note_upload();
+                    let released = staging.release_upload();
+                    assert!(released.is_some(), "settled upload buffer should release");
+                    drop(released);
+
+                    backing.copy_from_slice(&updated);
+                    super::upload_again(res);
+                    let list2 = host.new_list().unwrap();
+                    super::upload(&list2, res, tex);
+                    crate::list::ensure_state(
+                        &list2,
+                        res,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32,
+                    );
+                    list2.close();
+                    host.execute(&[&list2]);
+                    if let Some(err) = host.log_messages() {
+                        panic!("D3D12 debug layer error (use_gpu={use_gpu}, reupload): {err}");
+                    }
+                    Some(read_all_mips(tex))
+                } else {
+                    None
+                };
+
+                // Release the title resource cleanly.
+                super::forget(res as usize);
+                // SAFETY: valid COM object returned by `create_at_address`.
+                unsafe {
+                    type Release = unsafe extern "system" fn(crate::object::This) -> u32;
+                    let vtable = *res.cast::<*const [Release; 3]>();
+                    ((*vtable)[2])(res);
+                }
+                (first_read, second_read)
+            };
+
+            let (gpu_first, gpu_second) = run_mode(true);
+            let (cpu_first, cpu_second) = run_mode(false);
+            assert_eq!(gpu_first, cpu_first, "initial GPU vs CPU upload mismatch");
+            assert_eq!(gpu_second, cpu_second, "re-upload GPU vs CPU mismatch");
+        };
+
+        // Case 1: 256x256 BC7, 9 mips (with mip tail), SW_64KB_D (0x10a) + reupload.
+        run_case(
+            [3, 0, 0, 0, 256, 0, 256, (9 << 16) | 1, 98, 1, 0, 0x10a, 0, 0],
+            true,
+        );
+        // Case 2: 131x79 RGBA8, 8 mips (NPOT with mip tail), SW_4KB_S (0x105).
+        run_case(
+            [3, 0, 0, 0, 131, 0, 79, (8 << 16) | 1, 28, 1, 0, 0x105, 0, 0],
+            true,
+        );
     }
 }
 
@@ -2690,6 +3042,8 @@ mod title_memory_tests {
             detiled: AtomicU32::new(0),
             judged: [const { AtomicU64::new(0) }; 2],
             waiting: AtomicU64::new(0),
+            gpu_detile: false,
+            vram_needs_zero: AtomicBool::new(false),
         });
         // Not uploaded yet and dirty: must block release.
         assert!(staging.release_upload().is_none());
