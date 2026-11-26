@@ -183,14 +183,29 @@ impl Big {
                     (a, l)
                 })
                 .collect();
-            let views: ID3D12DescriptorHeap = device
-                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+            let mut view_count = VIEWS;
+            let views: ID3D12DescriptorHeap = match device.CreateDescriptorHeap(
+                &D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                    NumDescriptors: VIEWS,
+                    NumDescriptors: view_count,
                     Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                     NodeMask: 0,
-                })
-                .unwrap();
+                },
+            ) {
+                Ok(h) => h,
+                Err(_) => {
+                    // NVIDIA caps shader-visible CBV/SRV/UAV descriptor heaps at 1,000,000.
+                    view_count = 1_000_000;
+                    device
+                        .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                            NumDescriptors: view_count,
+                            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                            NodeMask: 0,
+                        })
+                        .unwrap()
+                }
+            };
             let step = device
                 .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
                 as usize;
@@ -204,7 +219,7 @@ impl Big {
                     )
                 })
                 .collect();
-            for i in 0..VIEWS as usize {
+            for i in 0..view_count as usize {
                 let at = D3D12_CPU_DESCRIPTOR_HANDLE {
                     ptr: start + i * step,
                 };

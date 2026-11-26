@@ -309,7 +309,8 @@ pub(crate) fn removal_note() -> String {
             );
         }
     }
-    let (at, len) = (VIEW[0].load(Ordering::Relaxed), VIEW[1].load(Ordering::Relaxed));
+    let at = VIEW[0].load(Ordering::Acquire);
+    let len = VIEW[1].load(Ordering::Relaxed);
     if at == 0 {
         text.push_str("; its file is not mapped");
         return text;
@@ -369,7 +370,8 @@ pub(crate) fn removal_note() -> String {
 /// `VICTORY_LIBRARY_TRIM=0`: the pages stay until Windows takes them.
 pub(crate) fn trim() {
     static ON: OnceLock<bool> = OnceLock::new();
-    let (at, len) = (VIEW[0].load(Ordering::Relaxed), VIEW[1].load(Ordering::Relaxed));
+    let at = VIEW[0].load(Ordering::Acquire);
+    let len = VIEW[1].load(Ordering::Relaxed);
     if at == 0
         || TRIMMED.load(Ordering::Relaxed)
         || !*ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_TRIM").is_none_or(|v| v != "0"))
@@ -474,7 +476,7 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
                 tracing::info!(bytes, mapped = matches!(blob, Blob::Mapped(_)), "host pipeline library loaded");
                 if let Blob::Mapped(file) = &blob {
                     VIEW[1].store(file.len, Ordering::Relaxed);
-                    VIEW[0].store(file.at.Value as usize, Ordering::Relaxed);
+                    VIEW[0].store(file.at.Value as usize, Ordering::Release);
                     LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
                 }
                 return Some(Library {
@@ -586,7 +588,9 @@ pub(crate) fn save(now: bool) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
     }
-    let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
+    static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!("{LIBRARY_FILE}.{}.{seq}.tmp", std::process::id()));
     // The bytes of the library written to `tmp`; 0 when no pipeline was
     // added: the library on disk is then what it was, and only the early
     // list is written (a title pipeline first drawn with wrote all 1,352 MB
@@ -622,7 +626,7 @@ pub(crate) fn save(now: bool) {
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
         let in_place = !dir.join(NEXT_FILE).exists();
-        if in_place && VIEW[0].load(Ordering::Relaxed) != 0 {
+        if in_place && VIEW[0].load(Ordering::Acquire) != 0 {
             REPLACED[1].store(crate::host::now_ms(), Ordering::Relaxed);
             REPLACED[0].fetch_add(1, Ordering::Relaxed);
         }

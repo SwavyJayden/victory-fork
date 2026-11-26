@@ -567,9 +567,11 @@ mod tests {
         assert_eq!(worker_count(None, 64), 16);
         assert_eq!(worker_count(Some(0), 24), 1);
         assert_eq!(worker_count(Some(20), 24), 20);
-        assert_eq!(worker_count_for(None, 8, true), 6);
-        assert_eq!(worker_count_for(None, 16, true), 8);
-        assert_eq!(worker_count_for(None, 24, true), 8);
+        assert_eq!(worker_count(None, 12), 6);
+        assert_eq!(worker_count_for(None, 8, true), 4);
+        assert_eq!(worker_count_for(None, 12, true), 6);
+        assert_eq!(worker_count_for(None, 16, true), 6);
+        assert_eq!(worker_count_for(None, 24, true), 6);
         assert_eq!(worker_count_for(Some(12), 8, true), 12);
     }
 

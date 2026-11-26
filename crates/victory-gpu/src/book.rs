@@ -604,11 +604,16 @@ pub(crate) fn at_loss(va: u64) -> String {
         }
     }
     // Every slot that reaches the address, and the nearest below it.
+    // Raw 32-byte descriptor decoding assumes AMD RDNA SRD layout; skip on
+    // non-AMD (e.g. NVIDIA Blackwell) where descriptors are opaque handles.
     let mut reach: Vec<(u32, Names)> = Vec::new();
     let mut near: Vec<(u64, u32, Names)> = Vec::new();
     let mut at = 0;
     let began = std::time::Instant::now();
-    while let Some((first, bytes, end)) = crate::descriptor::host::shown_bytes(at, 16_384) {
+    let is_amd = crate::host::host().is_some_and(|h| crate::indirect::amd(&h.device));
+    while is_amd
+        && let Some((first, bytes, end)) = crate::descriptor::host::shown_bytes(at, 16_384)
+    {
         for (i, d) in bytes.chunks_exact(32).enumerate() {
             let slot = first + i as u32;
             let names = decode(&d.try_into().unwrap_or([0; 32]));

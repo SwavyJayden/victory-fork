@@ -1045,6 +1045,8 @@ extern "system" fn copy_texture_region(
         let mut from = src;
         // Both sides are the same subresource of one host texture (set below).
         let mut same = false;
+        // Both sides are DIFFERENT subresources of the same host texture.
+        let mut same_texture_src_sub: Option<u32> = None;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
         let mut read = None;
@@ -1071,6 +1073,7 @@ extern "system" fn copy_texture_region(
             };
             from.resource = buffer.as_raw().cast_const().cast();
             from.footprint.offset = 0;
+            from.footprint.format = crate::resource::pc_format(from.footprint.format);
             #[cfg(feature = "diagnostics")]
             {
                 // SAFETY: a live buffer.
@@ -1089,11 +1092,14 @@ extern "system" fn copy_texture_region(
                 && src.kind != FOOTPRINT
                 && dst.kind != FOOTPRINT
                 && src.footprint.offset as u32 == dst.footprint.offset as u32;
+            if !same && texture.as_raw() == to.as_raw() && src.kind != FOOTPRINT && dst.kind != FOOTPRINT {
+                same_texture_src_sub = Some(src.footprint.offset as u32);
+            }
             list.twin_use(src.resource, false, false);
             if crate::texture::title_written(texture) {
                 crate::texture::upload(list, src.resource, texture);
             }
-            if !same {
+            if !same && same_texture_src_sub.is_none() {
                 ensure_state(list, src.resource, COPY_SOURCE);
             }
             from.resource = texture.as_raw().cast_const().cast();
@@ -1175,6 +1181,22 @@ extern "system" fn copy_texture_region(
         // SAFETY: an open list; both locations in the host's layout, naming
         // live resources; the box is the title's (same layout).
         unsafe {
+            if let Some(src_sub) = same_texture_src_sub {
+                use windows::Win32::Graphics::Direct3D12::*;
+                let to_src = D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                            pResource: std::mem::transmute_copy(to),
+                            Subresource: src_sub,
+                            StateBefore: D3D12_RESOURCE_STATE_COPY_DEST,
+                            StateAfter: D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        }),
+                    },
+                };
+                list.list.ResourceBarrier(&[to_src]);
+            }
             list.list.CopyTextureRegion(
                 (&raw const to_location).cast(),
                 x,
@@ -1182,7 +1204,23 @@ extern "system" fn copy_texture_region(
                 z,
                 (&raw const from).cast(),
                 host_box,
-            )
+            );
+            if let Some(src_sub) = same_texture_src_sub {
+                use windows::Win32::Graphics::Direct3D12::*;
+                let back = D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                            pResource: std::mem::transmute_copy(to),
+                            Subresource: src_sub,
+                            StateBefore: D3D12_RESOURCE_STATE_COPY_SOURCE,
+                            StateAfter: D3D12_RESOURCE_STATE_COPY_DEST,
+                        }),
+                    },
+                };
+                list.list.ResourceBarrier(&[back]);
+            }
         };
     }
     #[cfg(not(windows))]
@@ -1446,6 +1484,9 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
         && src != 0
     {
         let len = len as usize;
+        if len == 0 {
+            return;
+        }
         if list.place_copy(dst as usize, src as usize, len) {
             with_state(this, |_, state| state.copied());
             return;

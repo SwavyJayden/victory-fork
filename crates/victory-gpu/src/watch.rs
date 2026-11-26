@@ -435,7 +435,7 @@ fn note_hot(written: &[(usize, u16)]) {
     let mut hot = HOT.lock().unwrap_or_else(|e| e.into_inner());
     for (page, _) in written {
         let n = hot.entry(page / EARLY_PIECE).or_default();
-        *n = (*n + 1).min(1 << 10);
+        *n = n.saturating_add(1).min(1 << 10);
     }
     HOT_MOVED.notify_one();
     drop(hot);
@@ -462,7 +462,7 @@ fn ask_early(every: std::time::Duration) {
                 hot = HOT_MOVED.wait(hot).unwrap_or_else(|e| e.into_inner());
                 idle = 0;
             }
-            round += 1;
+            round = round.wrapping_add(1);
             if round.is_multiple_of(64) {
                 hot.retain(|_, n| {
                     *n /= 2;

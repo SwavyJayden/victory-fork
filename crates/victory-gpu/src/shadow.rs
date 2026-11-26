@@ -5202,8 +5202,18 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     });
     let room = host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
     let (staging, data) = host.shared_buffer(len)?;
-    let on_card = if room && USED.fetch_add(len, Ordering::Relaxed) + len <= most {
-        host.uav_buffer(len)
+    let reserved = room
+        && USED
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                cur.checked_add(len).filter(|&next| next <= most)
+            })
+            .is_ok();
+    let on_card = if reserved {
+        let made = host.uav_buffer(len);
+        if made.is_none() {
+            USED.fetch_sub(len, Ordering::Relaxed);
+        }
+        made
     } else {
         None
     };

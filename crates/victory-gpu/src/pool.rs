@@ -393,18 +393,33 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
     }
     // Copies from a buffer begin at multiples of 512.
     let bytes = bytes.next_multiple_of(512);
-    let (piece, memory, again) = lock(&STAGING).take(bytes, 512, now(), || {
+    let mut speculative_skip = false;
+    let mut guard = lock(&STAGING);
+    let (piece, memory, again) = match guard.take(bytes, 512, now(), || {
         // Only gate speculative bindless prefetch on staging-pool growth
         // headroom; table-bound textures and decoration bakes are sampled
         // immediately and would otherwise read uninitialized/reused VRAM.
         let speculative = crate::texture::PICKING.get().is_some() && !crate::texture::BAKING.get();
         if speculative && !crate::residency::allow_staging_growth(false) {
+            speculative_skip = true;
             return None;
         }
         let (buffer, data) = host.upload_buffer(BLOCK)?;
         crate::host::name(&buffer, || "staging of textures (a block)".into());
         Some(Upload(buffer, data))
-    })?;
+    }) {
+        Some(got) => got,
+        None => {
+            // Do not apply the 500 ms D3D12 OOM backoff when speculative
+            // prefetch voluntarily yielded; table-bound uploads and ped bakes
+            // must remain allowed to grow immediately.
+            if speculative_skip {
+                guard.retry_growth_at = 0;
+            }
+            return None;
+        }
+    };
+    drop(guard);
     let owned = StagingPiece(piece);
     // SAFETY: the piece lies in the block's mapping.
     let data = unsafe { memory.1.add(piece.start as usize) };

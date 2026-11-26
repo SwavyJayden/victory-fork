@@ -82,6 +82,13 @@ impl Front {
             && !self.submitted
         {
             recording.abandoned.store(true, Release);
+            // Wait for any worker currently translating a chunk of this
+            // abandoned recording so guest objects referenced in that chunk
+            // are not freed underneath it.
+            let mut inner = held(&recording.inner);
+            while inner.running {
+                inner = recording.moved.wait(inner).unwrap_or_else(|e| e.into_inner());
+            }
         }
         self.words.clear();
     }
@@ -194,6 +201,8 @@ struct Inner {
     kept: Vec<Vec<u64>>,
     /// It is among [`READY`] or being translated.
     scheduled: bool,
+    /// A worker thread is actively translating a chunk right now.
+    running: bool,
     /// The list of ours (0: none yet).
     back: usize,
     /// That list was closed by the stream.
@@ -235,8 +244,11 @@ impl Recording {
                 let mut inner = held(&self.inner);
                 let Some(chunk) = inner.chunks.pop_front() else {
                     inner.scheduled = false;
+                    inner.running = false;
+                    self.moved.notify_all();
                     return;
                 };
+                inner.running = true;
                 if inner.back == 0 {
                     inner.back = back_list(self.kind) as usize;
                 }
@@ -719,7 +731,8 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
             RESET => {
                 // (Only whether there is an allocator is looked at.)
                 let allocator: This = std::ptr::NonNull::<u64>::dangling().as_ptr().cast_const().cast();
-                super::reset(list, allocator, w[0] as This);
+                let pipeline = if skip { std::ptr::null() } else { w[0] as This };
+                super::reset(list, allocator, pipeline);
             }
             CLOSE => {
                 super::close(list);

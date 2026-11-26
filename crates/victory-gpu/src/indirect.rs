@@ -2723,7 +2723,9 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         // SAFETY: mapped buffers of these sizes; nothing runs yet.
         unsafe {
             for i in 0..3 {
-                let words = [65535u32, 16, 1];
+                // 32768 * 32 * 64 = 2^26 per record: two records spend the exact
+                // 2^27 budget regardless of `VICTORY_INDIRECT_REST` (0 or 1).
+                let words = [32768u32, 32, 1];
                 std::ptr::copy_nonoverlapping(
                     words.as_ptr().cast::<u8>(),
                     big_ptr.add(i * STRIDE as usize),
@@ -3206,7 +3208,12 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
             };
             assert_eq!(out.iter().filter(|&&v| v == 1 << 22).count(), filled, "{times} times {records}: {out:?}");
             assert!(out.iter().all(|&v| v == 0 || v == 1 << 22));
-            assert_eq!(spent, BUDGET.min((1 << 26) * times * records as u32));
+            let expected_spent = if rest() != 0 {
+                BUDGET.min((1 << 26) * times * records as u32)
+            } else {
+                (filled as u32) * (1 << 26) * times
+            };
+            assert_eq!(spent, expected_spent);
         }
     }
 

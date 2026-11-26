@@ -153,24 +153,34 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
 }
 /// Moves the fence to `value` and sets the events that waited for it.
 pub(crate) fn set(this: This, value: u64) {
+    // Hold our own reference across waking waiters and `WakeByAddressAll` so
+    // a woken or polling guest thread cannot free `Fence` underneath us.
+    object::add_ref(this);
     let fence = fence(this);
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::timeline::told("a fence set", this as usize, value);
-    let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
-    fence.value.store(value, Ordering::Release);
-    waiters.retain(|&(wanted, event)| {
-        let reached = wanted <= value;
-        if reached {
-            set_event(event);
-        }
-        !reached
-    });
-    drop(waiters);
+    let mut reached = Vec::new();
+    {
+        let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
+        fence.value.store(value, Ordering::Release);
+        waiters.retain(|&(wanted, event)| {
+            let done = wanted <= value;
+            if done {
+                reached.push(event);
+            }
+            !done
+        });
+    }
     #[cfg(windows)]
-    // SAFETY: wake any guest thread polling/blocking via WaitOnAddress on the fence's GPU VA.
+    // SAFETY: `this` is held alive by `add_ref` above; wake any guest thread
+    // polling/blocking via `WaitOnAddress` on the fence's GPU VA.
     unsafe {
         windows_sys::Win32::System::Threading::WakeByAddressAll((&raw const fence.value).cast());
     }
+    for event in reached {
+        set_event(event);
+    }
+    release(this);
 }
 pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
     let _called = crate::timeline::span("a fence set");

@@ -462,19 +462,6 @@ impl Had {
 /// While the world streams a change is under way nearly all the time (pages
 /// are mapped in groups, eight threads side by side: 28 of 1,620 pieces a
 /// frame went through a view of ours in run textures-4, 630 in run n03). Put
-/// through the title's address a piece opens the guards of its blocks, 5,000
-/// changes of protection a frame, which wait for the address-space lock the
-/// mapping wants as well, and every refresh guards them again: the frame went
-/// from 105 to 140 ms. The record names a run of a section only while it is
-/// mapped there (it is taken out before a view goes and put in when one is
-/// there), so the change is one of other memory, or one the title makes of
-/// memory its shaders are writing at that moment, which it may not (its
-/// fences are signalled after the landing).
-fn anytime() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_ANYTIME").is_none_or(|v| v != "0"))
-}
-
 /// What a job wrote beside the guards, to be noted ([`Notes::flush`]).
 #[derive(Default)]
 pub(crate) struct Notes {
@@ -584,11 +571,12 @@ unsafe fn piece_at(
         return 0;
     };
     // From here until the piece is put the runtime changes no mapping: our
-    // view's address stays where the title sees `title`. Not waited for: if
-    // a change is under way, what the record of the views says now does
-    // ([`anytime`]), or the title's own address.
+    // view's address stays where the title sees `title`. Only write through
+    // `beside` while holding `title_memory_reading` so `title_memory_section_gone`
+    // cannot unmap the section view mid-write; if a remap is active, fall back
+    // to the guarded title-address path.
     let reading = beside.then(crate::watch::title_memory_reading_now).flatten();
-    let beside = if reading.is_some() || beside && anytime() { crate::inplace::beside(title, end) } else { None };
+    let beside = if reading.is_some() { crate::inplace::beside(title, end) } else { None };
     count(stat::PIECES, 1);
     count(if beside.is_some() { stat::BESIDE } else { stat::DIRECT }, 1);
     // The pages that differ, before any is written: none, and the guard

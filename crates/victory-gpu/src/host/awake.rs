@@ -185,7 +185,12 @@ fn run(device: &ID3D12Device, wanted: &dyn Fn() -> bool, stop: &AtomicBool) -> w
                 continue;
             }
             // Never more than two on the way.
-            if value >= 2 && fence.GetCompletedValue() + 2 <= value {
+            let done = fence.GetCompletedValue();
+            if done == u64::MAX {
+                result = device.GetDeviceRemovedReason();
+                break;
+            }
+            if value >= 2 && done.saturating_add(2) <= value {
                 result = fence.SetEventOnCompletion(value - 1, event);
                 if result.is_ok() {
                     WaitForSingleObject(event, 1000);
@@ -197,7 +202,8 @@ fn run(device: &ID3D12Device, wanted: &dyn Fn() -> bool, stop: &AtomicBool) -> w
             value += 1;
             result = queue.Signal(&fence, value);
         }
-        if result.is_ok() && fence.GetCompletedValue() < value && fence.SetEventOnCompletion(value, event).is_ok() {
+        let done = fence.GetCompletedValue();
+        if result.is_ok() && done != u64::MAX && done < value && fence.SetEventOnCompletion(value, event).is_ok() {
             WaitForSingleObject(event, INFINITE);
         }
         let _ = CloseHandle(event);

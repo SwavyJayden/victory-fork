@@ -323,10 +323,17 @@ pub(crate) fn release_held(all: bool) {
     let _looking = crate::timeline::span("looking at what queues hold");
     let _one = lock(&RELEASING);
     loop {
-        let queues = lock(&WAITING).clone();
+        let queues: Vec<usize> = {
+            let waiting = lock(&WAITING);
+            waiting
+                .iter()
+                .copied()
+                .filter(|&q| object::try_add_ref(q as This))
+                .collect()
+        };
         let mut moved = false;
         for q in queues {
-            // SAFETY: a live queue: one released is taken off the list.
+            // SAFETY: pinned alive by `try_add_ref` above until `release` below.
             let held = unsafe { &(*(q as *const Queue)).held };
             let mut held = lock(held);
             loop {
@@ -425,6 +432,8 @@ pub(crate) fn release_held(all: bool) {
             if held.is_empty() {
                 lock(&WAITING).retain(|&w| w != q);
             }
+            drop(held);
+            release(q as This);
         }
         if !moved {
             break;
@@ -555,12 +564,10 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
     )
 }
 extern "system" fn release(this: This) -> u32 {
-    let left = object::release_boxed::<Queue>(this);
-    #[cfg(windows)]
-    if left == 0 {
+    object::release_boxed_before::<Queue>(this, || {
+        #[cfg(windows)]
         lock(&WAITING).retain(|&q| q != this as usize);
-    }
-    left
+    })
 }
 
 /// Runs the lists' host lists and waits for them (decision 0007). A queue

@@ -71,6 +71,18 @@ pub(crate) extern "system" fn add_ref(this: This) -> u32 {
     unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 
+/// Atomically increments `this`'s refcount if and only if it is still `> 0`.
+/// Prevents resurrecting an object concurrently being freed by `release_boxed`.
+#[cfg(windows)]
+pub(crate) fn try_add_ref(this: This) -> bool {
+    // SAFETY: caller holds the registry lock that keeps `this` registered
+    // until `release_boxed` has already decremented `refs` to 0.
+    unsafe { &*this }
+        .refs
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n > 0).then_some(n + 1))
+        .is_ok()
+}
+
 pub(crate) extern "system" fn release(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
     let refs = &unsafe { &*this }.refs;
@@ -132,10 +144,18 @@ pub(crate) fn hand_out<T>(
 
 /// Release for objects made by [`hand_out`]: the last reference frees it.
 pub(crate) fn release_boxed<T>(this: This) -> u32 {
+    release_boxed_before::<T>(this, || {})
+}
+
+/// Like [`release_boxed`], running `before_drop` once the refcount reaches `0`
+/// and before freeing the allocation (so registry locks can detach `this` while
+/// [`try_add_ref`] already rejects it).
+pub(crate) fn release_boxed_before<T>(this: This, before_drop: impl FnOnce()) -> u32 {
     // SAFETY: `this` is the header of a boxed `T`.
     let refs = &unsafe { &*this }.refs;
     match refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)) {
         Ok(1) => {
+            before_drop();
             let address = this as usize;
             let keys = (address, [u8::MIN; 16])..=(address, [u8::MAX; 16]);
             {
