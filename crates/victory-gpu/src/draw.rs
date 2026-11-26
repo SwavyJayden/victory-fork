@@ -8,7 +8,7 @@
 //! stencil reference, topology, targets) is set on the host list as the
 //! title sets it.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_shader::resource::RootIndexedView;
 use victory_shader::{ResourceType, RootType, UsedResource};
@@ -57,6 +57,18 @@ const DEPTH_WRITE: u32 = 0x10;
 const DEPTH_READ: u32 = 0x20;
 const SHADER_RESOURCE: u32 = 0x40 | 0x80;
 
+/// Per-pass budget handed from `State::early_textures` to `State::heap_textures`.
+#[derive(Clone, Copy)]
+struct PassBudget {
+    ms: u64,
+    bytes: u64,
+    bake: bool,
+    loading: bool,
+    /// When `false`, the caller aggregates `HEAP_TEXTURES_WAITING` /
+    /// `HEAP_TEXTURES_QUEUE` across multiple view heaps itself.
+    update_census: bool,
+}
+
 thread_local! {
     /// While a draw is prepared (`State::bind`, then its targets' states):
     /// the depth target the draw only tests (0: none, or one it writes),
@@ -71,9 +83,9 @@ thread_local! {
     /// falls back to `STORES` (the whole stage).
     static BINDING_WRITES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     /// While `State::early_textures` runs the texture pass: the
-    /// milliseconds, the bytes, and whether this pass is for a bake draw, in
-    /// place of the pass's own per frame.
-    static PASS_BUDGET: std::cell::Cell<Option<(u64, u64, bool)>> = const { std::cell::Cell::new(None) };
+    /// milliseconds, the bytes, and whether this pass is for a bake or
+    /// loading-screen preload, in place of the pass's own per frame.
+    static PASS_BUDGET: std::cell::Cell<Option<PassBudget>> = const { std::cell::Cell::new(None) };
 }
 
 /// What [`crate::descriptor::host::HostHeap::texture_news`] said when the
@@ -102,6 +114,127 @@ fn early_budgets() -> (u64, u64) {
         };
         (ms("VICTORY_EARLY_TEXTURES_MS", 12), ms("VICTORY_BAKE_TEXTURES_MS", 1500))
     })
+}
+
+/// Bytes of texture memory staged per frame in live 3D scenes: 192 MiB, or
+/// `VICTORY_TEXTURE_STAGE_MB` (fallback `VICTORY_HEAP_TEXTURE_MB`).
+fn texture_stage_mb() -> u64 {
+    static PER_FRAME_MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PER_FRAME_MB.get_or_init(|| {
+        ["VICTORY_TEXTURE_STAGE_MB", "VICTORY_HEAP_TEXTURE_MB"]
+            .iter()
+            .find_map(|name| std::env::var(name).ok().and_then(|v| v.trim().parse().ok()))
+            .unwrap_or(192)
+    })
+}
+
+/// Optional explicit `VICTORY_EARLY_TEXTURES_MB` override.
+fn early_textures_mb_override() -> Option<u64> {
+    static MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *MB.get_or_init(|| {
+        std::env::var("VICTORY_EARLY_TEXTURES_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    })
+}
+
+/// Byte budget for `State::early_textures`: defaults to 512 MiB during loading
+/// screens or 256 MiB in live 3D scenes, honoring `VICTORY_TEXTURE_STAGE_MB`
+/// (`stage_mb`) if higher, or an explicit `VICTORY_EARLY_TEXTURES_MB` override.
+fn early_texture_bytes(loading: bool, early_mb_override: Option<u64>, stage_mb: u64) -> u64 {
+    let mb = match early_mb_override {
+        Some(v) => v,
+        None => (if loading { 512 } else { 256 }).max(stage_mb),
+    };
+    mb.saturating_mul(1 << 20)
+}
+
+fn loading_preload_from(val: Option<&std::ffi::OsStr>) -> bool {
+    val.is_none_or(|v| v != "0")
+}
+
+/// Aggressive loading-screen VRAM texture preloader (`VICTORY_LOADING_PRELOAD=1`,
+/// default ON; `=0` disables).
+fn loading_preload() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| loading_preload_from(std::env::var_os("VICTORY_LOADING_PRELOAD").as_deref()))
+}
+
+const DEFAULT_LOADING_TEXTURE_MS: u64 = 250;
+const DEFAULT_LOADING_TEXTURE_MB: u64 = 1024;
+const LOADING_REPROBE_MOST: u64 = 6;
+const LOADING_SCAN_LIMIT: usize = 1 << 16;
+const LIVE_SCAN_LIMIT: usize = 4096;
+
+fn loading_ms_override() -> Option<u64> {
+    static MS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("VICTORY_LOADING_TEXTURE_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    })
+}
+
+fn loading_mb_override() -> Option<u64> {
+    static MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *MB.get_or_init(|| {
+        std::env::var("VICTORY_LOADING_TEXTURE_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    })
+}
+
+/// Loading-screen time (ms) and byte budgets (`VICTORY_LOADING_TEXTURE_MS`,
+/// default 250 ms; `VICTORY_LOADING_TEXTURE_MB`, default 1024 MiB).
+fn loading_texture_budgets() -> (u64, u64) {
+    let ms = loading_ms_override().unwrap_or(DEFAULT_LOADING_TEXTURE_MS);
+    let bytes = loading_mb_override()
+        .unwrap_or(DEFAULT_LOADING_TEXTURE_MB)
+        .saturating_mul(1 << 20);
+    (ms, bytes)
+}
+
+/// Effective `(ms, bytes)` for an `early_textures` pass during a loading screen:
+/// uses `VICTORY_LOADING_TEXTURE_MS` / `VICTORY_LOADING_TEXTURE_MB` when set,
+/// otherwise upgrades the pass to at least `250 ms` and `1024 MiB` (honoring
+/// higher `early_ms` / `early_bytes` if the user configured them larger).
+fn loading_pass_budget(
+    early_ms: u64,
+    early_bytes: u64,
+    loading_ms_override: Option<u64>,
+    loading_mb_override: Option<u64>,
+) -> (u64, u64) {
+    let ms = match loading_ms_override {
+        Some(v) => v,
+        None => DEFAULT_LOADING_TEXTURE_MS.max(early_ms),
+    };
+    let bytes = match loading_mb_override {
+        Some(v) => v.saturating_mul(1 << 20),
+        None => DEFAULT_LOADING_TEXTURE_MB.saturating_mul(1 << 20).max(early_bytes),
+    };
+    (ms, bytes)
+}
+
+/// Maximum re-probe backoff (in frames) for an unmapped or partially-mapped
+/// texture slot: `6` frames (~200 ms at 30 FPS) while loading so DirectStorage
+/// arrivals are uploaded almost immediately, else `(4000 / took_ms).clamp(16, 256)`.
+fn texture_reprobe_most(took_ms: u64, loading: bool) -> u64 {
+    if loading {
+        LOADING_REPROBE_MOST
+    } else {
+        (4000 / took_ms.max(1)).clamp(16, 256)
+    }
+}
+
+/// Maximum due texture slots scanned per pass: `65536` during loading screens
+/// or exact bake passes so mapped textures are never stuck behind thousands of
+/// not-yet-mapped slots; `4096` in live 3D scenes.
+fn texture_due_scan_limit(bake_ahead: bool, loading: bool) -> usize {
+    if bake_ahead || loading {
+        LOADING_SCAN_LIMIT
+    } else {
+        LIVE_SCAN_LIMIT
+    }
 }
 
 fn bake_exact_from(val: Option<&std::ffi::OsStr>) -> bool {
@@ -245,6 +378,39 @@ fn effective_texture_span(
     }
     let remaining_us = cap_ms.saturating_mul(1000).saturating_sub(spent_us);
     stage.min(std::time::Duration::from_micros(remaining_us))
+}
+
+/// Computes `(span, bytes_at_most)` for `State::heap_textures` when called
+/// without an explicit `PASS_BUDGET`:
+/// - During loading screens (`loading == true`), ignores `VICTORY_HEAP_TEXTURE_MS`
+///   (`cap_ms`) and uses `loading_ms` (minus prior frame `spent_us`) and
+///   `loading_bytes` so each loading frame drains massive batches into VRAM.
+/// - In live 3D scenes (`loading == false`), preserves `effective_texture_span`
+///   (including the hard `cap_ms` ceiling) and `per_frame_bytes` (tripled on
+///   backlog when `catchup` is active).
+#[allow(clippy::too_many_arguments)]
+fn effective_texture_budget(
+    stage_span: std::time::Duration,
+    per_frame_bytes: u64,
+    catchup: bool,
+    on_time: usize,
+    cap_ms: u64,
+    spent_us: u64,
+    loading: bool,
+    loading_ms: u64,
+    loading_bytes: u64,
+) -> (std::time::Duration, u64) {
+    if loading {
+        let remaining_us = loading_ms.saturating_mul(1000).saturating_sub(spent_us);
+        return (std::time::Duration::from_micros(remaining_us), loading_bytes);
+    }
+    let span = effective_texture_span(stage_span, catchup, on_time, cap_ms, spent_us);
+    let bytes = if catchup && on_time >= 1024 {
+        per_frame_bytes.saturating_mul(3)
+    } else {
+        per_frame_bytes
+    };
+    (span, bytes)
 }
 
 /// With [`table_on_card`]: the host GPU address a table constant buffer view
@@ -779,6 +945,157 @@ static DRAWN: AtomicU64 = AtomicU64::new(0);
 /// Draws run on the host so far.
 pub(crate) fn drawn() -> u64 {
     DRAWN.load(Ordering::Relaxed)
+}
+
+/// Flipped `true` once any frame records more than [`WORLD_DRAW_THRESHOLD`]
+/// draws (live 3D world entry).
+static WORLD_SEEN: AtomicBool = AtomicBool::new(false);
+/// Frame token of the active per-frame draw count window (`u64::MAX` initially).
+/// Published with Release after updating [`DRAW_WINDOW_BASE`].
+static DRAW_WINDOW_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+/// Cumulative [`DRAWN`] count at the start of [`DRAW_WINDOW_FRAME`].
+static DRAW_WINDOW_BASE: AtomicU64 = AtomicU64::new(0);
+/// Consecutive completed frames that recorded `<= LOADING_LOW_DRAWS` draws.
+static LOW_DRAW_STREAK: AtomicU64 = AtomicU64::new(0);
+/// Serializes once-per-frame window rollovers without locking the hot draw path.
+static DRAW_WINDOW_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+const WORLD_DRAW_THRESHOLD: u64 = 64;
+const LOADING_LOW_DRAWS: u64 = 32;
+const LOADING_STREAK_MIN: u64 = 4;
+
+/// Pure phase detector for loading-screen VRAM preloading:
+/// - Before the first heavy 3D world frame (`!world_seen`, `cur_draws <= 64`),
+///   treats frames as loading screens so textures drain into VRAM aggressively.
+/// - Once the 3D world has been entered (`world_seen`), only re-enters loading
+///   mode after at least [`LOADING_STREAK_MIN`] consecutive low-draw frames
+///   (`<= 32` draws/frame) while DirectStorage is streaming or `>= 1024`
+///   textures are waiting, guaranteeing live 3D / Cutscene 1 frames (~3,000+
+///   draws) never trigger loading-screen mode even across extra frame ticks.
+fn is_loading_phase(
+    enabled: bool,
+    world_seen: bool,
+    low_draw_streak: u64,
+    cur_draws: u64,
+    dstorage_pending: usize,
+    waiting: u64,
+) -> bool {
+    if !enabled || cur_draws > WORLD_DRAW_THRESHOLD {
+        return false;
+    }
+    if !world_seen {
+        return true;
+    }
+    low_draw_streak >= LOADING_STREAK_MIN
+        && cur_draws <= LOADING_LOW_DRAWS
+        && (dstorage_pending > 0 || waiting >= 1024)
+}
+
+/// Closes any prior frame's draw window when `frame` advances so `WORLD_SEEN`
+/// and `LOW_DRAW_STREAK` reflect the completed previous frame.
+fn sync_draw_window(frame: u64, base_for_frame: u64) {
+    if DRAW_WINDOW_FRAME.load(Ordering::Acquire) == frame {
+        return;
+    }
+    let _guard = DRAW_WINDOW_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev_frame = DRAW_WINDOW_FRAME.load(Ordering::Relaxed);
+    if prev_frame == frame {
+        return;
+    }
+    let prev_base = DRAW_WINDOW_BASE.load(Ordering::Relaxed);
+    if prev_frame != u64::MAX {
+        let prev_draws = base_for_frame.saturating_sub(prev_base);
+        if prev_draws > WORLD_DRAW_THRESHOLD {
+            WORLD_SEEN.store(true, Ordering::Relaxed);
+        }
+        if prev_draws <= LOADING_LOW_DRAWS {
+            LOW_DRAW_STREAK.fetch_add(1, Ordering::Relaxed);
+        } else {
+            LOW_DRAW_STREAK.store(0, Ordering::Relaxed);
+        }
+    }
+    DRAW_WINDOW_BASE.store(base_for_frame, Ordering::Relaxed);
+    DRAW_WINDOW_FRAME.store(frame, Ordering::Release);
+}
+
+/// Records one host draw call and maintains per-frame world/loading detection
+/// without taking a lock on the same-frame hot path.
+#[inline]
+fn note_draw() {
+    let total = DRAWN.fetch_add(1, Ordering::Relaxed) + 1;
+    let frame = crate::frame::current();
+    if DRAW_WINDOW_FRAME.load(Ordering::Acquire) != frame {
+        sync_draw_window(frame, total - 1);
+        return;
+    }
+    let cur_draws = total.saturating_sub(DRAW_WINDOW_BASE.load(Ordering::Relaxed));
+    if cur_draws > LOADING_LOW_DRAWS {
+        if LOW_DRAW_STREAK.load(Ordering::Relaxed) != 0 {
+            LOW_DRAW_STREAK.store(0, Ordering::Relaxed);
+        }
+        if cur_draws > WORLD_DRAW_THRESHOLD && !WORLD_SEEN.load(Ordering::Relaxed) {
+            WORLD_SEEN.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Returns whether `frame` is currently in loading-screen VRAM preload mode.
+fn current_loading_phase(frame: u64, waiting: u64) -> bool {
+    if !loading_preload() {
+        return false;
+    }
+    let total = DRAWN.load(Ordering::Relaxed);
+    sync_draw_window(frame, total);
+    let cur_draws = total.saturating_sub(DRAW_WINDOW_BASE.load(Ordering::Relaxed));
+    is_loading_phase(
+        true,
+        WORLD_SEEN.load(Ordering::Relaxed),
+        LOW_DRAW_STREAK.load(Ordering::Relaxed),
+        cur_draws,
+        crate::title_hints::dstorage_pending(),
+        waiting,
+    )
+}
+
+/// Rate-limited (at most 1/sec) loading-screen preload telemetry.
+fn note_loading_preload_log(
+    uploaded: u64,
+    bytes: u64,
+    elapsed_us: u64,
+    due: u64,
+    waiting: u64,
+) {
+    static LAST_MS: AtomicU64 = AtomicU64::new(0);
+    static ACC_TEXTURES: AtomicU64 = AtomicU64::new(0);
+    static ACC_BYTES: AtomicU64 = AtomicU64::new(0);
+    static ACC_US: AtomicU64 = AtomicU64::new(0);
+
+    ACC_TEXTURES.fetch_add(uploaded, Ordering::Relaxed);
+    ACC_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    ACC_US.fetch_add(elapsed_us, Ordering::Relaxed);
+
+    let pending = crate::title_hints::dstorage_pending();
+    if uploaded == 0 && due == 0 && waiting == 0 && pending == 0 {
+        return;
+    }
+    let now = crate::host::now_ms().max(1);
+    let last = LAST_MS.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < 1000 {
+        return;
+    }
+    if LAST_MS
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    let total_uploaded = ACC_TEXTURES.swap(0, Ordering::Relaxed);
+    let total_bytes = ACC_BYTES.swap(0, Ordering::Relaxed);
+    let total_ms = ACC_US.swap(0, Ordering::Relaxed) / 1000;
+    tracing::info!(
+        "loading preload: uploaded {total_uploaded} textures ({:.1} MB) in {total_ms} ms; due={due}, waiting={waiting}, dstorage_pending={pending}",
+        total_bytes as f64 / (1024.0 * 1024.0),
+    );
 }
 
 /// The draws traced since the last present (diagnostics builds, with
@@ -2154,7 +2471,8 @@ impl State {
     /// of the draw being bound, as the world's pass records them.
     fn early_textures(&self, list: &HostList, p: &HostPipeline, compute: bool) {
         let (early_ms, bake_ms) = early_budgets();
-        if compute || (early_ms == 0 && bake_ms == 0) {
+        let (loading_ms, _) = loading_texture_budgets();
+        if compute || (early_ms == 0 && bake_ms == 0 && (!loading_preload() || loading_ms == 0)) {
             return;
         }
         let bake = bake_ms > 0
@@ -2169,36 +2487,126 @@ impl State {
             BAKED_MS.store(0, Ordering::Relaxed);
             BAKE_SERVED.store(0, Ordering::Relaxed);
         }
+        let waiting = HEAP_TEXTURES_WAITING
+            .load(Ordering::Relaxed)
+            .max(crate::descriptor::host::max_queued_textures());
+        let loading = current_loading_phase(frame, waiting);
         let left = bake_ms.saturating_sub(BAKED_MS.load(Ordering::Relaxed));
-        let budget = if bake && left > 0 {
+        let is_bake = bake && left > 0;
+        let budget = if is_bake {
             // What a bake may read must be there now: up to 2 GiB.
             (left, 2 << 30)
-        } else if first && early_ms > 0 {
-            (early_ms, 64 << 20)
+        } else if first {
+            let early_bytes =
+                early_texture_bytes(loading, early_textures_mb_override(), texture_stage_mb());
+            if loading {
+                let (ms, bytes) = loading_pass_budget(
+                    early_ms,
+                    early_bytes,
+                    loading_ms_override(),
+                    loading_mb_override(),
+                );
+                if ms > 0 {
+                    (ms, bytes)
+                } else if early_ms > 0 {
+                    (early_ms, early_bytes)
+                } else {
+                    return;
+                }
+            } else if early_ms > 0 {
+                (early_ms, early_bytes)
+            } else {
+                return;
+            }
         } else {
             return;
         };
-        let Some(heap) = self
+        let bound_heap = self
             .heaps
             .iter()
             .filter(|&&h| h != 0)
             .map(|&h| crate::descriptor::heap(h as This))
-            .find(|h| !h.samplers())
-        else {
+            .find(|h| !h.samplers());
+        let bound_host = bound_heap.and_then(|h| h.host());
+        if loading {
+            let began = std::time::Instant::now();
+            let mut total_uploaded = 0u64;
+            let mut total_bytes = 0u64;
+            let mut combined = [0u64; 5];
+            let mut visited = 0usize;
+            if is_bake {
+                let n = EARLY_TEXTURE_PASSES[1].fetch_add(1, Ordering::Relaxed) + 1;
+                if n.is_power_of_two() {
+                    let [slots, due, ..] =
+                        HEAP_TEXTURES_QUEUE.each_ref().map(|c| c.load(Ordering::Relaxed));
+                    tracing::info!(
+                        frame,
+                        bakes = n,
+                        queued_at_the_last_pass = slots,
+                        due_at_the_last_pass = due,
+                        uploaded_so_far = HEAP_TEXTURES.load(Ordering::Relaxed),
+                        "a draw of the title's decoration bake: textures picked by index are uploaded first (VICTORY_BAKE_TEXTURES_MS=0: not)"
+                    );
+                }
+            } else {
+                EARLY_TEXTURE_PASSES[0].fetch_add(1, Ordering::Relaxed);
+            }
+            // Drain all live, initialized non-sampler view heaps (largest waiting
+            // queue first) so a loading-screen UI draw binding a small UI heap
+            // still drains the 3D world's 100k-slot view heap into VRAM.
+            crate::descriptor::host::for_each_waiting_view_heap(|heap, host, _| {
+                let elapsed_ms = began.elapsed().as_millis() as u64;
+                let rem_ms = budget.0.saturating_sub(elapsed_ms);
+                let rem_bytes = budget.1.saturating_sub(total_bytes);
+                if rem_ms == 0 || rem_bytes == 0 {
+                    return;
+                }
+                PASS_BUDGET.set(Some(PassBudget {
+                    ms: rem_ms,
+                    bytes: rem_bytes,
+                    bake: is_bake,
+                    loading: true,
+                    update_census: false,
+                }));
+                let (uploaded, bytes, census) = self.heap_textures_pass(list, heap, host);
+                PASS_BUDGET.set(None);
+                total_uploaded += uploaded;
+                total_bytes += bytes;
+                for i in 0..4 {
+                    combined[i] = combined[i].saturating_add(census[i]);
+                }
+                combined[4] = combined[4].max(census[4]);
+                visited += 1;
+            });
+            if visited > 0 {
+                HEAP_TEXTURES_WAITING.store(combined[0], Ordering::Relaxed);
+                for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(combined) {
+                    count.store(now, Ordering::Relaxed);
+                }
+                note_loading_preload_log(
+                    total_uploaded,
+                    total_bytes,
+                    began.elapsed().as_micros() as u64,
+                    combined[1],
+                    combined[0],
+                );
+            }
+            if is_bake {
+                BAKED_MS.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
+            }
+            return;
+        }
+        let (Some(heap), Some(host)) = (bound_heap, bound_host) else {
             return;
         };
-        let Some(host) = heap.host() else {
-            return;
-        };
-        let bake = bake && left > 0;
-        if bake && !first {
+        if is_bake && !first {
             let (writes, noted) = host.texture_news();
             if !noted && BAKE_SERVED.load(Ordering::Relaxed) == writes + 1 {
                 return;
             }
         }
-        let n = EARLY_TEXTURE_PASSES[usize::from(bake)].fetch_add(1, Ordering::Relaxed) + 1;
-        if bake && n.is_power_of_two() {
+        let n = EARLY_TEXTURE_PASSES[usize::from(is_bake)].fetch_add(1, Ordering::Relaxed) + 1;
+        if is_bake && n.is_power_of_two() {
             let [slots, due, ..] = HEAP_TEXTURES_QUEUE.each_ref().map(|c| c.load(Ordering::Relaxed));
             tracing::info!(
                 frame,
@@ -2210,10 +2618,16 @@ impl State {
             );
         }
         let began = std::time::Instant::now();
-        PASS_BUDGET.set(Some((budget.0, budget.1, bake)));
-        self.heap_textures(list, heap, host);
+        PASS_BUDGET.set(Some(PassBudget {
+            ms: budget.0,
+            bytes: budget.1,
+            bake: is_bake,
+            loading: false,
+            update_census: true,
+        }));
+        let _ = self.heap_textures_pass(list, heap, host);
         PASS_BUDGET.set(None);
-        if bake {
+        if is_bake {
             BAKED_MS.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
         }
     }
@@ -2313,20 +2727,20 @@ impl State {
         heap: &crate::descriptor::Heap,
         host: &crate::descriptor::host::HostHeap,
     ) {
+        let _ = self.heap_textures_pass(list, heap, host);
+    }
+
+    fn heap_textures_pass(
+        &self,
+        list: &HostList,
+        heap: &crate::descriptor::Heap,
+        host: &crate::descriptor::host::HostHeap,
+    ) -> (u64, u64, [u64; 5]) {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
-            return;
+            return (0, 0, [0; 5]);
         }
-        /// Bytes of texture memory staged per frame: 192 MB, or
-        /// `VICTORY_TEXTURE_STAGE_MB` (read once; `VICTORY_HEAP_TEXTURE_MB`
-        /// fallback).
-        static PER_FRAME_MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        let per_frame: u64 = *PER_FRAME_MB.get_or_init(|| {
-            ["VICTORY_TEXTURE_STAGE_MB", "VICTORY_HEAP_TEXTURE_MB"]
-                .iter()
-                .find_map(|name| std::env::var(name).ok().and_then(|v| v.trim().parse().ok()))
-                .unwrap_or(192)
-        }) << 20;
+        let per_frame: u64 = texture_stage_mb().saturating_mul(1 << 20);
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static SPENT: AtomicU64 = AtomicU64::new(0);
         static SPENT_US: AtomicU64 = AtomicU64::new(0);
@@ -2370,32 +2784,41 @@ impl State {
             host.texture_slots_waiting(frame);
         }
         let pass_budget = PASS_BUDGET.get();
-        let bake_ahead = pass_budget.is_some_and(|(_, _, bake)| bake) && bake_exact();
-        let (mut due, census) = host.texture_slots_due(frame, if bake_ahead { 1 << 16 } else { 4096 });
+        let loading = match pass_budget {
+            Some(pb) => pb.loading,
+            None => {
+                let waiting = HEAP_TEXTURES_WAITING
+                    .load(Ordering::Relaxed)
+                    .max(host.queued_texture_count() as u64);
+                current_loading_phase(frame, waiting)
+            }
+        };
+        let bake_ahead = pass_budget.is_some_and(|pb| pb.bake) && bake_exact();
+        let (mut due, census) =
+            host.texture_slots_due(frame, texture_due_scan_limit(bake_ahead, loading));
         // (Those that are due later after all that are due.)
         let on_time = due.len();
         if bake_ahead {
-            let (ahead, _) = host.texture_slots_due(frame + BAKE_AHEAD, 1 << 16);
+            let (ahead, _) = host.texture_slots_due(frame + BAKE_AHEAD, LOADING_SCAN_LIMIT);
             append_bake_ahead(&mut due, ahead);
         }
-        HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
-        for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
-            count.store(now, Ordering::Relaxed);
+        if pass_budget.is_none_or(|pb| pb.update_census) {
+            HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
+            for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
+                count.store(now, Ordering::Relaxed);
+            }
         }
         // Where the card's memory is, and what the due slots would need
         // (`VICTORY_CARD_ACCOUNTING=1`; a line when the card first has no
         // room, and every five seconds after it).
         Self::card_accounting(heap, host, frame, room);
-        // The frames in about four seconds, between 16 and 256: how long a
-        // slot with nothing to upload waits at most for its next look. In
-        // frames alone it was 120: four minutes at the opening cutscene's
-        // half a frame per second, while the title streams by the clock.
-        // (About a second before the runtime told of the memory it maps:
-        // the looks are now only for what that does not tell.)
+        // The frames in about four seconds, between 16 and 256 (or 6 frames
+        // while loading so DirectStorage arrivals upload almost immediately):
+        // how long a slot with nothing to upload waits at most for its next look.
         static PASSED: AtomicU64 = AtomicU64::new(0);
         let now = crate::host::now_ms();
         let took = now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1);
-        let most = (4000 / took).clamp(16, 256);
+        let most = texture_reprobe_most(took, loading);
         // What a table entry of a texture a shader samples says.
         let sampled = UsedResource {
             kind: ResourceType::Srv,
@@ -2428,19 +2851,30 @@ impl State {
         // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget. When the user
         // explicitly sets a non-zero `VICTORY_HEAP_TEXTURE_MS`, `cap_ms` remains a
         // hard per-frame ceiling (not multiplied by 3) so live 3D scenes stay smooth,
-        // while `early_textures` (`PASS_BUDGET`) keeps its own loading/bake budget.
+        // while loading screens and `early_textures` (`PASS_BUDGET`) keep their own
+        // aggressive drain budget.
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
-        let per_frame = if catchup && on_time >= 1024 { per_frame * 3 } else { per_frame };
-        let span = effective_texture_span(span, catchup, on_time, cap_ms, SPENT_US.load(Ordering::Relaxed));
+        let (loading_ms, loading_bytes) = loading_texture_budgets();
+        let (span, per_frame) = effective_texture_budget(
+            span,
+            per_frame,
+            catchup,
+            on_time,
+            cap_ms,
+            SPENT_US.load(Ordering::Relaxed),
+            loading,
+            loading_ms,
+            loading_bytes,
+        );
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
         let (span, bytes_at_most, baking) = match pass_budget {
-            Some((ms, bytes, baking)) => (
-                std::time::Duration::from_millis(ms),
-                SPENT.load(Ordering::Relaxed).saturating_add(bytes),
-                baking,
+            Some(pb) => (
+                std::time::Duration::from_millis(pb.ms),
+                SPENT.load(Ordering::Relaxed).saturating_add(pb.bytes),
+                pb.bake,
             ),
             None => (span, per_frame, false),
         };
@@ -2448,9 +2882,10 @@ impl State {
         BAKE_SERVED.store(0, Ordering::Relaxed);
         let mut served = true;
         let due_count = on_time as u64;
-        // Bytes of textures uploaded in this pass so far: used to gate
-        // giant textures under a budget (one alone is allowed when nothing
-        // else has been done yet, to avoid starvation).
+        // Textures and bytes uploaded in this pass so far: used for telemetry
+        // and to gate giant textures under a budget (one alone is allowed when
+        // nothing else has been done yet, to avoid starvation).
+        let mut done_textures: u64 = 0;
         let mut done_bytes: u64 = 0;
         for (index, write) in due {
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() >= span {
@@ -2587,19 +3022,21 @@ impl State {
                 }
             }
             // Under a budget (early or bake pass): recheck time before the
-            // heavy work of making and staging a texture, and cap each
-            // texture at 64 MiB so one giant upload cannot alone blow the
-            // watchdog. One giant texture is still allowed when nothing
-            // else has been done yet, to avoid starvation of textures that
-            // are always large.
+            // heavy work of making and staging a texture, and reserve headroom
+            // (up to 64 MiB, capped at half the pass budget so small budgets
+            // still upload multiple textures) so one giant upload cannot alone
+            // blow the watchdog. One giant texture is still allowed when nothing
+            // else has been done yet, to avoid starvation of textures that are
+            // always large.
             const PER_TEXTURE_BUDGET: u64 = 64 << 20;
-            if pass_budget.is_some() {
+            if let Some(pb) = pass_budget {
                 if began.elapsed() >= span {
                     served = false;
                     break;
                 }
+                let guard_bytes = PER_TEXTURE_BUDGET.min(pb.bytes / 2);
                 if done_bytes > 0
-                    && SPENT.load(Ordering::Relaxed).saturating_add(PER_TEXTURE_BUDGET)
+                    && SPENT.load(Ordering::Relaxed).saturating_add(guard_bytes)
                         > bytes_at_most
                 {
                     served = false;
@@ -2669,7 +3106,7 @@ impl State {
                 let text: String = format!("{view:?}").chars().take(300).collect();
                 tracing::error!(why, slot = index, "the host device went while textures picked by index were made ready; last: {text}");
                 crate::host::log_removal_context();
-                return;
+                return (done_textures, done_bytes, census);
             }
             let (bytes, whole) = crate::texture::staged(resource, there.is_none()).unwrap_or((0, true));
             // Not all of it there: looked at again next frame, and from
@@ -2704,6 +3141,7 @@ impl State {
             };
             crate::texture::unstage(resource);
             SPENT.fetch_add(bytes, Ordering::Relaxed);
+            done_textures += 1;
             done_bytes = done_bytes.saturating_add(bytes);
             since_asked += bytes;
             if room && since_asked >= 32 << 20 {
@@ -2724,7 +3162,12 @@ impl State {
         if baking && served && due_count >= census[1] {
             BAKE_SERVED.store(host.texture_news().0 + 1, Ordering::Relaxed);
         }
-        SPENT_US.fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let elapsed_us = began.elapsed().as_micros() as u64;
+        SPENT_US.fetch_add(elapsed_us, Ordering::Relaxed);
+        if loading && pass_budget.is_none() {
+            note_loading_preload_log(done_textures, done_bytes, elapsed_us, census[1], census[0]);
+        }
+        (done_textures, done_bytes, census)
     }
 
     /// For the frame listing, after a dropped dispatch's line: its group
@@ -3278,7 +3721,7 @@ impl State {
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     self.mesh_scissor(list, false);
-                    DRAWN.fetch_add(1, Ordering::Relaxed);
+                    note_draw();
                     true
                 }
                 Err(_) => false,
@@ -3841,7 +4284,7 @@ impl State {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
-            DRAWN.fetch_add(1, Ordering::Relaxed);
+            note_draw();
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -3946,7 +4389,7 @@ impl State {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
-            DRAWN.fetch_add(1, Ordering::Relaxed);
+            note_draw();
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -4382,7 +4825,7 @@ impl State {
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
-            DRAWN.fetch_add(1, Ordering::Relaxed);
+            note_draw();
         }
         true
     }
@@ -4984,6 +5427,113 @@ mod tests {
             effective_texture_span(Duration::from_millis(5), false, 10, 16, 0),
             Duration::from_millis(5)
         );
+    }
+
+    #[test]
+    fn loading_screen_budget_ignores_cap_ms_and_live_3d_preserves_cap() {
+        use std::time::Duration;
+        let stage = Duration::from_millis(250);
+        let per_frame = 192u64 << 20;
+        let loading_bytes = 1024u64 << 20;
+
+        // Loading screen ignores cap_ms (e.g. 16 ms or 120 ms) and grants 250 ms / 1024 MiB.
+        assert_eq!(
+            effective_texture_budget(stage, per_frame, true, 4096, 16, 0, true, 250, loading_bytes),
+            (Duration::from_millis(250), loading_bytes)
+        );
+        assert_eq!(
+            effective_texture_budget(stage, per_frame, true, 4096, 120, 50_000, true, 250, loading_bytes),
+            (Duration::from_millis(200), loading_bytes)
+        );
+        assert_eq!(
+            effective_texture_budget(stage, per_frame, false, 10, 16, 300_000, true, 250, loading_bytes),
+            (Duration::ZERO, loading_bytes)
+        );
+
+        // Live 3D preserves Wave 12's exact hard cap_ms ceiling and catchup byte scaling.
+        assert_eq!(
+            effective_texture_budget(stage, per_frame, true, 4096, 120, 0, false, 250, loading_bytes),
+            (Duration::from_millis(120), per_frame * 3)
+        );
+        assert_eq!(
+            effective_texture_budget(stage, per_frame, true, 4096, 120, 40_000, false, 250, loading_bytes),
+            (Duration::from_millis(80), per_frame * 3)
+        );
+        assert_eq!(
+            effective_texture_budget(stage, per_frame, false, 10, 16, 12_000, false, 250, loading_bytes),
+            (Duration::from_millis(4), per_frame)
+        );
+        assert_eq!(
+            effective_texture_budget(stage, per_frame, true, 2048, 0, 0, false, 250, loading_bytes),
+            (Duration::from_millis(750), per_frame * 3)
+        );
+    }
+
+    #[test]
+    fn loading_screen_reprobe_backoff_and_scan_limits() {
+        // Loading screen caps re-probe backoff at 6 frames (~200 ms at 30 FPS).
+        assert_eq!(texture_reprobe_most(33, true), 6);
+        assert_eq!(texture_reprobe_most(1, true), 6);
+        assert_eq!(texture_reprobe_most(500, true), 6);
+        // Live 3D keeps `(4000 / took).clamp(16, 256)`.
+        assert_eq!(texture_reprobe_most(33, false), 121);
+        assert_eq!(texture_reprobe_most(1, false), 256);
+        assert_eq!(texture_reprobe_most(500, false), 16);
+        assert_eq!(texture_reprobe_most(0, false), 256);
+
+        // Scan limit raises from 4096 to 65536 during loading screens (or bake-ahead).
+        assert_eq!(texture_due_scan_limit(false, true), 65536);
+        assert_eq!(texture_due_scan_limit(true, false), 65536);
+        assert_eq!(texture_due_scan_limit(false, false), 4096);
+    }
+
+    #[test]
+    fn early_texture_bytes_lifts_64mb_cap_and_honors_stage_and_loading_budgets() {
+        // Default live 3D is 256 MiB (no longer 64 MiB); honors higher VICTORY_TEXTURE_STAGE_MB.
+        assert_eq!(early_texture_bytes(false, None, 192), 256 << 20);
+        assert_eq!(early_texture_bytes(false, None, 384), 384 << 20);
+        // Default loading screen is 512 MiB; honors higher VICTORY_TEXTURE_STAGE_MB.
+        assert_eq!(early_texture_bytes(true, None, 192), 512 << 20);
+        assert_eq!(early_texture_bytes(true, None, 384), 512 << 20);
+        assert_eq!(early_texture_bytes(true, None, 768), 768 << 20);
+        // Explicit VICTORY_EARLY_TEXTURES_MB override is respected directly.
+        assert_eq!(early_texture_bytes(false, Some(128), 384), 128 << 20);
+        assert_eq!(early_texture_bytes(true, Some(1024), 192), 1024 << 20);
+
+        // Loading pass upgrades early_textures to at least 250 ms / 1024 MiB by default.
+        assert_eq!(loading_pass_budget(12, 512 << 20, None, None), (250, 1024 << 20));
+        assert_eq!(loading_pass_budget(180, 512 << 20, None, None), (250, 1024 << 20));
+        assert_eq!(loading_pass_budget(400, 1536 << 20, None, None), (400, 1536 << 20));
+        // Explicit VICTORY_LOADING_TEXTURE_MS / MB overrides are respected directly.
+        assert_eq!(loading_pass_budget(180, 512 << 20, Some(150), Some(768)), (150, 768 << 20));
+        assert_eq!(loading_pass_budget(180, 512 << 20, Some(0), Some(512)), (0, 512 << 20));
+    }
+
+    #[test]
+    fn loading_phase_detects_loading_and_never_triggers_in_cutscene_3d() {
+        use std::ffi::OsStr;
+        assert!(loading_preload_from(None));
+        assert!(loading_preload_from(Some(OsStr::new("1"))));
+        assert!(!loading_preload_from(Some(OsStr::new("0"))));
+
+        // Disabled switch always returns false.
+        assert!(!is_loading_phase(false, false, 10, 0, 100, 16_449));
+        // Initial boot / loading screen before first 3D world frame (`world_seen = false`).
+        assert!(is_loading_phase(true, false, 0, 0, 0, 0));
+        assert!(is_loading_phase(true, false, 2, 32, 64, 16_449));
+        // As soon as current frame exceeds 64 draws, loading mode turns off immediately.
+        assert!(!is_loading_phase(true, false, 0, 65, 64, 16_449));
+        // Normal Cutscene 1 (~3,000+ draws/frame): at draw #1 of a new frame (`cur_draws == 0`)
+        // or even after 1-3 skipped/short frame tokens, `low_draw_streak < 4` so NEVER loading!
+        assert!(!is_loading_phase(true, true, 0, 0, 128, 16_449));
+        assert!(!is_loading_phase(true, true, 2, 0, 128, 16_449));
+        assert!(!is_loading_phase(true, true, 3, 16, 128, 16_449));
+        assert!(!is_loading_phase(true, true, 10, 33, 128, 16_449));
+        // Post-world loading/transition screen: >= 4 consecutive low-draw frames AND streaming/waiting.
+        assert!(is_loading_phase(true, true, 4, 0, 1, 0));
+        assert!(is_loading_phase(true, true, 4, 32, 0, 1024));
+        // Post-world idle pause menu with nothing streaming or waiting does not trigger preload.
+        assert!(!is_loading_phase(true, true, 20, 8, 0, 512));
     }
 
     #[test]
