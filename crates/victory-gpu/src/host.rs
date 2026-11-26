@@ -4857,36 +4857,6 @@ fn declare_once() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_DECLARE_ONCE").map_or(true, |v| v != "0"))
 }
 
-/// The ranges the shaders of `runs` may write, per host copy, deduplicated.
-/// One list's lock at a time: a submission may name a list twice.
-fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
-    let mut index: std::collections::HashMap<usize, usize, std::hash::BuildHasherDefault<AddressHash>> =
-        std::collections::HashMap::default();
-    let mut back: Vec<Declared> = Vec::new();
-    for list in runs {
-        for step in &list.deferred().copies {
-            if let Step::GpuWrite(shadow, address, len) = step {
-                let range = (*address, *address + *len);
-                let key = std::sync::Arc::as_ptr(shadow) as usize;
-                match index.get(&key) {
-                    Some(&at) => back[at].1.push(range),
-                    None => {
-                        index.insert(key, back.len());
-                        back.push((shadow.clone(), vec![range]));
-                    }
-                }
-            }
-        }
-    }
-    for (_, ranges) in &mut back {
-        if ranges.len() > 1 {
-            ranges.sort_unstable();
-            ranges.dedup();
-        }
-    }
-    back
-}
-
 /// Merges declared write lists from multiple flights into one deduplicated
 /// `Vec<Declared>` in O(N log N) instead of O(N^2) linear scans.
 fn merge_declared<'a>(sets: impl IntoIterator<Item = &'a [Declared]>) -> Vec<Declared> {
@@ -7239,9 +7209,10 @@ impl Host {
         }
         // Copies in the card's memory: what changed on their CPU side goes
         // up ahead of the lists, and a compare of what the shaders may
-        // write follows them in the same submission. Collect declared writes
-        // once and reuse for both `card_before` and copy-back.
-        let back = declared_writes(runs);
+        // write follows them in the same submission. Reuse the writes accepted
+        // by `Shadow::writing` during `run_deferred` so skipped read-only
+        // ranges never enter `card_before`, `hand_back`, or `line.written`.
+        let back = batch.take_declared();
         let flown = late && relay();
         if flown && self.card_results_low() {
             let settling = std::time::Instant::now();
@@ -8927,11 +8898,13 @@ impl HostList {
                     batch.flush_one(shadow);
                     #[cfg(feature = "diagnostics")]
                     let snapshot = std::time::Instant::now();
-                    shadow.writing(*address, *len);
-                    #[cfg(feature = "diagnostics")]
-                    {
-                        add(C::GpuWrites, 1);
-                        add(C::SnapshotUs, snapshot.elapsed().as_micros() as u64);
+                    if shadow.writing(*address, *len) {
+                        batch.note_gpu_write(shadow, *address, *len);
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            add(C::GpuWrites, 1);
+                            add(C::SnapshotUs, snapshot.elapsed().as_micros() as u64);
+                        }
                     }
                     continue;
                 }
@@ -9115,9 +9088,37 @@ struct Batch {
     /// Texture stagings with `uploads == true` seen during `run_deferred`,
     /// avoiding a second full scan of all lists' deferred steps after `Signal`.
     uploaded: Vec<std::sync::Arc<crate::texture::Staging>>,
+    /// GPU-written ranges accepted by [`Shadow::writing`] during `run_deferred`,
+    /// deduplicated per copy when taken via [`Batch::take_declared`].
+    declared: Vec<Declared>,
+    declared_index: std::collections::HashMap<usize, usize, std::hash::BuildHasherDefault<AddressHash>>,
 }
 
 impl Batch {
+    fn note_gpu_write(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+        let range = (address, address + len);
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        match self.declared_index.get(&key) {
+            Some(&at) => self.declared[at].1.push(range),
+            None => {
+                self.declared_index.insert(key, self.declared.len());
+                self.declared.push((shadow.clone(), vec![range]));
+            }
+        }
+    }
+
+    fn take_declared(&mut self) -> Vec<Declared> {
+        self.declared_index.clear();
+        let mut back = std::mem::take(&mut self.declared);
+        for (_, ranges) in &mut back {
+            if ranges.len() > 1 {
+                ranges.sort_unstable();
+                ranges.dedup();
+            }
+        }
+        back
+    }
+
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let Some(end) = address.checked_add(len).filter(|&e| e > address) else {
             return;
@@ -9804,6 +9805,7 @@ impl Meter {
         let planes = crate::resource::PLANES[0].swap(0, Ordering::Relaxed) as f64 / frames;
         // Copies in the card's memory (`crate::shadow::cards`).
         let card = crate::shadow::card_stats();
+        let readonly = crate::shadow::readonly_stats();
         #[cfg(feature = "diagnostics")]
         let slow = crate::watch::slow_asks();
         // Over the same frames as the counts above.
@@ -9897,6 +9899,16 @@ impl Meter {
                     bar[2] >> 20,
                 );
             }
+            let (ro_ranges, ro_bytes) = crate::title_hints::gpu_readonly_stats();
+            if ro_ranges > 0 || readonly[0] > 0 {
+                tracing::info!(
+                    "xmem gpu-readonly: {} ranges ({} MB), skipped {} write declarations ({:.1} MB/frame) (VICTORY_XMEM_READONLY=0 turns it off)",
+                    ro_ranges,
+                    ro_bytes >> 20,
+                    readonly[0],
+                    readonly[1] as f64 / (1 << 20) as f64 / frames,
+                );
+            }
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
@@ -9982,6 +9994,156 @@ impl Meter {
     }
 }
 
+/// Parses `VICTORY_WORLD_ENTRY_STREAM_MS`: defaults to `VICTORY_WORLD_ENTRY_WAIT_MS`
+/// (8,000 ms, clamped `0..=15_000`) when `VICTORY_LOADING_WARM` is active; `0` disables.
+fn parse_world_entry_stream_ms(
+    stream_raw: Option<&str>,
+    wait_raw: Option<&str>,
+    loading_warm: bool,
+) -> u64 {
+    if let Some(ms) = stream_raw.and_then(|v| v.trim().parse::<u64>().ok()) {
+        return ms.min(15_000);
+    }
+    if !loading_warm {
+        return 0;
+    }
+    wait_raw
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(8_000, |v| v.min(15_000))
+}
+
+/// Budget in milliseconds to hold the loading-screen -> first 3D world
+/// transition while DirectStorage reads drain into RAM (`VICTORY_WORLD_ENTRY_STREAM_MS`).
+fn world_entry_stream_ms() -> u64 {
+    static MS: OnceLock<u64> = OnceLock::new();
+    *MS.get_or_init(|| {
+        let loading_warm = std::env::var_os("VICTORY_LOADING_WARM").is_none_or(|v| v != "0");
+        parse_world_entry_stream_ms(
+            std::env::var("VICTORY_WORLD_ENTRY_STREAM_MS").ok().as_deref(),
+            std::env::var("VICTORY_WORLD_ENTRY_WAIT_MS").ok().as_deref(),
+            loading_warm,
+        )
+    })
+}
+
+/// Outcome of a world-entry DirectStorage drain hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StreamDrainOutcome {
+    waited_ms: u64,
+    timed_out: bool,
+    dstorage_pending: usize,
+    dstorage_completed_ops: u64,
+    dstorage_completed_bytes: u64,
+}
+
+/// Polls DirectStorage backlog in 10 ms slices up to `budget` until `pending`
+/// stays 0 for 150 ms (or `completed_ops` stops advancing for 250 ms while
+/// `pending == 0`), returning `None` immediately when `budget` is zero or no
+/// DirectStorage activity is present.
+fn drain_dstorage_until_settled(
+    budget: std::time::Duration,
+    mut elapsed: impl FnMut() -> std::time::Duration,
+    mut sleep: impl FnMut(std::time::Duration),
+    mut pending_fn: impl FnMut() -> usize,
+    mut completed_fn: impl FnMut() -> (u64, u64),
+) -> Option<StreamDrainOutcome> {
+    use std::time::Duration;
+    const POLL_SLICE: Duration = Duration::from_millis(10);
+    const ZERO_DEBOUNCE: Duration = Duration::from_millis(150);
+    const QUIET_OPS_DEBOUNCE: Duration = Duration::from_millis(250);
+
+    if budget.is_zero() {
+        return None;
+    }
+    let mut pending = pending_fn();
+    let (mut last_ops, mut last_bytes) = completed_fn();
+    if pending == 0 && last_ops == 0 {
+        return None;
+    }
+
+    let mut quiet_since: Option<Duration> = None;
+    let mut saw_ops_advance_at_zero = false;
+    let mut timed_out = true;
+
+    loop {
+        let now = elapsed();
+        if pending > 0 {
+            quiet_since = None;
+        } else {
+            let since = *quiet_since.get_or_insert(now);
+            let settle = if saw_ops_advance_at_zero {
+                QUIET_OPS_DEBOUNCE
+            } else {
+                ZERO_DEBOUNCE
+            };
+            if now.saturating_sub(since) >= settle {
+                timed_out = false;
+                break;
+            }
+        }
+        let rem = budget.saturating_sub(now);
+        if rem.is_zero() {
+            break;
+        }
+        sleep(POLL_SLICE.min(rem));
+        pending = pending_fn();
+        let (ops, bytes) = completed_fn();
+        if ops != last_ops {
+            if pending == 0 && quiet_since.is_some() {
+                saw_ops_advance_at_zero = true;
+            }
+            last_ops = ops;
+            last_bytes = bytes;
+            quiet_since = if pending == 0 { Some(elapsed()) } else { None };
+        }
+    }
+
+    Some(StreamDrainOutcome {
+        waited_ms: elapsed().as_millis() as u64,
+        timed_out,
+        dstorage_pending: pending,
+        dstorage_completed_ops: last_ops,
+        dstorage_completed_bytes: last_bytes,
+    })
+}
+
+/// On the loading-screen -> first 3D world transition (`delta >= 60` draws,
+/// matching `pipeline::make::frame_drew`), holds up to `VICTORY_WORLD_ENTRY_STREAM_MS`
+/// while active DirectStorage disk/decompression streams finish draining into RAM.
+fn world_entry_stream_hold(drawn: u64) {
+    static WORLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static LAST_DRAWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let delta = drawn.saturating_sub(LAST_DRAWN.swap(drawn, Ordering::Relaxed));
+    if WORLD.load(Ordering::Relaxed) || delta < 60 {
+        return;
+    }
+    if WORLD.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let budget_ms = world_entry_stream_ms();
+    let budget = std::time::Duration::from_millis(budget_ms);
+    let started = std::time::Instant::now();
+    let Some(outcome) = drain_dstorage_until_settled(
+        budget,
+        || started.elapsed(),
+        std::thread::sleep,
+        crate::title_hints::dstorage_pending,
+        crate::title_hints::dstorage_completed,
+    ) else {
+        return;
+    };
+    tracing::info!(
+        waited_ms = outcome.waited_ms,
+        timed_out = outcome.timed_out,
+        dstorage_pending = outcome.dstorage_pending,
+        dstorage_completed_ops = outcome.dstorage_completed_ops,
+        dstorage_completed_mb = outcome.dstorage_completed_bytes >> 20,
+        pipelines_waiting = crate::pipeline::making(),
+        "world-entry DirectStorage streaming wait {} (VICTORY_WORLD_ENTRY_STREAM_MS={budget_ms})",
+        if outcome.timed_out { "timed out" } else { "complete" },
+    );
+}
+
 impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
     /// as frame `frame` (saved if captures are on). `None` if nothing was
@@ -10003,6 +10165,7 @@ impl Host {
         let showing = std::time::Instant::now();
         let shown = self.present_now(texture, state, over, frame);
         crate::framelog::add(crate::framelog::T::PresentShowUs, showing.elapsed().as_micros() as u64);
+        world_entry_stream_hold(crate::draw::drawn());
         shown
     }
 
@@ -10974,6 +11137,203 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         drop(shadow);
         crate::shadow::unregister(start, start as u64);
         assert_ne!(unsafe { VirtualFree(start as _, 0, MEM_RELEASE) }, 0);
+    }
+
+    #[test]
+    fn world_entry_stream_ms_parsing_defaults_and_overrides() {
+        use super::parse_world_entry_stream_ms;
+        // Inherits `WORLD_ENTRY_WAIT_MS` (default 8000) when loading warm is on.
+        assert_eq!(parse_world_entry_stream_ms(None, None, true), 8_000);
+        assert_eq!(parse_world_entry_stream_ms(None, Some("5000"), true), 5_000);
+        assert_eq!(parse_world_entry_stream_ms(None, Some("0"), true), 0);
+        assert_eq!(parse_world_entry_stream_ms(None, Some("30000"), true), 15_000);
+        // `VICTORY_LOADING_WARM=0` disables default stream hold unless explicitly set.
+        assert_eq!(parse_world_entry_stream_ms(None, None, false), 0);
+        assert_eq!(parse_world_entry_stream_ms(None, Some("5000"), false), 0);
+        assert_eq!(parse_world_entry_stream_ms(Some("4000"), None, false), 4_000);
+        // Explicit `VICTORY_WORLD_ENTRY_STREAM_MS` overrides `WORLD_ENTRY_WAIT_MS`.
+        assert_eq!(parse_world_entry_stream_ms(Some("0"), Some("8000"), true), 0);
+        assert_eq!(parse_world_entry_stream_ms(Some(" 3500 "), Some("8000"), true), 3_500);
+        assert_eq!(parse_world_entry_stream_ms(Some("99999"), None, true), 15_000);
+    }
+
+    #[test]
+    fn world_entry_dstorage_drain_settles_chains_and_times_out() {
+        use super::drain_dstorage_until_settled;
+        use std::cell::Cell;
+        use std::time::Duration;
+
+        // 1) Zero budget -> no wait.
+        assert!(
+            drain_dstorage_until_settled(
+                Duration::ZERO,
+                || Duration::ZERO,
+                |_| unreachable!(),
+                || 5,
+                || (10, 1 << 20),
+            )
+            .is_none()
+        );
+
+        // 2) No DirectStorage activity (pending == 0 && completed_ops == 0) -> no wait.
+        assert!(
+            drain_dstorage_until_settled(
+                Duration::from_millis(8_000),
+                || Duration::ZERO,
+                |_| unreachable!(),
+                || 0,
+                || (0, 0),
+            )
+            .is_none()
+        );
+
+        // 3) Pending drains at 100 ms, then stays quiet -> settles after 150 ms debounce (250 ms total).
+        let now = Cell::new(Duration::ZERO);
+        let outcome = drain_dstorage_until_settled(
+            Duration::from_millis(8_000),
+            || now.get(),
+            |d| now.set(now.get() + d),
+            || if now.get() < Duration::from_millis(100) { 4 } else { 0 },
+            || {
+                if now.get() < Duration::from_millis(100) {
+                    (10, 10 << 20)
+                } else {
+                    (14, 14 << 20)
+                }
+            },
+        )
+        .expect("should wait until settled");
+        assert!(!outcome.timed_out);
+        assert_eq!(outcome.waited_ms, 250);
+        assert_eq!(outcome.dstorage_pending, 0);
+        assert_eq!(outcome.dstorage_completed_ops, 14);
+        assert_eq!(outcome.dstorage_completed_bytes, 14 << 20);
+
+        // 4) Chained batch arrives 50 ms after first batch finishes -> resets debounce and settles after second batch.
+        let now = Cell::new(Duration::ZERO);
+        let outcome = drain_dstorage_until_settled(
+            Duration::from_millis(8_000),
+            || now.get(),
+            |d| now.set(now.get() + d),
+            || {
+                let ms = now.get().as_millis();
+                if ms < 100 || (150..200).contains(&ms) { 3 } else { 0 }
+            },
+            || {
+                let ms = now.get().as_millis();
+                if ms < 100 {
+                    (10, 10 << 20)
+                } else if ms < 200 {
+                    (13, 13 << 20)
+                } else {
+                    (16, 16 << 20)
+                }
+            },
+        )
+        .expect("should wait through chained batch");
+        assert!(!outcome.timed_out);
+        assert_eq!(outcome.waited_ms, 350);
+        assert_eq!(outcome.dstorage_pending, 0);
+        assert_eq!(outcome.dstorage_completed_ops, 16);
+
+        // 5) Rapid micro-batches advancing `completed_ops` while `pending == 0` settle after 250 ms quiet period.
+        let now = Cell::new(Duration::ZERO);
+        let outcome = drain_dstorage_until_settled(
+            Duration::from_millis(8_000),
+            || now.get(),
+            |d| now.set(now.get() + d),
+            || 0,
+            || {
+                let ms = now.get().as_millis();
+                if ms < 60 {
+                    (20, 20 << 20)
+                } else {
+                    (25, 25 << 20)
+                }
+            },
+        )
+        .expect("should wait 250 ms after ops stop advancing");
+        assert!(!outcome.timed_out);
+        assert_eq!(outcome.waited_ms, 310);
+        assert_eq!(outcome.dstorage_completed_ops, 25);
+
+        // 6) Budget timeout while pending remains > 0.
+        let now = Cell::new(Duration::ZERO);
+        let outcome = drain_dstorage_until_settled(
+            Duration::from_millis(500),
+            || now.get(),
+            |d| now.set(now.get() + d),
+            || 7,
+            || (100, 128 << 20),
+        )
+        .expect("should time out at budget");
+        assert!(outcome.timed_out);
+        assert_eq!(outcome.waited_ms, 500);
+        assert_eq!(outcome.dstorage_pending, 7);
+    }
+
+    #[test]
+    fn readonly_gpu_writes_excluded_from_list_and_batch_declared() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        struct ClearGuard;
+        impl Drop for ClearGuard {
+            fn drop(&mut self) {
+                crate::title_hints::clear_gpu_readonly_ranges();
+            }
+        }
+        crate::title_hints::clear_gpu_readonly_ranges();
+        let _clear = ClearGuard;
+        let _ = crate::shadow::readonly_stats();
+
+        let Some(host) = super::host() else {
+            return;
+        };
+        const LEN: usize = 2 * (64 << 10);
+        // SAFETY: private anonymous RW allocation freed before returning.
+        let start = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(start, 0);
+        // SAFETY: committed allocation of `LEN` bytes.
+        unsafe { std::ptr::write_bytes(start as *mut u8, 0, LEN) };
+        crate::shadow::register(start, start as u64, LEN as u64);
+        let shadow = crate::shadow::find(start as u64, 1).unwrap();
+
+        // Mark first page RO, leave second page RW.
+        crate::title_hints::set_gpu_memory_readonly(start as u64, 64 << 10, true);
+        let list = host.new_list().unwrap();
+        // RO write skipped at `gpu_writes` before deferring.
+        shadow.gpu_writes(&list, start as u64, 4096);
+        assert_eq!(crate::shadow::readonly_stats(), [1, 4096]);
+        // RW write accepted and deferred into the list.
+        let rw_addr = start + (64 << 10);
+        shadow.gpu_writes(&list, rw_addr as u64, 4096);
+        assert_eq!(crate::shadow::readonly_stats(), [0, 0]);
+
+        let mut batch = Batch::default();
+        list.run_deferred(&mut batch);
+        let declared = batch.take_declared();
+        assert_eq!(declared.len(), 1);
+        assert_eq!(declared[0].1, vec![(rw_addr, rw_addr + 4096)]);
+        shadow.copy_back_done(&declared[0].1);
+
+        // Even if a write was deferred BEFORE its range became RO, `run_deferred`
+        // skips it and excludes it from `batch.take_declared()`.
+        let list2 = host.new_list().unwrap();
+        shadow.gpu_writes(&list2, rw_addr as u64, 2048);
+        crate::title_hints::set_gpu_memory_readonly(rw_addr as u64, 64 << 10, true);
+        let mut batch2 = Batch::default();
+        list2.run_deferred(&mut batch2);
+        assert!(batch2.take_declared().is_empty());
+        assert!(!shadow.writes_pending());
+        assert_eq!(crate::shadow::readonly_stats(), [1, 2048]);
+
+        drop(list2);
+        drop(list);
+        drop(shadow);
+        crate::shadow::unregister(start, start as u64);
+        assert_ne!(unsafe { VirtualFree(start as _, 0, MEM_RELEASE) }, 0);
+        crate::title_hints::clear_gpu_readonly_ranges();
     }
 }
 

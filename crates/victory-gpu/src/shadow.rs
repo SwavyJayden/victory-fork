@@ -309,6 +309,20 @@ pub(crate) fn card_stats() -> [u64; 10] {
     out
 }
 
+/// Since the last frame line: GPU-write declarations skipped because their
+/// range lies wholly inside an Xbox `PAGE_GRAPHICS_READONLY` /
+/// `PAGE_GRAPHICS_EXECUTE_READ` pool (`[count, bytes]`).
+static READONLY_SKIPPED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// [`READONLY_SKIPPED`] (`[count, bytes]`), taken and reset per reporting
+/// period (matching [`card_stats`]).
+pub(crate) fn readonly_stats() -> [u64; 2] {
+    [
+        READONLY_SKIPPED[0].swap(0, Ordering::Relaxed),
+        READONLY_SKIPPED[1].swap(0, Ordering::Relaxed),
+    ]
+}
+
 /// The bytes of the hashes kept on the card for a copy of `size` bytes: 16
 /// for each 64 KiB piece (a copy that does not start on a piece boundary
 /// has one piece more).
@@ -3527,6 +3541,16 @@ impl Shadow {
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        let len = len.min(self.left(address));
+        // Xbox `PAGE_GRAPHICS_READONLY` / `PAGE_GRAPHICS_EXECUTE_READ` pools
+        // are guaranteed by hardware memory protection never to be written by
+        // the GPU (CPU->GPU uploads via `refresh`/`update`/`card_before`
+        // continue normally).
+        if crate::title_hints::gpu_readonly_contains(address, len) {
+            READONLY_SKIPPED[0].fetch_add(1, Ordering::Relaxed);
+            READONLY_SKIPPED[1].fetch_add(len, Ordering::Relaxed);
+            return;
+        }
         list.gather_wrote(self.id);
         // In place the shaders write title memory itself: no snapshot, no
         // compare, nothing to copy back, and no wait on its account.
@@ -3536,7 +3560,6 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
-        let len = len.min(self.left(address));
         if self.bar.is_some() {
             // Their snapshot and compare read the copy back through the
             // bus, uncached (`gpu_upload_copies`): counted, said once.
@@ -3562,10 +3585,22 @@ impl Shadow {
     /// views of its 174 MB heap dozens of times, from different offsets: a
     /// snapshot grown to cover each was copied whole every time), in reused
     /// memory (fresh snapshots cost ~2.3 million page faults per world
-    /// frame).
-    pub(crate) fn writing(&self, address: usize, len: usize) {
+    /// frame). Returns `false` if GPU-write tracking was skipped (in-place
+    /// copy or Xbox GPU-read-only pool).
+    pub(crate) fn writing(&self, address: usize, len: usize) -> bool {
         if self.place.is_some() {
-            return;
+            return false;
+        }
+        let (from, to) = self.inside(address, len);
+        let (check_addr, check_len) = if from < to {
+            (self.start + from as u64, (to - from) as u64)
+        } else {
+            (address as u64, len as u64)
+        };
+        if crate::title_hints::gpu_readonly_contains(check_addr, check_len) {
+            READONLY_SKIPPED[0].fetch_add(1, Ordering::Relaxed);
+            READONLY_SKIPPED[1].fetch_add(check_len, Ordering::Relaxed);
+            return false;
         }
         let range = (address, address + len);
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -3576,19 +3611,19 @@ impl Shadow {
         }
         // Dispatches declare the same ranges thousands of times.
         if pending.contains(&range) {
-            return;
+            return true;
         }
         // In the card's memory: no snapshot. What shaders wrote is found on
         // the card (`Host::card_before` reads the declared ranges from the
         // lists).
         if self.card.is_some() {
             pending.push(range);
-            return;
+            return true;
         }
         // The parts no declared range holds yet: their bytes are taken now,
         // just after the range's refresh (a part declared earlier has not
         // been refreshed since, and keeps the bytes taken then).
-        let mut parts = vec![self.inside(address, len)];
+        let mut parts = vec![(from, to)];
         let mut rest = Vec::new();
         for &(a, e) in pending.iter() {
             if parts.is_empty() {
@@ -3613,7 +3648,7 @@ impl Shadow {
         pending.push(range);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         if taken == 0 {
-            return;
+            return true;
         }
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
@@ -3648,7 +3683,7 @@ impl Shadow {
                     kept.0[piece] = whole;
                 }
             }
-            return;
+            return true;
         }
         if wide_back() {
             // Noted, and taken with the submission's other snapshots when
@@ -3659,7 +3694,7 @@ impl Shadow {
             let mut snaps = SNAPS.lock().unwrap_or_else(|e| e.into_inner());
             let (data, snapshot) = (self.data as usize, snapshot.as_mut_ptr() as usize);
             snaps.extend(parts.into_iter().filter(|&(from, to)| from < to).map(|(from, to)| (data + from, snapshot + from, to - from)));
-            return;
+            return true;
         }
         for (from, to) in parts {
             if from < to {
@@ -3670,6 +3705,7 @@ impl Shadow {
                 }
             }
         }
+        true
     }
 
     /// After the submission ran: copies the bytes its shaders wrote back
@@ -4710,6 +4746,12 @@ impl Shadow {
         let Some(card) = &self.card else {
             return false;
         };
+        // A shadow wholly inside an Xbox GPU-read-only pool is never written by
+        // shaders, so skip allocating its "before" hash twin in VRAM while
+        // keeping its main card copy for fast GPU reads and CPU->GPU uploads.
+        if crate::title_hints::gpu_readonly_contains(self.start, self.len) {
+            return false;
+        }
         let mut before = card.before.lock().unwrap_or_else(|e| e.into_inner());
         if before.is_some() {
             return false;
@@ -6324,6 +6366,113 @@ mod card_merge_tests {
         // SAFETY: free our private write-watched allocation.
         unsafe { VirtualFree(title as *mut _, 0, MEM_RELEASE) };
         crate::watch::forget_test_pages(addr, addr + LEN);
+    }
+
+    #[test]
+    fn gpu_readonly_pool_skips_gpu_write_tracking_and_preserves_cpu_uploads() {
+        struct ClearGuard;
+        impl Drop for ClearGuard {
+            fn drop(&mut self) {
+                crate::title_hints::clear_gpu_readonly_ranges();
+            }
+        }
+
+        let _serial = BUFFERS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::title_hints::clear_gpu_readonly_ranges();
+        let _clear = ClearGuard;
+        let _ = super::readonly_stats();
+
+        let (Some(buffer), Some(staging), Some(twin)) = (warp_buffer(), warp_buffer(), warp_buffer()) else {
+            return;
+        };
+        const LEN: usize = 2 * super::PAGE;
+        let mut title = vec![0x42u8; LEN];
+        let base = title.as_ptr() as u64;
+        let mut side = vec![0u8; LEN];
+
+        // Register the entire buffer as Xbox GPU-read-only.
+        crate::title_hints::set_gpu_memory_readonly(base, LEN as u64, true);
+
+        // 1) PC-side shadow: `writing()` skips RO range, bumps READONLY_SKIPPED,
+        //    leaves `pending` empty and `before` unallocated.
+        let pc_shadow = std::sync::Arc::new(Shadow::new(buffer.clone(), side.as_mut_ptr(), 0, base, LEN as u64));
+        assert!(!pc_shadow.writing(base as usize, 4096));
+        assert!(!pc_shadow.writes_pending());
+        assert!(pc_shadow.before.lock().unwrap().is_none());
+        assert_eq!(super::readonly_stats(), [1, 4096]);
+        assert_eq!(super::readonly_stats(), [0, 0]);
+
+        // `gpu_writes()` also skips RO range before deferring and bumps stats.
+        if let Some(host) = crate::host::host()
+            && let Ok(list) = host.new_list()
+        {
+            pc_shadow.gpu_writes(&list, base + 512, 2048);
+            assert_eq!(super::readonly_stats(), [1, 2048]);
+            // Clamped unsized write inside RO range is also skipped with clamped length.
+            pc_shadow.gpu_writes(&list, base + (LEN as u64 - 1024), u64::MAX);
+            assert_eq!(super::readonly_stats(), [1, 1024]);
+        }
+
+        // 2) Carded shadow wholly inside RO range: `card_make_before` skips
+        //    allocating the "before" twin, while CPU->GPU `update()` still works!
+        let mut card_shadow = Shadow::new(buffer.clone(), side.as_mut_ptr(), 0, base, LEN as u64);
+        card_shadow.card = Some(Card {
+            staging: staging.clone(),
+            before: Mutex::new(None),
+            dirty: Mutex::default(),
+            sent: Mutex::default(),
+            side: std::sync::RwLock::new(()),
+            size: 0,
+        });
+        let mut alloc_called = false;
+        assert!(!card_shadow.card_make_before(|_| {
+            alloc_called = true;
+            Some(twin.clone())
+        }));
+        assert!(!alloc_called, "wholly read-only card shadow must not allocate a before twin");
+        assert!(card_shadow.card_sides().unwrap().1.is_none());
+
+        // CPU->GPU upload (`update`) MUST continue working normally on RO pools.
+        title[128] = 0xAB;
+        let copied = card_shadow.update(base as usize, 4096);
+        assert!(copied >= 4096);
+        assert_eq!(side[128], 0xAB);
+        assert!(!card_shadow.card.as_ref().unwrap().dirty.lock().unwrap().is_empty());
+
+        // 3) Carve out second page as RW (`set_gpu_memory_readonly(..., false)`):
+        //    - First page (still RO) is skipped.
+        //    - Second page (now RW) is NOT skipped.
+        //    - Range spanning across the RO/RW boundary is NOT skipped.
+        //    - Partially-RO card shadow CAN allocate its "before" twin.
+        let page1 = base + super::PAGE as u64;
+        crate::title_hints::set_gpu_memory_readonly(page1, super::PAGE as u64, false);
+        assert!(!pc_shadow.writing(base as usize, 1024));
+        assert_eq!(super::readonly_stats(), [1, 1024]);
+
+        assert!(pc_shadow.writing(page1 as usize, 1024));
+        assert!(pc_shadow.writes_pending());
+        assert_eq!(super::readonly_stats(), [0, 0]);
+        pc_shadow.copy_back_done(&[(page1 as usize, page1 as usize + 1024)]);
+        assert!(!pc_shadow.writes_pending());
+
+        // Spanning RO->RW boundary must NOT be skipped.
+        assert!(pc_shadow.writing((page1 - 512) as usize, 1024));
+        assert!(pc_shadow.writes_pending());
+        assert_eq!(super::readonly_stats(), [0, 0]);
+        pc_shadow.copy_back_done(&[((page1 - 512) as usize, (page1 + 512) as usize)]);
+
+        // Partially-RO card shadow allocates its "before" twin normally.
+        assert!(card_shadow.card_make_before(|_| {
+            alloc_called = true;
+            Some(twin.clone())
+        }));
+        assert!(alloc_called);
+        assert!(card_shadow.card_sides().unwrap().1.is_some());
+
+        // `card.size == 0`, so `Drop` subtracts `card_hash_bytes(0)` cleanly and leaves global CARD_BYTES unchanged.
+        drop(card_shadow);
+        drop(pc_shadow);
+        crate::title_hints::clear_gpu_readonly_ranges();
     }
 }
 
