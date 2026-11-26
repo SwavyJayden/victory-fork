@@ -59,6 +59,12 @@ impl Shard {
         Shard { written: BTreeMap::new(), parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()) }
     }
 
+    /// Last asking that found `page` written (0: never).
+    #[cfg(test)]
+    fn get(&self, page: usize) -> u64 {
+        self.written.get(&(page >> SHARD_SHIFT)).map_or(0, |chunk| chunk[page & (SHARD_PAGES - 1)])
+    }
+
     /// Page `page` was found written by asking `now`: the parts in `parts`
     /// (a bit each). The asking that found it written before (0: none).
     ///
@@ -67,8 +73,10 @@ impl Shard {
     /// (renderer port #7) another asking with a higher number may have
     /// noted it first.
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
-        let before = self.written.get(&page).copied().unwrap_or(0);
-        self.written.insert(page, before.max(now));
+        let chunk = self.written.entry(page >> SHARD_SHIFT).or_insert_with(|| Box::new([0u64; SHARD_PAGES]));
+        let slot = &mut chunk[page & (SHARD_PAGES - 1)];
+        let before = *slot;
+        *slot = before.max(now);
         if parts == WHOLE || !parts_on() {
             if now >= before {
                 self.parts.remove(&page);
@@ -86,6 +94,48 @@ impl Shard {
         before
     }
 
+    /// Walks written pages in `[from, to)` lying within a single 4 MiB chunk
+    /// (`from >> SHARD_SHIFT == (to - 1) >> SHARD_SHIFT`) in page order.
+    fn each_in_chunk(&self, from: usize, to: usize, mut f: impl FnMut(usize, u64) -> bool) -> bool {
+        if from >= to {
+            return true;
+        }
+        let chunk = from >> SHARD_SHIFT;
+        debug_assert_eq!(chunk, (to - 1) >> SHARD_SHIFT);
+        let Some(slots) = self.written.get(&chunk) else {
+            return true;
+        };
+        let base = chunk << SHARD_SHIFT;
+        let lo = from - base;
+        let hi = to - base;
+        for (off, &w) in slots[lo..hi].iter().enumerate() {
+            if w != 0 && !f(base + lo + off, w) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Walks written pages in `[first, last)` held by this shard in page order.
+    fn each_in(&self, first: usize, last: usize, mut f: impl FnMut(usize, u64) -> bool) -> bool {
+        if first >= last {
+            return true;
+        }
+        let first_chunk = first >> SHARD_SHIFT;
+        let last_chunk = (last - 1) >> SHARD_SHIFT;
+        for (&chunk, slots) in self.written.range(first_chunk..=last_chunk) {
+            let base = chunk << SHARD_SHIFT;
+            let lo = first.saturating_sub(base);
+            let hi = (last - base).min(SHARD_PAGES);
+            for (off, &w) in slots[lo..hi].iter().enumerate() {
+                if w != 0 && !f(base + lo + off, w) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// The parts of `page` written by an asking after `taken`.
     fn parts_since(&self, page: usize, taken: u64) -> u16 {
         match self.parts.get(&page) {
@@ -96,30 +146,113 @@ impl Shard {
 }
 
 /// The pages of a part of the journal ([`Notes`]): pieces of
-/// `1 << SHARD_SHIFT` pages (64 MiB), every [`SHARDS`]th piece in one part.
-const SHARD_SHIFT: u32 = 10;
-/// The parts: a bit each in a `u64` ([`shards_of`]).
-const SHARDS: usize = 64;
+/// `1 << SHARD_SHIFT` pages (4 MiB = 64 pages), every [`SHARDS`]th piece in one part.
+const SHARD_SHIFT: u32 = 6;
+/// Pages per shard piece (64 pages = 4 MiB).
+const SHARD_PAGES: usize = 1 << SHARD_SHIFT;
+/// The parts: a bit each in a [`ShardMask`] (`[u64; 4]`).
+const SHARDS: usize = 256;
 
+/// A bitmask of [`SHARDS`] (256) shard indices.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ShardMask([u64; 4]);
+
+impl ShardMask {
+    const EMPTY: ShardMask = ShardMask([0; 4]);
+    const ALL: ShardMask = ShardMask([u64::MAX; 4]);
+
+    #[inline]
+    fn set(&mut self, shard: usize) {
+        self.0[shard >> 6] |= 1u64 << (shard & 63);
+    }
+
+    #[inline]
+    fn contains(self, shard: usize) -> bool {
+        (self.0[shard >> 6] >> (shard & 63)) & 1 != 0
+    }
+
+    #[inline]
+    fn union(self, other: ShardMask) -> ShardMask {
+        ShardMask([
+            self.0[0] | other.0[0],
+            self.0[1] | other.0[1],
+            self.0[2] | other.0[2],
+            self.0[3] | other.0[3],
+        ])
+    }
+
+    #[inline]
+    fn difference(self, other: ShardMask) -> ShardMask {
+        ShardMask([
+            self.0[0] & !other.0[0],
+            self.0[1] & !other.0[1],
+            self.0[2] & !other.0[2],
+            self.0[3] & !other.0[3],
+        ])
+    }
+
+    #[inline]
+    fn count(self) -> usize {
+        self.0.iter().map(|w| w.count_ones() as usize).sum()
+    }
+
+    /// Number of set bits strictly below `shard`.
+    #[inline]
+    fn rank_before(self, shard: usize) -> usize {
+        let word = shard >> 6;
+        let bit = shard & 63;
+        let mut count = 0usize;
+        for &bits in &self.0[..word] {
+            count += bits.count_ones() as usize;
+        }
+        count += (self.0[word] & ((1u64 << bit) - 1)).count_ones() as usize;
+        count
+    }
+
+    /// Set shard indices in strictly ascending order `0..SHARDS`.
+    fn iter(self) -> impl Iterator<Item = usize> {
+        (0..4usize).flat_map(move |w| {
+            let mut bits = self.0[w];
+            std::iter::from_fn(move || {
+                if bits == 0 {
+                    return None;
+                }
+                let bit = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                Some((w << 6) + bit)
+            })
+        })
+    }
+}
+
+#[inline]
 fn shard_of(page: usize) -> usize {
-    (page >> SHARD_SHIFT) % SHARDS
+    (page >> SHARD_SHIFT) & (SHARDS - 1)
 }
 
 /// The parts that hold pages `[first, last)`, a bit each.
-fn shards_of(first: usize, last: usize) -> u64 {
+fn shards_of(first: usize, last: usize) -> ShardMask {
     if first >= last {
-        return 0;
+        return ShardMask::EMPTY;
     }
     let (a, b) = (first >> SHARD_SHIFT, (last - 1) >> SHARD_SHIFT);
     if b - a + 1 >= SHARDS {
-        return u64::MAX;
+        return ShardMask::ALL;
     }
-    (a..=b).fold(0, |m, piece| m | 1 << (piece % SHARDS))
+    let mut m = ShardMask::EMPTY;
+    for piece in a..=b {
+        m.set(piece & (SHARDS - 1));
+    }
+    m
 }
 
 /// The parts that hold `pages`, a bit each.
-fn shards_of_pages(pages: impl IntoIterator<Item = usize>) -> u64 {
-    pages.into_iter().fold(0, |m, page| m | 1 << shard_of(page))
+fn shards_of_pages(pages: impl IntoIterator<Item = usize>) -> ShardMask {
+    let mut m = ShardMask::EMPTY;
+    for page in pages {
+        m.set(shard_of(page));
+    }
+    m
 }
 
 /// The pages' notes, in parts of their own, each under a lock of its own
@@ -131,8 +264,8 @@ struct Notes([RwLock<Shard>; SHARDS]);
 
 /// A part of [`Notes`].
 struct Shard {
-    /// Page number → the asking that last found it written.
-    written: BTreeMap<usize, u64>,
+    /// 4 MiB chunk (`page >> SHARD_SHIFT`) → last asking per 64 KiB page (`[page & 63]`, 0: never).
+    written: BTreeMap<usize, Box<[u64; SHARD_PAGES]>>,
     /// The same for each of a page's sixteen parts ([`KERNEL_PAGE`]), where
     /// the parts are known ([`parts_on`]); a page that is not here was
     /// written whole, as far as anyone knows.
@@ -165,23 +298,21 @@ impl Notes {
         self.shard_mut(page).note(page, parts, now)
     }
 
-    /// See [`Shard::parts_since`].
-    fn parts_since(&self, page: usize, taken: u64) -> u16 {
-        self.read(shard_of(page)).parts_since(page, taken)
-    }
-
     /// The notes of pages `[first, last)` in page order, `each` of them
     /// until it says no: whether it never did. A part at a time.
     fn each(&self, first: usize, last: usize, mut each: impl FnMut(usize, u64) -> bool) -> bool {
-        match pieces(first, last) {
-            Some(pieces) => pieces.into_iter().all(|(from, to)| {
+        match pieces_iter(first, last) {
+            Some(mut pieces) => pieces.all(|(from, to)| {
                 let s = self.read(shard_of(from));
-                s.written.range(from..to).all(|(&p, &w)| each(p, w))
+                s.each_in_chunk(from, to, &mut each)
             }),
             None => {
                 let mut all: Vec<(usize, u64)> = Vec::new();
                 for shard in 0..SHARDS {
-                    all.extend(self.read(shard).written.range(first..last).map(|(&p, &w)| (p, w)));
+                    self.read(shard).each_in(first, last, |p, w| {
+                        all.push((p, w));
+                        true
+                    });
                 }
                 all.sort_unstable();
                 all.into_iter().all(|(p, w)| each(p, w))
@@ -202,14 +333,29 @@ impl Notes {
     /// The parts `shards` (a bit each), held until dropped: for writing
     /// (`write`) or reading. Taken in order: whoever waits for a part holds
     /// only lower ones, so no two holders wait for each other.
-    fn hold(&self, shards: u64, write: bool) -> Held<'_> {
-        let mut held = Held { shards, read: Vec::new(), write: Vec::new() };
-        let mut m = shards;
-        while m != 0 {
-            let shard = m.trailing_zeros() as usize;
-            m &= m - 1;
+    fn hold(&self, shards: ShardMask, write: bool) -> Held<'_> {
+        if write {
+            self.hold_mixed(ShardMask::EMPTY, shards)
+        } else {
+            self.hold_mixed(shards, ShardMask::EMPTY)
+        }
+    }
+
+    /// Holds `write_shards` for writing and `read_shards \ write_shards` for
+    /// reading, acquired in strictly ascending shard order `0..SHARDS`
+    /// (deadlock-free, preserves renderer port #7 ordering).
+    fn hold_mixed(&self, read_shards: ShardMask, write_shards: ShardMask) -> Held<'_> {
+        let read_mask = read_shards.difference(write_shards);
+        let all = read_mask.union(write_shards);
+        let mut held = Held {
+            read_mask,
+            write_mask: write_shards,
+            read: Vec::with_capacity(read_mask.count()),
+            write: Vec::with_capacity(write_shards.count()),
+        };
+        for shard in all.iter() {
             let lock = &self.0[shard];
-            if write {
+            if write_shards.contains(shard) {
                 let guard = match lock.try_write() {
                     Ok(g) => g,
                     Err(_) => {
@@ -231,61 +377,83 @@ impl Notes {
 /// The pieces of pages `[first, last)` in page order, each in one part;
 /// `None` for a range of more pieces than is worth walking (then each part
 /// is looked at once).
-fn pieces(first: usize, last: usize) -> Option<Vec<(usize, usize)>> {
-    if first >= last {
-        return Some(Vec::new());
-    }
-    let (a, b) = (first >> SHARD_SHIFT, (last - 1) >> SHARD_SHIFT);
-    if b - a >= 4 * SHARDS {
-        return None;
-    }
-    Some((a..=b).map(|piece| (first.max(piece << SHARD_SHIFT), last.min((piece + 1) << SHARD_SHIFT))).collect())
+fn pieces_iter(first: usize, last: usize) -> Option<impl Iterator<Item = (usize, usize)>> {
+    let range = if first >= last {
+        0..0
+    } else {
+        let (a, b) = (first >> SHARD_SHIFT, (last - 1) >> SHARD_SHIFT);
+        if b - a >= 4 * SHARDS {
+            return None;
+        }
+        a..b + 1
+    };
+    Some(range.map(move |piece| {
+        let end = (piece + 1).saturating_mul(SHARD_PAGES);
+        (first.max(piece << SHARD_SHIFT), last.min(end))
+    }))
 }
 
-/// Parts of [`Notes`] held ([`Notes::hold`]).
+#[cfg(test)]
+fn pieces(first: usize, last: usize) -> Option<Vec<(usize, usize)>> {
+    pieces_iter(first, last).map(Iterator::collect)
+}
+
+/// Parts of [`Notes`] held ([`Notes::hold`], [`Notes::hold_mixed`]).
 struct Held<'a> {
-    shards: u64,
+    read_mask: ShardMask,
+    write_mask: ShardMask,
     read: Vec<std::sync::RwLockReadGuard<'a, Shard>>,
     write: Vec<std::sync::RwLockWriteGuard<'a, Shard>>,
 }
 
 impl Held<'_> {
-    /// The place among those held of the part of `page`.
-    fn place(&self, page: usize) -> usize {
-        let shard = shard_of(page);
-        assert!(self.shards >> shard & 1 != 0, "page {page:#x}: its part is not held");
-        (self.shards & ((1u64 << shard) - 1)).count_ones() as usize
-    }
-
     fn shard(&self, page: usize) -> &Shard {
-        let at = self.place(page);
-        if self.write.is_empty() { &self.read[at] } else { &self.write[at] }
+        let shard = shard_of(page);
+        if self.write_mask.contains(shard) {
+            &self.write[self.write_mask.rank_before(shard)]
+        } else {
+            assert!(self.read_mask.contains(shard), "page {page:#x}: its part is not held");
+            &self.read[self.read_mask.rank_before(shard)]
+        }
     }
 
     /// See [`Shard::note`]; held for writing.
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
-        let at = self.place(page);
+        let shard = shard_of(page);
+        assert!(self.write_mask.contains(shard), "page {page:#x}: its part is not held for writing");
+        let at = self.write_mask.rank_before(shard);
         self.write[at].note(page, parts, now)
     }
 
     /// The notes of pages `[first, last)` in page order; their parts held.
     fn range(&self, first: usize, last: usize) -> Vec<(usize, u64)> {
-        match pieces(first, last) {
-            Some(pieces) => pieces
-                .into_iter()
-                .flat_map(|(from, to)| self.shard(from).written.range(from..to).map(|(&p, &w)| (p, w)))
-                .collect(),
+        let mut out = Vec::new();
+        match pieces_iter(first, last) {
+            Some(pieces) => {
+                for (from, to) in pieces {
+                    self.shard(from).each_in_chunk(from, to, |p, w| {
+                        out.push((p, w));
+                        true
+                    });
+                }
+            }
             None => {
-                let all = if self.write.is_empty() {
-                    self.read.iter().flat_map(|s| s.written.range(first..last)).map(|(&p, &w)| (p, w)).collect::<Vec<_>>()
-                } else {
-                    self.write.iter().flat_map(|s| s.written.range(first..last)).map(|(&p, &w)| (p, w)).collect::<Vec<_>>()
-                };
-                let mut all = all;
-                all.sort_unstable();
-                all
+                for s in &self.read {
+                    s.each_in(first, last, |p, w| {
+                        out.push((p, w));
+                        true
+                    });
+                }
+                for s in &self.write {
+                    s.each_in(first, last, |p, w| {
+                        out.push((p, w));
+                        true
+                    });
+                }
+                out.sort_unstable();
             }
         }
+        out
     }
 }
 
@@ -293,8 +461,25 @@ impl Held<'_> {
 /// the asking it took the page at): the parts to take again, a bit for each
 /// 4 KiB, in the same order.
 pub(crate) fn parts_written(pages: &[(usize, u64)]) -> Vec<u16> {
+    if pages.is_empty() {
+        return Vec::new();
+    }
+    if !parts_on() {
+        return vec![WHOLE; pages.len()];
+    }
     let j = journal();
-    pages.iter().map(|&(page, taken)| j.notes.parts_since(page, taken)).collect()
+    let mut out = Vec::with_capacity(pages.len());
+    let mut i = 0;
+    while i < pages.len() {
+        let shard = shard_of(pages[i].0);
+        let guard = j.notes.read(shard);
+        while i < pages.len() && shard_of(pages[i].0) == shard {
+            let (page, taken) = pages[i];
+            out.push(guard.parts_since(page, taken));
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Numbers the askings; 0 is "never". Counted up with the journal held
@@ -384,6 +569,7 @@ impl Ahead {
         self.most.clear();
     }
 
+    #[cfg(test)]
     fn take(&mut self) -> Vec<(usize, usize)> {
         self.most.clear();
         std::mem::take(&mut self.ranges)
@@ -769,6 +955,121 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
     })
 }
 
+/// Write-watched reservation page spans `(first_page, last_page)` recorded by
+/// [`title_memory_allocated`], sorted and non-overlapping (adjacent distinct
+/// reservations are never merged so [`ask_once`] never spans two reservations
+/// in one `GetWriteWatch` call).
+static RESERVATIONS: RwLock<Vec<(usize, usize)>> = RwLock::new(Vec::new());
+
+/// Whole 64 KiB blocks belonging to private allocations reported by
+/// [`title_memory_allocated`]; cleared when remapped, unmapped, or freed.
+static PRIVATE: Bits = Bits::new();
+
+fn note_reservation(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let first = at / PAGE;
+    let last = at.saturating_add(len).div_ceil(PAGE);
+    if first < last {
+        let mut res = RESERVATIONS.write().unwrap_or_else(|e| e.into_inner());
+        let idx = res.partition_point(|r| r.1 <= first);
+        // A `MEM_COMMIT` inside an already-recorded reservation keeps the
+        // outer reservation span intact.
+        if !res.get(idx).is_some_and(|r| r.0 <= first && last <= r.1) {
+            res.retain(|r| r.1 <= first || r.0 >= last);
+            let pos = res.partition_point(|r| r.0 < first);
+            res.insert(pos, (first, last));
+        }
+    }
+    let first_whole = at.div_ceil(BLOCK);
+    let last_whole = at.saturating_add(len) / BLOCK;
+    for block in first_whole..last_whole {
+        PRIVATE.set(block);
+    }
+}
+
+fn forget_private(first: usize, last: usize) {
+    if first >= last || !PRIVATE.any(first, last) {
+        return;
+    }
+    let set: Vec<usize> = PRIVATE.set_in(first, last).collect();
+    for block in set {
+        PRIVATE.clear(block);
+    }
+}
+
+fn forget_reservations_range(first: usize, last: usize) {
+    if first >= last {
+        return;
+    }
+    let overlaps = {
+        let res = RESERVATIONS.read().unwrap_or_else(|e| e.into_inner());
+        let idx = res.partition_point(|r| r.1 <= first);
+        res.get(idx).is_some_and(|r| r.0 < last)
+    };
+    if overlaps {
+        let mut res = RESERVATIONS.write().unwrap_or_else(|e| e.into_inner());
+        res.retain(|r| r.1 <= first || r.0 >= last);
+    }
+    forget_private(first, last);
+}
+
+fn forget_reservation_at(at: usize) {
+    let page = at / PAGE;
+    let removed = {
+        let has = {
+            let res = RESERVATIONS.read().unwrap_or_else(|e| e.into_inner());
+            let idx = res.partition_point(|r| r.1 <= page);
+            res.get(idx).is_some_and(|r| r.0 <= page)
+        };
+        if has {
+            let mut res = RESERVATIONS.write().unwrap_or_else(|e| e.into_inner());
+            let idx = res.partition_point(|r| r.1 <= page);
+            if res.get(idx).is_some_and(|r| r.0 <= page) {
+                Some(res.remove(idx))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    if let Some((first, last)) = removed {
+        forget_private(first, last);
+    } else if PRIVATE.any(page, page + 1) {
+        let end = allocation_end(at, at).div_ceil(BLOCK).max(page + 1);
+        forget_private(page, end);
+    }
+}
+
+fn same_reservation_in(res: &[(usize, usize)], page_a: usize, page_b: usize) -> bool {
+    let (lo, hi) = if page_a <= page_b { (page_a, page_b) } else { (page_b, page_a) };
+    let idx_a = res.partition_point(|r| r.1 <= lo);
+    let in_a = res.get(idx_a).filter(|r| r.0 <= lo);
+    let idx_b = res.partition_point(|r| r.1 <= hi);
+    let in_b = res.get(idx_b).filter(|r| r.0 <= hi);
+    match (in_a, in_b) {
+        (Some(a), Some(b)) => a == b,
+        // Neither page lies in a tracked reservation: allow merging only if no
+        // tracked reservation lies between them (falling back gracefully to
+        // `ask_run`'s binary split if they still belong to separate untracked
+        // reservations).
+        (None, None) => idx_a == idx_b,
+        _ => false,
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn same_reservation(page_a: usize, page_b: usize) -> bool {
+    same_reservation_in(&RESERVATIONS.read().unwrap_or_else(|e| e.into_inner()), page_a, page_b)
+}
+
+/// Whether a submission's one asking ([`ask_once`]) currently stands.
+pub(crate) fn is_kept() -> bool {
+    journal().kept
+}
+
 /// Ranges of one submission closer than this are asked about together:
 /// walking the pages between them costs less than another kernel call (a
 /// call that resets written pages costs 30-70 microseconds whatever the
@@ -788,6 +1089,11 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
 
 /// [`ask_ahead`]; `held`: the caller holds everything ([`Asking::hold_all`]).
 fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
+    // The submission's one asking stands ([`ask_once`]): skip all filtering
+    // and sorting immediately.
+    if !held && journal().kept {
+        return;
+    }
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
         // Not view memory known by its bits: the kernel would refuse the
@@ -799,28 +1105,31 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
         return;
     }
     pieces.sort_unstable();
-    // The submission's one asking stands ([`ask_once`]): what it does not
-    // hold is left to `writes`.
-    if journal().kept {
+    let _all = (!held).then(Asking::hold_all);
+    if !held && journal().kept {
         return;
     }
-    let _all = (!held).then(Asking::hold_all);
     let (mut asked, mut written) = (Vec::new(), Vec::new());
     let mut runs = Vec::new();
-    let mut i = 0;
-    while i < pieces.len() {
-        let first = pieces[i].0;
-        let mut last = pieces[i].1;
-        let mut k = i + 1;
-        while k < pieces.len()
-            && pieces[k].0 <= last + AHEAD_GAP
-            && last.max(pieces[k].1) - first <= AHEAD_MAX
-        {
-            last = last.max(pieces[k].1);
-            k += 1;
+    {
+        let res = RESERVATIONS.read().unwrap_or_else(|e| e.into_inner());
+        let mut i = 0;
+        while i < pieces.len() {
+            let first = pieces[i].0;
+            let mut last = pieces[i].1;
+            let mut k = i + 1;
+            while k < pieces.len()
+                && pieces[k].0 <= last + AHEAD_GAP
+                && last.max(pieces[k].1) - first <= AHEAD_MAX
+                && same_reservation_in(&res, first, last.max(pieces[k].1) - 1)
+                && same_reservation_in(&res, last - 1, pieces[k].0)
+            {
+                last = last.max(pieces[k].1);
+                k += 1;
+            }
+            runs.push(i..k);
+            i = k;
         }
-        runs.push(i..k);
-        i = k;
     }
     for (a, w) in spread_each(runs.len(), |r| {
         let (mut a, mut w) = (Vec::new(), Vec::new());
@@ -835,9 +1144,9 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
         // Renderer port #7: the pages noted shared, under their parts; then
         // the number and the ranges, alone (no shared holder with a lower
         // number is left by then).
-        let now = note_shared(&written);
+        let now = if written.is_empty() { None } else { Some(note_shared(&written)) };
         let mut j = journal_mut();
-        j.ahead_asked = now;
+        j.ahead_asked = now.unwrap_or_else(next_asking);
         j.ahead.set(asked);
         return;
     }
@@ -1058,108 +1367,90 @@ pub(crate) fn once() -> bool {
 }
 
 /// With [`once`]: asks about `ranges` (everything a submission's lists
-/// refresh) as [`ask_ahead`] does, and lets that asking stand until
-/// [`ask_once_end`].
+/// refresh) in one reservation-aware pass handling both runs and singletons,
+/// and lets that asking stand until [`ask_once_end`].
 pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     if !once() {
         return;
     }
-    let mut spent = crate::timeline::span("asking: ahead");
-    ask_once_end();
-    // Hold only the page spans that `ask_ahead_held` (bridged up to
-    // `AHEAD_GAP`/`AHEAD_MAX`) and `ask_rest` can actually query, so
-    // disjoint regions (like descriptor heaps on `victory-heap-sync`) never
-    // block waiting for this submission's asking.
-    let mut pieces: Vec<(usize, usize)> = ranges
+    let spent = crate::timeline::span("asking: ahead");
+    if is_kept() {
+        ask_once_end();
+    }
+    // Filter once, sort by (start ASC, end DESC) and drop pieces already
+    // covered by an earlier piece in O(N).
+    let mut raw: Vec<(usize, usize)> = ranges
         .iter()
         .filter(|r| r.0 < r.1 && !published(r.0, r.1) && !refused_as_view(r.0, r.1))
         .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
         .collect();
-    pieces.sort_unstable();
-    let mut spans: Vec<(usize, usize)> = Vec::new();
-    let mut i = 0;
-    while i < pieces.len() {
-        let first = pieces[i].0;
-        let mut last = pieces[i].1;
-        let mut k = i + 1;
-        while k < pieces.len()
-            && pieces[k].0 <= last + AHEAD_GAP
-            && last.max(pieces[k].1) - first <= AHEAD_MAX
-        {
-            last = last.max(pieces[k].1);
-            k += 1;
-        }
-        if let Some(prev) = spans.last_mut()
-            && first <= prev.1
-        {
-            prev.1 = prev.1.max(last);
-        } else {
-            spans.push((first, last));
-        }
-        i = k;
+    if raw.is_empty() {
+        spent.end();
+        return;
     }
-    let _held = Asking::hold_many(spans);
-    ask_ahead_held(ranges, true);
-    spent.next("asking: the rest");
-    ask_rest(ranges, true);
-    spent.end();
-}
-
-/// [`ask_once`] after its [`ask_ahead`]: what that left to `writes`, and the
-/// asking stands.
-fn ask_rest(ranges: &[(usize, usize)], held: bool) {
-    let _all = (!held).then(Asking::hold_all);
-    let mut ahead = {
-        let mut j = journal_mut();
-        j.ahead.take()
-    };
-    // `ask_ahead` leaves a range that lies alone to `writes`, which asks
-    // once per flush: with one asking for the submission that was every
-    // such range asked again at each of its 70 flushes (run 76: 2,300
-    // askings a frame with the switch on, as without it). They are asked
-    // here, once; what is not write-watched stays with `writes`.
-    let mut written = Vec::new();
-    // Those not held by an asking ahead, each once.
-    let mut alone_ranges: Vec<(usize, usize)> = Vec::new();
-    let mut held_ahead = Ahead::new();
-    held_ahead.set(std::mem::take(&mut ahead));
-    for &(start, end) in ranges {
-        if start >= end || published(start, end) || refused_as_view(start, end) {
+    raw.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+    let mut pieces: Vec<(usize, usize)> = Vec::with_capacity(raw.len());
+    for (first, last) in raw {
+        if let Some(prev) = pieces.last()
+            && last <= prev.1
+        {
             continue;
         }
-        let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !held_ahead.holds(first, last) && !alone_ranges.iter().any(|&(a, b)| a <= first && last <= b) {
-            alone_ranges.push((first, last));
+        pieces.push((first, last));
+    }
+    // Group pieces into runs within `AHEAD_GAP`/`AHEAD_MAX` without ever
+    // merging across distinct tracked reservations, and build the exact page
+    // spans to reserve in `ASKING` so disjoint regions (like descriptor heaps
+    // on `victory-heap-sync`) never block waiting for this asking.
+    let mut runs: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    {
+        let res = RESERVATIONS.read().unwrap_or_else(|e| e.into_inner());
+        let mut i = 0;
+        while i < pieces.len() {
+            let first = pieces[i].0;
+            let mut last = pieces[i].1;
+            let mut k = i + 1;
+            while k < pieces.len()
+                && pieces[k].0 <= last + AHEAD_GAP
+                && last.max(pieces[k].1) - first <= AHEAD_MAX
+                && same_reservation_in(&res, first, last.max(pieces[k].1) - 1)
+                && same_reservation_in(&res, last - 1, pieces[k].0)
+            {
+                last = last.max(pieces[k].1);
+                k += 1;
+            }
+            runs.push(i..k);
+            if let Some(prev) = spans.last_mut()
+                && first <= prev.1
+            {
+                prev.1 = prev.1.max(last);
+            } else {
+                spans.push((first, last));
+            }
+            i = k;
         }
     }
-    let mut ahead = held_ahead.take();
-    let answers = spread_each(alone_ranges.len(), |r| {
-        let (first, last) = alone_ranges[r];
-        #[cfg(feature = "diagnostics")]
-        let asking = std::time::Instant::now();
-        let found = kernel_written(first, last);
-        #[cfg(feature = "diagnostics")]
-        alone(first * PAGE, last * PAGE, found.as_ref().map_or(0, Vec::len), asking.elapsed());
-        found
-    });
-    for (&(first, last), found) in alone_ranges.iter().zip(answers) {
-        if let Some(pages) = found {
-            written.extend(pages);
-            ahead.push((first, last));
-        }
+    let _held = Asking::hold_many(spans);
+    let (mut asked, mut written) = (Vec::new(), Vec::new());
+    for (a, w) in spread_each(runs.len(), |r| {
+        let (mut a, mut w) = (Vec::new(), Vec::new());
+        ask_run_all(&pieces[runs[r].clone()], &mut a, &mut w);
+        (a, w)
+    }) {
+        asked.extend(a);
+        written.extend(w);
     }
     note_hot(&written);
-    // A number of its own, and the one this asking stands under: between
-    // the two parts another thread may have asked about a range of the
-    // second, copied it, and the title written it since. Under the first
-    // part's number that write was older than the copy, and never copied.
     if port_journal() {
-        // Renderer port #7: noted shared first (see `ask_ahead_held`).
-        let now = note_shared(&written);
+        // Renderer port #7: note dirty pages shared (skipped when nothing was
+        // written), then publish the standing asking under one `journal_mut()`.
+        let now = if written.is_empty() { None } else { Some(note_shared(&written)) };
         let mut j = journal_mut();
-        j.ahead_asked = now;
-        j.kept = !ahead.is_empty();
-        j.ahead.set(ahead);
+        j.ahead_asked = now.unwrap_or_else(next_asking);
+        j.kept = !asked.is_empty();
+        j.ahead.set(asked);
+        spent.end();
         return;
     }
     let mut j = journal_mut();
@@ -1168,12 +1459,13 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
     for (page, parts) in written {
         j.notes.note(page, parts, now);
     }
-    j.kept = !ahead.is_empty();
-    j.ahead.set(ahead);
+    j.kept = !asked.is_empty();
+    j.ahead.set(asked);
+    spent.end();
 }
 
 /// Diagnostics: the ranges a submission's asking asks about alone
-/// ([`ask_rest`]), by (start, end): askings, 64 KiB pages found written,
+/// ([`ask_once`]), by (start, end): askings, 64 KiB pages found written,
 /// microseconds.
 #[cfg(feature = "diagnostics")]
 static ALONE: Mutex<Option<std::collections::HashMap<(usize, usize), (u64, u64, u64)>>> = Mutex::new(None);
@@ -1286,6 +1578,37 @@ fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: 
     ask_run(b, asked, written);
 }
 
+/// Like [`ask_run`], for [`ask_once`]: handles both multi-piece runs and
+/// singletons (including singletons produced by binary fallback splits on
+/// untracked reservations), leaving only non-write-watched singletons to
+/// [`writes`].
+fn ask_run_all(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: &mut Vec<(usize, u16)>) {
+    let Some(&(first, single_last)) = pieces.first() else {
+        return;
+    };
+    if pieces.len() == 1 {
+        #[cfg(feature = "diagnostics")]
+        let asking = std::time::Instant::now();
+        let found = kernel_written(first, single_last);
+        #[cfg(feature = "diagnostics")]
+        alone(first * PAGE, single_last * PAGE, found.as_ref().map_or(0, Vec::len), asking.elapsed());
+        if let Some(pages) = found {
+            written.extend(pages);
+            asked.push((first, single_last));
+        }
+        return;
+    }
+    let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
+    if let Some(pages) = kernel_written(first, last) {
+        written.extend(pages);
+        asked.push((first, last));
+        return;
+    }
+    let (a, b) = pieces.split_at(pieces.len() / 2);
+    ask_run_all(a, asked, written);
+    ask_run_all(b, asked, written);
+}
+
 /// What [`writes`] would say of `[start, end)` from the journal alone, if
 /// the range lies in one asked ahead ([`ask_ahead`], [`ask_once`]): the
 /// pages written since tracking began and the asking that last found each
@@ -1387,10 +1710,13 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         return Some(fresh());
     }
     let answer = if port_journal() {
-        // Renderer port #7: shared, the range's parts held for writing (the
-        // range is held too: no other asking notes any of it meanwhile).
+        // Renderer port #7: shared, taking write locks ONLY on shards that
+        // contain dirty `pages` and read locks on clean shards of `[first, last)`
+        // in strictly ascending shard order `0..SHARDS`.
         let j = journal();
-        let mut held = j.notes.hold(shards_of(first, last) | shards_of_pages(pages.iter().map(|p| p.0)), true);
+        let dirty_shards = shards_of_pages(pages.iter().map(|p| p.0));
+        let clean_shards = shards_of(first, last).difference(dirty_shards);
+        let mut held = j.notes.hold_mixed(clean_shards, dirty_shards);
         let now = next_asking();
         for &(page, parts) in &pages {
             held.note(page, parts, now);
@@ -1649,6 +1975,37 @@ impl Drop for Claims {
     }
 }
 
+/// Stack-allocated claim of a single block ([`BUSY`]), avoiding a heap
+/// allocation per block in [`publish`].
+struct ClaimOne(usize);
+
+impl ClaimOne {
+    fn wait_for(block: usize) -> ClaimOne {
+        let mut spun = 0u64;
+        let mut tries = 0u32;
+        while !BUSY.try_set(block) {
+            tries += 1;
+            spun += 1;
+            if tries < 64 {
+                std::hint::spin_loop();
+            } else {
+                // Another thread's `VirtualProtect` of the block.
+                std::thread::yield_now();
+            }
+        }
+        if spun != 0 {
+            port6_count(P6_CLAIM_SPINS, spun);
+        }
+        ClaimOne(block)
+    }
+}
+
+impl Drop for ClaimOne {
+    fn drop(&mut self) {
+        BUSY.clear(self.0);
+    }
+}
+
 /// Renderer port #6's counts since the last line: faults opened under the
 /// shared lock; nanoseconds they waited for the lock; refreshes' guards
 /// done shared; blocks a refresh could not claim (left written); spins for
@@ -1839,6 +2196,7 @@ impl Bits {
 
     /// Whether a bit of `[first, last)` is set.
     fn any(&self, first: usize, last: usize) -> bool {
+        let last = last.min(Bits::PIECES * Bits::WORDS * 64);
         let mut block = first;
         while block < last {
             let word = block / 64;
@@ -2048,7 +2406,7 @@ fn publish(pages: &[usize]) {
         // clears the bit after this sets it, never before.
         let g = guards_shared();
         for &page in pages {
-            let _claim = Claims::wait_for(&[page]);
+            let _claim = ClaimOne::wait_for(page);
             if g.clean.contains(page) || g.held.contains(page) {
                 PUBLISHED.set(page);
                 if BESIDE.any(page, page + 1) {
@@ -2130,9 +2488,14 @@ fn placeholder(block: usize) -> bool {
 }
 
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
-/// committed: what was known of holes there is asked again.
+/// committed: record its reservation bounds for [`ask_once`] and ask again
+/// about any known holes there.
 pub fn title_memory_allocated(at: usize, len: usize) {
-    if len == 0 || !known_holes() {
+    if len == 0 {
+        return;
+    }
+    note_reservation(at, len);
+    if !known_holes() {
         return;
     }
     let g = guards();
@@ -2611,12 +2974,19 @@ impl std::hash::Hasher for PageHash {
     }
 }
 
-/// What shaders wrote is about to go into title memory at `[at, at + len)`.
-pub(crate) fn landing(at: usize, len: usize) {
-    {
-        let frame = crate::frame::current();
-        let (first, last) = (at / KERNEL_PAGE, (at + len.max(1) - 1) / KERNEL_PAGE);
-        (first..=last).for_each(|page| LANDED.note(page, frame));
+fn landing_inner(at: usize, len: usize, notify_remapped: bool) {
+    let first_block = at / BLOCK;
+    let last_block = at.saturating_add(len).div_ceil(BLOCK);
+    let frame = crate::frame::current();
+    let (first, last) = (at / KERNEL_PAGE, (at.saturating_add(len.max(1)) - 1) / KERNEL_PAGE);
+    (first..=last).for_each(|page| LANDED.note(page, frame));
+    // Private-memory fast-path: known private allocation with no guard cannot
+    // be an aliased view and has no guard to open.
+    let private_unguarded = light()
+        && first_block < last_block
+        && !PROTECTED.any(first_block, last_block)
+        && PRIVATE.all(first_block, last_block);
+    if !private_unguarded {
         for (block, others) in elsewhere(at, len) {
             let block = block / KERNEL_PAGE;
             let here = first.max(block)..=last.min(block + BLOCK / KERNEL_PAGE - 1);
@@ -2624,8 +2994,32 @@ pub(crate) fn landing(at: usize, len: usize) {
                 here.clone().for_each(|page| LANDED.note(page - block + other / KERNEL_PAGE, frame));
             }
         }
+        if !light() || PROTECTED.any(first_block, last_block) {
+            let g = guards_timed();
+            let opened = open(&g, at, at.saturating_add(len));
+            #[cfg(feature = "diagnostics")]
+            {
+                tally(6, opened as u64);
+                crate::faultbook::note(crate::faultbook::What::Ours, first_block, last_block, opened as u64);
+            }
+            let _ = opened;
+        }
     }
-    writing(at, len);
+    if notify_remapped {
+        // A placed texture there changes with no descriptor written.
+        crate::descriptor::host::remapped(at, len);
+    }
+}
+
+/// What shaders wrote is about to go into title memory at `[at, at + len)`.
+pub(crate) fn landing(at: usize, len: usize) {
+    landing_inner(at, len, true);
+}
+
+/// Like [`landing`], for `crate::land` jobs that collect landed spans in
+/// `land::Notes` and notify `descriptor::host::remapped` once per joined run.
+pub(crate) fn landing_deferred(at: usize, len: usize) {
+    landing_inner(at, len, false);
 }
 
 
@@ -2646,7 +3040,36 @@ pub(crate) fn landing(at: usize, len: usize) {
 ///
 /// Returns the note's number, and for each 64 KiB block noted the number of
 /// the block's last write before (0: none is known).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn landed_beside(pages: &[usize], spans: &[(usize, usize)]) -> (u64, Vec<(usize, u64)>) {
+    let mut remapped = Vec::with_capacity(spans.len());
+    let out = landed_beside_collecting(pages, spans, &mut remapped);
+    if !remapped.is_empty() {
+        remapped.sort_unstable();
+        let mut iter = remapped.drain(..);
+        if let Some((mut start, mut end)) = iter.next() {
+            for (a, b) in iter {
+                if a <= end {
+                    end = end.max(b);
+                } else {
+                    crate::descriptor::host::remapped(start, end - start);
+                    (start, end) = (a, b);
+                }
+            }
+            crate::descriptor::host::remapped(start, end - start);
+        }
+    }
+    out
+}
+
+/// Like [`landed_beside`], appending `[start, end)` spans into `remapped` so
+/// the caller (`crate::land::Notes::flush`) can coalesce and notify
+/// `descriptor::host::remapped` once per contiguous run.
+pub(crate) fn landed_beside_collecting(
+    pages: &[usize],
+    spans: &[(usize, usize)],
+    remapped: &mut Vec<(usize, usize)>,
+) -> (u64, Vec<(usize, u64)>) {
     let mut before = Vec::with_capacity(spans.len());
     let noted;
     // The same pages at other addresses: copies of the memory there have not
@@ -2700,11 +3123,12 @@ pub(crate) fn landed_beside(pages: &[usize], spans: &[(usize, usize)]) -> (u64, 
         }
     }
     for &(at, len) in spans {
-        // A placed texture there changes with no descriptor written.
-        crate::descriptor::host::remapped(at, len);
+        if len > 0 {
+            remapped.push((at, at.saturating_add(len)));
+        }
     }
     for other in elsewhere.into_iter().flat_map(|(_, others)| others) {
-        crate::descriptor::host::remapped(other, BLOCK);
+        remapped.push((other, other.saturating_add(BLOCK)));
     }
     (noted, before)
 }
@@ -3419,6 +3843,9 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
         return;
     }
     let ranges = crate::inplace::views_of_section(section, offset, len);
+    for &(at, n) in &ranges {
+        forget_private(at / BLOCK, at.saturating_add(n).div_ceil(BLOCK));
+    }
     // (A block is noted in `PROTECTED` ahead of the look at its page's views
     // that did not find this one yet.)
     if !ranges.iter().any(|&(at, n)| PROTECTED.any(at / BLOCK, (at + n).div_ceil(BLOCK))) {
@@ -3712,9 +4139,13 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
     if len != 0 {
+        forget_reservations_range(at / PAGE, at.saturating_add(len).div_ceil(PAGE));
         forget_views(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
-    } else if VIEWS.any(at / BLOCK, at / BLOCK + 1) {
-        forget_views(at / BLOCK, allocation_end(at, at).div_ceil(BLOCK).max(at / BLOCK + 1));
+    } else {
+        forget_reservation_at(at);
+        if VIEWS.any(at / BLOCK, at / BLOCK + 1) {
+            forget_views(at / BLOCK, allocation_end(at, at).div_ceil(BLOCK).max(at / BLOCK + 1));
+        }
     }
     let mut g = guards();
     let first = at / BLOCK;
@@ -3780,6 +4211,9 @@ fn forget_views(first: usize, last: usize) {
 /// Tells what keeps track of what title memory shows; the guards, with no
 /// block of the range known unmapped.
 fn title_memory_changed(at: usize, len: usize) -> std::sync::RwLockWriteGuard<'static, Guards> {
+    if len != 0 {
+        forget_reservations_range(at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    }
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
@@ -4381,9 +4815,9 @@ mod tests {
         }
     }
 
-    /// A write between another thread's asking about a range and the second
-    /// part of a submission's one asking is later than what that thread
-    /// copied.
+    /// A write between another thread's asking about a range and a submission's
+    /// one asking is later than what that thread copied, and `is_kept()` tracks
+    /// the standing asking.
     #[test]
     fn the_rest_of_the_one_asking_has_a_number_of_its_own() {
         // SAFETY: a fresh write-watched allocation, freed at the end.
@@ -4391,18 +4825,63 @@ mod tests {
             VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
         } as usize;
         assert_ne!(p, 0);
-        // One range: `ask_ahead` leaves it.
+        // One range: `ask_ahead` leaves it, unified `ask_once` asks it.
         let ranges = [(p, p + 4 * PAGE)];
         ask_ahead(&ranges);
         let (copied, _) = writes(p, p + 4 * PAGE, false).expect("watched");
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE) as *mut u8).write_volatile(1) };
-        ask_rest(&ranges, false);
+        ask_once(&ranges);
+        let _ = is_kept();
         let last = journal().notes.range(p / PAGE + 1, p / PAGE + 2).first().map(|n| n.1);
         ask_once_end();
         assert!(last.is_some_and(|last| last > copied), "{last:?} is not after {copied}");
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Separate tracked write-watched reservations are never merged by
+    /// `same_reservation`, and `ask_once` reports writes in both without
+    /// merging across reservation boundaries.
+    #[test]
+    fn reservations_do_not_merge_across_boundaries() {
+        // SAFETY: fresh write-watched allocations, freed at the end.
+        let a = unsafe {
+            VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        // SAFETY: as above.
+        let b = unsafe {
+            VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert!(a != 0 && b != 0);
+        title_memory_allocated(a, 4 * PAGE);
+        title_memory_allocated(b, 4 * PAGE);
+        // A commit inside reservation `a` preserves `a`'s full reservation span.
+        title_memory_allocated(a + PAGE, PAGE);
+        assert!(same_reservation(a / PAGE, a / PAGE + 3));
+        assert!(same_reservation(b / PAGE, b / PAGE + 3));
+        assert!(!same_reservation(a / PAGE + 3, b / PAGE));
+        // Clean baseline.
+        let (before_a, _) = writes(a, a + 4 * PAGE, false).expect("watched a");
+        let (before_b, _) = writes(b, b + 4 * PAGE, false).expect("watched b");
+        // SAFETY: committed pages of ours.
+        unsafe {
+            ((a + PAGE) as *mut u8).write_volatile(1);
+            ((b + 2 * PAGE) as *mut u8).write_volatile(1);
+        }
+        ask_once(&[(a, a + 2 * PAGE), (a + 3 * PAGE, a + 4 * PAGE), (b, b + 4 * PAGE)]);
+        let (_, seen_a) = writes(a, a + 4 * PAGE, false).expect("watched a");
+        let (_, seen_b) = writes(b, b + 4 * PAGE, false).expect("watched b");
+        ask_once_end();
+        assert!(seen_a.iter().any(|&(p, w)| p == a / PAGE + 1 && w > before_a));
+        assert!(seen_b.iter().any(|&(p, w)| p == b / PAGE + 2 && w > before_b));
+        title_memory_freed(a, 0);
+        title_memory_freed(b, 4 * PAGE);
+        // SAFETY: our allocations.
+        unsafe {
+            VirtualFree(a as *mut _, 0, MEM_RELEASE);
+            VirtualFree(b as *mut _, 0, MEM_RELEASE);
+        }
     }
 
     /// The runtime maps a view and then tells us; a copy's refresh on another
@@ -5749,32 +6228,43 @@ mod port7_tests {
     #[test]
     fn parts_pieces_and_ranges_agree() {
         const P: usize = 1 << SHARD_SHIFT;
-        assert_eq!(shards_of(0, 0), 0);
-        assert_eq!(shards_of(0, 1), 1);
-        assert_eq!(shards_of(P - 1, P + 1), 0b11);
-        assert_eq!(shards_of(63 * P, 65 * P), 1 << 63 | 1);
-        assert_eq!(shards_of(5, 5 + SHARDS * P), u64::MAX);
+        assert_eq!(shards_of(0, 0), ShardMask::EMPTY);
+        let mut s0 = ShardMask::EMPTY;
+        s0.set(0);
+        assert_eq!(shards_of(0, 1), s0);
+        let mut s01 = s0;
+        s01.set(1);
+        assert_eq!(shards_of(P - 1, P + 1), s01);
+        let mut wrap = ShardMask::EMPTY;
+        wrap.set(SHARDS - 1);
+        wrap.set(0);
+        assert_eq!(shards_of((SHARDS - 1) * P, (SHARDS + 1) * P), wrap);
+        assert_eq!(shards_of(5, 5 + SHARDS * P), ShardMask::ALL);
         assert_eq!(pieces(P - 2, 2 * P + 3), Some(vec![(P - 2, P), (P, 2 * P), (2 * P, 2 * P + 3)]));
         assert_eq!(pieces(0, 1 << 40), None);
         let notes = Notes::new();
         let mut want: BTreeMap<usize, u64> = BTreeMap::new();
         let mut seed = 7;
         for n in 1..4000u64 {
-            let page = rng(&mut seed, 70 * P);
+            let page = rng(&mut seed, (SHARDS + 16) * P);
             let mut held = notes.hold(shards_of_pages([page]), true);
             held.note(page, WHOLE, n);
             want.insert(page, n);
         }
         for _ in 0..500 {
-            let first = rng(&mut seed, 70 * P);
+            let first = rng(&mut seed, (SHARDS + 16) * P);
             let last = first + rng(&mut seed, 3 * P);
             let expected: Vec<(usize, u64)> = want.range(first..last).map(|(&p, &w)| (p, w)).collect();
             assert_eq!(notes.range(first, last), expected, "{first}..{last} a part at a time");
             assert_eq!(notes.hold(shards_of(first, last), false).range(first, last), expected, "{first}..{last} held");
+            // Mixed read/write hold (write on a subset of shards, read on the rest).
+            let dirty = shards_of_pages([first]);
+            let clean = shards_of(first, last).difference(dirty);
+            assert_eq!(notes.hold_mixed(clean, dirty).range(first, last), expected, "{first}..{last} mixed");
         }
         // The whole space: each part once.
         assert_eq!(notes.range(0, usize::MAX / 2), want.iter().map(|(&p, &w)| (p, w)).collect::<Vec<_>>());
-        assert_eq!(notes.hold(u64::MAX, false).range(0, usize::MAX / 2).len(), want.len());
+        assert_eq!(notes.hold(ShardMask::ALL, false).range(0, usize::MAX / 2).len(), want.len());
     }
 
     /// Noted out of order (shared noters' numbers may come in any order): a
@@ -5784,7 +6274,7 @@ mod port7_tests {
         let mut s = Shard::new();
         assert_eq!(s.note(3, WHOLE, 9), 0);
         assert_eq!(s.note(3, 0b11, 5), 9);
-        assert_eq!(s.written[&3], 9);
+        assert_eq!(s.get(3), 9);
         assert_eq!(s.parts_since(3, 8), WHOLE, "all of it at 9");
         assert_eq!(s.note(3, 0b100, 12), 9);
         assert_eq!(s.parts_since(3, 9), 0b100);
@@ -5792,7 +6282,7 @@ mod port7_tests {
         assert_eq!(s.note(3, WHOLE, 10), 12);
         assert_eq!(s.parts_since(3, 10), 0b100);
         assert_eq!(s.parts_since(3, 9), WHOLE);
-        assert_eq!(s.written[&3], 12);
+        assert_eq!(s.get(3), 12);
     }
 
     /// Many threads note pages (holding their parts for writing, a number

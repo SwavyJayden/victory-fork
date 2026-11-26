@@ -29,7 +29,7 @@
 //! [`crate::watch::landed_beside`] notes the blocks written afterwards, so
 //! that the next refresh takes them as before.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
 /// The unit pieces are cut in (of title memory), and the guards' blocks.
@@ -197,22 +197,31 @@ pub(crate) fn log(frames: f64) {
 
 /// Threads kept for landing, and the work they are at.
 struct Pool {
+    /// Monotonically bumped on every new batch (polled lock-free by spinning helpers).
+    generation: AtomicU64,
+    /// Lock-free work index claimed via `fetch_add(1, Relaxed)`.
+    next: AtomicUsize,
+    /// Items in the current batch (0 when idle or aborted on caller panic).
+    count: AtomicUsize,
+    /// Whether any helper panicked in the current batch.
+    panicked: AtomicBool,
     state: Mutex<State>,
     more: Condvar,
     idle: Condvar,
     /// One batch at a time.
     turn: Mutex<()>,
     threads: usize,
+    /// Microseconds helpers spin-wait on `generation` before sleeping on `more`.
+    spin_us: u64,
 }
 
 struct State {
-    /// What to do with each number below `count`.
+    /// What to do with each number below `count` (`None` when idle or aborted).
     work: Option<Work>,
-    next: usize,
-    count: usize,
-    /// Helpers inside a call.
+    /// Batch number matching [`Pool::generation`] when `work` is `Some`.
+    generation: u64,
+    /// Helpers currently inside a batch.
     running: usize,
-    panicked: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -228,12 +237,21 @@ impl Pool {
     }
 
     fn new(name: &'static str, threads: usize) -> &'static Pool {
+        Pool::with_spin(name, threads, 0)
+    }
+
+    fn with_spin(name: &'static str, threads: usize, spin_us: u64) -> &'static Pool {
         let pool: &'static Pool = Box::leak(Box::new(Pool {
-            state: Mutex::new(State { work: None, next: 0, count: 0, running: 0, panicked: false }),
+            generation: AtomicU64::new(0),
+            next: AtomicUsize::new(0),
+            count: AtomicUsize::new(0),
+            panicked: AtomicBool::new(false),
+            state: Mutex::new(State { work: None, generation: 0, running: 0 }),
             more: Condvar::new(),
             idle: Condvar::new(),
             turn: Mutex::new(()),
             threads,
+            spin_us,
         }));
         for i in 1..threads {
             // (A helper that is not there is only missed.)
@@ -250,23 +268,55 @@ impl Pool {
     }
 
     fn help(&self) {
+        let mut seen_gen = 0u64;
         let mut state = self.state();
         loop {
-            let Some((work, i)) = take(&mut state) else {
+            let work = loop {
+                if let Some(work) = state.work
+                    && state.generation != seen_gen
+                {
+                    seen_gen = state.generation;
+                    state.running += 1;
+                    break work;
+                }
+                seen_gen = state.generation;
                 state = self.more.wait(state).unwrap_or_else(|e| e.into_inner());
-                continue;
             };
-            state.running += 1;
             drop(state);
             let working = crate::timeline::span("a landing's job");
-            // SAFETY: counted in `running`, so `each` has not returned.
-            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { (*work.0)(i) }));
+            let mut batch_panicked = false;
+            loop {
+                let count = self.count.load(Ordering::Acquire);
+                let i = self.next.fetch_add(1, Ordering::Relaxed);
+                if i >= count {
+                    break;
+                }
+                // SAFETY: counted in `running`, so `each` has not returned.
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { (*work.0)(i) })).is_err() {
+                    batch_panicked = true;
+                }
+            }
             working.end();
             state = self.state();
             state.running -= 1;
-            state.panicked |= ran.is_err();
+            if batch_panicked {
+                self.panicked.store(true, Ordering::Release);
+            }
             if state.running == 0 {
                 self.idle.notify_all();
+            }
+            if self.spin_us > 0 && (state.work.is_none() || state.generation == seen_gen) {
+                drop(state);
+                let began = std::time::Instant::now();
+                let mut spins = 0u32;
+                while self.generation.load(Ordering::Acquire) == seen_gen {
+                    spins = spins.wrapping_add(1);
+                    if spins.is_multiple_of(64) && began.elapsed().as_micros() as u64 >= self.spin_us {
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
+                state = self.state();
             }
         }
     }
@@ -284,7 +334,13 @@ impl Pool {
         // it does not before no helper is inside `f` and none can enter.
         let work = Work(unsafe { std::mem::transmute::<*const (dyn Fn(usize) + Sync + '_), *const (dyn Fn(usize) + Sync + 'static)>(f) });
         let mut state = self.state();
-        (state.work, state.next, state.count, state.panicked) = (Some(work), 0, count, false);
+        let next_gen = state.generation + 1;
+        state.generation = next_gen;
+        state.work = Some(work);
+        self.next.store(0, Ordering::Relaxed);
+        self.count.store(count, Ordering::Relaxed);
+        self.panicked.store(false, Ordering::Relaxed);
+        self.generation.store(next_gen, Ordering::Release);
         drop(state);
         if count > self.threads {
             self.more.notify_all();
@@ -293,33 +349,30 @@ impl Pool {
         }
         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             loop {
-                let Some((_, i)) = take(&mut self.state()) else { break };
+                let i = self.next.fetch_add(1, Ordering::Relaxed);
+                if i >= count {
+                    break;
+                }
                 f(i);
             }
         }));
+        if ran.is_err() {
+            // (After a panic here: nothing more is begun.)
+            self.count.store(0, Ordering::Release);
+        }
         let mut state = self.state();
-        // (After a panic here: nothing more is begun.)
         state.work = None;
+        self.count.store(0, Ordering::Relaxed);
         while state.running > 0 {
             state = self.idle.wait(state).unwrap_or_else(|e| e.into_inner());
         }
-        let panicked = state.panicked;
+        let panicked = self.panicked.load(Ordering::Acquire);
         drop(state);
         if let Err(panic) = ran {
             std::panic::resume_unwind(panic);
         }
         assert!(!panicked, "a job of landing panicked");
     }
-}
-
-/// The next number of the batch, if there is one.
-fn take(state: &mut State) -> Option<(Work, usize)> {
-    let work = state.work?;
-    if state.next >= state.count {
-        return None;
-    }
-    state.next += 1;
-    Some((work, state.next - 1))
 }
 
 /// [`Pool::each`] on the threads kept for landing.
@@ -336,7 +389,7 @@ pub(crate) fn each_under(count: usize, f: &(dyn Fn(usize) + Sync)) {
         let logical = std::thread::available_parallelism().map_or(12, |n| n.get());
         let default = (logical / 3).clamp(2, 6);
         let threads = std::env::var("VICTORY_UNDER_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default);
-        Pool::new("victory-under", threads.clamp(1, 16))
+        Pool::with_spin("victory-under", threads.clamp(1, 16), 25)
     })
     .each(count, f);
 }
@@ -473,7 +526,8 @@ fn anytime() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_ANYTIME").is_none_or(|v| v != "0"))
 }
 
-/// What a job wrote beside the guards, to be noted ([`Notes::flush`]).
+/// What a job wrote beside the guards, and title-memory spans landed into
+/// (coalesced and told to `descriptor::host::remapped` once in [`Notes::flush`]).
 #[derive(Default)]
 pub(crate) struct Notes {
     /// Pages of 4 KiB, by number.
@@ -483,10 +537,19 @@ pub(crate) struct Notes {
     /// Per piece put beside the guards, all of it: its 64 KiB block and the
     /// copy it was landed through (which the job holds until the flush).
     landed: Vec<(usize, *const crate::shadow::Shadow)>,
+    /// Half-open `[start, end)` title-memory spans landed in this job (both
+    /// direct and beside), joined before notifying `descriptor::host::remapped`.
+    remapped: Vec<(usize, usize)>,
 }
 
 // SAFETY: the pointers are used by the job that has the notes, in `flush`.
 unsafe impl Send for Notes {}
+
+impl Drop for Notes {
+    fn drop(&mut self) {
+        self.flush_remapped();
+    }
+}
 
 /// Whether a copy a landing went through is noted as up to date with it
 /// (`VICTORY_LAND_TAKEN=0`: it is not, and the next refresh copies the 64
@@ -514,30 +577,56 @@ fn taken() -> bool {
 static TAKEN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 impl Notes {
-    /// At the end of a job: what it wrote beside the guards is noted.
+    /// Joins overlapping/adjacent `[start, end)` spans in `self.remapped` and
+    /// notifies `descriptor::host::remapped` once per contiguous run.
+    fn flush_remapped(&mut self) {
+        if self.remapped.is_empty() {
+            return;
+        }
+        self.remapped.sort_unstable();
+        let mut iter = self.remapped.drain(..);
+        let Some((mut start, mut end)) = iter.next() else {
+            return;
+        };
+        for (a, b) in iter {
+            if a <= end {
+                end = end.max(b);
+            } else {
+                crate::descriptor::host::remapped(start, end - start);
+                (start, end) = (a, b);
+            }
+        }
+        crate::descriptor::host::remapped(start, end - start);
+    }
+
+    /// At the end of a job: what it wrote beside the guards is noted, and all
+    /// landed spans notify `descriptor::host::remapped` once per joined run.
     pub(crate) fn flush(&mut self) {
-        if self.pages.is_empty() {
+        if self.pages.is_empty() && self.remapped.is_empty() {
             return;
         }
         let noting = std::time::Instant::now();
-        let (now, blocks) = crate::watch::landed_beside(&self.pages, &self.spans);
-        TAKEN[0].fetch_add(blocks.len() as u64, Ordering::Relaxed);
-        if taken() {
-            for (block, before) in blocks {
-                let mut through = self.landed.iter().filter(|l| l.0 == block).map(|l| l.1);
-                let Some(copy) = through.next() else {
-                    continue;
-                };
-                if !copy.is_null() && through.all(|other| other == copy) {
-                    // SAFETY: the job holds its copies until this is done.
-                    let copy = unsafe { &*copy };
-                    TAKEN[1].fetch_add(u64::from(copy.landed(block, before, now)), Ordering::Relaxed);
+        if !self.pages.is_empty() {
+            let (now, blocks) = crate::watch::landed_beside_collecting(&self.pages, &self.spans, &mut self.remapped);
+            TAKEN[0].fetch_add(blocks.len() as u64, Ordering::Relaxed);
+            if taken() {
+                for (block, before) in blocks {
+                    let mut through = self.landed.iter().filter(|l| l.0 == block).map(|l| l.1);
+                    let Some(copy) = through.next() else {
+                        continue;
+                    };
+                    if !copy.is_null() && through.all(|other| other == copy) {
+                        // SAFETY: the job holds its copies until this is done.
+                        let copy = unsafe { &*copy };
+                        TAKEN[1].fetch_add(u64::from(copy.landed(block, before, now)), Ordering::Relaxed);
+                    }
                 }
             }
+            self.pages.clear();
+            self.spans.clear();
+            self.landed.clear();
         }
-        self.pages.clear();
-        self.spans.clear();
-        self.landed.clear();
+        self.flush_remapped();
         spent(stat::NOTES, noting);
     }
 }
@@ -613,7 +702,10 @@ unsafe fn piece_at(
         let last = differing.iter().rposition(|&d| d).unwrap_or(first);
         let (from, to) = (((base + first) * PAGE).max(title), ((base + last + 1) * PAGE).min(title + end));
         let opening = std::time::Instant::now();
-        crate::watch::landing(from, to - from);
+        crate::watch::landing_deferred(from, to - from);
+        if from < to {
+            notes.remapped.push((from, to));
+        }
         spent(stat::NOTES, opening);
     }
     let into = beside.unwrap_or(title);

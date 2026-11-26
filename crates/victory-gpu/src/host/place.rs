@@ -92,8 +92,19 @@ impl Placed {
         if !free {
             return None;
         }
-        copy_mapped(self.dst as *mut u8, bytes.as_ptr(), self.len, true);
+        let wrote_whole = copy_mapped_whole(self.dst as *mut u8, bytes.as_ptr(), self.len, true);
         crate::watch::wrote(self.dst, self.len);
+        // When `copy_mapped_whole` wrote every byte without fault, skip the
+        // redundant read-back allocation and comparison in release builds.
+        if wrote_whole {
+            #[cfg(feature = "diagnostics")]
+            {
+                let mut there = vec![0u8; self.len];
+                return (read_into(self.dst as *const u8, &mut there) && there == bytes).then_some(bytes);
+            }
+            #[cfg(not(feature = "diagnostics"))]
+            return Some(bytes);
+        }
         // Title memory that is not all there was left alone.
         let mut there = vec![0u8; self.len];
         (read_into(self.dst as *const u8, &mut there) && there == bytes).then_some(bytes)
@@ -249,6 +260,7 @@ impl HostList {
         STATS[1].fetch_add(len as u64, Ordering::Relaxed);
         to.gpu_writes(self, dst as u64, len as u64);
         let mut deferred = self.deferred();
+        deferred.has_placed = true;
         deferred.copies.push(Step::Placed(Placed {
             dst,
             src,

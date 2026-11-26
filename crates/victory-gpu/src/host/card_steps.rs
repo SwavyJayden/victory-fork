@@ -427,6 +427,10 @@ fn does_of(
     runs: &[&HostList],
     with_fills: bool,
 ) -> (Vec<Does>, Vec<(usize, usize)>, Vec<Option<FillTo>>) {
+    // `Does::Refresh` is only inspected by `elsewhere()` for `Does::Copy`
+    // steps during `take_steps` (`with_fills == true`); skip pushing them when
+    // no list in `runs` contains a `Step::Copy`.
+    let keep_refresh = with_fills && runs.iter().any(|list| list.deferred().has_copy);
     let mut does = Vec::new();
     // Which step each is. One list's lock at a time: a submission may
     // name a list twice.
@@ -468,14 +472,14 @@ fn does_of(
                     asked: touches(written, at, at.saturating_add(len)),
                 },
                 &Step::Host(_, (from, to)) if from < to => Does::Read { from, to, asked: false },
-                Step::Refresh(shadow, at, len) => Does::Refresh {
+                Step::Refresh(shadow, at, len) if keep_refresh => Does::Refresh {
                     shadow: Arc::as_ptr(shadow) as usize,
                     from: *at,
                     to: *at + *len,
                 },
                 Step::Run(_) => Does::Run,
                 Step::Placed(p) => Does::Placed { dst: p.dst, src: p.src, len: p.len },
-                Step::GpuWrite(..) | Step::Host(..) => continue,
+                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(..) => continue,
             });
             steps.push((ptr, i));
             if with_fills {
@@ -495,7 +499,7 @@ pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
         return None;
     }
     // (Most submissions have none.)
-    let first = runs.iter().position(|l| l.deferred().copies.iter().any(|s| matches!(s, Step::Placed(_))))?;
+    let first = runs.iter().position(|l| l.deferred().has_placed)?;
     if first + 1 == runs.len() {
         return None;
     }
@@ -859,7 +863,7 @@ impl Host {
         // once so each worker visits only its own slots and acquires
         // `SHADER_HEAPS.read()` once for its whole batch, preserving step order
         // per slot.)
-        let parts = if ops.len() < 256 { 1 } else { 8 };
+        let parts = if ops.len() < 64 { 1 } else { 8 };
         let mut buckets: Vec<Vec<(usize, u32, u64, u32)>> = (0..parts).map(|_| Vec::new()).collect();
         for op in &ops {
             if let To::Slot(heap, index) = &op.to {
@@ -868,7 +872,9 @@ impl Host {
             }
         }
         crate::land::each_under(parts, &|part| {
-            crate::descriptor::constant_slots_batch(&buckets[part], &own.between);
+            if !buckets[part].is_empty() {
+                crate::descriptor::constant_slots_batch(&buckets[part], &own.between);
+            }
         });
         let copies = ops.iter().filter(|op| matches!(op.to, To::Copy(..))).count();
         DONE[0].fetch_add((ops.len() - copies) as u64, Ordering::Relaxed);

@@ -365,6 +365,7 @@ pub(crate) struct HostHeap {
     pub(crate) buffer_frame: std::sync::atomic::AtomicU64,
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
+    gpu: u64,
     step: u32,
     /// Slots mirroring the title's; view heaps have `dynamic` more starting at
     /// `dynamic_base`.
@@ -1901,6 +1902,7 @@ impl HostHeap {
             buffer_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
             heap,
             cpu,
+            gpu,
             step,
             count,
             dynamic_base,
@@ -2912,16 +2914,17 @@ impl HostHeap {
         }
     }
 
-    /// Title slot `index` is a table's ([`HostHeap::tabled`]). `read`: a
-    /// draw read it through the table and brought what it views up to
-    /// date, so the slot leaves the queue of textures picked by index; the
+    /// Title slot `index` is a table's ([`HostHeap::tabled`]) in `frame`.
+    /// `read`: a draw read it through the table and brought what it views up
+    /// to date, so the slot leaves the queue of textures picked by index; the
     /// caller makes the host slot in place ([`HostHeap::mirror`]), as the
     /// pass would have, for a shader that picks it by index all the same.
-    pub(crate) fn texture_slot_tabled(&self, index: u32, read: bool) {
-        self.tabled_in(index, read, crate::frame::current());
+    #[inline]
+    pub(crate) fn texture_slot_tabled_at(&self, index: u32, read: bool, frame: u64) {
+        self.tabled_in(index, read, frame);
     }
 
-    /// [`HostHeap::texture_slot_tabled`] in frame `frame`.
+    /// [`HostHeap::texture_slot_tabled_at`] in frame `frame`.
     fn tabled_in(&self, index: u32, read: bool, frame: u64) {
         use std::sync::atomic::Ordering::Relaxed;
         let Some(stamp) = self.tabled.get(index as usize) else {
@@ -2995,10 +2998,11 @@ impl HostHeap {
         }
     }
 
-    /// Title slot `index` lies in a table a draw reads or had made afresh:
-    /// what it holds is the draw's to make ([`HostHeap::copied_tabled`]).
-    pub(crate) fn slot_tabled(&self, index: u32) {
-        self.tabled_in(index, false, crate::frame::current());
+    /// Title slot `index` lies in a table a draw reads or had made afresh in
+    /// `frame`: what it holds is the draw's to make ([`HostHeap::copied_tabled`]).
+    #[inline]
+    pub(crate) fn slot_tabled_at(&self, index: u32, frame: u64) {
+        self.tabled_in(index, false, frame);
     }
 
     /// The title slots that hold buffer views.
@@ -3541,11 +3545,10 @@ impl HostHeap {
     }
 
     /// The shader-visible handle of slot `index`.
+    #[inline]
     pub(crate) fn gpu_handle(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
-        // SAFETY: a live shader-visible heap.
-        let start = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart().ptr };
         D3D12_GPU_DESCRIPTOR_HANDLE {
-            ptr: start + u64::from(index) * u64::from(self.step),
+            ptr: self.gpu + u64::from(index) * u64::from(self.step),
         }
     }
 

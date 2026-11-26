@@ -392,6 +392,9 @@ pub(crate) struct HostPipeline {
     /// (`victory_shader::emit::rect_list_gs`): its rectangle draws go out
     /// as the title gives them, three vertices a rectangle.
     pub(crate) rects: bool,
+    /// Whether any stage of this graphics/mesh pipeline is a known ped or
+    /// decoration bake shader (`BAKE_PIXEL_SHADERS` / `BAKE_GEOMETRY_SHADERS`).
+    pub(crate) is_bake_shader: bool,
     /// Its shaders, for reports of slow submissions.
     pub(crate) name: String,
     /// Its depth, stencil, cull and blend state in short, for the frame
@@ -593,6 +596,12 @@ impl HostPipeline {
             }
             bound.push(stage);
         }
+        let is_bake_shader = compute.is_none()
+            && bound.iter().any(|s| {
+                let h = s.shader.hash.as_str();
+                crate::draw::BAKE_PIXEL_SHADERS.contains(&h)
+                    || crate::draw::BAKE_GEOMETRY_SHADERS.contains(&h)
+            });
         let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Ok(root) => root,
             Err(e) => {
@@ -644,6 +653,7 @@ impl HostPipeline {
                 slots: 0,
                 inputs: Vec::new(),
                 rects: false,
+                is_bake_shader: false,
                 state: String::new(),
             });
         }
@@ -697,6 +707,7 @@ impl HostPipeline {
                 slots: 0,
                 inputs: Vec::new(),
                 rects: false,
+                is_bake_shader,
                 state: String::new(),
             });
         }
@@ -813,6 +824,7 @@ impl HostPipeline {
             slots: g.slots(),
             inputs: g.elements(),
             rects: rect_gs.is_some(),
+            is_bake_shader,
             state: {
                 let (d, r, b) = (&g.depth, &g.rasterizer, &g.blend.RenderTarget[0]);
                 let face = |f: &D3D12_DEPTH_STENCILOP_DESC| {

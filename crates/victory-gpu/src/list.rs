@@ -1321,11 +1321,8 @@ extern "system" fn resolve(
         )
     {
         use windows::Win32::Foundation::RECT;
-        use windows::Win32::Graphics::Direct3D12::{
-            D3D12_RESOLVE_MODE_AVERAGE, ID3D12GraphicsCommandList1,
-        };
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOLVE_MODE_AVERAGE;
         use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
-        use windows::core::Interface;
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
         if unlike(dst, src) {
@@ -1348,7 +1345,7 @@ extern "system" fn resolve(
             if (a.Width, a.Height) == (b.Width, b.Height) {
                 list.list
                     .ResolveSubresource(to, dst_sub, from, src_sub, format);
-            } else if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
+            } else if let Some(list1) = list.list1() {
                 // The console clips a larger source to the destination.
                 let rect = RECT {
                     left: 0,
@@ -1804,16 +1801,26 @@ mod state {
         one_range: i32,
         depth: *const u64,
     ) {
-        let handles: Vec<u64> = if one_range != 0 && !handles.is_null() {
-            // SAFETY: the title passes the first handle.
-            let first = unsafe { *handles };
-            (0..u64::from(count)).map(|i| first + 128 * i).collect()
+        let mut buf = [0u64; 8];
+        let n = if handles.is_null() {
+            0
         } else {
-            items(handles, count).to_vec()
+            (count as usize).min(buf.len())
         };
+        if n > 0 {
+            if one_range != 0 {
+                // SAFETY: the title passes the first handle.
+                let first = unsafe { *handles };
+                for (i, slot) in buf[..n].iter_mut().enumerate() {
+                    *slot = first + 128 * i as u64;
+                }
+            } else {
+                buf[..n].copy_from_slice(items(handles, n as u32));
+            }
+        }
         // SAFETY: the title passes a handle or null.
         let depth = unsafe { depth.as_ref() }.copied().unwrap_or(0);
-        with_state(this, |list, s| s.set_targets(list, &handles, depth));
+        with_state(this, |list, s| s.set_targets(list, &buf[..n], depth));
     }
     pub(super) extern "system" fn draw(
         this: This,

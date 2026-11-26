@@ -247,7 +247,11 @@ fn memory(host: &Host, size: u64) -> Option<Memory> {
     };
     let (buffer, data) = match mapped {
         Some(made) => made,
-        None => host.upload_buffer_private(size)?,
+        // Match `Card::staging`: custom L0 WRITE_BACK heap avoids WC
+        // partial-cacheline thrashing on 12-byte scatter job headers and small
+        // payloads while starting in `COMMON` (implicitly promoting to
+        // `COPY_SOURCE | NON_PIXEL_SHADER_RESOURCE` and decaying back).
+        None => host.shared_buffer_private(size)?,
     };
     name(&buffer, || "bytes a submission sends up".into());
     Some(Memory {
@@ -737,7 +741,7 @@ mod tests {
         let payload_at = up_bytes as u64;
         up_bytes += payload.len().next_multiple_of(256);
 
-        let (up_buf, up_ptr) = host.upload_buffer(up_bytes as u64).unwrap();
+        let (up_buf, up_ptr) = host.shared_buffer_private(up_bytes as u64).unwrap();
         // SAFETY: `up_ptr` is mapped for `up_bytes`.
         unsafe {
             for &(a, to, n) in &copy_runs {
