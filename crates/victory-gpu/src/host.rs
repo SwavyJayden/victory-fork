@@ -497,7 +497,11 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
 fn bury_lag() -> u64 {
     static LAG: OnceLock<u64> = OnceLock::new();
     *LAG.get_or_init(|| {
-        let default = if crate::residency::limited_host_ram() { 16 } else { 64 };
+        let default = match crate::residency::host_ram_tier() {
+            crate::residency::HostRamTier::Tight => 16,
+            crate::residency::HostRamTier::Moderate => 32,
+            crate::residency::HostRamTier::Plentiful => 64,
+        };
         std::env::var("VICTORY_BURY_LAG").ok().and_then(|v| v.parse().ok()).unwrap_or(default)
     })
 }

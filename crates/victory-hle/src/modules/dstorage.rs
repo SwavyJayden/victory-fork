@@ -146,11 +146,15 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         return from_win32(&error);
     }
     let kept = name.clone();
+    let is_data_rpf = super::prompts::is_data_rpf_path(&name);
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
     let files = Files::new(file, Io::chosen());
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { files });
+    let file = Instance::create(
+        Object::new("dstorage file", &FILE_VTABLE),
+        File { files, is_data_rpf },
+    );
     if stream_log::on() {
         stream_log::line(format_args!("F\t{:x}\t{kept}", file as usize));
     }
@@ -278,6 +282,7 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 
 struct File {
     files: Files,
+    is_data_rpf: bool,
 }
 
 /// How files are read (`VICTORY_DSTORAGE_IO`).
@@ -1398,13 +1403,22 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     }
     let bc = ((options & BCPACK) >> 1) as u8;
     let size = request.destination_size as usize;
+    let is_data_rpf = options & MEMORY_SOURCE == 0
+        // SAFETY: non-memory source is a `File` object we created.
+        && unsafe { &*request.source.cast::<Instance<File>>() }.state.is_data_rpf;
     if options & (ZLIB | BCPACK) == 0 {
         if request.source_size > request.destination_size {
             return Err(fail(E_INVALIDARG, "source larger than destination"));
         }
         let size = request.source_size as usize;
-        return into_destination(request, size, |out| read_into(request, out).map(|()| size))
-            .map_err(|hr| fail(hr, "copying"));
+        return into_destination(request, size, |out| {
+            read_into(request, out)?;
+            if is_data_rpf && super::prompts::patch_data_rpf_compressed_region(request.offset, out) {
+                super::prompts::log_patched_once("DirectStorage raw");
+            }
+            Ok(size)
+        })
+        .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
@@ -1417,11 +1431,23 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     } else {
         source
     };
+    let check_prompts = is_data_rpf || options & MEMORY_SOURCE != 0;
     into_destination(request, size, |out| match tables {
         Some(tables) => bcpack::decode(bc, &source, out, tables)
             .map(|()| out.len())
             .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
+        None => {
+            let n = inflate(&source, out).map_err(|hr| fail(hr, "zlib"))?;
+            if check_prompts
+                && n == super::prompts::INPUT_ICONS_INFLATED_LEN
+                && out[..n].starts_with(b"GFX")
+                && super::prompts::ps5_enabled()
+                && super::prompts::patch_input_icons_gfx(&mut out[..n])
+            {
+                super::prompts::log_patched_once("DirectStorage");
+            }
+            Ok(n)
+        }
     })?;
     tracing::trace!(
         options = format_args!("{options:#x}"),

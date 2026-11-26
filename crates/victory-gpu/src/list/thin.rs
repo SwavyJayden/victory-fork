@@ -299,8 +299,17 @@ fn back_list(kind: u32) -> This {
     list
 }
 
+/// Default thin-list worker count scales to half the logical cores (2..=8) so
+/// 6C/12T CPUs (e.g. Ryzen 5 5600X) run 6 workers instead of oversubscribing
+/// with 8+, while 16–24T CPUs keep 8 workers.
+fn thin_threads_for(asked: Option<usize>, processors: usize) -> usize {
+    asked.unwrap_or_else(|| (processors / 2).clamp(2, 8)).clamp(1, 32)
+}
+
 fn start() {
-    let threads = std::env::var("VICTORY_THIN_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8usize).clamp(1, 32);
+    let processors = std::thread::available_parallelism().map_or(8, |n| n.get());
+    let asked = std::env::var("VICTORY_THIN_THREADS").ok().and_then(|v| v.trim().parse().ok());
+    let threads = thin_threads_for(asked, processors);
     for i in 0..threads {
         let worker = move || {
             crate::cores::keep_many_on_fast_cores("victory-list");
@@ -909,5 +918,15 @@ mod tests {
         assert_eq!(slot[1], 99);
         assert_eq!(kept[1], 2);
         assert_eq!(record(0), [0; RECORD]);
+    }
+
+    #[test]
+    fn thin_threads_scale_to_host_cores() {
+        assert_eq!(thin_threads_for(None, 4), 2);
+        assert_eq!(thin_threads_for(None, 12), 6);
+        assert_eq!(thin_threads_for(None, 16), 8);
+        assert_eq!(thin_threads_for(None, 24), 8);
+        assert_eq!(thin_threads_for(Some(4), 12), 4);
+        assert_eq!(thin_threads_for(Some(0), 12), 1);
     }
 }

@@ -90,9 +90,39 @@ pub(crate) fn allow_staging_growth(bake: bool) -> bool {
     has_growth_reserve(sample_commit(now), bake)
 }
 
+/// Host physical-memory tier used to size upload pools, staging caps, and
+/// retirement lag without starving 32–48 GiB hosts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HostRamTier {
+    /// <= 32 GiB physical RAM.
+    Tight,
+    /// 33–52 GiB physical RAM (e.g. 48 GiB DDR4 desktop).
+    Moderate,
+    /// > 52 GiB physical RAM (e.g. 64 GiB+ workstation).
+    Plentiful,
+}
+
+fn ram_tier_for(total_phys: u64) -> HostRamTier {
+    if total_phys <= 32 * GIB {
+        HostRamTier::Tight
+    } else if total_phys <= 52 * GIB {
+        HostRamTier::Moderate
+    } else {
+        HostRamTier::Plentiful
+    }
+}
+
+pub(crate) fn host_ram_tier() -> HostRamTier {
+    static TIER: OnceLock<HostRamTier> = OnceLock::new();
+    *TIER.get_or_init(|| memory_status().map_or(HostRamTier::Plentiful, |s| ram_tier_for(s.ullTotalPhys)))
+}
+
 pub(crate) fn limited_host_ram() -> bool {
-    static LIMITED: OnceLock<bool> = OnceLock::new();
-    *LIMITED.get_or_init(|| memory_status().is_some_and(|s| s.ullTotalPhys <= 32 * GIB))
+    host_ram_tier() == HostRamTier::Tight
+}
+
+pub(crate) fn moderate_or_limited_ram() -> bool {
+    host_ram_tier() != HostRamTier::Plentiful
 }
 
 fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
@@ -149,9 +179,31 @@ pub(crate) fn critical_commit() -> bool {
 /// A soft per-frame admission limit. A single texture can cross it. The
 /// queue retains unserved slots so they can be retried on later frames.
 pub(crate) fn prefetch_limit(bytes: u64, pressure: bool, critical: bool, limited: bool, staging: u64) -> u64 {
+    let tier = if limited {
+        HostRamTier::Tight
+    } else if host_ram_tier() == HostRamTier::Moderate {
+        HostRamTier::Moderate
+    } else {
+        HostRamTier::Plentiful
+    };
+    prefetch_limit_for_tier(bytes, pressure, critical, tier, staging)
+}
+
+pub(crate) fn prefetch_limit_for_tier(
+    bytes: u64,
+    pressure: bool,
+    critical: bool,
+    tier: HostRamTier,
+    staging: u64,
+) -> u64 {
+    let staging_cap = match tier {
+        HostRamTier::Tight => GIB,
+        HostRamTier::Moderate => 1536 * MIB,
+        HostRamTier::Plentiful => u64::MAX,
+    };
     if critical {
         bytes.min(16 << 20)
-    } else if pressure || (limited && staging >= GIB) {
+    } else if pressure || staging >= staging_cap {
         bytes.min(64 << 20)
     } else {
         bytes
@@ -189,13 +241,18 @@ mod tests {
 
     #[test]
     fn prefetch_respects_existing_budgets_and_resumes_after_recovery() {
-        assert_eq!(prefetch_limit(512 << 20, false, false, true, GIB), 64 << 20);
-        assert_eq!(prefetch_limit(512 << 20, false, false, true, GIB - 1), 512 << 20);
-        assert_eq!(prefetch_limit(512 << 20, false, false, false, 2 * GIB), 512 << 20);
-        assert_eq!(prefetch_limit(0, true, true, false, 0), 0);
-        assert_eq!(prefetch_limit(8 << 20, true, true, false, 0), 8 << 20);
-        assert_eq!(prefetch_limit(512 << 20, true, false, false, 0), 64 << 20);
-        assert_eq!(prefetch_limit(512 << 20, true, true, false, 0), 16 << 20);
-        assert_eq!(prefetch_limit(192 << 20, false, false, false, 0), 192 << 20);
+        assert_eq!(prefetch_limit_for_tier(512 << 20, false, false, HostRamTier::Tight, GIB), 64 << 20);
+        assert_eq!(prefetch_limit_for_tier(512 << 20, false, false, HostRamTier::Tight, GIB - 1), 512 << 20);
+        assert_eq!(prefetch_limit_for_tier(512 << 20, false, false, HostRamTier::Moderate, 1536 * MIB), 64 << 20);
+        assert_eq!(prefetch_limit_for_tier(512 << 20, false, false, HostRamTier::Moderate, 1536 * MIB - 1), 512 << 20);
+        assert_eq!(prefetch_limit_for_tier(512 << 20, false, false, HostRamTier::Plentiful, 2 * GIB), 512 << 20);
+        assert_eq!(prefetch_limit_for_tier(0, true, true, HostRamTier::Plentiful, 0), 0);
+        assert_eq!(prefetch_limit_for_tier(8 << 20, true, true, HostRamTier::Plentiful, 0), 8 << 20);
+        assert_eq!(prefetch_limit_for_tier(512 << 20, true, false, HostRamTier::Plentiful, 0), 64 << 20);
+        assert_eq!(prefetch_limit_for_tier(512 << 20, true, true, HostRamTier::Plentiful, 0), 16 << 20);
+        assert_eq!(prefetch_limit_for_tier(192 << 20, false, false, HostRamTier::Plentiful, 0), 192 << 20);
+        assert_eq!(ram_tier_for(32 * GIB), HostRamTier::Tight);
+        assert_eq!(ram_tier_for(48 * GIB), HostRamTier::Moderate);
+        assert_eq!(ram_tier_for(64 * GIB), HostRamTier::Plentiful);
     }
 }

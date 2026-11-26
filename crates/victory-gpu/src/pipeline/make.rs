@@ -478,7 +478,8 @@ fn worker_count(asked: Option<usize>, processors: usize) -> usize {
 fn worker_count_for(asked: Option<usize>, processors: usize, limited_ram: bool) -> usize {
     match asked {
         Some(n) => n.clamp(1, 64),
-        None if limited_ram => (processors * 3 / 4).clamp(2, 8),
+        None if limited_ram => (processors / 2).clamp(2, 6),
+        None if processors <= 12 => (processors / 2).clamp(2, 6),
         None => (processors * 2 / 3).clamp(2, 16),
     }
 }

@@ -16,6 +16,7 @@
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use windows_sys::Win32::Globalization::{CP_ACP, MultiByteToWideChar};
@@ -258,6 +259,92 @@ fn widen(mode: *const c_char) -> Vec<u16> {
 type Handle = *mut c_void;
 type File = *mut c_void;
 
+/// Win64 `OVERLAPPED` header layout used by `ReadFile`.
+#[repr(C)]
+struct Overlapped {
+    internal: usize,
+    internal_high: usize,
+    offset: u32,
+    offset_high: u32,
+    event: Handle,
+}
+
+const _: () = assert!(size_of::<Overlapped>() == 32);
+const _: () = assert!(std::mem::offset_of!(Overlapped, offset) == 0x10);
+
+/// Tracked Win32 handles opened on `data.rpf` for in-memory PS5 prompt patching.
+static HAS_DATA_RPF_HANDLE: AtomicBool = AtomicBool::new(false);
+static DATA_RPF_HANDLES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// Tracked CRT `FILE*` streams opened on `data.rpf`.
+static HAS_DATA_RPF_STREAM: AtomicBool = AtomicBool::new(false);
+static DATA_RPF_STREAMS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+fn is_data_rpf_wide_ptr(path: *const u16) -> bool {
+    if path.is_null() {
+        return false;
+    }
+    // SAFETY: caller passes a NUL-terminated UTF-16 path.
+    let slice = unsafe {
+        let len = (0..).take_while(|&i| *path.add(i) != 0).count();
+        std::slice::from_raw_parts(path, len)
+    };
+    super::prompts::is_data_rpf_wide(slice)
+}
+
+fn is_data_rpf_narrow_ptr(path: *const c_char) -> bool {
+    if path.is_null() {
+        return false;
+    }
+    // SAFETY: caller passes a NUL-terminated narrow path.
+    let text = unsafe { CStr::from_ptr(path) }.to_string_lossy();
+    super::prompts::is_data_rpf_path(&text)
+}
+
+fn track_data_rpf_handle(handle: Handle, is_data_rpf: bool) {
+    if !is_data_rpf || handle.is_null() || handle as isize == -1 {
+        return;
+    }
+    let key = handle as usize;
+    let mut list = DATA_RPF_HANDLES.lock().unwrap_or_else(|e| e.into_inner());
+    if !list.contains(&key) {
+        list.push(key);
+        HAS_DATA_RPF_HANDLE.store(true, Ordering::Release);
+    }
+}
+
+fn is_data_rpf_handle(handle: Handle) -> bool {
+    if !HAS_DATA_RPF_HANDLE.load(Ordering::Acquire) || handle.is_null() || handle as isize == -1 {
+        return false;
+    }
+    DATA_RPF_HANDLES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&(handle as usize))
+}
+
+fn track_data_rpf_stream(stream: File, is_data_rpf: bool) {
+    if !is_data_rpf || stream.is_null() {
+        return;
+    }
+    let key = stream as usize;
+    let mut list = DATA_RPF_STREAMS.lock().unwrap_or_else(|e| e.into_inner());
+    if !list.contains(&key) {
+        list.push(key);
+        HAS_DATA_RPF_STREAM.store(true, Ordering::Release);
+    }
+}
+
+fn is_data_rpf_stream(stream: File) -> bool {
+    if !HAS_DATA_RPF_STREAM.load(Ordering::Acquire) || stream.is_null() {
+        return false;
+    }
+    DATA_RPF_STREAMS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&(stream as usize))
+}
+
 // kernel32 and its file API sets.
 
 pub extern "system" fn CreateFileW(
@@ -270,7 +357,8 @@ pub extern "system" fn CreateFileW(
     template: Handle,
 ) -> Handle {
     let p = wide(path);
-    host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
+    let is_data_rpf = is_data_rpf_wide_ptr(p.ptr());
+    let handle = host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
         p.ptr(),
         access,
         share,
@@ -278,7 +366,9 @@ pub extern "system" fn CreateFileW(
         disposition,
         flags,
         template,
-    )
+    );
+    track_data_rpf_handle(handle, is_data_rpf);
+    handle
 }
 
 pub extern "system" fn CreateFileA(
@@ -292,7 +382,8 @@ pub extern "system" fn CreateFileA(
 ) -> Handle {
     match narrow(path) {
         Some(p) => {
-            host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
+            let is_data_rpf = super::prompts::is_data_rpf_wide(&p[..p.len().saturating_sub(1)]);
+            let handle = host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
                 p.as_ptr(),
                 access,
                 share,
@@ -300,10 +391,13 @@ pub extern "system" fn CreateFileA(
                 disposition,
                 flags,
                 template,
-            )
+            );
+            track_data_rpf_handle(handle, is_data_rpf);
+            handle
         }
         None => {
-            host!("kernel32.dll", "CreateFileA": extern "system" fn(*const c_char, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
+            let is_data_rpf = is_data_rpf_narrow_ptr(path);
+            let handle = host!("kernel32.dll", "CreateFileA": extern "system" fn(*const c_char, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
                 path,
                 access,
                 share,
@@ -311,7 +405,9 @@ pub extern "system" fn CreateFileA(
                 disposition,
                 flags,
                 template,
-            )
+            );
+            track_data_rpf_handle(handle, is_data_rpf);
+            handle
         }
     }
 }
@@ -325,13 +421,16 @@ pub extern "system" fn CreateFile2(
     params: *const c_void,
 ) -> Handle {
     let p = wide(path);
-    host!("kernel32.dll", "CreateFile2": extern "system" fn(*const u16, u32, u32, u32, *const c_void) -> Handle)(
+    let is_data_rpf = is_data_rpf_wide_ptr(p.ptr());
+    let handle = host!("kernel32.dll", "CreateFile2": extern "system" fn(*const u16, u32, u32, u32, *const c_void) -> Handle)(
         p.ptr(),
         access,
         share,
         disposition,
         params,
-    )
+    );
+    track_data_rpf_handle(handle, is_data_rpf);
+    handle
 }
 
 pub extern "system" fn DeleteFileA(path: *const c_char) -> i32 {
@@ -500,25 +599,40 @@ pub extern "system" fn SetCurrentDirectoryA(path: *const c_char) -> i32 {
 
 pub extern "C" fn _wfopen(path: *const u16, mode: *const u16) -> File {
     let p = wide(path);
-    host!("ucrtbase.dll", "_wfopen": extern "C" fn(*const u16, *const u16) -> File)(p.ptr(), mode)
+    let is_data_rpf = is_data_rpf_wide_ptr(p.ptr());
+    let stream = host!("ucrtbase.dll", "_wfopen": extern "C" fn(*const u16, *const u16) -> File)(
+        p.ptr(),
+        mode,
+    );
+    track_data_rpf_stream(stream, is_data_rpf);
+    stream
 }
 
 pub extern "C" fn _wfopen_s(out: *mut File, path: *const u16, mode: *const u16) -> i32 {
     let p = wide(path);
-    host!("ucrtbase.dll", "_wfopen_s": extern "C" fn(*mut File, *const u16, *const u16) -> i32)(
+    let is_data_rpf = is_data_rpf_wide_ptr(p.ptr());
+    let rc = host!("ucrtbase.dll", "_wfopen_s": extern "C" fn(*mut File, *const u16, *const u16) -> i32)(
         out,
         p.ptr(),
         mode,
-    )
+    );
+    if rc == 0 && !out.is_null() {
+        // SAFETY: `_wfopen_s` returned 0, so `*out` holds the opened `FILE*`.
+        track_data_rpf_stream(unsafe { *out }, is_data_rpf);
+    }
+    rc
 }
 
 pub extern "C" fn _wfsopen(path: *const u16, mode: *const u16, share: i32) -> File {
     let p = wide(path);
-    host!("ucrtbase.dll", "_wfsopen": extern "C" fn(*const u16, *const u16, i32) -> File)(
+    let is_data_rpf = is_data_rpf_wide_ptr(p.ptr());
+    let stream = host!("ucrtbase.dll", "_wfsopen": extern "C" fn(*const u16, *const u16, i32) -> File)(
         p.ptr(),
         mode,
         share,
-    )
+    );
+    track_data_rpf_stream(stream, is_data_rpf);
+    stream
 }
 
 // Kernel reads into title memory. The GPU side leaves blocks of title GPU
@@ -535,6 +649,27 @@ pub extern "system" fn ReadFile(
     read: *mut u32,
     overlapped: *mut c_void,
 ) -> i32 {
+    let tracked = is_data_rpf_handle(file);
+    let file_offset = if tracked && !buffer.is_null() && len > 0 {
+        if !overlapped.is_null() {
+            // SAFETY: caller passed a valid `OVERLAPPED` struct for this `ReadFile`.
+            let ov = unsafe { &*overlapped.cast::<Overlapped>() };
+            Some((u64::from(ov.offset_high) << 32) | u64::from(ov.offset))
+        } else {
+            const FILE_CURRENT: u32 = 1;
+            let mut pos = 0i64;
+            let ok = host!("kernel32.dll", "SetFilePointerEx": extern "system" fn(Handle, i64, *mut i64, u32) -> i32)(
+                file,
+                0,
+                &mut pos,
+                FILE_CURRENT,
+            );
+            (ok != 0 && pos >= 0).then_some(pos as u64)
+        }
+    } else {
+        None
+    };
+
     let writing = victory_gpu::kernel_writing(buffer as usize, len as usize);
     let done = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
         file, buffer, len, read, overlapped,
@@ -556,6 +691,27 @@ pub extern "system" fn ReadFile(
             tracing::warn!(n, buffer = format_args!("{buffer:p}"), len, "ReadFile: the title's buffer could not be written");
         }
     }
+    if done != 0
+        && let Some(offset) = file_offset
+    {
+        let got = if !read.is_null() {
+            // SAFETY: host `ReadFile` succeeded and wrote `*read`.
+            unsafe { *read as usize }
+        } else if !overlapped.is_null() {
+            // SAFETY: synchronous completion on overlapped `ReadFile` populates `InternalHigh`.
+            unsafe { (*overlapped.cast::<Overlapped>()).internal_high }
+        } else {
+            0
+        };
+        let n = got.min(len as usize);
+        if n > 0 {
+            // SAFETY: host `ReadFile` filled `n` bytes of `buffer`.
+            let slice = unsafe { std::slice::from_raw_parts_mut(buffer, n) };
+            if super::prompts::patch_data_rpf_compressed_region(offset, slice) {
+                super::prompts::log_patched_once("ReadFile");
+            }
+        }
+    }
     drop(writing);
     // SAFETY: as above.
     unsafe { windows_sys::Win32::Foundation::SetLastError(error) };
@@ -564,28 +720,51 @@ pub extern "system" fn ReadFile(
 
 /// The host CRT reads large requests straight into the caller's buffer
 /// through the kernel, whose write fails on a guarded block instead of
-/// faulting into the guard. So the bytes are read beside, a chunk at a time
-/// (a caller may ask for far more than the file holds), and copied in from
-/// user mode, where a guarded block faults into the guard like the title's
-/// own writes. Returns the items read, as the CRT does; the bytes of a
-/// partial last item are copied too, as the CRT leaves them.
+/// faulting into the guard. Keep the destination open while the CRT reads,
+/// and patch `data.rpf` in memory when Sony PS5 prompts are active.
 pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
-    let _writing = victory_gpu::kernel_writing(buffer as usize, size.saturating_mul(count));
-    host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
+    let total = size.saturating_mul(count);
+    let file_offset = if !buffer.is_null() && total > 0 && is_data_rpf_stream(stream) {
+        let pos = host!("ucrtbase.dll", "_ftelli64": extern "C" fn(File) -> i64)(stream);
+        (pos >= 0).then_some(pos as u64)
+    } else {
+        None
+    };
+    let _writing = victory_gpu::kernel_writing(buffer as usize, total);
+    let items = host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
         buffer, size, count, stream,
-    )
+    );
+    if let Some(offset) = file_offset {
+        let bytes = items.saturating_mul(size).min(total);
+        if bytes > 0 {
+            // SAFETY: host `fread` filled `bytes` bytes of `buffer`.
+            let slice = unsafe { std::slice::from_raw_parts_mut(buffer, bytes) };
+            if super::prompts::patch_data_rpf_compressed_region(offset, slice) {
+                super::prompts::log_patched_once("fread");
+            }
+        }
+    }
+    items
 }
 
 pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {
     match narrow(path) {
-        Some(p) => host!("ucrtbase.dll", "_wfopen": extern "C" fn(*const u16, *const u16) -> File)(
-            p.as_ptr(),
-            widen(mode).as_ptr(),
-        ),
+        Some(p) => {
+            let is_data_rpf = super::prompts::is_data_rpf_wide(&p[..p.len().saturating_sub(1)]);
+            let stream = host!("ucrtbase.dll", "_wfopen": extern "C" fn(*const u16, *const u16) -> File)(
+                p.as_ptr(),
+                widen(mode).as_ptr(),
+            );
+            track_data_rpf_stream(stream, is_data_rpf);
+            stream
+        }
         None => {
-            host!("ucrtbase.dll", "fopen": extern "C" fn(*const c_char, *const c_char) -> File)(
+            let is_data_rpf = is_data_rpf_narrow_ptr(path);
+            let stream = host!("ucrtbase.dll", "fopen": extern "C" fn(*const c_char, *const c_char) -> File)(
                 path, mode,
-            )
+            );
+            track_data_rpf_stream(stream, is_data_rpf);
+            stream
         }
     }
 }
@@ -593,16 +772,28 @@ pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {
 pub extern "C" fn fopen_s(out: *mut File, path: *const c_char, mode: *const c_char) -> i32 {
     match narrow(path) {
         Some(p) => {
-            host!("ucrtbase.dll", "_wfopen_s": extern "C" fn(*mut File, *const u16, *const u16) -> i32)(
+            let is_data_rpf = super::prompts::is_data_rpf_wide(&p[..p.len().saturating_sub(1)]);
+            let rc = host!("ucrtbase.dll", "_wfopen_s": extern "C" fn(*mut File, *const u16, *const u16) -> i32)(
                 out,
                 p.as_ptr(),
                 widen(mode).as_ptr(),
-            )
+            );
+            if rc == 0 && !out.is_null() {
+                // SAFETY: `fopen_s` returned 0, so `*out` holds the opened `FILE*`.
+                track_data_rpf_stream(unsafe { *out }, is_data_rpf);
+            }
+            rc
         }
         None => {
-            host!("ucrtbase.dll", "fopen_s": extern "C" fn(*mut File, *const c_char, *const c_char) -> i32)(
+            let is_data_rpf = is_data_rpf_narrow_ptr(path);
+            let rc = host!("ucrtbase.dll", "fopen_s": extern "C" fn(*mut File, *const c_char, *const c_char) -> i32)(
                 out, path, mode,
-            )
+            );
+            if rc == 0 && !out.is_null() {
+                // SAFETY: `fopen_s` returned 0, so `*out` holds the opened `FILE*`.
+                track_data_rpf_stream(unsafe { *out }, is_data_rpf);
+            }
+            rc
         }
     }
 }
@@ -681,27 +872,36 @@ const FIOPEN_WIDE: &str = "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z";
 /// `_Fiopen(const wchar_t* path, ios_base::openmode, int protection)`.
 extern "C" fn fiopen_wide(path: *const u16, mode: i32, protection: i32) -> File {
     let p = wide(path);
-    host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z": extern "C" fn(*const u16, i32, i32) -> File)(
+    let is_data_rpf = is_data_rpf_wide_ptr(p.ptr());
+    let stream = host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z": extern "C" fn(*const u16, i32, i32) -> File)(
         p.ptr(),
         mode,
         protection,
-    )
+    );
+    track_data_rpf_stream(stream, is_data_rpf);
+    stream
 }
 
 /// `_Fiopen(const char* path, ios_base::openmode, int protection)`.
 extern "C" fn fiopen(path: *const c_char, mode: i32, protection: i32) -> File {
     match narrow(path) {
         Some(p) => {
-            host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z": extern "C" fn(*const u16, i32, i32) -> File)(
+            let is_data_rpf = super::prompts::is_data_rpf_wide(&p[..p.len().saturating_sub(1)]);
+            let stream = host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z": extern "C" fn(*const u16, i32, i32) -> File)(
                 p.as_ptr(),
                 mode,
                 protection,
-            )
+            );
+            track_data_rpf_stream(stream, is_data_rpf);
+            stream
         }
         None => {
-            host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEBDHH@Z": extern "C" fn(*const c_char, i32, i32) -> File)(
+            let is_data_rpf = is_data_rpf_narrow_ptr(path);
+            let stream = host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEBDHH@Z": extern "C" fn(*const c_char, i32, i32) -> File)(
                 path, mode, protection,
-            )
+            );
+            track_data_rpf_stream(stream, is_data_rpf);
+            stream
         }
     }
 }

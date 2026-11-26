@@ -65,7 +65,12 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
     match memory {
-        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
+        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => {
+            // Cap idle empty 64 MiB blocks at 10% of the adapter's VRAM budget
+            // (~1.5 GiB on a 16 GB RTX 5070 Ti instead of 4 GiB) so active
+            // textures and GPU compute detiling never starve on 12–16 GB cards.
+            ((budget / 10) / BLOCK).clamp(SPARE as u64, SPARE_KEPT as u64) as usize
+        }
         _ => SPARE,
     }
 }
@@ -98,7 +103,10 @@ pub(crate) fn on() -> bool {
 /// no such lists: pieces are cut from those first.
 fn ahead() -> usize {
     static AHEAD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *AHEAD.get_or_init(|| std::env::var("VICTORY_RIPE_BLOCKS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(12))
+    *AHEAD.get_or_init(|| {
+        let default = if crate::residency::moderate_or_limited_ram() { 8 } else { 12 };
+        std::env::var("VICTORY_RIPE_BLOCKS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+    })
 }
 
 /// Submissions begun and finished ([`crate::host::submissions`]), and how
@@ -599,9 +607,10 @@ mod tests {
 
     #[test]
     fn empty_blocks_stay_while_the_card_has_room() {
-        assert_eq!(spares(Some([100, 84, 0, 0]), true), SPARE_KEPT);
-        assert_eq!(spares(Some([100, 85, 0, 0]), true), SPARE);
-        assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
+        let b = 100 * (1u64 << 30);
+        assert_eq!(spares(Some([b, b * 84 / 100, 0, 0]), true), SPARE_KEPT);
+        assert_eq!(spares(Some([b, b * 85 / 100, 0, 0]), true), SPARE);
+        assert_eq!(spares(Some([b, b * 10 / 100, 0, 0]), false), SPARE);
         assert_eq!(spares(None, true), SPARE);
     }
 
@@ -745,5 +754,18 @@ mod tests {
             // SAFETY: plain query.
             assert!(host.device.GetDeviceRemovedReason().is_ok());
         }
+    }
+
+    #[test]
+    fn spares_scale_proportionally_with_vram_budget() {
+        const GIB: u64 = 1 << 30;
+        // 16 GB card (~15 GiB budget) under 85% keeps 24 x 64 MiB = 1.5 GiB, not 4 GiB.
+        assert_eq!(spares(Some([15 * GIB, 8 * GIB, 0, 0]), true), 24);
+        // 24 GB card (~23 GiB budget) keeps 36 x 64 MiB = 2.25 GiB.
+        assert_eq!(spares(Some([23 * GIB, 10 * GIB, 0, 0]), true), 36);
+        // At/above 85% pressure or keep=false falls back to SPARE (2).
+        assert_eq!(spares(Some([15 * GIB, 13 * GIB, 0, 0]), true), SPARE);
+        assert_eq!(spares(Some([15 * GIB, 4 * GIB, 0, 0]), false), SPARE);
+        assert_eq!(spares(None, true), SPARE);
     }
 }
