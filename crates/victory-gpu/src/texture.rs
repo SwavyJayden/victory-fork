@@ -47,7 +47,16 @@ pub(crate) struct Staging {
     data: *mut u8,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
+    row_sizes: Vec<u64>,
     layout: victory_formats::texture::Layout,
+    /// Committed VRAM bytes tracked by `gpu_detile` (`> 0` => `buffer` is a
+    /// `DEFAULT`-heap UAV buffer filled on the GPU compute queue).
+    vram_alloc: u64,
+    /// Pooled VRAM bucket size returned to `gpu_detile::release_vram_buf`.
+    vram_pooled: u64,
+    /// For `vram_alloc > 0`: whether a newly acquired/recycled VRAM buffer
+    /// still needs a GPU detile or GPU zero-fill before any copy reads it.
+    vram_needs_zero: std::sync::atomic::AtomicBool,
     /// Mips per array slice, of the title's texture.
     mips: u32,
     /// The first of them that is read and uploaded
@@ -479,8 +488,16 @@ pub(crate) fn live_staging_bytes() -> u64 {
 impl Drop for Staging {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
-        STAGED[0].fetch_sub(1, Relaxed);
-        STAGED[1].fetch_sub(self.bytes, Relaxed);
+        if self.vram_alloc > 0 {
+            crate::gpu_detile::release_vram_buf(
+                self.buffer.clone(),
+                self.vram_alloc,
+                self.vram_pooled,
+            );
+        } else {
+            STAGED[0].fetch_sub(1, Relaxed);
+            STAGED[1].fetch_sub(self.bytes, Relaxed);
+        }
     }
 }
 
@@ -525,6 +542,7 @@ pub(crate) fn let_go_idle() {
         return;
     }
     let idle_ms = crate::host::ram_idle_ms(crate::residency::headroom());
+    crate::gpu_detile::trim_idle(idle_ms);
     // A list that recorded an upload or a check holds the staging until it
     // is reset: one only the table holds is named by no list, recorded or
     // running.
@@ -1254,9 +1272,20 @@ impl Staging {
 
     /// Returns the bytes of title memory read.
     fn refresh_now(&self) -> usize {
+        use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
         let whole = std::time::Instant::now();
         let read = self.refresh_timed();
-        REFRESH_WAITS[3].fetch_add(whole.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        // If this is a newly acquired/recycled VRAM staging buffer and
+        // `refresh_timed` returned without detiling (e.g. unmapped or empty),
+        // zero-fill on the GPU so `CopyTextureRegion` never sees stale texels.
+        if self.vram_alloc > 0
+            && self.vram_needs_zero.load(Acquire)
+            && let Some(host) = host()
+            && crate::gpu_detile::zero_buffer(host, &self.buffer, self.base, self.bytes)
+        {
+            self.vram_needs_zero.store(false, Release);
+        }
+        REFRESH_WAITS[3].fetch_add(whole.elapsed().as_micros() as u64, Relaxed);
         read
     }
 
@@ -1512,6 +1541,28 @@ impl Staging {
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
         }
+        if self.vram_alloc > 0 {
+            if let Some(host) = host()
+                && crate::gpu_detile::detile(
+                    host,
+                    &self.buffer,
+                    self.base,
+                    self.bytes,
+                    &self.layout,
+                    tiled,
+                    &self.footprints,
+                    &self.rows,
+                    &self.row_sizes,
+                    self.first,
+                    self.mips,
+                    held,
+                )
+            {
+                self.vram_needs_zero.store(false, std::sync::atomic::Ordering::Release);
+            }
+            return;
+        }
+        crate::gpu_detile::note_cpu_detile();
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
             let (mip, slice) = self.part(i);
             let f = footprint.Footprint;
@@ -1873,6 +1924,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     };
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
     let mut rows = vec![0u32; count as usize];
+    let mut row_sizes = vec![0u64; count as usize];
     let mut total = 0;
     // SAFETY: outputs for `count` subresources.
     unsafe {
@@ -1883,33 +1935,53 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
             0,
             Some(footprints.as_mut_ptr()),
             Some(rows.as_mut_ptr()),
-            None,
+            Some(row_sizes.as_mut_ptr()),
             Some(&mut total),
         );
     }
-    let (piece, buffer, base, data) = match crate::pool::staging(host, total) {
-        Some((piece, buffer, base, data)) => (Some(piece), buffer, base, data),
-        None => {
-            let speculative = PICKING.get().is_some() && !BAKING.get();
-            if crate::residency::upload_refused()
-                || (speculative && !crate::residency::allow_staging_growth(false))
-            {
-                crate::residency::note_staging_deferred();
-                return None;
+    let want_gpu = d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D
+        && !crate::residency::pressured()
+        && crate::gpu_detile::eligible(
+            &layout,
+            read,
+            total,
+            &footprints,
+            &rows,
+            &row_sizes,
+            first,
+            mips,
+        );
+    let (piece, buffer, base, data, vram_alloc, vram_pooled) = if want_gpu
+        && let Some((buffer, vram_alloc, vram_pooled)) = crate::gpu_detile::take_vram_buf(host, total)
+    {
+        (None, buffer, 0, std::ptr::null_mut(), vram_alloc, vram_pooled)
+    } else {
+        match crate::pool::staging(host, total) {
+            Some((piece, buffer, base, data)) => (Some(piece), buffer, base, data, 0, 0),
+            None => {
+                let speculative = PICKING.get().is_some() && !BAKING.get();
+                if crate::residency::upload_refused()
+                    || (speculative && !crate::residency::allow_staging_growth(false))
+                {
+                    crate::residency::note_staging_deferred();
+                    return None;
+                }
+                let (buffer, data) = host.upload_buffer(total)?;
+                crate::host::name(&buffer, || {
+                    format!(
+                        "staging of {resource:?} {}x{}x{} f{}",
+                        d.Width, d.Height, d.DepthOrArraySize, d.Format.0
+                    )
+                });
+                (None, buffer, 0, data, 0, 0)
             }
-            let (buffer, data) = host.upload_buffer(total)?;
-            crate::host::name(&buffer, || {
-                format!(
-                    "staging of {resource:?} {}x{}x{} f{}",
-                    d.Width, d.Height, d.DepthOrArraySize, d.Format.0
-                )
-            });
-            (None, buffer, 0, data)
         }
     };
-    tracing::debug!(?desc, total, "texture contents uploaded from title memory");
-    STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+    tracing::debug!(?desc, total, vram = vram_alloc > 0, "texture contents uploaded from title memory");
+    if vram_alloc == 0 {
+        STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+    }
     let s = Arc::new(Staging {
         buffer,
         base,
@@ -1919,7 +1991,11 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         data,
         footprints,
         rows,
+        row_sizes,
         layout,
+        vram_alloc,
+        vram_pooled,
+        vram_needs_zero: std::sync::atomic::AtomicBool::new(vram_alloc > 0),
         mips,
         first,
         level0,

@@ -265,9 +265,14 @@ impl Worker {
     }
 
     fn copy(&self, jobs: &[Arc<Job>], value: u64) -> windows::core::Result<()> {
+        let detile_batch = crate::gpu_detile::BatchGuard::begin_thread();
         for job in jobs {
             job.staging.refresh();
         }
+        // Flush any GPU-detiled VRAM staging buffers for this worker onto the
+        // compute queue and synchronize `self.queue` (COPY) on the GPU fence
+        // before recording/executing `CopyTextureRegion`.
+        detile_batch.flush(&self.queue);
         // SAFETY: this worker's allocator and list, whose last submission has
         // run; the jobs hold what the list names until after the wait.
         unsafe {

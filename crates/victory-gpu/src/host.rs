@@ -32,13 +32,65 @@ pub(crate) fn texture_state(state: u32) -> u32 {
     pc_state(state) & !BUFFER_ONLY
 }
 
+/// Whether structured low-overhead per-stage frame telemetry is emitted
+/// (`VICTORY_ADV_LOG=1`; off by default).
+pub(crate) fn adv_log() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_ADV_LOG")
+            .ok()
+            .is_some_and(|v| matches!(v.trim(), "1" | "2"));
+        if on {
+            tracing::info!("structured per-stage frame telemetry enabled (VICTORY_ADV_LOG=1)");
+        }
+        on
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn adv_log_line(
+    fps: f64,
+    ms: f64,
+    prep_ms: f64,
+    copy_ms: f64,
+    copy_mb: f64,
+    tex_ms: f64,
+    tex_mb: f64,
+    gpu_ms: f64,
+    back_ms: f64,
+    back_mb: f64,
+    draws: f64,
+) {
+    if !adv_log() {
+        return;
+    }
+    let ram_tier = match crate::residency::host_ram_tier() {
+        crate::residency::HostRamTier::Tight => "tight",
+        crate::residency::HostRamTier::Moderate => "48g",
+        crate::residency::HostRamTier::Plentiful => "64g+",
+    };
+    let (vram_used_mb, vram_budget_mb) = host()
+        .and_then(Host::video_memory)
+        .map_or((0, 0), |[budget, used, ..]| (used >> 20, budget >> 20));
+    let detile_vram_mb = crate::gpu_detile::active_vram_bytes() >> 20;
+    let host_staging_mb = crate::texture::live_staging_bytes() >> 20;
+    tracing::info!(
+        "adv-log: fps={fps:.1} frame={ms:.2}ms prep={prep_ms:.2}ms \
+         (copy={copy_ms:.2}ms/{copy_mb:.1}MB tex={tex_ms:.2}ms/{tex_mb:.1}MB) \
+         gpu={gpu_ms:.2}ms back={back_ms:.2}ms/{back_mb:.1}MB draws={draws:.0} | \
+         vram={vram_used_mb}/{vram_budget_mb}MB detile_vram={detile_vram_mb}MB \
+         host_stage={host_staging_mb}MB ram_tier={ram_tier} pressured={}",
+        u8::from(crate::residency::pressured()),
+    );
+}
+
 /// Render target views live only until their command is recorded, so a
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
-    queue: ID3D12CommandQueue,
+    pub(crate) queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
@@ -3640,10 +3692,14 @@ fn late_line(frames: f64) {
         if send::own() {
             let t: Vec<f64> = send::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
             tracing::info!(
-                "bytes of submissions' own sent up per frame (VICTORY_SEND_OWN): {:.1} MB in {:.0} runs, {:.0} words in scatters; {:.2} ms \
-                 taking them out of the CPU sides",
+                "bytes of submissions' own sent up per frame (VICTORY_SEND_OWN, VICTORY_CARD_SCATTER={}): \
+                 {:.1} MB in {:.0} copy runs, {:.1} MB in {:.0} dense scatter runs, {:.0} pair words; \
+                 {:.2} ms taking them out of the CPU sides",
+                u8::from(send::card_scatter()),
                 t[0] / (1 << 20) as f64,
                 t[1],
+                t[5] / (1 << 20) as f64,
+                t[4],
                 t[2],
                 t[3] / 1000.0,
             );
@@ -5569,6 +5625,7 @@ impl Host {
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
+        let detile_batch = crate::gpu_detile::BatchGuard::begin();
         #[cfg(feature = "diagnostics")]
         let split = Split::begin();
         // The time a settle of flights takes inside this preparing: the
@@ -5706,6 +5763,10 @@ impl Host {
         }
         #[cfg(feature = "diagnostics")]
         let sending = crate::timeline::ticks();
+        // Flush any GPU-detiled VRAM staging buffers for this submission onto
+        // the compute queue and synchronize `self.queue` on the GPU fence
+        // before recording/executing `CopyTextureRegion` (zero CPU stall).
+        detile_batch.flush(&self.queue);
         if late {
             *submitted += 1;
             #[cfg(feature = "diagnostics")]
@@ -8742,6 +8803,8 @@ impl Meter {
         late_line(frames);
         crate::queue::behind_line(frames);
         card_clock_line(frames, ms);
+        crate::gpu_detile::line(frames);
+        adv_log_line(fps, ms, cpu, copy_ms, copy_mb, texture_ms, texture_mb, gpu, back_ms, back_mb, draws);
         #[cfg(feature = "diagnostics")]
         spans::line(frames);
         crate::shadow::back_line(frames);

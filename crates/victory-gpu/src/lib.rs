@@ -38,6 +38,8 @@ pub mod frame;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod book;
 #[cfg(windows)]
+mod gpu_detile;
+#[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod indirect;

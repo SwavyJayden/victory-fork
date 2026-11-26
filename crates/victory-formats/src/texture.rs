@@ -537,6 +537,17 @@ impl Layout {
         self.desc.swizzle == Swizzle::LINEAR || !self.pattern[0].is_empty()
     }
 
+    /// Coordinate-to-byte-offset bit-interleave lookup tables `[pat_x, pat_y, pat_z]`
+    /// within one tile block (`block_bytes` wide). Empty for linear or non-addressable modes.
+    pub fn pattern(&self) -> &[Vec<u32>; 3] {
+        self.pattern
+    }
+
+    /// Log2 of the tile block size in bytes (8 for 256B, 12 for 4KB, 16 for 64KB, 0 for linear).
+    pub fn block_log2(&self) -> u32 {
+        self.desc.swizzle.block_log2().unwrap_or(0)
+    }
+
     /// The slice and the depth inside it for `z` (an array slice or a 3D
     /// depth slice).
     fn split(&self, z: u32) -> (u32, u32) {
