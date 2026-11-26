@@ -104,6 +104,56 @@ fn early_budgets() -> (u64, u64) {
     })
 }
 
+fn bake_exact_from(val: Option<&std::ffi::OsStr>) -> bool {
+    val.is_none_or(|v| v != "0")
+}
+
+/// Whether a draw of the title's bake also pulls in slots due within the next
+/// [`BAKE_AHEAD`] frames after all currently-due slots (`VICTORY_BAKE_EXACT=0`:
+/// only slots due now). The pass schedules slots whose memory was written or
+/// mapped a frame or two later and whole uploads a few frames later for
+/// unnoticed updates; pulling those in ahead of a bake (after all due-now
+/// slots) keeps baked character/decoration targets from latching stale bytes.
+fn bake_exact() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| bake_exact_from(std::env::var_os("VICTORY_BAKE_EXACT").as_deref()))
+}
+
+fn recheck_soon_from(val: Option<&std::ffi::OsStr>) -> bool {
+    val.is_none_or(|v| v != "0")
+}
+
+/// Whether a texture found changed with nothing to tell of it is looked at
+/// again in the next frame (`VICTORY_RECHECK_SOON=0`: after four, as
+/// before).
+fn recheck_soon() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| recheck_soon_from(std::env::var_os("VICTORY_RECHECK_SOON").as_deref()))
+}
+
+/// Frames until the next recheck after uploading a texture picked by index:
+/// 1 frame when `changed_unnoticed` and [`recheck_soon`] are both true, else
+/// `RECHECK_FRAMES[0]` (4 frames).
+fn next_recheck_frames(changed_unnoticed: bool, soon: bool) -> u64 {
+    if changed_unnoticed && soon {
+        1
+    } else {
+        RECHECK_FRAMES[0]
+    }
+}
+
+/// Appends lookahead bake slots after all immediately-due (`on_time`) slots
+/// without duplicating any slot already scheduled due now.
+fn append_bake_ahead(due: &mut Vec<(u32, u64)>, ahead: Vec<(u32, u64)>) {
+    let known: std::collections::HashSet<u32> = due.iter().map(|&(index, _)| index).collect();
+    due.extend(ahead.into_iter().filter(|(index, _)| !known.contains(index)));
+}
+
+/// Frames ahead the pass before a bake takes slots from that are due only
+/// then ([`bake_exact`]): those of notices (1 and 2), and the first looks
+/// again ([`RECHECK_FRAMES`]).
+const BAKE_AHEAD: u64 = 12;
+
 /// The pixel shaders of the title's decoration bake (the title:
 /// `PS_BakeDecorations_*`), by the first 16 hex digits of their hash as the
 /// frame listings print it. They draw into a 256x256 corner of 2048x2048
@@ -172,16 +222,29 @@ fn cbv_card_slot_fits(gpu: u64, left: u64, clamped_len: u64) -> bool {
     gpu.is_multiple_of(256) && left >= clamped_len.next_multiple_of(256)
 }
 
+/// Computes the per-pass elapsed budget for `State::heap_textures`:
+/// `stage_span` (tripled during a backlog of `>= 1024` due-now slots when
+/// `catchup` is active) bounded by any explicit non-zero
+/// `VICTORY_HEAP_TEXTURE_MS` (`cap_ms`) minus what this frame has already
+/// spent (`spent_us`). An explicit non-zero `cap_ms` is a true per-frame
+/// ceiling and is never multiplied by catchup.
 fn effective_texture_span(
     stage_span: std::time::Duration,
+    catchup: bool,
+    on_time: usize,
     cap_ms: u64,
     spent_us: u64,
 ) -> std::time::Duration {
+    let stage = if catchup && on_time >= 1024 {
+        stage_span.saturating_mul(3)
+    } else {
+        stage_span
+    };
     if cap_ms == 0 {
-        return stage_span;
+        return stage;
     }
     let remaining_us = cap_ms.saturating_mul(1000).saturating_sub(spent_us);
-    stage_span.min(std::time::Duration::from_micros(remaining_us))
+    stage.min(std::time::Duration::from_micros(remaining_us))
 }
 
 /// With [`table_on_card`]: the host GPU address a table constant buffer view
@@ -852,6 +915,30 @@ pub(crate) fn dispatched() -> u64 {
 /// What a render target or depth view of the host is made from: the host
 /// texture, and [`crate::descriptor::RtvRecord::key`].
 type TargetKey = (usize, (usize, [u32; 7]));
+/// All render targets and optional depth view bound on a host list.
+type BoundTargets = (Vec<TargetKey>, Option<TargetKey>);
+
+fn bind_cache_from(val: Option<&std::ffi::OsStr>) -> bool {
+    val.is_none_or(|v| v != "0")
+}
+
+/// Whether `State::set_targets` skips redundant host view creation and
+/// `OMSetRenderTargets` when the host list already has the exact same views
+/// (`VICTORY_BIND_CACHE=0` sets them every time).
+fn bind_cache() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| bind_cache_from(std::env::var_os("VICTORY_BIND_CACHE").as_deref()))
+}
+
+/// Updates `cached` to `now` and returns `true` when `enabled` and the host
+/// list already holds the exact same render targets and depth view.
+fn targets_unchanged(cached: &mut Option<BoundTargets>, now: BoundTargets, enabled: bool) -> bool {
+    if enabled && cached.as_ref() == Some(&now) {
+        return true;
+    }
+    *cached = Some(now);
+    false
+}
 
 fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -1091,13 +1178,9 @@ impl State {
             dsv.as_ref()
                 .map(|(texture, record, _)| (texture.as_raw() as usize, record.key())),
         );
-        static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *CACHE.get_or_init(|| std::env::var("VICTORY_BIND_CACHE").map_or(true, |v| v != "0"))
-            && self.host_targets.as_ref() == Some(&now)
-        {
+        if targets_unchanged(&mut self.host_targets, now, bind_cache()) {
             return;
         }
-        self.host_targets = Some(now);
         let rtvs: Vec<_> = views
             .iter()
             .map(|(texture, desc)| host.rtv(*texture, desc.as_ref()))
@@ -2286,7 +2369,15 @@ impl State {
         if room {
             host.texture_slots_waiting(frame);
         }
-        let (due, census) = host.texture_slots_due(frame, 4096);
+        let pass_budget = PASS_BUDGET.get();
+        let bake_ahead = pass_budget.is_some_and(|(_, _, bake)| bake) && bake_exact();
+        let (mut due, census) = host.texture_slots_due(frame, if bake_ahead { 1 << 16 } else { 4096 });
+        // (Those that are due later after all that are due.)
+        let on_time = due.len();
+        if bake_ahead {
+            let (ahead, _) = host.texture_slots_due(frame + BAKE_AHEAD, 1 << 16);
+            append_bake_ahead(&mut due, ahead);
+        }
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
             count.store(now, Ordering::Relaxed);
@@ -2334,16 +2425,18 @@ impl State {
         });
         // A backlog (a scene's first minutes: 22,000 slots due, 2-3 minutes of black
         // surfaces at 192 MB a frame) gets three times the bytes and the time until it
-        // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
+        // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget. When the user
+        // explicitly sets a non-zero `VICTORY_HEAP_TEXTURE_MS`, `cap_ms` remains a
+        // hard per-frame ceiling (not multiplied by 3) so live 3D scenes stay smooth,
+        // while `early_textures` (`PASS_BUDGET`) keeps its own loading/bake budget.
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
-        let (per_frame, span) = if catchup && due.len() >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
-        let effective_cap = if catchup && due.len() >= 1024 { cap_ms.saturating_mul(3) } else { cap_ms };
-        let span = effective_texture_span(span, effective_cap, SPENT_US.load(Ordering::Relaxed));
+        let per_frame = if catchup && on_time >= 1024 { per_frame * 3 } else { per_frame };
+        let span = effective_texture_span(span, catchup, on_time, cap_ms, SPENT_US.load(Ordering::Relaxed));
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
-        let (span, bytes_at_most, baking) = match PASS_BUDGET.get() {
+        let (span, bytes_at_most, baking) = match pass_budget {
             Some((ms, bytes, baking)) => (
                 std::time::Duration::from_millis(ms),
                 SPENT.load(Ordering::Relaxed).saturating_add(bytes),
@@ -2354,13 +2447,13 @@ impl State {
         let began = std::time::Instant::now();
         BAKE_SERVED.store(0, Ordering::Relaxed);
         let mut served = true;
-        let due_count = due.len() as u64;
+        let due_count = on_time as u64;
         // Bytes of textures uploaded in this pass so far: used to gate
         // giant textures under a budget (one alone is allowed when nothing
         // else has been done yet, to avoid starvation).
         let mut done_bytes: u64 = 0;
         for (index, write) in due {
-            if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
+            if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() >= span {
                 served = false;
                 break;
             }
@@ -2383,6 +2476,12 @@ impl State {
             // first look for the rest of the run. The look reads 48 KiB;
             // only a changed texture is uploaded again.
             // `VICTORY_HEAP_RECHECK=0`: uploaded once, as before.
+            // One found changed by such a look is looked at in the next frame
+            // again: the textures left that change unnoticed are ones the
+            // title paints all the time through another view of their pages
+            // (all their blocks are shown at other addresses too), and each
+            // was shown four frames late, over and over.
+            let mut again_in = RECHECK_FRAMES[0];
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
                 if crate::texture::fingerprint(at, len) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
@@ -2394,6 +2493,7 @@ impl State {
                     }
                     continue;
                 }
+                again_in = next_recheck_frames(true, recheck_soon());
                 let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
                 if n < 200 || n.is_multiple_of(1000) {
                     tracing::warn!(
@@ -2493,8 +2593,8 @@ impl State {
             // else has been done yet, to avoid starvation of textures that
             // are always large.
             const PER_TEXTURE_BUDGET: u64 = 64 << 20;
-            if PASS_BUDGET.get().is_some() {
-                if began.elapsed() > span {
+            if pass_budget.is_some() {
+                if began.elapsed() >= span {
                     served = false;
                     break;
                 }
@@ -2616,7 +2716,7 @@ impl State {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
                     let print = crate::texture::fingerprint(at, len);
-                    host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[0], (at, len), print, 0, frame);
+                    host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
                 }
                 None => host.texture_slot_done(index, write, again),
             }
@@ -4854,19 +4954,115 @@ mod tests {
     #[test]
     fn heap_texture_ms_budget_caps_span_only_when_nonzero() {
         use std::time::Duration;
-        let stage = Duration::from_millis(750);
-        // Default 0 = unlimited by VICTORY_HEAP_TEXTURE_MS (keeps stage/catchup span).
-        assert_eq!(effective_texture_span(stage, 0, 0), stage);
-        assert_eq!(effective_texture_span(stage, 0, 50_000), stage);
-        // Non-zero caps per-frame elapsed budget, accounting for prior frame spend.
-        assert_eq!(effective_texture_span(stage, 16, 0), Duration::from_millis(16));
-        assert_eq!(effective_texture_span(stage, 16, 12_000), Duration::from_millis(4));
-        assert_eq!(effective_texture_span(stage, 16, 20_000), Duration::ZERO);
-        // Never extends a shorter stage span.
+        let stage = Duration::from_millis(250);
+        // Default 0 = unlimited by VICTORY_HEAP_TEXTURE_MS; catchup triples stage span
+        // only when due-now (`on_time`) >= 1024.
+        assert_eq!(effective_texture_span(stage, true, 500, 0, 0), stage);
+        assert_eq!(effective_texture_span(stage, true, 1024, 0, 0), Duration::from_millis(750));
+        assert_eq!(effective_texture_span(stage, false, 2048, 0, 50_000), stage);
+        // Explicit non-zero cap_ms is a TRUE per-frame hard ceiling: NEVER multiplied by 3
+        // under catchup, even with thousands of backlog slots due!
         assert_eq!(
-            effective_texture_span(Duration::from_millis(5), 16, 0),
+            effective_texture_span(stage, true, 4096, 120, 0),
+            Duration::from_millis(120)
+        );
+        assert_eq!(
+            effective_texture_span(stage, true, 4096, 120, 40_000),
+            Duration::from_millis(80)
+        );
+        assert_eq!(
+            effective_texture_span(stage, true, 4096, 120, 120_000),
+            Duration::ZERO
+        );
+        assert_eq!(
+            effective_texture_span(stage, true, 4096, 120, 180_000),
+            Duration::ZERO
+        );
+        // Also accounts for prior frame spend without catchup and never extends a shorter stage span.
+        assert_eq!(effective_texture_span(stage, false, 10, 16, 12_000), Duration::from_millis(4));
+        assert_eq!(
+            effective_texture_span(Duration::from_millis(5), false, 10, 16, 0),
             Duration::from_millis(5)
         );
+    }
+
+    #[test]
+    fn bind_cache_hits_identical_targets_and_invalidates_on_view_change_clear_or_reset() {
+        use std::ffi::OsStr;
+        assert!(bind_cache_from(None));
+        assert!(bind_cache_from(Some(OsStr::new("1"))));
+        assert!(!bind_cache_from(Some(OsStr::new("0"))));
+
+        // Write RTV/DSV records into fixed handles and overwrite them in place to confirm
+        // caching compares the actual views (host texture + RtvRecord::key), not handles.
+        let mut rtv_slot = [0u64; 16];
+        let mut dsv_slot = [0u64; 16];
+        let rtv_handle = rtv_slot.as_mut_ptr() as u64;
+        let dsv_handle = dsv_slot.as_mut_ptr() as u64;
+        let res_rtv = 0x1111_0000usize as This;
+        let res_dsv = 0x2222_0000usize as This;
+        let desc_a = [28u32, 4, 0, 0, 0, 0];
+        let desc_b = [28u32, 4, 1, 0, 0, 0];
+        let dsv_desc = [45u32, 3, 0, 0, 0, 0];
+        crate::descriptor::create_rtv(std::ptr::null(), res_rtv, &desc_a, rtv_handle);
+        crate::descriptor::create_dsv(std::ptr::null(), res_dsv, &dsv_desc, dsv_handle);
+
+        let key_rtv_a = (0xA000usize, crate::descriptor::rtv_record(rtv_handle).unwrap().key());
+        let key_dsv = (0xD000usize, crate::descriptor::dsv_record(dsv_handle).unwrap().key());
+
+        let mut state = State::default();
+        assert!(state.host_targets.is_none());
+        // First bind misses and populates cache.
+        assert!(!targets_unchanged(&mut state.host_targets, (vec![key_rtv_a], Some(key_dsv)), true));
+        // Identical repeat bind hits cache.
+        assert!(targets_unchanged(&mut state.host_targets, (vec![key_rtv_a], Some(key_dsv)), true));
+        // VICTORY_BIND_CACHE=0 forces a miss even on identical views.
+        assert!(!targets_unchanged(&mut state.host_targets, (vec![key_rtv_a], Some(key_dsv)), false));
+
+        // Overwriting the descriptor behind the SAME handle invalidates the cache.
+        crate::descriptor::create_rtv(std::ptr::null(), res_rtv, &desc_b, rtv_handle);
+        let key_rtv_b = (0xA000usize, crate::descriptor::rtv_record(rtv_handle).unwrap().key());
+        assert!(!targets_unchanged(&mut state.host_targets, (vec![key_rtv_b], Some(key_dsv)), true));
+        assert!(targets_unchanged(&mut state.host_targets, (vec![key_rtv_b], Some(key_dsv)), true));
+
+        // New host texture at the same title resource pointer also invalidates the cache.
+        let key_rtv_new_host = (0xB000usize, crate::descriptor::rtv_record(rtv_handle).unwrap().key());
+        assert!(!targets_unchanged(&mut state.host_targets, (vec![key_rtv_new_host], Some(key_dsv)), true));
+
+        // Clearing render targets (empty RTVs, no DSV) misses once, then hits on repeat clear.
+        assert!(!targets_unchanged(&mut state.host_targets, (Vec::new(), None), true));
+        assert!(targets_unchanged(&mut state.host_targets, (Vec::new(), None), true));
+
+        // Command list reset clears host_targets so the next bind always sets host state.
+        state.reset(std::ptr::null());
+        assert!(state.host_targets.is_none());
+        assert!(!targets_unchanged(&mut state.host_targets, (Vec::new(), None), true));
+    }
+
+    #[test]
+    fn bake_ahead_puts_due_now_first_without_duplicates() {
+        use std::ffi::OsStr;
+        assert!(bake_exact_from(None));
+        assert!(bake_exact_from(Some(OsStr::new("1"))));
+        assert!(!bake_exact_from(Some(OsStr::new("0"))));
+
+        let mut due = vec![(10, 1), (20, 2)];
+        let on_time = due.len();
+        append_bake_ahead(&mut due, vec![(20, 2), (30, 3), (10, 1), (40, 4)]);
+        assert_eq!(on_time, 2);
+        assert_eq!(due, vec![(10, 1), (20, 2), (30, 3), (40, 4)]);
+    }
+
+    #[test]
+    fn recheck_soon_schedules_next_frame_for_unnoticed_changes() {
+        use std::ffi::OsStr;
+        assert!(recheck_soon_from(None));
+        assert!(recheck_soon_from(Some(OsStr::new("1"))));
+        assert!(!recheck_soon_from(Some(OsStr::new("0"))));
+
+        assert_eq!(next_recheck_frames(false, true), RECHECK_FRAMES[0]);
+        assert_eq!(next_recheck_frames(true, true), 1);
+        assert_eq!(next_recheck_frames(true, false), RECHECK_FRAMES[0]);
     }
 
     #[test]
