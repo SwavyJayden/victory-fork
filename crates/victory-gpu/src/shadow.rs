@@ -182,17 +182,18 @@ fn parse_card_limits(
     let parse = |val: Option<&str>, default: u64| {
         val.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default)
     };
-    let mut min_bytes = parse(min_mb, 1).max(1) << 20;
-    let max_bytes = parse(max_mb, default_card_buffers_mb(vram_budget)) << 20;
+    let mut min_bytes = parse(min_mb, 1).max(1).saturating_mul(1 << 20);
+    let max_bytes = parse(max_mb, default_card_buffers_mb(vram_budget)).saturating_mul(1 << 20);
     // `VICTORY_CARD_BUFFERS_MIN_KB` (after fxceless c36971b2) says the
     // least size in KiB, so that it can go under 1 MiB: 64 is every title
-    // buffer. Copies under 1 MiB are nearly all there are and few bytes;
-    // in the PC's memory every load, store and atomic a shader does on
-    // them crosses the bus.
+    // buffer, clamped to a 64 KiB (`PIECE`) floor so GPU 64 KiB card-compare
+    // pieces align cleanly. Copies under 1 MiB are nearly all there are and
+    // few bytes; in the PC's memory every load, store and atomic a shader
+    // does on them crosses the bus.
     if let Some(kib) = min_kb.and_then(|v| v.trim().parse::<u64>().ok())
         && kib > 0
     {
-        min_bytes = kib.saturating_mul(1 << 10);
+        min_bytes = kib.saturating_mul(1 << 10).max(PIECE as u64);
     }
     (min_bytes, max_bytes)
 }
@@ -378,8 +379,15 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
 
 fn parse_gpu_upload_copies(level: Option<&str>, mb: Option<&str>) -> (u8, u64) {
     let level = level.and_then(|v| v.trim().parse::<u8>().ok()).unwrap_or(0).min(2);
-    let most = mb.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(2048) << 20;
+    let most = mb.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(2048).saturating_mul(1 << 20);
     (level, most)
+}
+
+/// Whether ReBAR GPU upload heap copies are enabled for a copy of this kind
+/// (`window` outside buffers at level >= 1; title buffers/views at level >= 2)
+/// with a non-zero byte budget.
+fn rebar_enabled_for(level: u8, most: u64, window: bool) -> bool {
+    level >= if window { 1 } else { 2 } && most > 0
 }
 
 /// Whether host copies with no card side are made in the card's memory,
@@ -422,22 +430,35 @@ pub(crate) fn bar_copies() -> [u64; 3] {
     BAR_COPIES.each_ref().map(|b| b.load(Ordering::Relaxed))
 }
 
+/// Attempts to allocate a host copy of `size` bytes in a GPU upload heap
+/// (ReBAR / GDDR) when [`gpu_upload_copies`] enables it for this kind of copy
+/// (`window` vs title buffer/view), VRAM stays under 80% of budget, and the
+/// `VICTORY_GPU_UPLOAD_COPIES_MB` budget has room.
+fn try_gpu_upload_buffer(size: u64, window: bool) -> Option<(ID3D12Resource, *mut u8, u64)> {
+    let (level, most) = gpu_upload_copies();
+    if !rebar_enabled_for(level, most, window) {
+        return None;
+    }
+    let host = host()?;
+    if !host.video_memory().is_none_or(|[budget, used, ..]| used.saturating_add(size) <= budget / 10 * 8) {
+        return None;
+    }
+    if BAR_COPIES[1].fetch_add(size, Ordering::Relaxed).saturating_add(size) <= most
+        && let Some((buffer, data)) = host.card_shared_buffer(size)
+    {
+        BAR_COPIES[0].fetch_add(1, Ordering::Relaxed);
+        return Some((buffer, data, size));
+    }
+    BAR_COPIES[1].fetch_sub(size, Ordering::Relaxed);
+    None
+}
+
 /// The buffer of a host copy of `size` bytes that has no card side (a
 /// `window` or not): in a GPU upload heap with [`gpu_upload_copies`], else
 /// a shared buffer in the PC's memory; and with the first, its bytes.
 fn pc_copy_buffer(size: u64, window: bool) -> Option<(ID3D12Resource, *mut u8, Option<u64>)> {
-    let (level, most) = gpu_upload_copies();
-    if level >= if window { 1 } else { 2 }
-        && let Some(host) = host()
-        && host.video_memory().is_none_or(|[budget, used, ..]| used + size <= budget / 10 * 8)
-    {
-        if BAR_COPIES[1].fetch_add(size, Ordering::Relaxed) + size <= most
-            && let Some((buffer, data)) = host.card_shared_buffer(size)
-        {
-            BAR_COPIES[0].fetch_add(1, Ordering::Relaxed);
-            return Some((buffer, data, Some(size)));
-        }
-        BAR_COPIES[1].fetch_sub(size, Ordering::Relaxed);
+    if let Some((buffer, data, bar)) = try_gpu_upload_buffer(size, window) {
+        return Some((buffer, data, Some(bar)));
     }
     let (buffer, data) = host()?.shared_buffer(size)?;
     Some((buffer, data, None))
@@ -823,7 +844,17 @@ mod card_tests {
         assert_eq!(parse_card_limits(Some(24 * GIB), None, None, None), (1 << 20, 3072 << 20));
         assert_eq!(parse_card_limits(Some(16 * GIB), None, Some("64"), None), (64 << 10, 2048 << 20));
         assert_eq!(parse_card_limits(Some(16 * GIB), Some("4"), Some("128"), None), (128 << 10, 2048 << 20));
-        // Zero or invalid `VICTORY_CARD_BUFFERS_MIN_KB` is ignored.
+        assert_eq!(parse_card_limits(Some(16 * GIB), None, Some("256"), None), (256 << 10, 2048 << 20));
+        // Positive `VICTORY_CARD_BUFFERS_MIN_KB` below 64 KiB clamps to the 64 KiB piece floor.
+        for small in ["1", "16", "32", "63", " 48 "] {
+            assert_eq!(
+                parse_card_limits(Some(16 * GIB), Some("4"), Some(small), None),
+                (64 << 10, 2048 << 20),
+                "min_kb={small}"
+            );
+        }
+        // `VICTORY_CARD_BUFFERS_MIN_MB` preserved when `MIN_KB` is unset, zero, or invalid.
+        assert_eq!(parse_card_limits(Some(16 * GIB), Some("4"), None, None), (4 << 20, 2048 << 20));
         assert_eq!(parse_card_limits(Some(16 * GIB), Some("4"), Some("0"), None), (4 << 20, 2048 << 20));
         assert_eq!(parse_card_limits(Some(16 * GIB), None, Some("bad"), Some("512")), (1 << 20, 512 << 20));
     }
@@ -2103,6 +2134,40 @@ fn back_piece(
 /// compared, changed runs put in, and their bytes.
 static MERGED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
+/// Why [`Shadow::merge_under_writes`] gave up (the flights are then
+/// settled whole, 64 to 94 ms each in run 282), since they were last
+/// taken: the copy's memory is not watched; the write tracking had no
+/// answer for the range; more changed runs than `VICTORY_MERGE_RUNS`
+/// leaves; a copy in PC memory without its snapshot.
+static MERGE_GAVE_UP: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// [`MERGE_GAVE_UP`], taken.
+#[allow(dead_code)]
+pub(crate) fn merge_gave_up() -> [u64; 4] {
+    [0, 1, 2, 3].map(|i| MERGE_GAVE_UP[i].swap(0, Ordering::Relaxed))
+}
+
+/// With the frame line: why [`Shadow::merge_under_writes`] gave up since the
+/// last line (causing flights to settle whole).
+#[allow(dead_code)]
+pub(crate) fn merge_giveup_line(frames: f64) {
+    let gave_up = merge_gave_up();
+    let total: u64 = gave_up.iter().sum();
+    if total == 0 {
+        return;
+    }
+    tracing::info!(
+        "in these frames the merge under flights gave up ({total} times, {:.1}/frame; flights settled whole): \
+         {} because the copy's memory is not watched, {} because the write tracking had no answer, \
+         {} for more changed runs than VICTORY_MERGE_RUNS leaves, {} for a copy in PC memory without its snapshot",
+        total as f64 / frames,
+        gave_up[0],
+        gave_up[1],
+        gave_up[2],
+        gave_up[3]
+    );
+}
+
 /// [`MERGED`], taken.
 pub(crate) fn merged_stats() -> [u64; 3] {
     [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
@@ -2219,31 +2284,38 @@ const COPY_CHANGED_CHUNK: usize = 256;
 
 /// The stretches of `now` that differ from `was` (of one length), in
 /// whole chunks of `chunk` bytes (the last one shorter), as (offset,
-/// bytes) in order, chunks side by side made one stretch.
+/// bytes) in order, chunks side by side made one stretch. Uses
+/// [`first_difference`] (32-byte SIMD chunks) to skip unchanged spans
+/// without invoking per-chunk comparisons over equal memory.
 fn changed_chunks(now: &[u8], was: &[u8], chunk: usize) -> Vec<(usize, usize)> {
     let n = now.len().min(was.len());
+    if chunk == 0 || n == 0 {
+        return Vec::new();
+    }
     let mut out: Vec<(usize, usize)> = Vec::new();
     let mut at = 0;
     while at < n {
-        let len = chunk.min(n - at);
-        if now[at..at + len] != was[at..at + len] {
-            match out.last_mut() {
-                Some(last) if last.0 + last.1 == at => last.1 += len,
-                _ => out.push((at, len)),
-            }
+        let Some(diff) = first_difference(&now[at..n], &was[at..n]) else {
+            break;
+        };
+        let hit = at + (diff / chunk) * chunk;
+        let len = chunk.min(n - hit);
+        match out.last_mut() {
+            Some(last) if last.0 + last.1 == hit => last.1 += len,
+            _ => out.push((hit, len)),
         }
-        at += len;
+        at = hit + len;
     }
     out
 }
 
 /// The runs of bytes where `now` differs from `was` (of one length), as
 /// (offset, bytes) in order: every differing byte is in a run and no equal
-/// byte is. Uses AVX2 (32 bytes per step) when available.
+/// byte is. Uses AVX2 (64/32 bytes per step) when available.
 fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     let n = now.len().min(was.len());
     #[cfg(target_arch = "x86_64")]
-    if n >= 64 && std::arch::is_x86_feature_detected!("avx2") {
+    if n >= 32 && std::arch::is_x86_feature_detected!("avx2") {
         // SAFETY: AVX2 is detected and both slices have length >= `n`.
         return unsafe { changed_runs_avx2(&now[..n], &was[..n]) };
     }
@@ -2314,6 +2386,24 @@ unsafe fn changed_runs_avx2(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
             differ &= u64::MAX << (first + count);
         }
         i += 64;
+    }
+    if i + 32 <= n {
+        // SAFETY: `i + 32 <= n` for both slices.
+        let mut differ = unsafe {
+            let a0 = _mm256_loadu_si256(now.as_ptr().add(i).cast());
+            let b0 = _mm256_loadu_si256(was.as_ptr().add(i).cast());
+            !(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a0, b0)) as u32)
+        };
+        while differ != 0 {
+            let first = differ.trailing_zeros();
+            let count = (differ >> first).trailing_ones();
+            push(i + first as usize, count as usize);
+            if first + count >= 32 {
+                break;
+            }
+            differ &= u32::MAX << (first + count);
+        }
+        i += 32;
     }
     while i < n {
         if now[i] != was[i] {
@@ -2470,12 +2560,82 @@ mod merge_tests {
     }
 
     #[test]
+    fn changed_chunks_wide_matches_naive_on_unaligned_and_edge_bytes() {
+        let mut seed = 0x51a7_9911u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed >> 8
+        };
+        let naive = |now: &[u8], was: &[u8], chunk: usize| -> Vec<(usize, usize)> {
+            let n = now.len().min(was.len());
+            if chunk == 0 || n == 0 {
+                return Vec::new();
+            }
+            let mut out: Vec<(usize, usize)> = Vec::new();
+            let mut at = 0;
+            while at < n {
+                let len = chunk.min(n - at);
+                if now[at..at + len] != was[at..at + len] {
+                    match out.last_mut() {
+                        Some(last) if last.0 + last.1 == at => last.1 += len,
+                        _ => out.push((at, len)),
+                    }
+                }
+                at += len;
+            }
+            out
+        };
+        assert!(changed_chunks(&[1, 2], &[3, 4], 0).is_empty());
+        assert!(changed_chunks(&[], &[], 256).is_empty());
+        for len in [0usize, 1, 31, 32, 33, 63, 64, 65, 255, 256, 257, 513, 1025] {
+            let was: Vec<u8> = (0..len).map(|i| (i * 19 + 3) as u8).collect();
+            for edge in [0usize, 31, 32, 33, 63, 64, 255, 256, len.saturating_sub(1)] {
+                if edge >= len {
+                    continue;
+                }
+                let mut now = was.clone();
+                now[edge] ^= 0xff;
+                for chunk in [1usize, 32, 64, 256] {
+                    assert_eq!(changed_chunks(&now, &was, chunk), naive(&now, &was, chunk), "len {len} edge {edge} chunk {chunk}");
+                }
+            }
+        }
+        // Multiple disjoint & adjacent runs across random unaligned lengths.
+        for round in 0..100 {
+            let len = next() as usize % 1500;
+            let was: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+            let mut now = was.clone();
+            for _ in 0..next() % 16 {
+                if len == 0 {
+                    break;
+                }
+                let at = next() as usize % len;
+                now[at] ^= 0x3c;
+            }
+            for chunk in [1usize, 17, 32, 64, 256] {
+                assert_eq!(changed_chunks(&now, &was, chunk), naive(&now, &was, chunk), "round {round} len {len} chunk {chunk}");
+            }
+        }
+    }
+
+    #[test]
     fn changed_runs_avx2_matches_scalar() {
         let mut seed = 0x1234_5678u32;
         let mut next = || {
             seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
             seed >> 8
         };
+        // Explicit boundary lengths and edge bytes around 32- and 64-byte SIMD boundaries.
+        for len in [0usize, 1, 31, 32, 33, 63, 64, 65, 95, 96, 97] {
+            let was: Vec<u8> = (0..len).map(|i| (i * 11 + 5) as u8).collect();
+            let mut now = was.clone();
+            for edge in [0usize, 31, 32, 63, 64, len.saturating_sub(1)] {
+                if edge < len {
+                    now[edge] ^= 0x81;
+                }
+            }
+            assert_eq!(super::changed_runs(&now, &was), super::changed_runs_scalar(&now, &was), "edges len {len}");
+        }
         for round in 0..200 {
             let n = next() as usize % 600;
             let was: Vec<u8> = (0..n).map(|_| next() as u8).collect();
@@ -2854,7 +3014,11 @@ pub(crate) fn let_go_idle() {
             })
             .map(|(key, _)| *key)
             .collect();
-        idle.into_iter().filter_map(|key| map.remove(&key)).collect()
+        let removed: Vec<Arc<Shadow>> = idle.into_iter().filter_map(|key| map.remove(&key)).collect();
+        if !removed.is_empty() {
+            tables_changed();
+        }
+        removed
     };
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
@@ -3630,6 +3794,7 @@ impl Shadow {
             return false;
         }
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+            MERGE_GAVE_UP[0].fetch_add(1, Ordering::Relaxed);
             return true;
         }
         let base = start / PAGE;
@@ -3642,6 +3807,7 @@ impl Shadow {
             // the submission's asking covered the range, else the kernel,
             // else the guards.
             let Some((now, written)) = crate::watch::writes(a, e, true) else {
+                MERGE_GAVE_UP[1].fetch_add(1, Ordering::Relaxed);
                 return true;
             };
             let stale: Vec<usize> = {
@@ -3690,6 +3856,7 @@ impl Shadow {
                         let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                         let runs = joined_over(changed_runs(title, held), merge_gap());
                         if runs.len() > *runs_left {
+                            MERGE_GAVE_UP[2].fetch_add(1, Ordering::Relaxed);
                             return true;
                         }
                         *runs_left -= runs.len();
@@ -3719,6 +3886,7 @@ impl Shadow {
                         }
                         MERGED[0].fetch_add(1, Ordering::Relaxed);
                         let Some(snapshot) = before.as_mut() else {
+                            MERGE_GAVE_UP[3].fetch_add(1, Ordering::Relaxed);
                             return true;
                         };
                         // SAFETY: the snapshot's allocation holds the copy's
@@ -4362,11 +4530,36 @@ struct Entry {
 /// written when a buffer comes, goes or gets its copy: readers share it.
 static BUFFERS: std::sync::RwLock<BTreeMap<(u64, usize), Entry>> = std::sync::RwLock::new(BTreeMap::new());
 
-fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
+/// Write guard for [`BUFFERS`] that bumps [`TABLES_CHANGED`] after all
+/// mutations complete and before releasing the write lock, guaranteeing no
+/// thread can observe the new generation before the mutated map is visible.
+struct BuffersWriteGuard(std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>>);
+
+impl std::ops::Deref for BuffersWriteGuard {
+    type Target = BTreeMap<(u64, usize), Entry>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for BuffersWriteGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for BuffersWriteGuard {
+    fn drop(&mut self) {
+        tables_changed();
+    }
+}
+
+fn buffers() -> BuffersWriteGuard {
     let map = BUFFERS.write().unwrap_or_else(|e| e.into_inner());
     // What threads remember of it ([`FOUND`]) is of before.
     BUFFERS_CHANGED.fetch_add(1, Ordering::SeqCst);
-    map
+    BuffersWriteGuard(map)
 }
 
 /// How often [`BUFFERS`] was taken to be changed.
@@ -4469,7 +4662,11 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
             .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
             .map(|(key, _)| *key)
             .collect();
+        let before = gone.len();
         gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
+        if gone.len() > before {
+            tables_changed();
+        }
     }
     {
         // As `lookup` finds a buffer: among the 256 that start below.
@@ -4575,8 +4772,143 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
     lookup(address, len, true)
 }
 
+/// Counts the changes of the tables [`lookup`] reads (`BUFFERS` and `LOOSE`)
+/// that can change what an ask finds: a buffer registered or released, a copy
+/// inserted or taken out of a table, a window made or let go. A thread's
+/// remembered answers ([`LOOKUP_FOUND`]) are valid for one count.
+static TABLES_CHANGED: AtomicU64 = AtomicU64::new(0);
+
+fn tables_changed() {
+    TABLES_CHANGED.fetch_add(1, Ordering::Release);
+}
+
+/// Since the last frame line: asks answered from a thread's own lookup cache,
+/// and asks that went to the tables (`VICTORY_LOOKUP_CACHE`).
+pub(crate) static LOOKUPS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// With the frame line: asks for a buffer's host copy answered from the asking
+/// thread's lookup cache vs. the tables (`VICTORY_LOOKUP_CACHE`).
+#[allow(dead_code)]
+pub(crate) fn lookup_cache_line(frames: f64) {
+    let hits = LOOKUPS[0].swap(0, Ordering::Relaxed);
+    let misses = LOOKUPS[1].swap(0, Ordering::Relaxed);
+    if hits == 0 && misses == 0 && lookup_cache_mode() == 0 {
+        return;
+    }
+    tracing::info!(
+        "asks for a buffer's host copy per frame: {:.0} answered from the asking thread's memory of them, {:.0} from the tables (VICTORY_LOOKUP_CACHE)",
+        hits as f64 / frames,
+        misses as f64 / frames
+    );
+}
+
+/// Parses `VICTORY_LOOKUP_CACHE`: `0` off, `1` on, `2` alternating (`alt`).
+fn parse_lookup_cache_mode(val: Option<&str>) -> u8 {
+    match val.map(str::trim) {
+        Some("1") => 1,
+        Some("alt") => 2,
+        _ => 0,
+    }
+}
+
+fn lookup_cache_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| parse_lookup_cache_mode(std::env::var("VICTORY_LOOKUP_CACHE").ok().as_deref()))
+}
+
+/// Whether a thread remembers what its asks found across both `BUFFERS` and
+/// `LOOSE` (upstream PR #1237; `VICTORY_LOOKUP_CACHE=1|alt`).
+///
+/// Off by default (`0`); `1` enables the full lock-free generation-validated
+/// thread-local cache; `alt` alternates twenty seconds on / twenty seconds off
+/// with a log line on each toggle.
+fn lookup_cache() -> bool {
+    match lookup_cache_mode() {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "a thread remembers what its asks for a buffer's host copy found from now (VICTORY_LOOKUP_CACHE=alt): {}",
+                    if on { "ON" } else { "off, every ask goes to the tables as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// The most asks a thread remembers in [`LOOKUP_FOUND`] before it clears and
+/// starts again.
+const LOOKUP_CACHE_MOST: usize = 8192;
+
+type LookupFound = std::collections::HashMap<(u64, u64, bool), std::sync::Weak<Shadow>>;
+
+thread_local! {
+    /// What this thread's asks found across `BUFFERS` and `LOOSE`, tagged with
+    /// the [`TABLES_CHANGED`] generation they came from.
+    static LOOKUP_FOUND: std::cell::RefCell<(u64, LookupFound)> = std::cell::RefCell::new((u64::MAX, LookupFound::new()));
+}
+
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
-    let quick = quick_find();
+    if lookup_cache() {
+        return lookup_cached(address, len, any);
+    }
+    lookup_tables(address, len, any, lookup_cache_mode() == 0 && quick_find())
+}
+
+fn lookup_cached(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+    let changes = TABLES_CHANGED.load(Ordering::Acquire);
+    let found = LOOKUP_FOUND.with(|f| {
+        let f = &mut *f.borrow_mut();
+        if f.0 != changes {
+            f.1.clear();
+            f.0 = changes;
+        }
+        f.1.get(&(address, len, any)).and_then(std::sync::Weak::upgrade)
+    });
+    if let Some(shadow) = found {
+        LOOKUPS[0].fetch_add(1, Ordering::Relaxed);
+        if shadow.window {
+            // As `loose` notes an ask of a window it hands out (read-first to
+            // avoid cache-line bouncing across recording threads).
+            let now = crate::host::moment();
+            if shadow.used.load(Ordering::Relaxed) != now {
+                shadow.used.store(now, Ordering::Relaxed);
+            }
+            if shadow.asked[0].load(Ordering::Relaxed) > address {
+                shadow.asked[0].fetch_min(address, Ordering::Relaxed);
+            }
+            let end = address.saturating_add(len.max(1));
+            if shadow.asked[1].load(Ordering::Relaxed) < end {
+                shadow.asked[1].fetch_max(end, Ordering::Relaxed);
+            }
+            if len <= 1 {
+                shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        return Some(shadow);
+    }
+    LOOKUPS[1].fetch_add(1, Ordering::Relaxed);
+    let shadow = lookup_tables(address, len, any, false)?;
+    LOOKUP_FOUND.with(|f| {
+        let f = &mut *f.borrow_mut();
+        // Tagged with the count read before the tables: any mutation since
+        // clears it on the next ask.
+        if f.0 == changes {
+            if f.1.len() >= LOOKUP_CACHE_MOST {
+                f.1.clear();
+            }
+            f.1.insert((address, len, any), Arc::downgrade(&shadow));
+        }
+    });
+    Some(shadow)
+}
+
+fn lookup_tables(address: u64, len: u64, any: bool, quick: bool) -> Option<Arc<Shadow>> {
     if quick && let Some(shadow) = found(address, len) {
         return Some(shadow);
     }
@@ -4616,17 +4948,13 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
         let size = len.next_multiple_of(1 << 16);
-        // In place, if asked for and the memory can be opened
-        // (`crate::inplace::place_for`): the buffer is the title's own
-        // memory. Not the big ones `cards` puts in the card's memory: those
-        // are read too often to stay in the PC's.
-        let big = cards() && size >= card_limits().0;
-        if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
-            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
-            return entry.shadow.clone();
-        }
         // A big one, with `cards`: shaders get a buffer in the card's own
         // memory, and the CPU's side is made beside it in PC memory.
+        // Otherwise, when ReBAR GPU upload copies are enabled for title
+        // buffers, allocate in full-speed GDDR before falling back to in-place
+        // system RAM (`crate::inplace::place_for`, only for `!big`) and finally
+        // a normal PC shared buffer.
+        let big = cards() && size >= card_limits().0;
         let (buffer, data, card, bar) = match card_for(size) {
             Some(on_card) => {
                 let Some((staging, data)) = host().and_then(|h| h.shared_buffer(size)) else {
@@ -4651,11 +4979,17 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                 (on_card, data, Some(card), None)
             }
             None => {
-                let (buffer, data, bar) = pc_copy_buffer(size, false)?;
-                crate::host::name(&buffer, || {
-                    format!("title buffer {:#x}+{len:#x}{}", key.0, if bar.is_some() { " (GPU upload heap)" } else { "" })
-                });
-                (buffer, data, None, bar)
+                if let Some((buffer, data, bar)) = try_gpu_upload_buffer(size, false) {
+                    crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x} (GPU upload heap)", key.0));
+                    (buffer, data, None, Some(bar))
+                } else if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
+                    entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+                    return entry.shadow.clone();
+                } else {
+                    let (buffer, data) = host()?.shared_buffer(size)?;
+                    crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
+                    (buffer, data, None, None)
+                }
             }
         };
         // SAFETY: a live buffer.
@@ -4865,40 +5199,46 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         note(shadow);
         return Some(shadow.clone());
     }
-    // In place, if asked for and the window's memory can be opened: the
-    // window is the title's own memory, with nothing to copy.
-    if let Some(placed) = crate::inplace::place_for(start, len, true) {
+    // When ReBAR GPU upload copies are enabled, allocate hot windows in
+    // full-speed GDDR before falling back to in-place system RAM, card-sided
+    // windows, or normal PC shared memory. When `VICTORY_GPU_UPLOAD_COPIES=0`,
+    // `try_gpu_upload_buffer` returns `None` immediately, preserving exact
+    // existing priority.
+    let (buffer, data, card, bar) = if let Some((buffer, data, bar)) = try_gpu_upload_buffer(len, true) {
+        crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} (GPU upload heap)"));
+        (buffer, data, None, Some(bar))
+    } else if let Some(placed) = crate::inplace::place_for(start, len, true) {
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
         map.insert((start, len), shadow.clone());
+        tables_changed();
         return Some(shadow);
-    }
-    // With room for windows on the card (`window_card_most`): shaders get a
-    // buffer there, and the CPU's side is made beside it in PC memory.
-    let (buffer, data, card, bar) = match window_card_for(len) {
-        Some(on_card) => {
-            let Some((staging, data)) = host().and_then(|h| h.shared_buffer(len)) else {
-                WINDOW_CARD_BYTES.fetch_sub(len, Ordering::Relaxed);
-                return None;
-            };
-            crate::host::name(&staging, || format!("title memory {start:#x}+{len:#x}"));
-            crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
-            let card = Card {
-                staging,
-                before: Mutex::default(),
-                dirty: Mutex::default(),
-                sent: Mutex::default(),
-                side: std::sync::RwLock::new(()),
-                size: len,
-            };
-            (on_card, data, Some(card), None)
-        }
-        None => {
-            let (buffer, data, bar) = pc_copy_buffer(len, true)?;
-            crate::host::name(&buffer, || {
-                format!("title memory {start:#x}+{len:#x}{}", if bar.is_some() { " (GPU upload heap)" } else { "" })
-            });
-            (buffer, data, None, bar)
+    } else {
+        // With room for windows on the card (`window_card_most`): shaders get a
+        // buffer there, and the CPU's side is made beside it in PC memory.
+        match window_card_for(len) {
+            Some(on_card) => {
+                let Some((staging, data)) = host().and_then(|h| h.shared_buffer(len)) else {
+                    WINDOW_CARD_BYTES.fetch_sub(len, Ordering::Relaxed);
+                    return None;
+                };
+                crate::host::name(&staging, || format!("title memory {start:#x}+{len:#x}"));
+                crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
+                let card = Card {
+                    staging,
+                    before: Mutex::default(),
+                    dirty: Mutex::default(),
+                    sent: Mutex::default(),
+                    side: std::sync::RwLock::new(()),
+                    size: len,
+                };
+                (on_card, data, Some(card), None)
+            }
+            None => {
+                let (buffer, data) = host()?.shared_buffer(len)?;
+                crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
+                (buffer, data, None, None)
+            }
         }
     };
     // SAFETY: a live buffer.
@@ -4918,6 +5258,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());
+    tables_changed();
     Some(shadow)
 }
 
@@ -5106,12 +5447,26 @@ mod window_tests {
 
     #[test]
     fn gpu_upload_copies_parsing_defaults_and_clamps() {
-        use super::parse_gpu_upload_copies;
+        use super::{parse_gpu_upload_copies, rebar_enabled_for};
         assert_eq!(parse_gpu_upload_copies(None, None), (0, 2048 << 20));
         assert_eq!(parse_gpu_upload_copies(Some("1"), None), (1, 2048 << 20));
         assert_eq!(parse_gpu_upload_copies(Some("2"), Some("1024")), (2, 1024 << 20));
         assert_eq!(parse_gpu_upload_copies(Some("9"), Some(" 512 ")), (2, 512 << 20));
         assert_eq!(parse_gpu_upload_copies(Some("bad"), Some("bad")), (0, 2048 << 20));
+        // Large ReBAR budgets accepted without artificial caps.
+        assert_eq!(parse_gpu_upload_copies(Some("1"), Some("2560")), (1, 2560 << 20));
+        assert_eq!(parse_gpu_upload_copies(Some("2"), Some("3072")), (2, 3072 << 20));
+        assert_eq!(parse_gpu_upload_copies(Some("2"), Some("4096")), (2, 4096 << 20));
+        assert_eq!(parse_gpu_upload_copies(Some("2"), Some("0")), (2, 0));
+        // ReBAR eligibility matches level and non-zero budget for windows vs buffers.
+        assert!(!rebar_enabled_for(0, 2048 << 20, true));
+        assert!(!rebar_enabled_for(0, 2048 << 20, false));
+        assert!(rebar_enabled_for(1, 2048 << 20, true));
+        assert!(!rebar_enabled_for(1, 2048 << 20, false));
+        assert!(rebar_enabled_for(2, 4096 << 20, true));
+        assert!(rebar_enabled_for(2, 4096 << 20, false));
+        assert!(!rebar_enabled_for(2, 0, true));
+        assert!(!rebar_enabled_for(2, 0, false));
     }
 }
 
@@ -5273,6 +5628,7 @@ mod card_merge_tests {
         {
             let mut loose = super::LOOSE.write().unwrap();
             loose.insert((outer + 0x2_0000, 0x1_0000), shadow_inner);
+            super::tables_changed();
         }
         assert_eq!(
             super::sole_buffer_copy(outer + 0x2_0000, 256).err().unwrap(),
@@ -5284,6 +5640,7 @@ mod card_merge_tests {
         );
         {
             super::LOOSE.write().unwrap().remove(&(outer + 0x2_0000, 0x1_0000));
+            super::tables_changed();
             super::buffers().remove(&(outer, 0x9001));
         }
     }
@@ -5344,6 +5701,127 @@ mod card_merge_tests {
         // Any mutation of `BUFFERS` via `buffers()` invalidates the cache.
         super::unregister(0x9101, addr);
         assert!(super::found(addr, 64).is_none());
+    }
+
+    #[test]
+    fn lookup_cache_caches_buffers_and_windows_and_invalidates_on_all_mutations() {
+        use std::sync::atomic::Ordering;
+        let _serial = BUFFERS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(super::parse_lookup_cache_mode(None), 0);
+        assert_eq!(super::parse_lookup_cache_mode(Some("0")), 0);
+        assert_eq!(super::parse_lookup_cache_mode(Some("1")), 1);
+        assert_eq!(super::parse_lookup_cache_mode(Some(" 1 ")), 1);
+        assert_eq!(super::parse_lookup_cache_mode(Some("alt")), 2);
+        assert_eq!(super::parse_lookup_cache_mode(Some(" alt ")), 2);
+        assert_eq!(super::parse_lookup_cache_mode(Some("bad")), 0);
+
+        let Some(buffer) = warp_buffer() else {
+            return;
+        };
+        let outer = 0x7FF0_6000_0000u64;
+        let inner = 0x7FF0_6000_1000u64;
+        let win_start = 0x7FF0_7000_0000u64;
+        let mut backing = vec![0u8; 64 << 10];
+        let shadow_outer = std::sync::Arc::new(Shadow::new(
+            buffer.clone(),
+            backing.as_mut_ptr(),
+            0,
+            outer,
+            0x1_0000,
+        ));
+        let shadow_inner = std::sync::Arc::new(Shadow::new(
+            buffer.clone(),
+            backing.as_mut_ptr(),
+            0,
+            inner,
+            0x1000,
+        ));
+        let mut win_shadow = Shadow::new(buffer, backing.as_mut_ptr(), 0, win_start, super::WINDOW);
+        win_shadow.window = true;
+        let win_shadow = std::sync::Arc::new(win_shadow);
+
+        // 1) Cache miss -> hit on `BUFFERS`, then invalidation when an inner buffer is registered.
+        {
+            let mut map = super::buffers();
+            map.insert(
+                (outer, 0x9201),
+                super::Entry {
+                    end: outer + 0x1_0000,
+                    shadow: Some(shadow_outer.clone()),
+                },
+            );
+        }
+        let misses0 = super::LOOKUPS[1].load(Ordering::Relaxed);
+        let hits0 = super::LOOKUPS[0].load(Ordering::Relaxed);
+        let first = super::lookup_cached(inner, 64, false).expect("outer buffer miss->populate");
+        assert!(std::sync::Arc::ptr_eq(&first, &shadow_outer));
+        assert!(super::LOOKUPS[1].load(Ordering::Relaxed) > misses0);
+
+        let second = super::lookup_cached(inner, 64, false).expect("outer buffer cache hit");
+        assert!(std::sync::Arc::ptr_eq(&second, &shadow_outer));
+        assert!(super::LOOKUPS[0].load(Ordering::Relaxed) > hits0);
+
+        // Registering an inner buffer bumps `TABLES_CHANGED` and invalidates the stale outer entry.
+        let gen_before = super::TABLES_CHANGED.load(Ordering::Acquire);
+        {
+            let mut map = super::buffers();
+            map.insert(
+                (inner, 0x9202),
+                super::Entry {
+                    end: inner + 0x1000,
+                    shadow: Some(shadow_inner.clone()),
+                },
+            );
+        }
+        assert!(super::TABLES_CHANGED.load(Ordering::Acquire) > gen_before);
+        let after_insert = super::lookup_cached(inner, 64, false).expect("inner buffer after invalidation");
+        assert!(std::sync::Arc::ptr_eq(&after_insert, &shadow_inner));
+
+        // Unregistering the inner buffer bumps `TABLES_CHANGED` and returns to the outer buffer.
+        let gen_before = super::TABLES_CHANGED.load(Ordering::Acquire);
+        super::unregister(0x9202, inner);
+        assert!(super::TABLES_CHANGED.load(Ordering::Acquire) > gen_before);
+        let after_unreg = super::lookup_cached(inner, 64, false).expect("outer buffer after unregister");
+        assert!(std::sync::Arc::ptr_eq(&after_unreg, &shadow_outer));
+
+        // 2) Cache miss -> hit on `LOOSE` window updates `asked` & `unsized_asks` on hits.
+        let gen_before = super::TABLES_CHANGED.load(Ordering::Acquire);
+        {
+            let mut loose = super::LOOSE.write().unwrap();
+            loose.insert((win_start, super::WINDOW), win_shadow.clone());
+            super::tables_changed();
+        }
+        assert!(super::TABLES_CHANGED.load(Ordering::Acquire) > gen_before);
+        let win_ask = win_start + 0x1234;
+        let w1 = super::lookup_cached(win_ask, 1, false).expect("loose window miss->populate");
+        assert!(std::sync::Arc::ptr_eq(&w1, &win_shadow));
+        let unsized_before = win_shadow.unsized_asks.load(Ordering::Relaxed);
+        let hits_before = super::LOOKUPS[0].load(Ordering::Relaxed);
+        let w2 = super::lookup_cached(win_ask, 1, false).expect("loose window cache hit");
+        assert!(std::sync::Arc::ptr_eq(&w2, &win_shadow));
+        assert!(super::LOOKUPS[0].load(Ordering::Relaxed) > hits_before);
+        assert_eq!(win_shadow.unsized_asks.load(Ordering::Relaxed), unsized_before + 1);
+        assert!(win_shadow.asked[0].load(Ordering::Relaxed) <= win_ask);
+        assert!(win_shadow.asked[1].load(Ordering::Relaxed) > win_ask);
+
+        // Cleanup tables and bump generation so no test entries remain.
+        {
+            super::LOOSE.write().unwrap().remove(&(win_start, super::WINDOW));
+            super::tables_changed();
+            super::unregister(0x9201, outer);
+        }
+    }
+
+    #[test]
+    fn merge_gave_up_counters_take_and_reset() {
+        use std::sync::atomic::Ordering;
+        let _serial = BUFFERS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = super::merge_gave_up();
+        for (i, n) in [2u64, 5, 7, 11].into_iter().enumerate() {
+            super::MERGE_GAVE_UP[i].fetch_add(n, Ordering::Relaxed);
+        }
+        assert_eq!(super::merge_gave_up(), [2, 5, 7, 11]);
+        assert_eq!(super::merge_gave_up(), [0, 0, 0, 0]);
     }
 }
 
