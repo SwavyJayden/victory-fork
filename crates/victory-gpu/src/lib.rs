@@ -40,6 +40,8 @@ mod book;
 #[cfg(windows)]
 mod gpu_detile;
 #[cfg(windows)]
+mod gpu_only;
+#[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod indirect;

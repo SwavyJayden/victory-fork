@@ -82,32 +82,43 @@ impl Placed {
         if !free && self.from.is_none() {
             return None;
         }
-        let mut bytes = vec![0u8; self.len];
-        // (What is not there reads as zeros, as any copy's source.)
-        copy_mapped(bytes.as_mut_ptr(), self.src as *const u8, self.len, false);
-        if let Some(to) = self.from {
-            // SAFETY: the list's own upload memory of that many bytes.
-            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), to as *mut u8, self.len) };
+        thread_local! {
+            static SCRATCH: std::cell::RefCell<Vec<u8>> =
+                const { std::cell::RefCell::new(Vec::new()) };
         }
-        if !free {
-            return None;
-        }
-        let wrote_whole = copy_mapped_whole(self.dst as *mut u8, bytes.as_ptr(), self.len, true);
-        crate::watch::wrote(self.dst, self.len);
-        // When `copy_mapped_whole` wrote every byte without fault, skip the
-        // redundant read-back allocation and comparison in release builds.
-        if wrote_whole {
-            #[cfg(feature = "diagnostics")]
-            {
-                let mut there = vec![0u8; self.len];
-                return (read_into(self.dst as *const u8, &mut there) && there == bytes).then_some(bytes);
+        SCRATCH.with(|cell| {
+            let mut scratch = cell.borrow_mut();
+            let len = self.len;
+            if scratch.len() < len {
+                scratch.resize(len, 0);
             }
+            // (What is not there reads as zeros, as any copy's source.)
+            copy_mapped(scratch.as_mut_ptr(), self.src as *const u8, len, false);
+            if let Some(to) = self.from {
+                // SAFETY: the list's own upload memory of that many bytes.
+                unsafe { std::ptr::copy_nonoverlapping(scratch.as_ptr(), to as *mut u8, len) };
+            }
+            if !free {
+                return None;
+            }
+            let wrote_whole = copy_mapped_whole(self.dst as *mut u8, scratch.as_ptr(), len, true);
+            crate::watch::wrote(self.dst, len);
+            // When `copy_mapped_whole` wrote every byte without fault, skip the
+            // redundant read-back verification in release builds.
             #[cfg(not(feature = "diagnostics"))]
-            return Some(bytes);
-        }
-        // Title memory that is not all there was left alone.
-        let mut there = vec![0u8; self.len];
-        (read_into(self.dst as *const u8, &mut there) && there == bytes).then_some(bytes)
+            if wrote_whole {
+                return Some(scratch[..len].to_vec());
+            }
+            let _ = wrote_whole;
+            let need = len.checked_mul(2)?;
+            if scratch.len() < need {
+                scratch.resize(need, 0);
+            }
+            let (bytes, rest) = scratch.split_at_mut(len);
+            let there = &mut rest[..len];
+            // Title memory that is not all there was left alone.
+            (read_into(self.dst as *const u8, there) && there == bytes).then(|| bytes.to_vec())
+        })
     }
 }
 

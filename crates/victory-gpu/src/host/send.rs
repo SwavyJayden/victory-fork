@@ -247,11 +247,10 @@ fn memory(host: &Host, size: u64) -> Option<Memory> {
     };
     let (buffer, data) = match mapped {
         Some(made) => made,
-        // Match `Card::staging`: custom L0 WRITE_BACK heap avoids WC
-        // partial-cacheline thrashing on 12-byte scatter job headers and small
-        // payloads while starting in `COMMON` (implicitly promoting to
-        // `COPY_SOURCE | NON_PIXEL_SHADER_RESOURCE` and decaying back).
-        None => host.shared_buffer_private(size)?,
+        // Write-combined `UPLOAD` heap avoids L0 `WRITE_BACK` cache-snooping
+        // stalls on GPU reads; `take` streams payloads and batched job headers
+        // contiguously so WC fill buffers flush cleanly.
+        None => host.upload_buffer_private(size)?,
     };
     name(&buffer, || "bytes a submission sends up".into());
     Some(Memory {
@@ -394,7 +393,7 @@ pub(super) fn take(
     let memory = memory(host, at)?;
     let mut moves: Vec<(usize, usize, usize)> = Vec::new();
     let mut pair_work: Vec<(usize, &[(usize, usize)], usize)> = Vec::new();
-    let mut scatter_work: Vec<(usize, &[(usize, usize)], usize, usize, u32)> = Vec::new();
+    let mut scatter_work: Vec<(usize, &[(usize, usize)], usize, usize, u32, u32)> = Vec::new();
 
     for ((shadow, ranges), copy) in dirty.iter().zip(&copies) {
         let from = shadow.card_data() as usize;
@@ -441,7 +440,7 @@ pub(super) fn take(
                     chunk_bytes += len;
                 }
                 if chunk_jobs > 0 {
-                    scatter_work.push((from, chunk, job_ptr, pay_ptr, pay_rel));
+                    scatter_work.push((from, chunk, job_ptr, pay_ptr, pay_rel, chunk_jobs));
                     job_ptr += chunk_jobs as usize * 12;
                     pay_ptr += chunk_bytes as usize;
                     pay_rel += chunk_bytes;
@@ -449,6 +448,11 @@ pub(super) fn take(
                 }
             }
         }
+    }
+
+    thread_local! {
+        static SCATTER_JOBS: std::cell::RefCell<Vec<[u32; 3]>> =
+            const { std::cell::RefCell::new(Vec::new()) };
     }
 
     let pair_count = pair_work.len();
@@ -468,32 +472,61 @@ pub(super) fn take(
                 }
             }
         } else {
-            let (from, ranges, mut job_ptr, mut pay_ptr, mut pay_rel) = scatter_work[i - pair_count];
-            for &(a, b) in ranges.iter().filter(|r| route(r) == Route::DenseScatter) {
-                let len = b - a;
-                // SAFETY: disjoint reserved payload slice inside `memory` and
-                // live CPU-side shadow bytes `[from + a, from + b)`.
-                unsafe {
-                    std::ptr::copy_nonoverlapping((from + a) as *const u8, pay_ptr as *mut u8, len);
-                }
-                let mut rem_dwords = (len / 4) as u32;
-                let mut dst_off = a as u32;
-                let mut src_off = pay_rel;
-                while rem_dwords > 0 {
-                    let take_dw = rem_dwords.min(SCATTER_MAX_JOB_DWORDS);
-                    // SAFETY: disjoint reserved 12-byte job slot inside `memory`.
-                    unsafe {
-                        (job_ptr as *mut [u32; 3]).write_unaligned([dst_off, src_off, take_dw]);
+            let (from, ranges, job_ptr, mut pay_ptr, mut pay_rel, chunk_jobs) =
+                scatter_work[i - pair_count];
+            // Stage 12-byte `[dst_off, src_off, dwords]` job headers in cached
+            // RAM while streaming payloads contiguously to `pay_ptr`, then
+            // flush all job headers to WC `job_ptr` in one sequential copy.
+            SCATTER_JOBS.with(|cell| {
+                let mut jobs = cell.borrow_mut();
+                jobs.clear();
+                jobs.reserve(chunk_jobs as usize);
+                for &(a, b) in ranges.iter().filter(|r| route(r) == Route::DenseScatter) {
+                    let len = b - a;
+                    let run_jobs = jobs_for_run(len) as usize;
+                    if jobs.len() + run_jobs > chunk_jobs as usize {
+                        break;
                     }
-                    job_ptr += 12;
-                    let step_bytes = take_dw * 4;
-                    dst_off += step_bytes;
-                    src_off += step_bytes;
-                    rem_dwords -= take_dw;
+                    // SAFETY: disjoint reserved payload slice inside `memory` and
+                    // live CPU-side shadow bytes `[from + a, from + b)`.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            (from + a) as *const u8,
+                            pay_ptr as *mut u8,
+                            len,
+                        );
+                    }
+                    let mut rem_dwords = (len / 4) as u32;
+                    let mut dst_off = a as u32;
+                    let mut src_off = pay_rel;
+                    while rem_dwords > 0 {
+                        let take_dw = rem_dwords.min(SCATTER_MAX_JOB_DWORDS);
+                        jobs.push([dst_off, src_off, take_dw]);
+                        let step_bytes = take_dw * 4;
+                        dst_off += step_bytes;
+                        src_off += step_bytes;
+                        rem_dwords -= take_dw;
+                    }
+                    pay_ptr += len;
+                    pay_rel += len as u32;
                 }
-                pay_ptr += len;
-                pay_rel += len as u32;
-            }
+                debug_assert_eq!(jobs.len(), chunk_jobs as usize);
+                if !jobs.is_empty() {
+                    // SAFETY: disjoint reserved `chunk_jobs * 12`-byte job slice
+                    // inside `memory`, written sequentially in one burst.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            jobs.as_ptr().cast::<u8>(),
+                            job_ptr as *mut u8,
+                            jobs.len() * size_of::<[u32; 3]>(),
+                        );
+                    }
+                }
+                if jobs.capacity() > 16384 {
+                    jobs.clear();
+                    jobs.shrink_to(4096);
+                }
+            });
         }
     };
     crate::land::each_under(pair_count + scatter_work.len(), &do_compute);
@@ -741,7 +774,7 @@ mod tests {
         let payload_at = up_bytes as u64;
         up_bytes += payload.len().next_multiple_of(256);
 
-        let (up_buf, up_ptr) = host.shared_buffer_private(up_bytes as u64).unwrap();
+        let (up_buf, up_ptr) = host.upload_buffer_private(up_bytes as u64).unwrap();
         // SAFETY: `up_ptr` is mapped for `up_bytes`.
         unsafe {
             for &(a, to, n) in &copy_runs {

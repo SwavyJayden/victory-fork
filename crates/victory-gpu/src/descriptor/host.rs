@@ -317,6 +317,11 @@ impl CopyBatch {
     }
 
     #[inline]
+    pub(crate) fn is_full(&self) -> bool {
+        self.len == self.dsts.len()
+    }
+
+    #[inline]
     pub(crate) fn push(&mut self, dst: D3D12_CPU_DESCRIPTOR_HANDLE, src: D3D12_CPU_DESCRIPTOR_HANDLE) {
         if self.len == self.dsts.len() {
             self.flush();
@@ -412,9 +417,11 @@ pub(crate) struct HostHeap {
     /// waited for most (5.6 % of their time, profile waits-1: each descriptor
     /// made for a draw takes it, and lets go of what the slot held under it).
     kept: Box<[Mutex<Option<ID3D12Resource>>]>,
-    /// Lock-free presence bitmap for `self.kept` (`count + dynamic` slots) so
-    /// clearing an already-empty slot skips the per-slot mutex.
-    has_kept: Slots,
+    /// Lock-free mirror of `self.kept` storing each slot's raw COM pointer
+    /// (`ID3D12Resource::as_raw() as usize`, or `0` for `None`). Updated under
+    /// `self.kept[i]` so unchanged writes skip COM `AddRef`/`Release` and the
+    /// per-slot mutex entirely.
+    kept_raw: Box<[std::sync::atomic::AtomicUsize]>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset), stored as an L1-resident 64-bit bitset.
     next: Mutex<DynamicSlots>,
@@ -1920,7 +1927,9 @@ impl HostHeap {
             waiting: Mutex::default(),
             away: Mutex::default(),
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
-            has_kept: Slots::new((count + extra) as usize),
+            kept_raw: (0..count + extra)
+                .map(|_| std::sync::atomic::AtomicUsize::new(0))
+                .collect(),
             next: Mutex::new(DynamicSlots::new(extra)),
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
@@ -2076,6 +2085,62 @@ impl HostHeap {
         Some(self.dynamic_base + first)
     }
 
+    /// Allocates a slab of `want` dynamic slots (or falls back to `min` slots
+    /// under the same `self.next` lock if `want` does not fit), returning
+    /// `(first, got_len)`. Avoids double-locking and spurious refusal warnings
+    /// when `want` cannot fit under pressure but `min` can.
+    pub(crate) fn dynamic_slab(&self, want: u32, min: u32) -> Option<(u32, u32)> {
+        if self.sampler || min == 0 || min > self.dynamic {
+            return None;
+        }
+        let want = want.max(min).min(self.dynamic);
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
+        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        let free = self.free.load(std::sync::atomic::Ordering::Relaxed);
+        let too_long = self.too_long.load(std::sync::atomic::Ordering::Relaxed);
+        if free >= want && want < too_long {
+            if let Some(first) = guard.alloc(want) {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
+                self.free.fetch_sub(want, std::sync::atomic::Ordering::Relaxed);
+                return Some((self.dynamic_base + first, want));
+            }
+            self.too_long.fetch_min(want, std::sync::atomic::Ordering::Relaxed);
+        }
+        let enough = free >= min && min < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
+        let found = if enough { guard.alloc(min) } else { None };
+        let Some(first) = found else {
+            if enough {
+                self.too_long.fetch_min(min, std::sync::atomic::Ordering::Relaxed);
+            }
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                let largest_free = guard.largest_free();
+                tracing::warn!(
+                    n = min,
+                    largest_free,
+                    free = self.free.load(std::sync::atomic::Ordering::Relaxed),
+                    capacity = self.dynamic,
+                    "no free dynamic descriptor slots: a table is not made"
+                );
+            });
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                add(C::DynamicRefused, 1);
+                add(C::DynamicNs, started.elapsed().as_nanos() as u64);
+            }
+            return None;
+        };
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
+        self.free.fetch_sub(min, std::sync::atomic::Ordering::Relaxed);
+        Some((self.dynamic_base + first, min))
+    }
+
     /// The title slots this heap has host slots for; fewer than the title's
     /// when the host caps its size.
     pub(crate) fn count(&self) -> u32 {
@@ -2085,6 +2150,17 @@ impl HostHeap {
     #[cfg(test)]
     pub(crate) fn dynamic_capacity(&self) -> u32 {
         self.dynamic
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dynamic_free(&self) -> u32 {
+        self.free.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn kept_raw_at(&self, index: u32) -> usize {
+        self.kept_slot(index)
+            .map_or(0, |k| self.kept_raw[k].load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// Unique identity of this host heap ([`HostHeap::release`]).
@@ -2472,6 +2548,7 @@ impl HostHeap {
             starts.iter().flat_map(|&start| placed.slots_at(start)).collect()
         };
         let mut remade = 0;
+        let mut retired = Vec::new();
         for slot in slots {
             let _made = self.made.lock(slot);
             let Some(key) = self.made.get(slot).filter(|&key| key != 0) else {
@@ -2482,10 +2559,11 @@ impl HostHeap {
             };
             if let Some(kept) = make(&view, self.at(slot)) {
                 self.put(slot);
-                self.keep(slot, kept);
+                self.keep_owned(slot, kept, Some(&mut retired));
                 remade += 1;
             }
         }
+        crate::host::retire_resources(retired);
         remade
     }
 
@@ -2791,6 +2869,7 @@ impl HostHeap {
         };
         let mut flipped = 0;
         let mut late_flipped = 0;
+        let mut retired = Vec::new();
         for f in ready {
             let _made = self.made.lock(f.index);
             let Some(shown) = self.made.get(f.index) else {
@@ -2827,7 +2906,7 @@ impl HostHeap {
                 let was = shown;
                 self.quick_is(f.index, 0);
                 self.made.set(f.index, f.key);
-                self.keep(f.index, kept);
+                self.keep_owned(f.index, kept, Some(&mut retired));
                 #[cfg(feature = "diagnostics")]
                 if f.late.is_some() && was != 0 {
                     same_bytes(was, f.key);
@@ -2851,6 +2930,7 @@ impl HostHeap {
                 }
             }
         }
+        crate::host::retire_resources(retired);
         FLIPPED[0].fetch_add(flipped as u64, Relaxed);
         flipped + late_flipped
     }
@@ -2867,6 +2947,10 @@ impl HostHeap {
     /// Makes host slot `index` null again, as it is before its view is
     /// made: a null view of the kind it held. Under its lock ([`Made`]).
     fn unmake(&self, index: u32) {
+        self.unmake_into(index, None);
+    }
+
+    fn unmake_into(&self, index: u32, retired: Option<&mut Vec<ID3D12Resource>>) {
         self.quick_is(index, 0);
         let Some(key) = self.made.get(index) else {
             return;
@@ -2896,22 +2980,27 @@ impl HostHeap {
         self.clear_twin(index);
         self.write_stride(index, 0);
         self.write_address(index, 0);
-        self.keep(index, None);
+        self.keep_ref(index, None, retired);
     }
 
     /// The slots [`HostHeap::note_buffer`] found stale for slot `index`, with
     /// what they were made from then, become null. None of their locks is
     /// held here; one made from another record meanwhile is left as it is.
     fn unmake_stale(&self, index: u32, stale: Vec<(u32, u64)>) {
+        if stale.is_empty() {
+            return;
+        }
+        let mut retired = Vec::new();
         for (slot, key) in stale {
             if slot == index || key == 0 {
                 continue;
             }
             let _made = self.made.lock(slot);
             if self.made.get(slot) == Some(key) {
-                self.unmake(slot);
+                self.unmake_into(slot, Some(&mut retired));
             }
         }
+        crate::host::retire_resources(retired);
     }
 
     /// Title slot `index` is a table's ([`HostHeap::tabled`]) in `frame`.
@@ -3183,7 +3272,28 @@ impl HostHeap {
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn make_at(&self, index: u32, view: &View) {
+        self.make_at_inner(index, view, None);
+    }
+
+    /// As [`HostHeap::make_at`], collecting any displaced kept resource into
+    /// `retired` for batched retirement.
+    pub(crate) fn make_at_into(
+        &self,
+        index: u32,
+        view: &View,
+        retired: &mut Vec<ID3D12Resource>,
+    ) {
+        self.make_at_inner(index, view, Some(retired));
+    }
+
+    fn make_at_inner(
+        &self,
+        index: u32,
+        view: &View,
+        retired: Option<&mut Vec<ID3D12Resource>>,
+    ) {
         let kept = make_twinned(view, self.at(index), self.twin(index));
         if kept.is_none() {
             if let Some(src) = null_handle_for(view) {
@@ -3212,7 +3322,7 @@ impl HostHeap {
                 0
             },
         );
-        self.keep(index, kept.flatten());
+        self.keep_owned(index, kept.flatten(), retired);
     }
 
     /// Makes slot `index` (a dynamic one) the view the record `words` names,
@@ -3232,12 +3342,38 @@ impl HostHeap {
     /// so an entire dynamic descriptor table is flushed in a single D3D12
     /// `CopyDescriptors` call, and skipping unused raw-twin descriptor creation
     /// on 1M-capped NVIDIA heaps (`self.raw == 0`).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn make_listed_batched(
         &self,
         recording: u64,
         words: [u32; 3],
         index: u32,
         batch: &mut CopyBatch,
+    ) -> Option<Listed> {
+        self.make_listed_batched_inner(recording, words, index, batch, None)
+    }
+
+    /// As [`HostHeap::make_listed_batched`], also pushing any displaced kept
+    /// resource into `retired` for a single batched `retire_resources` call
+    /// per dynamic table.
+    pub(crate) fn make_listed_batched_into(
+        &self,
+        recording: u64,
+        words: [u32; 3],
+        index: u32,
+        batch: &mut CopyBatch,
+        retired: &mut Vec<ID3D12Resource>,
+    ) -> Option<Listed> {
+        self.make_listed_batched_inner(recording, words, index, batch, Some(retired))
+    }
+
+    fn make_listed_batched_inner(
+        &self,
+        recording: u64,
+        words: [u32; 3],
+        index: u32,
+        batch: &mut CopyBatch,
+        retired: Option<&mut Vec<ID3D12Resource>>,
     ) -> Option<Listed> {
         if self.sampler {
             return None;
@@ -3295,6 +3431,7 @@ impl HostHeap {
             if let Some(written) = self.written.get(index as usize) {
                 written.store(crate::host::coarse_ms() as u32, std::sync::atomic::Ordering::Relaxed);
             }
+            self.set_null_kind(index, NULL_KIND_LIVE);
             batch.push(self.cpu(index), slot_at(made.at));
             if made.twin && twins {
                 #[cfg(feature = "diagnostics")]
@@ -3304,11 +3441,11 @@ impl HostHeap {
                 batch.push(self.cpu(self.raw + index), slot_at(made.at + 1));
                 self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
             } else if has_twins {
-                self.clear_twin(index);
+                self.clear_twin_batched(index, batch);
             }
             self.write_stride(index, made.stride_word);
             self.write_address(index, made.address);
-            self.keep(index, made.kept.clone());
+            self.keep_ref(index, made.kept.as_ref(), retired);
             Some(made.listed)
         })
     }
@@ -3330,18 +3467,88 @@ impl HostHeap {
     pub(crate) fn make_null(&self, index: u32) {
         if self.sampler {
             self.null_sampler(index);
-        } else {
-            if let Some((kind, src)) = null_view_slot() {
-                self.copy_null(index, kind, src);
-            } else {
-                null_view(self.at(index));
-                self.put(index);
-            }
-            self.write_stride(index, 0);
-            self.write_address(index, 0);
+            self.clear_twin(index);
+            self.keep_ref(index, None, None);
+            return;
         }
+        if let Some((kind, src)) = null_view_slot() {
+            let same_null = self
+                .null_kind
+                .get(index as usize)
+                .is_some_and(|slot| slot.load(Ordering::Relaxed) == kind);
+            let kept_empty = self
+                .kept_slot(index)
+                .is_none_or(|k| self.kept_raw[k].load(Ordering::Relaxed) == 0);
+            let has_twin = self
+                .twins
+                .get(index as usize)
+                .is_some_and(|made| made.load(Ordering::Relaxed));
+            if same_null && kept_empty && !has_twin {
+                self.write_stride(index, 0);
+                self.write_address(index, 0);
+                return;
+            }
+            if !same_null {
+                self.copy_from(index, src);
+                self.set_null_kind(index, kind);
+            }
+        } else {
+            null_view(self.at(index));
+            self.put(index);
+        }
+        self.write_stride(index, 0);
+        self.write_address(index, 0);
         self.clear_twin(index);
-        self.keep(index, None);
+        self.keep_ref(index, None, None);
+    }
+
+    /// As [`HostHeap::make_null`], queueing null descriptor and twin clears
+    /// into `batch` and displaced kept resources into `retired`.
+    pub(crate) fn make_null_batched(
+        &self,
+        index: u32,
+        batch: &mut CopyBatch,
+        retired: &mut Vec<ID3D12Resource>,
+    ) {
+        if self.sampler {
+            self.null_sampler(index);
+            self.clear_twin_batched(index, batch);
+            self.keep_ref(index, None, Some(retired));
+            return;
+        }
+        if let Some((kind, src)) = null_view_slot() {
+            let same_null = self
+                .null_kind
+                .get(index as usize)
+                .is_some_and(|slot| slot.load(Ordering::Relaxed) == kind);
+            let kept_empty = self
+                .kept_slot(index)
+                .is_none_or(|k| self.kept_raw[k].load(Ordering::Relaxed) == 0);
+            let has_twin = self
+                .twins
+                .get(index as usize)
+                .is_some_and(|made| made.load(Ordering::Relaxed));
+            if same_null && kept_empty && !has_twin {
+                self.write_stride(index, 0);
+                self.write_address(index, 0);
+                return;
+            }
+            if !same_null {
+                #[cfg(feature = "diagnostics")]
+                if let Some(written) = self.written.get(index as usize) {
+                    written.store(crate::host::coarse_ms() as u32, Ordering::Relaxed);
+                }
+                batch.push(self.cpu(index), src);
+                self.set_null_kind(index, kind);
+            }
+        } else {
+            null_view(self.at(index));
+            self.put(index);
+        }
+        self.write_stride(index, 0);
+        self.write_address(index, 0);
+        self.clear_twin_batched(index, batch);
+        self.keep_ref(index, None, Some(retired));
     }
 
     /// Where the raw twin of slot `index` is made.
@@ -3375,6 +3582,23 @@ impl HostHeap {
         }
     }
 
+    fn clear_twin_batched(&self, index: u32, batch: &mut CopyBatch) {
+        if let Some(made) = self.twins.get(index as usize)
+            && made.swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            if let Some(src) = null_buffer_handle() {
+                #[cfg(feature = "diagnostics")]
+                if let Some(written) = self.written.get((self.raw + index) as usize) {
+                    written.store(crate::host::coarse_ms() as u32, std::sync::atomic::Ordering::Relaxed);
+                }
+                batch.push(self.cpu(self.raw + index), src);
+            } else {
+                null_buffer_view(self.at(self.raw + index));
+                self.put(self.raw + index);
+            }
+        }
+    }
+
     /// Maps a heap slot index (either a title slot `[0..count)` or a dynamic
     /// slot `[dynamic_base..dynamic_base+dynamic)`) into `self.kept`.
     fn kept_slot(&self, index: u32) -> Option<usize> {
@@ -3389,39 +3613,87 @@ impl HostHeap {
         }
     }
 
-    /// Slot `index` now views `resource` (or nothing of the host's).
-    fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+    /// Slot `index` now views `resource` (or nothing of the host's), avoiding
+    /// COM `AddRef`/`Release` and the per-slot mutex whenever `kept_raw`
+    /// already matches. Displaced resources are pushed to `retired` if given.
+    fn keep_ref(
+        &self,
+        index: u32,
+        resource: Option<&ID3D12Resource>,
+        retired: Option<&mut Vec<ID3D12Resource>>,
+    ) {
+        use windows::core::Interface;
         let Some(kept_idx) = self.kept_slot(index) else {
             return;
         };
-        if resource.is_none() && !self.has_kept.has(kept_idx as u32) {
+        let new_raw = resource.map_or(0, |r| r.as_raw() as usize);
+        if self.kept_raw[kept_idx].load(Ordering::Relaxed) == new_raw {
             return;
         }
         let Some(slot) = self.kept.get(kept_idx) else {
             return;
         };
         let old = {
-            use windows::core::Interface;
             let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
-            // The same again: nothing to retire.
-            if slot.as_ref().map(Interface::as_raw) == resource.as_ref().map(Interface::as_raw) {
+            if slot.as_ref().map_or(0, |r| r.as_raw() as usize) == new_raw {
+                self.kept_raw[kept_idx].store(new_raw, Ordering::Relaxed);
                 return;
             }
-            let has_new = resource.is_some();
-            if has_new {
-                self.has_kept.put(kept_idx as u32);
+            let owned = resource.cloned();
+            let prev = std::mem::replace(&mut *slot, owned);
+            self.kept_raw[kept_idx].store(new_raw, Ordering::Relaxed);
+            prev
+        };
+        if let Some(old) = old {
+            match retired {
+                Some(vec) => vec.push(old),
+                None => crate::host::retire_resource(old),
+            }
+        }
+    }
+
+    /// As [`HostHeap::keep_ref`], taking ownership of an already-owned
+    /// `Option<ID3D12Resource>`.
+    fn keep_owned(
+        &self,
+        index: u32,
+        resource: Option<ID3D12Resource>,
+        retired: Option<&mut Vec<ID3D12Resource>>,
+    ) {
+        use windows::core::Interface;
+        let Some(kept_idx) = self.kept_slot(index) else {
+            return;
+        };
+        let new_raw = resource.as_ref().map_or(0, |r| r.as_raw() as usize);
+        if self.kept_raw[kept_idx].load(Ordering::Relaxed) == new_raw {
+            return;
+        }
+        let Some(slot) = self.kept.get(kept_idx) else {
+            return;
+        };
+        let old = {
+            let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.as_ref().map_or(0, |r| r.as_raw() as usize) == new_raw {
+                self.kept_raw[kept_idx].store(new_raw, Ordering::Relaxed);
+                return;
             }
             let prev = std::mem::replace(&mut *slot, resource);
-            if !has_new {
-                self.has_kept.remove(kept_idx as u32);
-            }
+            self.kept_raw[kept_idx].store(new_raw, Ordering::Relaxed);
             prev
         };
         // A running submission may still read the old resource through
         // this slot.
         if let Some(old) = old {
-            crate::host::retire_resource(old);
+            match retired {
+                Some(vec) => vec.push(old),
+                None => crate::host::retire_resource(old),
+            }
         }
+    }
+
+    /// Slot `index` now views `resource` (or nothing of the host's).
+    fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+        self.keep_owned(index, resource, None);
     }
 
     /// What slot `index` views.
@@ -3463,7 +3735,7 @@ impl HostHeap {
         self.clear_twin(index);
         self.write_stride(index, 1);
         self.write_address(index, 0);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_ref(index, Some(buffer), None);
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view that reads
@@ -3474,7 +3746,7 @@ impl HostHeap {
         self.clear_twin(index);
         self.write_stride(index, 0);
         self.write_address(index, 0);
-        self.keep(index, None);
+        self.keep_ref(index, None, None);
     }
 
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
@@ -3510,7 +3782,7 @@ impl HostHeap {
         self.clear_twin(index);
         self.write_stride(index, 1);
         self.write_address(index, 0);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_ref(index, Some(buffer), None);
     }
 
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
@@ -3541,7 +3813,7 @@ impl HostHeap {
         self.clear_twin(index);
         self.write_stride(index, 0);
         self.write_address(index, 0);
-        self.keep(index, None);
+        self.keep_ref(index, None, None);
     }
 
     /// The shader-visible handle of slot `index`.
@@ -3561,9 +3833,20 @@ impl HostHeap {
     /// chunks go back to the pool and are freed past its limit: session n02
     /// lost the device to a page fault in the memory of three freed ones.
     /// `VICTORY_SLOT_HOLDS=0`: only the list holds it, as before.
+    #[cfg(test)]
     pub(crate) fn constant_at(&self, index: u32, buffer: &ID3D12Resource, gpu: u64, size: u32) {
-        static HOLDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let holds = *HOLDS.get_or_init(|| std::env::var_os("VICTORY_SLOT_HOLDS").is_none_or(|v| v != "0"));
+        self.constant_at_inner(index, buffer, gpu, size, None);
+    }
+
+    fn constant_at_inner(
+        &self,
+        index: u32,
+        buffer: &ID3D12Resource,
+        gpu: u64,
+        size: u32,
+        retired: Option<&mut Vec<ID3D12Resource>>,
+    ) {
+        let holds = slot_holds();
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
@@ -3601,7 +3884,59 @@ impl HostHeap {
         self.write_address(index, 0);
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
-        self.keep(index, holds.then(|| buffer.clone()));
+        self.keep_ref(index, holds.then_some(buffer), retired);
+    }
+
+    /// As [`HostHeap::constant_at`], staging CBVs into a thread-local 64-slot
+    /// CPU-only heap and queueing copies into `batch` when `self.raw == 0`
+    /// (NVIDIA 1M heaps), with batched resource retirement into `retired`.
+    pub(crate) fn constant_at_batched(
+        &self,
+        index: u32,
+        buffer: &ID3D12Resource,
+        gpu: u64,
+        size: u32,
+        batch: &mut CopyBatch,
+        retired: &mut Vec<ID3D12Resource>,
+    ) {
+        if self.raw != 0 {
+            self.constant_at_inner(index, buffer, gpu, size, Some(retired));
+            return;
+        }
+        let Some(host) = host() else { return };
+        let staged = CBV_STAGE.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            if slot.is_none() {
+                *slot = CbvStage::new();
+            }
+            let stage = slot.as_mut()?;
+            if batch.is_full() || stage.next >= CbvStage::SLOTS {
+                batch.flush();
+                stage.next = 0;
+            }
+            let cpu = stage.slot(stage.next);
+            stage.next += 1;
+            Some(cpu)
+        });
+        let Some(stage_cpu) = staged else {
+            self.constant_at_inner(index, buffer, gpu, size, Some(retired));
+            return;
+        };
+        let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
+            BufferLocation: gpu,
+            SizeInBytes: constant_bytes(size),
+        };
+        // SAFETY: valid slot in this thread's CPU-only `CbvStage` heap; memory is the caller's.
+        unsafe { host.device.CreateConstantBufferView(Some(&desc), stage_cpu) };
+        #[cfg(feature = "diagnostics")]
+        if let Some(written) = self.written.get(index as usize) {
+            written.store(crate::host::coarse_ms() as u32, Ordering::Relaxed);
+        }
+        self.set_null_kind(index, NULL_KIND_LIVE);
+        batch.push(self.cpu(index), stage_cpu);
+        self.write_stride(index, 0);
+        self.write_address(index, 0);
+        self.keep_ref(index, slot_holds().then_some(buffer), Some(retired));
     }
 
     /// Where a descriptor for slot `index` is made, then [`HostHeap::put`]:
@@ -3810,6 +4145,9 @@ impl HostHeap {
             && let Some(view) = view_at(i, generation)
         {
             return Some(view);
+        }
+        if tag != VIEW_TAG && !for_draw && self.made.get(index) == Some(0) {
+            return None;
         }
         let held = self.made.lock(index);
         let shown = self.made.get(index).unwrap_or(0);
@@ -6805,6 +7143,68 @@ mod tests {
         heap.make_at(1, &View::Constant(0x1000, 256));
         heap.make_at(2, &View::Placed(true, tex_res, d3d));
     }
+
+    #[test]
+    fn kept_raw_batched_cbv_and_null_preserve_invariants() {
+        use windows::core::Interface;
+        let (Some(host), Some(heap)) = (host(), HostHeap::new(false, 8)) else {
+            return; // no host GPU
+        };
+        let Some((buf_a, _)) = host.upload_buffer(4096) else {
+            return;
+        };
+        let Some((buf_b, _)) = host.upload_buffer(4096) else {
+            return;
+        };
+        // SAFETY: live upload buffers.
+        let (gpu_a, gpu_b) = unsafe { (buf_a.GetGPUVirtualAddress(), buf_b.GetGPUVirtualAddress()) };
+        let (raw_a, raw_b) = (buf_a.as_raw() as usize, buf_b.as_raw() as usize);
+        let holds = slot_holds();
+
+        // Stage > 64 CBVs in one loop to exercise `CbvStage` + `CopyBatch` auto-flush at 64.
+        let base = heap.dynamic(80).unwrap();
+        let mut batch = CopyBatch::new();
+        let mut retired = Vec::new();
+        for i in 0..80u32 {
+            heap.constant_at_batched(base + i, &buf_a, gpu_a, 256, &mut batch, &mut retired);
+        }
+        batch.flush();
+        assert!(retired.is_empty(), "initial writes must not retire anything");
+        assert_eq!(heap.kept_raw_at(base), if holds { raw_a } else { 0 });
+        assert_eq!(heap.kept_raw_at(base + 79), if holds { raw_a } else { 0 });
+
+        // Rewriting the same buffer hits the lock-free `kept_raw` fast-path and retires nothing.
+        heap.constant_at_batched(base, &buf_a, gpu_a, 256, &mut batch, &mut retired);
+        batch.flush();
+        assert!(retired.is_empty());
+
+        // Replacing with `buf_b` updates `kept_raw` and queues `buf_a` in `retired`.
+        heap.constant_at_batched(base, &buf_b, gpu_b, 256, &mut batch, &mut retired);
+        batch.flush();
+        if holds {
+            assert_eq!(heap.kept_raw_at(base), raw_b);
+            assert_eq!(retired.len(), 1);
+            assert_eq!(retired[0].as_raw() as usize, raw_a);
+        }
+        crate::host::retire_resources(std::mem::take(&mut retired));
+
+        // `make_null_batched` clears kept resource into `retired`, and a repeat call is a no-op.
+        heap.make_null_batched(base, &mut batch, &mut retired);
+        batch.flush();
+        assert_eq!(heap.kept_raw_at(base), 0);
+        if holds {
+            assert_eq!(retired.len(), 1);
+            assert_eq!(retired[0].as_raw() as usize, raw_b);
+        }
+        crate::host::retire_resources(std::mem::take(&mut retired));
+
+        // Title slot already holding `NULL_KIND_VIEW` with empty `kept_raw` skips copy cleanly.
+        heap.make_null_batched(0, &mut batch, &mut retired);
+        assert_eq!(batch.len, 0);
+        assert!(retired.is_empty());
+
+        heap.release(heap.id(), base, 80);
+    }
 }
 
 /// What is known of a record a list's tables hold, in that recording of the
@@ -6873,6 +7273,58 @@ impl ListViews {
 
 thread_local! {
     static LIST_VIEWS: std::cell::RefCell<Option<ListViews>> = const { std::cell::RefCell::new(None) };
+    static CBV_STAGE: std::cell::RefCell<Option<CbvStage>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Whether dynamic constant buffer slots keep a reference to their backing
+/// upload/scratch buffer (`VICTORY_SLOT_HOLDS=0` disables).
+#[inline]
+fn slot_holds() -> bool {
+    static HOLDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HOLDS.get_or_init(|| std::env::var_os("VICTORY_SLOT_HOLDS").is_none_or(|v| v != "0"))
+}
+
+/// Thread-local 64-slot CPU-only CBV/SRV/UAV descriptor heap matching
+/// [`CopyBatch`]'s capacity so `constant_at_batched` can stage CBVs and flush
+/// them together with `ListViews` / null descriptors in one `CopyDescriptors`
+/// call.
+struct CbvStage {
+    _heap: ID3D12DescriptorHeap,
+    start: usize,
+    step: usize,
+    next: usize,
+}
+
+impl CbvStage {
+    const SLOTS: usize = 64;
+
+    fn new() -> Option<Self> {
+        let host = host()?;
+        // SAFETY: plain non-shader-visible CPU descriptor heap creation.
+        unsafe {
+            let heap: ID3D12DescriptorHeap = host
+                .device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: Self::SLOTS as u32,
+                    ..Default::default()
+                })
+                .ok()?;
+            let step = host
+                .device
+                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                as usize;
+            let start = heap.GetCPUDescriptorHandleForHeapStart().ptr;
+            Some(Self { _heap: heap, start, step, next: 0 })
+        }
+    }
+
+    #[inline]
+    fn slot(&self, i: usize) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: self.start + i * self.step,
+        }
+    }
 }
 
 /// The view the record `words` names, as this thread made it for `recording`.

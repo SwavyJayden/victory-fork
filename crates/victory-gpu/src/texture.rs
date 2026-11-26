@@ -1050,17 +1050,128 @@ fn fill_plane(
     bytes: usize,
     pitch: usize,
 ) {
-    let _pin = crate::watch::title_memory_reading();
-    // SAFETY: the list owns this full upload allocation until its GPU work completes.
-    let out = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, bytes) };
+    // Every title-memory read below uses fault-safe `read_into` / `copy_mapped`
+    // (`safecopy::copy` or `ReadProcessMemory`), so we never block on
+    // `watch::title_memory_reading()` across multi-megabyte linear plane copies.
+    const PARALLEL_PLANE_BYTES: usize = 512 << 10;
+    const CHUNK_BYTES: usize = 256 << 10;
+
     let mip = &layout.mips[0];
-    if mip.offset == 0
-        && mip.pitch as usize * layout.desc.element_bytes as usize == pitch
+    let elem = layout.desc.element_bytes as usize;
+    let src_pitch = (mip.pitch as usize).saturating_mul(elem);
+    let row_bytes = (mip.width as usize).saturating_mul(elem);
+    let height = mip.height as usize;
+    let mip_offset = mip.offset as usize;
+    let src_base = at.wrapping_add(mip_offset);
+
+    // Fast path A: identical linear row pitch, zero mip offset — copy directly
+    // into WC upload memory in fault-safe chunks (parallelized when >= 512 KiB).
+    if layout.desc.swizzle.0 == 0
+        && mip.depth == 1
+        && mip_offset == 0
+        && src_pitch == pitch
         && bytes <= len
-        && crate::host::read_into(at as *const _, out)
     {
+        let copy_chunk = |off: usize, n: usize| {
+            let s = at.wrapping_add(off);
+            let d = dst.wrapping_add(off);
+            // SAFETY: `[d, d + n)` is a disjoint slice of the list's upload buffer.
+            let slice = unsafe { std::slice::from_raw_parts_mut(d as *mut u8, n) };
+            if !crate::host::read_into(s as *const u8, slice) {
+                crate::host::copy_mapped(d as *mut u8, s as *const u8, n, false);
+            }
+        };
+        if bytes >= PARALLEL_PLANE_BYTES {
+            let chunks = bytes.div_ceil(CHUNK_BYTES);
+            crate::land::each_under(chunks, &|i| {
+                let off = i * CHUNK_BYTES;
+                let n = (bytes - off).min(CHUNK_BYTES);
+                copy_chunk(off, n);
+            });
+        } else if bytes > 0 {
+            copy_chunk(0, bytes);
+        }
         return;
     }
+
+    // Fast path B: linear plane with mismatched pitch (e.g. 64B-aligned title
+    // pitch vs 256B-aligned D3D12 `RowPitch`) or non-zero mip offset — copy
+    // row-by-row directly into WC upload memory (or band-buffered when a page
+    // is unmapped / `safecopy` is off), parallelized by row bands when >= 512 KiB.
+    let src_end = height
+        .saturating_sub(1)
+        .checked_mul(src_pitch)
+        .and_then(|o| mip_offset.checked_add(o))
+        .and_then(|o| o.checked_add(row_bytes));
+    let dst_end = height
+        .saturating_sub(1)
+        .checked_mul(pitch)
+        .and_then(|o| o.checked_add(row_bytes));
+    if layout.desc.swizzle.0 == 0
+        && mip.depth == 1
+        && row_bytes > 0
+        && height > 0
+        && row_bytes <= src_pitch
+        && row_bytes <= pitch
+        && len >= layout.bytes_from(0) as usize
+        && src_end.is_some_and(|e| e <= len)
+        && dst_end.is_some_and(|e| e <= bytes)
+    {
+        let use_safecopy = crate::safecopy::on();
+        let copy_band = |y0: usize, y1: usize| {
+            let mut y = y0;
+            if use_safecopy {
+                while y < y1 {
+                    let s = src_base.wrapping_add(y * src_pitch);
+                    let d = dst.wrapping_add(y * pitch);
+                    // SAFETY: `[d, d + row_bytes)` is disjoint across rows and bands,
+                    // and `y * pitch + row_bytes <= bytes`.
+                    let row = unsafe { std::slice::from_raw_parts_mut(d as *mut u8, row_bytes) };
+                    if !crate::host::read_into(s as *const u8, row) {
+                        break;
+                    }
+                    y += 1;
+                }
+                if y == y1 {
+                    return;
+                }
+            }
+            // Fallback for unmapped pages (or `!safecopy::on()`): copy the remaining
+            // rows of this band once via `copy_mapped` (zeroing unmapped pages), then
+            // copy each row sequentially into WC `dst`.
+            let rem_rows = y1 - y;
+            let band_src = src_base.wrapping_add(y * src_pitch);
+            let band_len = (rem_rows - 1) * src_pitch + row_bytes;
+            with_read(band_len, |buf| {
+                crate::host::copy_mapped(buf.as_mut_ptr(), band_src as *const u8, band_len, false);
+                for r in y..y1 {
+                    let s = (r - y) * src_pitch;
+                    let d = dst.wrapping_add(r * pitch);
+                    // SAFETY: `s + row_bytes <= band_len == buf.len()`, and
+                    // `[d, d + row_bytes)` is a disjoint slice of `dst..dst + bytes`.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(buf.as_ptr().add(s), d as *mut u8, row_bytes);
+                    }
+                }
+            });
+        };
+        if bytes >= PARALLEL_PLANE_BYTES && height >= 2 {
+            let rows_per_band = (CHUNK_BYTES / pitch.max(1)).clamp(1, height);
+            let bands = height.div_ceil(rows_per_band);
+            crate::land::each_under(bands, &|band| {
+                let y0 = band * rows_per_band;
+                let y1 = (y0 + rows_per_band).min(height);
+                copy_band(y0, y1);
+            });
+        } else {
+            copy_band(0, height);
+        }
+        return;
+    }
+
+    // Fallback for non-linear or unusual geometry.
+    // SAFETY: the list owns this full upload allocation until its GPU work completes.
+    let out = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, bytes) };
     with_read(len, |read| {
         crate::host::copy_mapped(read.as_mut_ptr(), at as *const u8, len, false);
         if let Err(error) = layout.detile(read, 0, 0, out, pitch, bytes) {
@@ -2193,6 +2304,122 @@ mod title_memory_tests {
                     .expect("the staging buffer's bytes are enough");
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
+        }
+    }
+
+    /// `fill_plane` produces byte-identical output on every valid row to
+    /// `layout.detile` for both matching pitch (`src_pitch == pitch`, small
+    /// and >= 512 KiB parallel) and mismatched pitch (`src_pitch != pitch`,
+    /// e.g. 1920x1080 `R8_UNORM` with 1920 vs 2048), and safely zero-fills
+    /// unmapped pages without crashing.
+    #[test]
+    fn fill_plane_matches_detile_for_matching_and_mismatched_pitch() {
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        use windows_sys::Win32::System::Memory::*;
+
+        let check = |width: u32, height: u32, custom_src_pitch: Option<u32>, dst_pitch: usize| {
+            let mut layout = Layout::new(&Desc {
+                dimension: Dimension::Tex2d,
+                width,
+                height,
+                depth: 1,
+                mips: 1,
+                element_bytes: 1,
+                block: 1,
+                samples: 1,
+                swizzle: Swizzle::LINEAR,
+            })
+            .expect("linear R8_UNORM layout");
+            if let Some(p) = custom_src_pitch {
+                layout.mips[0].pitch = p;
+                layout.slice_size = u64::from(p) * u64::from(height);
+                layout.size = layout.slice_size;
+            }
+            let src_len = layout.size as usize;
+            let src: Vec<u8> = (0..src_len)
+                .map(|i| ((i.wrapping_mul(37) ^ (i >> 7) ^ 0x5A) as u8).max(1))
+                .collect();
+            let dst_bytes = dst_pitch * height as usize;
+            let mut expected = vec![0xCCu8; dst_bytes];
+            layout
+                .detile(&src, 0, 0, &mut expected, dst_pitch, dst_bytes)
+                .expect("detile reference");
+
+            let mut got = vec![0xCCu8; dst_bytes];
+            super::fill_plane(
+                &layout,
+                src.as_ptr() as usize,
+                src_len,
+                got.as_mut_ptr() as usize,
+                dst_bytes,
+                dst_pitch,
+            );
+            let row_bytes = width as usize;
+            for y in 0..height as usize {
+                let off = y * dst_pitch;
+                assert_eq!(
+                    got[off..off + row_bytes],
+                    expected[off..off + row_bytes],
+                    "row {y} mismatch ({width}x{height} src_pitch={} dst_pitch={dst_pitch})",
+                    layout.mips[0].pitch,
+                );
+            }
+        };
+
+        // Matching pitch: small (< 512 KiB) and large (>= 512 KiB parallel path A).
+        check(320, 180, None, 512);
+        check(1920, 1080, None, 2048);
+        // Mismatched pitch: small and 1920x1080 (`src_pitch = 1920`, `dst_pitch = 2048`, parallel path B).
+        check(300, 120, Some(320), 512);
+        check(1920, 1080, Some(1920), 2048);
+        check(1920, 1080, None, 2304);
+
+        // Unmapped pages inside a mismatched-pitch plane must zero-fill safely.
+        let mut layout = Layout::new(&Desc {
+            dimension: Dimension::Tex2d,
+            width: 1920,
+            height: 64,
+            depth: 1,
+            mips: 1,
+            element_bytes: 1,
+            block: 1,
+            samples: 1,
+            swizzle: Swizzle::LINEAR,
+        })
+        .expect("linear layout");
+        layout.mips[0].pitch = 1920;
+        layout.slice_size = 1920 * 64;
+        layout.size = layout.slice_size;
+        let total = (layout.size as usize).next_multiple_of(4096);
+        let mapped_head = 65536usize.min(total);
+        // SAFETY: private reservation with committed head and uncommitted tail.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), total, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            assert_eq!(VirtualAlloc(base.cast(), mapped_head, MEM_COMMIT, PAGE_READWRITE), base.cast());
+            for i in 0..mapped_head {
+                base.add(i).write(((i * 13 + 7) & 0xFF) as u8);
+            }
+            let mut ref_src = vec![0u8; layout.size as usize];
+            ref_src[..mapped_head].copy_from_slice(std::slice::from_raw_parts(base, mapped_head));
+            let dst_pitch = 2048usize;
+            let dst_bytes = dst_pitch * 64;
+            let mut expected = vec![0xEEu8; dst_bytes];
+            layout.detile(&ref_src, 0, 0, &mut expected, dst_pitch, dst_bytes).unwrap();
+            let mut got = vec![0xEEu8; dst_bytes];
+            super::fill_plane(
+                &layout,
+                base as usize,
+                layout.size as usize,
+                got.as_mut_ptr() as usize,
+                dst_bytes,
+                dst_pitch,
+            );
+            for y in 0..64 {
+                let off = y * dst_pitch;
+                assert_eq!(got[off..off + 1920], expected[off..off + 1920], "sparse row {y}");
+            }
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
         }
     }
 }

@@ -262,46 +262,85 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
         Does::Fill { to: false, .. } => Err("a fill of memory the card cannot be given the bytes of"),
         _ => Ok(()),
     };
-    let mut taken = vec![false; does.len()];
-    let (mut read, mut written) = (Vec::new(), Vec::new());
     let mut more = Vec::new();
+    let mut has_copy = false;
+    let mut has_placed = false;
     for (i, d) in does.iter().enumerate() {
         match *d {
             Does::Run => return Err("a step of ours runs"),
             Does::Read { asked: true, .. } => return Err("a texture reads it"),
-            Does::Copy { asked: true, .. } | Does::Fill { asked: true, .. } => more.push(i),
+            Does::Copy { asked, .. } => {
+                has_copy = true;
+                if asked {
+                    more.push(i);
+                }
+            }
+            Does::Fill { asked: true, .. } => more.push(i),
+            Does::Placed { .. } => has_placed = true,
             _ => {}
         }
     }
+    if more.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Common fills-only fast path (thousands of constant-buffer fills per frame
+    // with no buffer copies or placed copies): fills never write, so nothing
+    // can depend on them and every taken fill runs at level 0.
+    if !has_copy && !has_placed {
+        if more.len() > MOST {
+            return Err("too many steps depend on it");
+        }
+        let mut out = Vec::with_capacity(more.len());
+        for i in more {
+            takes(&does[i])?;
+            out.push((i, 0));
+        }
+        return Ok(out);
+    }
+    let mut taken = vec![false; does.len()];
+    let mut taken_count = 0usize;
+    let (mut read, mut written) = (Vec::new(), Vec::new());
+    let (mut reads, mut writes) = (Vec::new(), Vec::new());
     while !more.is_empty() {
         // (Joined once for the round: one by one the 2,800 fills of a frame
         // sorted the ranges each time, 16 ms of the submitting thread.)
-        let (mut reads, mut writes) = (Vec::new(), Vec::new());
-        for i in std::mem::take(&mut more) {
+        reads.clear();
+        writes.clear();
+        for i in more.drain(..) {
             takes(&does[i])?;
             taken[i] = true;
+            taken_count += 1;
             if let Some((r, w)) = reads_writes(&does[i]) {
-                if w.0 < w.1 && meet(r, w) {
-                    return Err("a copy onto itself");
+                if w.0 < w.1 {
+                    if meet(r, w) {
+                        return Err("a copy onto itself");
+                    }
+                    writes.push(w);
                 }
                 reads.push(r);
-                writes.push(w);
             }
         }
-        join_ranges(&mut read, reads);
-        if writes.iter().any(|w| w.0 < w.1) {
-            join_ranges(&mut written, writes);
+        join_ranges(&mut read, reads.drain(..));
+        if !writes.is_empty() {
+            join_ranges(&mut written, writes.drain(..));
         }
-        if taken.iter().filter(|t| **t).count() > MOST {
+        if taken_count > MOST {
             return Err("too many steps depend on it");
         }
+        if !has_copy {
+            break;
+        }
+        let has_written = !written.is_empty();
         for (i, d) in does.iter().enumerate() {
             // A fill that cannot be taken is looked at below.
             if taken[i] || matches!(d, Does::Fill { to: false, .. }) {
                 continue;
             }
+            if !has_written && !matches!(d, Does::Copy { .. }) {
+                continue;
+            }
             if let Some((r, w)) = reads_writes(d)
-                && (touched(&written, r) || touched(&written, w) || touched(&read, w))
+                && ((has_written && (touched(&written, r) || touched(&written, w))) || touched(&read, w))
             {
                 more.push(i);
             }
@@ -310,42 +349,59 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
     // A copy at its place in a list comes after what is done in front of all
     // of them: as it should after the steps ahead of it, but not after those
     // behind it that read or write its bytes.
-    for (p, d) in does.iter().enumerate() {
-        if let Does::Placed { dst, src, len } = *d
-            && (touched(&read, (dst, dst + len)) || touched(&written, (dst, dst + len)) || touched(&written, (src, src + len)))
-        {
-            let (to, from) = ((dst, dst + len), (src, src + len));
-            let in_the_way = |i: usize| {
-                reads_writes(&does[i]).is_some_and(|(r, w)| meet(r, to) || w.0 < w.1 && (meet(w, to) || meet(w, from)))
-            };
-            let found = (p + 1..does.len()).find(|&i| taken[i] && in_the_way(i));
-            *behind = found.map(|i| (p, i));
-            if !by_order || found.is_some() {
-                return Err(BEHIND_PLACED);
+    if has_placed {
+        for (p, d) in does.iter().enumerate() {
+            if let Does::Placed { dst, src, len } = *d
+                && (touched(&read, (dst, dst + len)) || touched(&written, (dst, dst + len)) || touched(&written, (src, src + len)))
+            {
+                let (to, from) = ((dst, dst + len), (src, src + len));
+                let in_the_way = |i: usize| {
+                    reads_writes(&does[i]).is_some_and(|(r, w)| meet(r, to) || w.0 < w.1 && (meet(w, to) || meet(w, from)))
+                };
+                let found = (p + 1..does.len()).find(|&i| taken[i] && in_the_way(i));
+                *behind = found.map(|i| (p, i));
+                if !by_order || found.is_some() {
+                    return Err(BEHIND_PLACED);
+                }
             }
         }
     }
     let order: Vec<usize> = (0..does.len()).filter(|&i| taken[i]).collect();
+    if written.is_empty() {
+        return Ok(order.into_iter().map(|i| (i, 0)).collect());
+    }
     // What stays on the CPU and reads what an earlier taken copy writes
     // would read it too early.
-    let mut behind: Vec<(usize, usize)> = Vec::new();
+    let mut behind_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut behind_dirty = false;
     for (i, d) in does.iter().enumerate() {
         if taken[i] {
             if let Some((_, w)) = reads_writes(d)
                 && w.0 < w.1
             {
-                join_ranges(&mut behind, [w]);
+                behind_ranges.push(w);
+                behind_dirty = true;
             }
             continue;
         }
-        match *d {
-            Does::Read { from, to, .. } if touched(&behind, (from, to)) => {
-                return Err("a texture or expanded vertices read what it writes");
+        if behind_ranges.is_empty() {
+            continue;
+        }
+        let query = match *d {
+            Does::Read { from, to, .. } => Some((from, to, "a texture or expanded vertices read what it writes")),
+            Does::Fill { src, len, .. } => {
+                Some((src, src + len, "a fill of memory the card cannot be given the bytes of reads what it writes"))
             }
-            Does::Fill { src, len, .. } if touched(&behind, (src, src + len)) => {
-                return Err("a fill of memory the card cannot be given the bytes of reads what it writes");
+            _ => None,
+        };
+        if let Some((from, to, err)) = query {
+            if behind_dirty {
+                join_ranges(&mut behind_ranges, []);
+                behind_dirty = false;
             }
-            _ => {}
+            if touched(&behind_ranges, (from, to)) {
+                return Err(err);
+            }
         }
     }
     let mut out: Vec<(usize, u32)> = Vec::with_capacity(order.len());
@@ -395,27 +451,170 @@ fn elsewhere(does: &[Does], shadow: usize, from: usize, to: usize) -> bool {
     })
 }
 
+/// Coalesced interval entry for O(log N) overlapping-writer queries without
+/// scanning thousands of in-flight write ranges per fill.
+struct WriterEntry {
+    shadow: Option<u32>,
+    from: usize,
+    to: usize,
+    max_to: usize,
+}
+
+/// Deduplicated, sorted index of in-flight writers plus any `Does::Copy`
+/// writers appended during this submission.
+struct WriterIndex {
+    shadows: Vec<Arc<Shadow>>,
+    entries: Vec<WriterEntry>,
+    extra: Vec<(u32, usize, usize)>,
+}
+
+impl WriterIndex {
+    fn intern(shadows: &mut Vec<Arc<Shadow>>, shadow: &Arc<Shadow>) -> u32 {
+        if let Some(pos) = shadows.iter().position(|s| Arc::ptr_eq(s, shadow)) {
+            return pos as u32;
+        }
+        shadows.push(shadow.clone());
+        (shadows.len() - 1) as u32
+    }
+
+    /// Snapshots in-flight and landing writers under `line`'s lock with one
+    /// `Arc::clone` per unique shadow, returning raw intervals to index outside
+    /// the lock.
+    fn collect_line(line: &Line) -> (Vec<Arc<Shadow>>, Vec<(Option<u32>, usize, usize)>) {
+        let mut shadows = Vec::new();
+        let mut raw = Vec::new();
+        for item in &line.line {
+            match item {
+                Late::Run(flight) => {
+                    for (shadow, ranges) in &flight.back {
+                        let id = Some(Self::intern(&mut shadows, shadow));
+                        raw.extend(ranges.iter().map(|&(from, to)| (id, from, to)));
+                    }
+                    for &i in &flight.order {
+                        for &(_, at, [row, rows, pitch]) in &flight.lists[i].host().deferred().backs {
+                            raw.push((None, at, at + rows.saturating_sub(1) * pitch + row));
+                        }
+                    }
+                    if let Some(own) = &flight.own {
+                        for (shadow, from, to) in &own.copied {
+                            let id = Some(Self::intern(&mut shadows, shadow));
+                            raw.push((id, *from, *to));
+                        }
+                    }
+                }
+                Late::Write(at, _, bytes) => raw.push((None, *at, *at + *bytes)),
+                Late::Signal(..) => {}
+            }
+        }
+        for w in &line.landing {
+            let id = w.shadow.as_ref().map(|s| Self::intern(&mut shadows, s));
+            raw.push((id, w.from, w.to));
+        }
+        (shadows, raw)
+    }
+
+    /// Coalesces overlapping/touching intervals with the same shadow and builds
+    /// a `from`-sorted prefix-max index.
+    fn build(shadows: Vec<Arc<Shadow>>, mut raw: Vec<(Option<u32>, usize, usize)>) -> Self {
+        raw.sort_unstable();
+        let mut merged: Vec<(Option<u32>, usize, usize)> = Vec::with_capacity(raw.len());
+        for (shadow, from, to) in raw {
+            match merged.last_mut() {
+                Some(last) if last.0 == shadow && from <= last.2 && last.1 < last.2 && from < to => {
+                    last.2 = last.2.max(to);
+                }
+                Some(last) if *last == (shadow, from, to) => {}
+                _ => merged.push((shadow, from, to)),
+            }
+        }
+        merged.sort_unstable_by_key(|e| e.1);
+        let mut max_to = 0usize;
+        let entries = merged
+            .into_iter()
+            .map(|(shadow, from, to)| {
+                max_to = max_to.max(to);
+                WriterEntry { shadow, from, to, max_to }
+            })
+            .collect();
+        Self { shadows, entries, extra: Vec::new() }
+    }
+
+    #[cfg(test)]
+    fn from_writers(writers: &[Writer]) -> Self {
+        let mut shadows = Vec::new();
+        let mut raw = Vec::with_capacity(writers.len());
+        for w in writers {
+            let id = w.shadow.as_ref().map(|s| Self::intern(&mut shadows, s));
+            raw.push((id, w.from, w.to));
+        }
+        Self::build(shadows, raw)
+    }
+
+    fn query_writers(&self, from: usize, to: usize) -> Result<Option<u32>, &'static str> {
+        let mut found: Option<u32> = None;
+        let hi = self.entries.partition_point(|e| e.from < to);
+        for e in self.entries[..hi].iter().rev() {
+            if e.max_to <= from {
+                break;
+            }
+            if e.to > from {
+                match (e.shadow, found) {
+                    (None, _) => return Err("a read-back or a value behind a flight is written there"),
+                    (Some(s), Some(f)) if s != f => return Err("flights write it through two host copies"),
+                    (Some(s), _) => found = Some(s),
+                }
+            }
+        }
+        for &(s, w_from, w_to) in &self.extra {
+            if meet((w_from, w_to), (from, to)) {
+                match found {
+                    Some(f) if f != s => return Err("flights write it through two host copies"),
+                    _ => found = Some(s),
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    fn holder(&mut self, from: usize, to: usize, fallback_cache: &mut HashMap<(usize, usize), u32>) -> Result<u32, &'static str> {
+        let idx = match self.query_writers(from, to)? {
+            Some(idx) => idx,
+            None => match fallback_cache.get(&(from, to - from)) {
+                Some(&idx) => return Ok(idx),
+                None => {
+                    let shadow = crate::shadow::find(from as u64, (to - from) as u64).ok_or("no host copy of it")?;
+                    let (start, len) = shadow.span();
+                    if shadow.in_place() || (from as u64) < start || to as u64 > start + len {
+                        return Err("no host copy holds all of it");
+                    }
+                    let idx = Self::intern(&mut self.shadows, &shadow);
+                    fallback_cache.insert((from, to - from), idx);
+                    return Ok(idx);
+                }
+            },
+        };
+        let shadow = &self.shadows[idx as usize];
+        let (start, len) = shadow.span();
+        if shadow.in_place() || (from as u64) < start || to as u64 > start + len {
+            return Err("no host copy holds all of it");
+        }
+        Ok(idx)
+    }
+
+    fn push_extra(&mut self, shadow: u32, from: usize, to: usize) {
+        self.extra.push((shadow, from, to));
+    }
+}
+
 /// The host copy that holds `[from, to)` on the card once what `writers`
 /// write is there: the one they all write it through, or without any the
 /// one shaders would be given.
+#[cfg(test)]
 fn holder(writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'static str> {
-    let mut found: Option<&Arc<Shadow>> = None;
-    for w in writers.iter().filter(|w| meet((w.from, w.to), (from, to))) {
-        match (&w.shadow, found) {
-            (None, _) => return Err("a read-back or a value behind a flight is written there"),
-            (Some(s), Some(f)) if !Arc::ptr_eq(s, f) => return Err("flights write it through two host copies"),
-            (Some(s), _) => found = Some(s),
-        }
-    }
-    let shadow = match found {
-        Some(s) => s.clone(),
-        None => crate::shadow::find(from as u64, (to - from) as u64).ok_or("no host copy of it")?,
-    };
-    let (start, len) = shadow.span();
-    if shadow.in_place() || (from as u64) < start || to as u64 > start + len {
-        return Err("no host copy holds all of it");
-    }
-    Ok(shadow)
+    let mut index = WriterIndex::from_writers(writers);
+    let mut cache = HashMap::default();
+    let idx = index.holder(from, to, &mut cache)?;
+    Ok(index.shadows[idx as usize].clone())
 }
 
 /// What the steps of `runs` do, which step each is (its list by address,
@@ -438,7 +637,14 @@ fn does_of(
     let mut fills = Vec::new();
     for list in runs {
         let ptr = std::ptr::from_ref::<HostList>(list) as usize;
-        for (i, step) in list.deferred().copies.iter().enumerate() {
+        let deferred = list.deferred();
+        let cap = deferred.copies.len();
+        does.reserve(cap);
+        steps.reserve(cap);
+        if with_fills {
+            fills.reserve(cap);
+        }
+        for (i, step) in deferred.copies.iter().enumerate() {
             let mut fill_target = None;
             does.push(match step {
                 &Step::Copy(dst, src, len) => Does::Copy {
@@ -516,29 +722,166 @@ pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
     (place(reader)? >= cut).then_some(cut)
 }
 
-/// Whether every page of `[from, to)` can be read (through the kernel:
-/// asking Windows walks the page tables, milliseconds in the title's heap).
-/// `known`: pages that could be, of the same submission: its fills' places
-/// lie eight to a page, and each was read whole to find out.
-fn mapped(from: usize, to: usize, known: &mut HashMap<usize, ()>) -> bool {
-    const PAGE: usize = 4096;
-    (from / PAGE..to.div_ceil(PAGE)).all(|page| {
-        known.contains_key(&page) || {
-            let there = read_into((page * PAGE).max(from) as *const u8, &mut [0]);
-            if there {
-                known.insert(page, ());
+/// Per-submission cache of readable 4 KiB title pages packed into 16-page
+/// (64 KiB) bitmasks plus a 1-entry hot-page register so consecutive constant
+/// fills in the same 4 KiB page avoid hashing altogether.
+struct MappedCache {
+    last_page: usize,
+    blocks: HashMap<usize, u16>,
+}
+
+impl Default for MappedCache {
+    fn default() -> Self {
+        Self { last_page: usize::MAX, blocks: HashMap::default() }
+    }
+}
+
+impl MappedCache {
+    /// Whether every page of `[from, to)` can be read (through `safecopy` or
+    /// the kernel: asking Windows walks the page tables, milliseconds in the
+    /// title's heap).
+    fn check(&mut self, from: usize, to: usize) -> bool {
+        const PAGE: usize = 4096;
+        for page in from / PAGE..to.div_ceil(PAGE) {
+            if page == self.last_page {
+                continue;
             }
-            there
+            let block = page >> 4;
+            let bit = 1u16 << (page & 15);
+            if self.blocks.get(&block).is_some_and(|&mask| mask & bit != 0) {
+                self.last_page = page;
+                continue;
+            }
+            if !read_into((page * PAGE).max(from) as *const u8, &mut [0]) {
+                return false;
+            }
+            *self.blocks.entry(block).or_insert(0) |= bit;
+            self.last_page = page;
         }
-    })
+        true
+    }
 }
 
 /// A table by addresses and numbers of ours.
 type HashMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<AddressHash>>;
 
+/// A coalesced `CopyBufferRegion` read from one host copy into `own.between`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReadSpan {
+    shadow: u32,
+    level: u32,
+    src: usize,
+    len: usize,
+    at: u64,
+}
+
+/// Read-layout request for one `Op` before coalescing into `own.between`.
+#[derive(Clone, Copy, Debug)]
+struct OpRead {
+    shadow: u32,
+    src: usize,
+    len: usize,
+    level: u32,
+    /// `To::Slot` constant buffer views require 256-byte alignment in `between`.
+    aligned_256: bool,
+}
+
+/// Coalesces adjacent, overlapping, and near-gap (`<= max_gap`) reads from the
+/// same `(level, shadow)` into contiguous `CopyBufferRegion` spans in `between`
+/// while preserving 256-byte CBV alignment for every `aligned_256` op.
+/// Returns `None` if the packed layout exceeds `budget`.
+fn layout_reads(ops: &[OpRead], budget: u64, max_gap: usize) -> Option<(Vec<ReadSpan>, Vec<u64>, u64)> {
+    if ops.is_empty() {
+        return Some((Vec::new(), Vec::new(), 0));
+    }
+    let mut order: Vec<usize> = (0..ops.len()).collect();
+    order.sort_unstable_by_key(|&i| {
+        let o = ops[i];
+        (o.level, o.shadow, o.aligned_256 && !o.src.is_multiple_of(256), o.src, o.len)
+    });
+
+    let mut spans: Vec<ReadSpan> = Vec::new();
+    let mut op_ats = vec![0u64; ops.len()];
+    let mut end = 0u64;
+    let mut k = 0usize;
+    while k < order.len() {
+        let first = ops[order[k]];
+        let unaligned_slot = first.aligned_256 && !first.src.is_multiple_of(256);
+        if unaligned_slot {
+            // Rare unaligned CBV source: place at its own 256-byte-aligned
+            // offset in `between`, deduplicating exact matches.
+            let at = match spans.last() {
+                Some(prev)
+                    if prev.level == first.level
+                        && prev.shadow == first.shadow
+                        && prev.src == first.src
+                        && prev.len == first.len =>
+                {
+                    prev.at
+                }
+                _ => {
+                    if end + first.len as u64 > budget {
+                        return None;
+                    }
+                    let at = end;
+                    end = (end + first.len as u64).next_multiple_of(256);
+                    spans.push(ReadSpan {
+                        shadow: first.shadow,
+                        level: first.level,
+                        src: first.src,
+                        len: first.len,
+                        at,
+                    });
+                    at
+                }
+            };
+            op_ats[order[k]] = at;
+            k += 1;
+            continue;
+        }
+        // Coalesce a run of normal ops within one `(level, shadow)`.
+        let group_start = k;
+        let span_src = first.src;
+        let mut span_end = first.src.saturating_add(first.len);
+        k += 1;
+        while k < order.len() {
+            let next = ops[order[k]];
+            let next_unaligned = next.aligned_256 && !next.src.is_multiple_of(256);
+            if next_unaligned
+                || next.level != first.level
+                || next.shadow != first.shadow
+                || next.src > span_end.saturating_add(max_gap)
+                || (next.aligned_256 && !span_src.is_multiple_of(256))
+            {
+                break;
+            }
+            span_end = span_end.max(next.src.saturating_add(next.len));
+            k += 1;
+        }
+        let span_len = span_end - span_src;
+        if end + span_len as u64 > budget {
+            return None;
+        }
+        let at = end;
+        end = (end + span_len as u64).next_multiple_of(256);
+        spans.push(ReadSpan {
+            shadow: first.shadow,
+            level: first.level,
+            src: span_src,
+            len: span_len,
+            at,
+        });
+        for &idx in &order[group_start..k] {
+            op_ats[idx] = at + (ops[idx].src - span_src) as u64;
+        }
+    }
+    Some((spans, op_ats, end))
+}
+
 /// A step done on the card.
 struct Op {
-    from: (Arc<Shadow>, usize),
+    from_shadow: u32,
+    src: usize,
     len: usize,
     /// Its place in the buffer between.
     at: u64,
@@ -547,8 +890,8 @@ struct Op {
 }
 
 enum To {
-    /// A host copy, and the title address.
-    Copy(Arc<Shadow>, usize),
+    /// A host copy (index in `WriterIndex::shadows`), and the title address.
+    Copy(u32, usize),
     /// A descriptor slot (title heap, slot).
     Slot(usize, u32),
     /// A buffer's beginning.
@@ -719,24 +1062,19 @@ impl Host {
             return Ok(None);
         }
         spent.next("steps on the card: what holds their bytes");
-        let mut writers = {
+        let (shadows, raw_writers) = {
             let line = line();
-            let mut all = writers(&line.line);
-            all.extend(line.landing.iter().map(|w| Writer {
-                shadow: w.shadow.clone(),
-                ..*w
-            }));
-            all
+            WriterIndex::collect_line(&line)
         };
+        let mut writer_index = WriterIndex::build(shadows, raw_writers);
         let mut ops: Vec<Op> = Vec::with_capacity(chosen.len());
-        // The places read (host copy, address, bytes, level): where in the
-        // buffer between their bytes are.
-        let mut places: HashMap<(usize, usize, usize, u32), u64> = HashMap::default();
-        // Some 2,800 fills a frame, of a few hundred places: what holds each
-        // is looked for once, as long as no copy is added to the writers.
-        let mut held: HashMap<(usize, usize), Arc<Shadow>> = HashMap::default();
-        let mut room = HashMap::default();
-        let mut end = 0u64;
+        let mut op_reads: Vec<OpRead> = Vec::with_capacity(chosen.len());
+        let mut held_fallback: HashMap<(usize, usize), u32> = HashMap::default();
+        let mut room = MappedCache::default();
+        let mut has_writes = false;
+        let mut copy_count = 0usize;
+        let mut total_bytes = 0u64;
+        let mut max_level = 0u32;
         for &(i, level) in &chosen {
             let Some(((src, _), (dst, _))) = reads_writes(&does[i]) else {
                 continue;
@@ -747,63 +1085,59 @@ impl Host {
             if len == 0 {
                 return Err("nothing to read");
             }
-            let from = match held.get(&(src, len)) {
-                Some(from) => from.clone(),
-                None => {
-                    let from = holder(&writers, src, src + len)?;
-                    held.insert((src, len), from.clone());
-                    from
-                }
-            };
-            let place = (Arc::as_ptr(&from) as usize, src, len, level);
-            let at = match places.get(&place) {
-                Some(&at) => at,
-                None => {
-                    if end + len as u64 > BETWEEN {
-                        return Err("too much at once");
-                    }
-                    if !mapped(src, src + len, &mut room) {
-                        return Err("not all of what it reads is mapped");
-                    }
-                    let at = end;
-                    end = (end + len as u64).next_multiple_of(256);
-                    places.insert(place, at);
-                    at
-                }
-            };
+            let from_shadow = writer_index.holder(src, src + len, &mut held_fallback)?;
+            if !room.check(src, src + len) {
+                return Err("not all of what it reads is mapped");
+            }
             let to = match does[i] {
                 Does::Copy { .. } => {
-                    let to = holder(&writers, dst, dst + len)?;
-                    if elsewhere(&does, Arc::as_ptr(&to) as usize, dst, dst + len) {
+                    let to_shadow = writer_index.holder(dst, dst + len, &mut held_fallback)?;
+                    let to_ptr = Arc::as_ptr(&writer_index.shadows[to_shadow as usize]) as usize;
+                    if elsewhere(&does, to_ptr, dst, dst + len) {
                         return Err("another host copy of what it writes is read");
                     }
-                    if !mapped(dst, dst + len, &mut room) {
+                    if !room.check(dst, dst + len) {
                         return Err("not all of what it writes is mapped");
                     }
                     // What the steps behind it read of it is in that host
                     // copy, or nowhere.
-                    writers.push(Writer {
-                        shadow: Some(to.clone()),
-                        from: dst,
-                        to: dst + len,
-                        copy: true,
-                    });
-                    held.clear();
-                    To::Copy(to, dst)
+                    writer_index.push_extra(to_shadow, dst, dst + len);
+                    held_fallback.clear();
+                    has_writes = true;
+                    copy_count += 1;
+                    To::Copy(to_shadow, dst)
                 }
                 _ => match fills[i].take() {
                     Some(FillTo::Slot(heap, index)) => To::Slot(heap, index),
-                    Some(FillTo::Buffer(buffer)) => To::Buffer(buffer),
+                    Some(FillTo::Buffer(buffer)) => {
+                        has_writes = true;
+                        To::Buffer(buffer)
+                    }
                     None => continue,
                 },
             };
+            let aligned_256 = matches!(to, To::Slot(..));
+            max_level = max_level.max(level);
+            total_bytes += len as u64;
+            op_reads.push(OpRead { shadow: from_shadow, src, len, level, aligned_256 });
             ops.push(Op {
-                from: (from, src),
+                from_shadow,
+                src,
                 len,
-                at,
+                at: 0,
                 level,
                 to,
             });
+        }
+        // Coalesce adjacent/overlapping/near-gap reads per `(level, shadow)` to
+        // collapse thousands of small `CopyBufferRegion` calls into a handful of
+        // bulk VRAM-to-VRAM copies; tighten gap threshold before refusing.
+        let (read_spans, op_ats, end) = layout_reads(&op_reads, BETWEEN, 2048)
+            .or_else(|| layout_reads(&op_reads, BETWEEN, 256))
+            .or_else(|| layout_reads(&op_reads, BETWEEN, 0))
+            .ok_or("too much at once")?;
+        for (op, at) in ops.iter_mut().zip(op_ats) {
+            op.at = at;
         }
         spent.next("steps on the card: the list");
         let Some(own) = self.own_list() else {
@@ -813,44 +1147,71 @@ impl Host {
         // the title's. (One step for each host copy, over all that is read of
         // it: a flush brings a copy up to date from the first range asked for
         // to the last, whatever the steps.)
-        let mut spans: ByCopy<(Arc<Shadow>, usize, usize)> = ByCopy::default();
+        let mut shadow_spans: Vec<Option<(usize, usize)>> = vec![None; writer_index.shadows.len()];
+        let mut extend_span = |shadow_idx: u32, at: usize, len: usize| {
+            let slot = &mut shadow_spans[shadow_idx as usize];
+            match slot {
+                Some((lo, hi)) => {
+                    *lo = (*lo).min(at);
+                    *hi = (*hi).max(at + len);
+                }
+                None => *slot = Some((at, at + len)),
+            }
+        };
         for op in &ops {
-            let to = match &op.to {
-                To::Copy(to, dst) => Some((to, *dst)),
-                _ => None,
-            };
-            for (shadow, at) in std::iter::once((&op.from.0, op.from.1)).chain(to) {
-                let span = spans.entry(Arc::as_ptr(shadow) as usize).or_insert_with(|| (shadow.clone(), at, at + op.len));
-                (span.1, span.2) = (span.1.min(at), span.2.max(at + op.len));
+            extend_span(op.from_shadow, op.src, op.len);
+            if let To::Copy(to_shadow, dst) = op.to {
+                extend_span(to_shadow, dst, op.len);
             }
         }
-        for (shadow, from, to) in spans.into_values() {
-            shadow.refresh(&own.list, from as u64, (to - from) as u64);
+        for (shadow, span) in writer_index.shadows.iter().zip(shadow_spans) {
+            if let Some((from, to)) = span {
+                shadow.refresh(&own.list, from as u64, (to - from) as u64);
+            }
         }
-        let mut copied = Vec::new();
-        for op in &ops {
-            if let To::Copy(to, dst) = &op.to {
-                to.gpu_writes(&own.list, *dst as u64, op.len as u64);
-                copied.push((to.clone(), *dst, *dst + op.len));
+        let mut copied = Vec::with_capacity(copy_count);
+        if copy_count > 0 {
+            for op in &ops {
+                if let To::Copy(to_shadow, dst) = op.to {
+                    let to = &writer_index.shadows[to_shadow as usize];
+                    to.gpu_writes(&own.list, dst as u64, op.len as u64);
+                    copied.push((to.clone(), dst, dst + op.len));
+                }
             }
         }
         #[cfg(feature = "diagnostics")]
-        own.list.note_op(|| format!("{} copies of title memory done on the card, {end} bytes (VICTORY_CARD_STEPS)", ops.len()));
-        let levels = ops.iter().map(|op| op.level).max().unwrap_or(0);
-        for level in 0..=levels {
-            let mut reads = Vec::new();
-            let mut writes = Vec::new();
-            for op in ops.iter().filter(|op| op.level == level) {
-                let len = op.len as u64;
-                let read = (&op.from.0.buffer, op.from.0.offset(op.from.1 as u64), op.at, len);
-                // (Each place once.)
-                if places.remove(&(Arc::as_ptr(&op.from.0) as usize, op.from.1, op.len, level)).is_some() {
-                    reads.push(read);
-                }
-                match &op.to {
-                    To::Copy(to, dst) => writes.push((&to.buffer, to.offset(*dst as u64), op.at, len)),
-                    To::Buffer(buffer) => writes.push((buffer, 0, op.at, len)),
-                    To::Slot(..) => {}
+        own.list.note_op(|| {
+            format!(
+                "{} copies of title memory done on the card ({} coalesced reads, {end} bytes, VICTORY_CARD_STEPS)",
+                ops.len(),
+                read_spans.len(),
+            )
+        });
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = end;
+        let mut span_cursor = 0usize;
+        let mut reads = Vec::with_capacity(read_spans.len());
+        let mut writes = Vec::new();
+        for level in 0..=max_level {
+            reads.clear();
+            writes.clear();
+            while span_cursor < read_spans.len() && read_spans[span_cursor].level == level {
+                let s = read_spans[span_cursor];
+                let shadow = &writer_index.shadows[s.shadow as usize];
+                reads.push((&shadow.buffer, shadow.offset(s.src as u64), s.at, s.len as u64));
+                span_cursor += 1;
+            }
+            if has_writes {
+                for op in ops.iter().filter(|op| op.level == level) {
+                    let len = op.len as u64;
+                    match &op.to {
+                        To::Copy(to_shadow, dst) => {
+                            let to = &writer_index.shadows[*to_shadow as usize];
+                            writes.push((&to.buffer, to.offset(*dst as u64), op.at, len));
+                        }
+                        To::Buffer(buffer) => writes.push((buffer, 0, op.at, len)),
+                        To::Slot(..) => {}
+                    }
                 }
             }
             record(level == 0, &own.list.list, &own.between, &reads, &writes);
@@ -864,7 +1225,10 @@ impl Host {
         // `SHADER_HEAPS.read()` once for its whole batch, preserving step order
         // per slot.)
         let parts = if ops.len() < 64 { 1 } else { 8 };
-        let mut buckets: Vec<Vec<(usize, u32, u64, u32)>> = (0..parts).map(|_| Vec::new()).collect();
+        let per = ops.len() / parts + 16;
+        let mut buckets: [Vec<(usize, u32, u64, u32)>; 8] = std::array::from_fn(|p| {
+            if p < parts { Vec::with_capacity(per) } else { Vec::new() }
+        });
         for op in &ops {
             if let To::Slot(heap, index) = &op.to {
                 let part = (*index as usize / 4) % parts;
@@ -876,16 +1240,18 @@ impl Host {
                 crate::descriptor::constant_slots_batch(&buckets[part], &own.between);
             }
         });
-        let copies = ops.iter().filter(|op| matches!(op.to, To::Copy(..))).count();
-        DONE[0].fetch_add((ops.len() - copies) as u64, Ordering::Relaxed);
-        DONE[1].fetch_add(copies as u64, Ordering::Relaxed);
-        DONE[2].fetch_add(ops.iter().map(|op| op.len as u64).sum(), Ordering::Relaxed);
+        DONE[0].fetch_add((ops.len() - copy_count) as u64, Ordering::Relaxed);
+        DONE[1].fetch_add(copy_count as u64, Ordering::Relaxed);
+        DONE[2].fetch_add(total_bytes, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
-        noted(&ops);
+        noted(&ops, &writer_index.shadows);
         spent.end();
+        let mut taken_steps =
+            std::collections::HashSet::with_capacity_and_hasher(chosen.len(), std::hash::BuildHasherDefault::default());
+        taken_steps.extend(chosen.iter().map(|&(i, _)| steps[i]));
         Ok(Some(Taken {
             own,
-            steps: chosen.iter().map(|&(i, _)| steps[i]).collect(),
+            steps: taken_steps,
             copied,
         }))
     }
@@ -913,16 +1279,16 @@ type Noted = std::collections::HashMap<(usize, (u64, u64), (u64, u64)), (u64, us
 static NOTED: Mutex<Option<Noted>> = Mutex::new(None);
 
 #[cfg(feature = "diagnostics")]
-fn noted(ops: &[Op]) {
+fn noted(ops: &[Op], shadows: &[Arc<Shadow>]) {
     let mut noted = NOTED.lock().unwrap_or_else(|e| e.into_inner());
     let noted = noted.get_or_insert_with(Default::default);
     for op in ops {
         let (to, dst) = match &op.to {
-            To::Copy(to, dst) => (to.span(), *dst),
+            To::Copy(to_shadow, dst) => (shadows[*to_shadow as usize].span(), *dst),
             To::Slot(..) | To::Buffer(_) => ((0, 0), 0),
         };
-        let e = noted.entry((op.len, op.from.0.span(), to)).or_default();
-        *e = (e.0 + 1, op.from.1, dst);
+        let e = noted.entry((op.len, shadows[op.from_shadow as usize].span(), to)).or_default();
+        *e = (e.0 + 1, op.src, dst);
     }
 }
 
@@ -1179,6 +1545,76 @@ mod tests {
     fn what_no_host_copy_holds_is_refused() {
         let writers = [Writer { shadow: None, from: 100, to: 108, copy: false }];
         assert!(holder(&writers, 104, 120).is_err());
+    }
+
+    /// `WriterIndex` coalesces redundant intervals and produces identical
+    /// conflict/match results to scanning raw intervals.
+    #[test]
+    fn writer_index_coalesces_and_detects_conflicts() {
+        let idx = WriterIndex::build(
+            Vec::new(),
+            vec![
+                (Some(0), 1000, 2000),
+                (Some(0), 1500, 3000),
+                (Some(0), 3000, 4000),
+                (Some(1), 3500, 5000),
+                (None, 8000, 8064),
+            ],
+        );
+        // Three overlapping/touching shadow-0 spans merged into one [1000, 4000).
+        assert_eq!(idx.entries.len(), 3);
+        assert_eq!(idx.query_writers(1200, 1400), Ok(Some(0)));
+        assert_eq!(idx.query_writers(3400, 3500), Ok(Some(0)));
+        assert_eq!(idx.query_writers(4000, 4200), Ok(Some(1)));
+        assert_eq!(idx.query_writers(5000, 6000), Ok(None));
+        // Overlap between shadow 0 and shadow 1 -> error.
+        assert!(idx.query_writers(3400, 3600).is_err());
+        // Overlap with shadowless writer -> error.
+        assert!(idx.query_writers(7990, 8010).is_err());
+    }
+
+    /// `layout_reads` merges adjacent, overlapping, and near-gap reads into
+    /// bulk spans while keeping every CBV (`aligned_256`) 256-byte aligned and
+    /// falling back cleanly when a gap budget would overflow `BETWEEN`.
+    #[test]
+    fn layout_reads_coalesces_and_preserves_cbv_alignment() {
+        let ops = [
+            OpRead { shadow: 0, src: 0x10000, len: 192, level: 0, aligned_256: true },
+            OpRead { shadow: 0, src: 0x10100, len: 480, level: 0, aligned_256: true },
+            OpRead { shadow: 0, src: 0x10400, len: 256, level: 0, aligned_256: true },
+            // Unaligned copy inside the same 256B-aligned span merges too.
+            OpRead { shadow: 0, src: 0x10040, len: 32, level: 0, aligned_256: false },
+            // Rare unaligned CBV stays isolated at its own 256B-aligned offset.
+            OpRead { shadow: 0, src: 0x10080, len: 64, level: 0, aligned_256: true },
+            // Different level never merges with level 0.
+            OpRead { shadow: 0, src: 0x10000, len: 256, level: 1, aligned_256: true },
+        ];
+        let (spans, ats, end) = layout_reads(&ops, BETWEEN, 2048).expect("fits in budget");
+        // Level 0 normal ops collapse into 1 span [0x10000..0x10500), unaligned slot gets 1, level 1 gets 1.
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0], ReadSpan { shadow: 0, level: 0, src: 0x10000, len: 0x500, at: 0 });
+        assert_eq!(ats[0], 0);
+        assert_eq!(ats[1], 0x100);
+        assert_eq!(ats[2], 0x400);
+        assert_eq!(ats[3], 0x40);
+        assert_eq!(ats[4] % 256, 0);
+        assert_eq!(ats[5] % 256, 0);
+        for (op, &at) in ops.iter().zip(&ats) {
+            if op.aligned_256 {
+                assert_eq!(at % 256, 0, "CBV must be 256B aligned");
+                assert!(at + op.len.next_multiple_of(256) as u64 <= end);
+            }
+        }
+        // Tight budget rejects 2048B gap bridging but succeeds with 0B gap.
+        let gapped = [
+            OpRead { shadow: 0, src: 0x10000, len: 256, level: 0, aligned_256: true },
+            OpRead { shadow: 0, src: 0x10800, len: 256, level: 0, aligned_256: true },
+        ];
+        assert!(layout_reads(&gapped, 512, 2048).is_none());
+        let (tight_spans, tight_ats, tight_end) = layout_reads(&gapped, 512, 0).expect("fits with gap=0");
+        assert_eq!(tight_spans.len(), 2);
+        assert_eq!(tight_ats, vec![0, 256]);
+        assert_eq!(tight_end, 512);
     }
 
     /// Reads are all before writes, between two buffers and within one, and

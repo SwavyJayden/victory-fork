@@ -705,6 +705,8 @@ extern "system" fn copy_texture_region_x(
 fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool) {
     let (mut i, mut calls, mut closed) = (0, 0, false);
     let mut skip = left();
+    let mut held_state: Option<super::ActiveStateGuard> = None;
+    let mut try_hold = true;
     while i < stream.len() {
         let (op, len) = (stream[i] & 0xffff, (stream[i] >> 16) as usize);
         let w = &stream[i + 1..i + 1 + len];
@@ -714,6 +716,7 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
             skip = left();
         }
         if op == UPLOAD {
+            held_state = None;
             // SAFETY: made by `allocate_upload`, named once.
             let block = *unsafe { Box::from_raw(w[0] as *mut Upload) };
             // SAFETY: a list of ours.
@@ -723,6 +726,24 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
         }
         if skip && op != CLOSE && op != RESET {
             continue;
+        }
+        // Ops that may mutate `list.host` (`cut`, `value_written`, `reset`) or
+        // directly touch `list.state` / close the list must run without the
+        // scoped `ActiveStateGuard` held.
+        if op == Plain::WAIT_VALUE as u64
+            || op == Plain::WAIT_VALUE64 as u64
+            || op == Plain::WRITE32 as u64
+            || op == Plain::WRITE64 as u64
+            || op == RESET
+            || op == CLOSE
+        {
+            held_state = None;
+            try_hold = true;
+        } else if held_state.is_none() && try_hold {
+            held_state = super::hold_state(list);
+            if held_state.is_none() {
+                try_hold = false;
+            }
         }
         if run_plain(op, list, w) {
             continue;
@@ -942,5 +963,28 @@ mod tests {
         assert_eq!(thin_threads_for(None, 24), 8);
         assert_eq!(thin_threads_for(Some(4), 12), 4);
         assert_eq!(thin_threads_for(Some(0), 12), 1);
+    }
+
+    #[test]
+    fn translate_scoped_state_handles_reset_write_wait_and_close() {
+        let mut f = Front::default();
+        f.recording = Some(Arc::new(Recording::new(0)));
+        f.put(RESET, &[0]);
+        f.put(Plain::TOPOLOGY as u64, &[4]);
+        f.put(Plain::GRAPHICS_CONSTANT as u64, &[0, 0x1234, 0]);
+        f.put(Plain::WRITE32 as u64, &[0, 1, 0, 0]);
+        f.put(Plain::WAIT_VALUE as u64, &[0, 8, 0]);
+        f.put(Plain::STENCIL_REF as u64, &[7]);
+        f.put(CLOSE, &[]);
+        let stream = std::mem::take(&mut f.words);
+        let back = Box::into_raw(super::boxed(0, std::ptr::null(), false))
+            .cast_const()
+            .cast();
+        super::close(back);
+        let (calls, closed) = translate(back, &stream, || false);
+        assert_eq!(calls, 7);
+        assert!(closed);
+        assert_eq!(super::ACTIVE_STATE.get(), (0, 0, 0));
+        crate::object::release(back);
     }
 }

@@ -146,10 +146,87 @@ struct Part {
 const _: () = assert!(offset_of!(List, put) == 0x18);
 const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 
+#[cfg(windows)]
+thread_local! {
+    /// `(list_ptr, host_list_ptr, state_mut_ptr)` for the command list whose
+    /// `draw::State` mutex is currently held on this thread via [`hold_state`].
+    static ACTIVE_STATE: std::cell::Cell<(usize, usize, usize)> = const { std::cell::Cell::new((0, 0, 0)) };
+}
+
+/// Panic-safe RAII guard holding `List::state`'s mutex across a batch of
+/// translated list calls (`thin::translate`) so [`with_state`] avoids per-call
+/// mutex lock/unlock overhead.
+///
+/// [`Drop::drop`] restores [`ACTIVE_STATE`] before `_guard` is dropped, so
+/// neither normal exits nor stack unwinding can leave a dangling TLS pointer.
+#[cfg(windows)]
+pub(crate) struct ActiveStateGuard {
+    prev: (usize, usize, usize),
+    _guard: std::sync::MutexGuard<'static, crate::draw::State>,
+}
+
+#[cfg(windows)]
+impl Drop for ActiveStateGuard {
+    fn drop(&mut self) {
+        ACTIVE_STATE.set(self.prev);
+    }
+}
+
+/// Locks `this`'s `draw::State` once for the lifetime of the returned guard and
+/// installs its pointers in [`ACTIVE_STATE`] for [`with_state`].
+///
+/// Callers MUST drop the returned guard before calling any operation that
+/// replaces `List::host` (`cut`, `value_written`), creates `&mut List`
+/// (`reset`), or locks `List::state` directly.
+#[cfg(windows)]
+pub(crate) fn hold_state(this: This) -> Option<ActiveStateGuard> {
+    if this.is_null() {
+        return None;
+    }
+    if ACTIVE_STATE.get().0 == this as usize {
+        return None;
+    }
+    // SAFETY: `this` is a live command list owned exclusively by the calling
+    // worker for the duration of the guard; `List::host` is not replaced while
+    // the guard is alive.
+    let list = unsafe { &*this.cast::<List>() };
+    let host = list.host.as_ref()?;
+    let mut guard = list.state.lock().unwrap_or_else(|e| e.into_inner());
+    let host_ptr = std::ptr::from_ref(host) as usize;
+    let state_ptr = std::ptr::from_mut(&mut *guard) as usize;
+    let prev = ACTIVE_STATE.replace((this as usize, host_ptr, state_ptr));
+    Some(ActiveStateGuard { prev, _guard: guard })
+}
+
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
 #[cfg(windows)]
 fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+    let active = ACTIVE_STATE.get();
+    if active.0 == this as usize && active.0 != 0 && active.2 != 0 {
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        struct Restore((usize, usize, usize));
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                ACTIVE_STATE.set(self.0);
+            }
+        }
+        ACTIVE_STATE.set((0, 0, 0));
+        let _restore = Restore(active);
+        // SAFETY: `ActiveStateGuard` on this thread holds `list.state`'s mutex
+        // and guarantees `list.host` is alive and unchanged; `ACTIVE_STATE` is
+        // cleared while `f` runs so re-entry cannot alias `&mut State`.
+        unsafe {
+            f(
+                &*(active.1 as *const crate::host::HostList),
+                &mut *(active.2 as *mut crate::draw::State),
+            );
+        }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::recorded(started);
+        return;
+    }
     let Some(list) = host_list(this) else { return };
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
@@ -418,7 +495,8 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
         let earlier = std::mem::take(&mut list.earlier);
         let gate = std::mem::take(&mut list.gate);
         let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
-        let state = std::mem::take(&mut *list.state.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut state = std::mem::take(&mut *list.state.lock().unwrap_or_else(|e| e.into_inner()));
+        state.trim_slab();
         let single = earlier.is_empty() && gate.is_empty();
         let mut pieces: Vec<(Vec<ValueWait>, Detached)> = earlier
             .into_iter()
@@ -490,8 +568,9 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             };
             let uploads =
                 std::mem::take(&mut *(*list).uploads.lock().unwrap_or_else(|e| e.into_inner()));
-            let state =
+            let mut state =
                 std::mem::take(&mut *(*list).state.lock().unwrap_or_else(|e| e.into_inner()));
+            state.trim_slab();
             (host, uploads, state)
         };
         order.push(taken.len());
@@ -656,9 +735,10 @@ extern "system" fn list_type(this: This) -> u32 {
 extern "system" fn close(this: This) -> HRESULT {
     let _called = crate::timeline::span("the title's Close");
     #[cfg(windows)]
-    if let Some(host) = host_list(this) {
+    with_state(this, |host, state| {
+        state.trim_slab();
         host.close();
-    }
+    });
     S_OK
 }
 extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT {
@@ -2495,5 +2575,53 @@ mod tests {
         for object in [buffer, list, allocator] {
             assert_eq!(release(object), 0);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hold_state_fast_path_and_unwind_safety() {
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+        if host_list(list).is_some() {
+            let guard = hold_state(list).expect("host list should acquire ActiveStateGuard");
+            assert_eq!(ACTIVE_STATE.get().0, list as usize);
+            // Repeated `hold_state` on the same list must not deadlock.
+            assert!(hold_state(list).is_none());
+            // `with_state` runs on the fast-path without deadlocking on `list.state`.
+            let mut ran = false;
+            with_state(list, |_, state| {
+                assert_eq!(ACTIVE_STATE.get(), (0, 0, 0));
+                state.set_pipeline(null);
+                ran = true;
+            });
+            assert!(ran);
+            assert_eq!(ACTIVE_STATE.get().0, list as usize);
+            drop(guard);
+            assert_eq!(ACTIVE_STATE.get(), (0, 0, 0));
+
+            // Panic while holding `ActiveStateGuard` restores TLS and releases the mutex.
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _g = hold_state(list).expect("guard");
+                with_state(list, |_, _| panic!("unwind test"));
+            }));
+            assert!(panicked.is_err());
+            assert_eq!(ACTIVE_STATE.get(), (0, 0, 0));
+            // Subsequent `with_state` works cleanly after unwind.
+            let mut after = false;
+            with_state(list, |_, _| after = true);
+            assert!(after);
+        }
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
     }
 }

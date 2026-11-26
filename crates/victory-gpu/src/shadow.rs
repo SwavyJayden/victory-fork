@@ -168,10 +168,12 @@ struct Card {
     self_weak: std::sync::OnceLock<std::sync::Weak<Shadow>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
+    /// Per-64 KiB piece zero-fault `GpuOnly` readback residency tracker.
+    gpu_only: crate::gpu_only::Tracker,
 }
 
 impl Card {
-    fn new(staging: ID3D12Resource, size: u64) -> Self {
+    fn new(staging: ID3D12Resource, size: u64, start: u64, len: u64) -> Self {
         Self {
             staging,
             before: std::sync::OnceLock::new(),
@@ -181,6 +183,7 @@ impl Card {
             touched: std::sync::atomic::AtomicBool::new(false),
             self_weak: std::sync::OnceLock::new(),
             size,
+            gpu_only: crate::gpu_only::Tracker::new(start as usize, len as usize),
         }
     }
 }
@@ -793,7 +796,7 @@ pub(crate) fn stale_pages(most: usize, say: &mut dyn FnMut(&Shadow, usize, usize
 /// many.
 pub(crate) fn copy_all(copies: Vec<(usize, usize, usize)>) {
     let bytes: usize = copies.iter().map(|c| c.2).sum();
-    if bytes > 256 << 10 {
+    if bytes > 2 << 20 {
         let chunk = (bytes / (wide_threads() + 1)).clamp(64 << 10, WIDE_JOB);
         wide(copy_jobs_sized(copies, chunk));
         return;
@@ -1048,16 +1051,93 @@ pub(crate) fn relay_fetched(number: u64) {
 /// writing: the next refresh would have put title bytes over what the
 /// second flight's shaders were writing.
 #[derive(Default)]
-struct Flights(std::collections::HashMap<(usize, usize), (u32, u64)>);
+struct Flights {
+    normal: std::collections::HashMap<(usize, usize), (u32, u64)>,
+    /// FIFO per-original-range split subranges (used when `GpuOnly` pieces are
+    /// excluded from a declared range in `Shadow::writing` so `copy_back_done`
+    /// releases the exact subranges pushed by each flight in order).
+    splits: std::collections::HashMap<(usize, usize), std::collections::VecDeque<(u64, Vec<(usize, usize)>)>>,
+    /// Active refcount of each split subrange currently held in `pending`.
+    split_subs: std::collections::HashMap<(usize, usize), u32>,
+}
 
 impl Flights {
     /// Submission `number` declares `range`: counted once for it, however
     /// often it declares it.
     fn declare(&mut self, range: (usize, usize), number: u64) {
-        let f = self.0.entry(range).or_insert((0, number));
+        if self.splits.contains_key(&range) {
+            let _ = self.declare_split(range, vec![range], number, true);
+            return;
+        }
+        let f = self.normal.entry(range).or_insert((0, number));
         if f.0 == 0 || f.1 != number {
             *f = (f.0 + 1, number);
         }
+    }
+
+    /// Declares `orig` split into `subranges` for submission `number` (or `0`
+    /// when `!relay_on`). Returns `Some(subranges)` if newly recorded for this
+    /// submission, or `None` if already declared by this submission.
+    fn declare_split(
+        &mut self,
+        orig: (usize, usize),
+        subranges: Vec<(usize, usize)>,
+        number: u64,
+        relay_on: bool,
+    ) -> Option<Vec<(usize, usize)>> {
+        // Migrate any earlier unsplit in-flight entries for `orig` to the front
+        // of the FIFO queue so `done_split` preserves exact flight order.
+        if let Some((count, prev_sub)) = self.normal.remove(&orig) {
+            let q = self.splits.entry(orig).or_default();
+            for _ in 0..count {
+                q.push_back((prev_sub, vec![orig]));
+            }
+            *self.split_subs.entry(orig).or_insert(0) += count;
+        }
+        let q = self.splits.entry(orig).or_default();
+        if relay_on {
+            if q.back().is_some_and(|(sub, _)| *sub == number) {
+                return None;
+            }
+        } else if !q.is_empty() {
+            return None;
+        }
+        for &sr in &subranges {
+            *self.split_subs.entry(sr).or_insert(0) += 1;
+        }
+        q.push_back((number, subranges.clone()));
+        Some(subranges)
+    }
+
+    /// Pops split entries for `ranges`, returning `(unsplit_ranges, freed_subs)`.
+    fn done_split(&mut self, ranges: &[(usize, usize)]) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+        if self.splits.is_empty() {
+            return (ranges.to_vec(), Vec::new());
+        }
+        let mut normal = Vec::with_capacity(ranges.len());
+        let mut freed = Vec::new();
+        for &orig in ranges {
+            if let Some(q) = self.splits.get_mut(&orig)
+                && let Some((_, subs)) = q.pop_front()
+            {
+                if q.is_empty() {
+                    self.splits.remove(&orig);
+                }
+                for sr in subs {
+                    match self.split_subs.get_mut(&sr) {
+                        Some(c) if *c > 1 => *c -= 1,
+                        Some(_) => {
+                            self.split_subs.remove(&sr);
+                            freed.push(sr);
+                        }
+                        None => freed.push(sr),
+                    }
+                }
+            } else {
+                normal.push(orig);
+            }
+        }
+        (normal, freed)
     }
 
     /// One submission that declared `ranges` (each once) is copied back:
@@ -1065,10 +1145,10 @@ impl Flights {
     fn done(&mut self, ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
         let mut free = Vec::new();
         for range in ranges {
-            match self.0.get_mut(range) {
+            match self.normal.get_mut(range) {
                 Some(f) if f.0 > 1 => f.0 -= 1,
                 Some(_) => {
-                    self.0.remove(range);
+                    self.normal.remove(range);
                     free.push(*range);
                 }
                 // Not counted (declared before anything counted): free.
@@ -1077,6 +1157,10 @@ impl Flights {
         }
         free.sort_unstable();
         free
+    }
+
+    fn still_held(&self, range: &(usize, usize)) -> bool {
+        self.normal.contains_key(range) || self.split_subs.contains_key(range)
     }
 }
 
@@ -1149,7 +1233,7 @@ mod relay_tests {
         flights.declare(a, 9);
         assert_eq!(flights.done(&[a]), vec![]);
         assert_eq!(flights.done(&[a]), vec![a]);
-        assert!(flights.0.is_empty());
+        assert!(flights.normal.is_empty() && flights.splits.is_empty() && flights.split_subs.is_empty());
         // The later flight first: the same.
         flights.declare(a, 1);
         flights.declare(a, 2);
@@ -3198,6 +3282,32 @@ impl Shadow {
             return;
         }
         let range = (address, address + len);
+        if self.card.is_some() && self.any_gpu_only() {
+            let (subranges, skipped) = self.non_gpu_only_title_ranges(address, address + len);
+            if skipped > 0 {
+                crate::gpu_only::record_pending_range_skipped();
+                if subranges.is_empty() {
+                    return;
+                }
+                let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+                let relay_on = relay();
+                let sub = if relay_on { PREPARED.load(Ordering::Relaxed) } else { 0 };
+                if let Some(added) = self
+                    .flights
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .declare_split(range, subranges, sub, relay_on)
+                {
+                    for sr in added {
+                        if !pending.contains(&sr) {
+                            pending.push(sr);
+                        }
+                    }
+                    self.pending_count.store(pending.len() as u32, Ordering::Release);
+                }
+                return;
+            }
+        }
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         // With the copy-back on its own thread: counted for this submission
         // (once), whether or not an earlier one still holds the range.
@@ -3522,11 +3632,22 @@ impl Shadow {
             return;
         }
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        if relay() {
-            let free = self.flights.lock().unwrap_or_else(|e| e.into_inner()).done(ranges);
-            pending.retain(|r| free.binary_search(r).is_err());
-        } else {
-            pending.retain(|r| !ranges.contains(r));
+        {
+            let mut flights = self.flights.lock().unwrap_or_else(|e| e.into_inner());
+            let (normal_ranges, freed_subs) = flights.done_split(ranges);
+            if relay() {
+                let mut free = flights.done(&normal_ranges);
+                if !freed_subs.is_empty() {
+                    free.extend(freed_subs);
+                    free.sort_unstable();
+                    free.dedup();
+                }
+                pending.retain(|r| free.binary_search(r).is_err() || flights.still_held(r));
+            } else if freed_subs.is_empty() {
+                pending.retain(|r| !normal_ranges.contains(r) || flights.still_held(r));
+            } else {
+                pending.retain(|r| (!normal_ranges.contains(r) && !freed_subs.contains(r)) || flights.still_held(r));
+            }
         }
         self.pending_count.store(pending.len() as u32, Ordering::Release);
         if !pending.is_empty() || self.card.is_some() {
@@ -3774,6 +3895,7 @@ impl Shadow {
                 MERGED[2].fetch_add(merged_bytes, Ordering::Relaxed);
             }
             if !all_runs.is_empty() {
+                self.note_cpu_write_offsets(&all_runs);
                 self.card_changed_runs(all_runs.into_iter());
             }
             drop(before);
@@ -4100,7 +4222,7 @@ impl Shadow {
         let bytes = self.take_all(runs);
         if !whole_pages.is_empty() || light {
             let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-            for page in whole_pages {
+            for &page in &whole_pages {
                 let at = &mut copied[page - base];
                 *at = (*at).max(now);
             }
@@ -4112,6 +4234,13 @@ impl Shadow {
                     ranged[1] = (from, to, now);
                 }
             }
+        }
+        if !whole_pages.is_empty()
+            && self.watched.load(Ordering::Relaxed) == 1
+            && crate::gpu_only::enabled()
+            && self.gpu_only_eligible()
+        {
+            self.gpu_only_try_promote_private(&whole_pages, base);
         }
         bytes
     }
@@ -4197,6 +4326,25 @@ impl Shadow {
                 at = next;
             }
         }
+        if crate::gpu_only::enabled() && self.gpu_only_eligible() {
+            // Probe working set on private MEM_WRITE_WATCH pieces BEFORE
+            // `copy_mapped` reads title memory below, so our own echo read is
+            // never mistaken for a title CPU touch.
+            let frame = crate::frame::current();
+            let mut last_piece = usize::MAX;
+            for &(r_from, r_to, noted) in &runs {
+                if !noted || r_from >= r_to {
+                    continue;
+                }
+                for piece in self.pieces(r_from - start, r_to - start) {
+                    if piece == last_piece {
+                        continue;
+                    }
+                    last_piece = piece;
+                    self.gpu_only_probe_before_read_piece(piece, frame);
+                }
+            }
+        }
         let mut dirty_runs: Vec<(usize, usize)> = Vec::new();
         let mut push_dirty = |a: usize, b: usize| {
             if a >= b {
@@ -4238,6 +4386,7 @@ impl Shadow {
             }
         });
         if !dirty_runs.is_empty() {
+            self.note_cpu_write_offsets(&dirty_runs);
             self.card_changed_runs(dirty_runs.into_iter());
         }
         to - from
@@ -4276,6 +4425,9 @@ impl Shadow {
                 for &(a, len) in &runs {
                     held[a..a + len].copy_from_slice(&title[a..a + len]);
                     self.changed(at - start + a, at - start + a + len);
+                }
+                if !runs.is_empty() {
+                    self.note_cpu_write_title(at, at + n);
                 }
                 self.card_changed_runs(runs.iter().map(|&(a, len)| (at - start + a, at - start + a + len)));
                 if let Some(was) = was {
@@ -4321,6 +4473,9 @@ impl Shadow {
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
     fn copy(&self, from: usize, to: usize) -> usize {
         let (lo, hi) = self.copy_bytes(from, to);
+        if lo < hi {
+            self.note_cpu_write_title(self.start as usize + lo, self.start as usize + hi);
+        }
         self.card_changed(lo, hi);
         hi - lo
     }
@@ -4396,6 +4551,7 @@ impl Shadow {
         let start = self.start as usize;
         let _merging = self.lock_merging_write(stripe_mask_range(start + from, start + to));
         if self.card.is_some() {
+            self.note_cpu_write_title(start + from, start + to);
             // SAFETY: inside the mapping of the CPU's side, in a range no
             // refresh writes; the lock keeps the landing out.
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(from), bytes.len()) };
@@ -4671,7 +4827,7 @@ impl Shadow {
         let none = || unsafe { std::mem::transmute::<usize, ID3D12Resource>(8) };
         let mut shadow = Shadow::new(none(), data, 0, start, len);
         if card {
-            shadow.card = Some(Card::new(none(), len.next_multiple_of(PIECE as u64)));
+            shadow.card = Some(Card::new(none(), len.next_multiple_of(PIECE as u64), start, len));
         }
         let shadow = Arc::new(shadow);
         std::mem::forget(shadow.clone());
@@ -4743,6 +4899,7 @@ impl Shadow {
             if lo >= hi || hi > self.len as usize {
                 continue;
             }
+            self.gpu_only_before_land(lo, hi);
             let near: Vec<(usize, usize)> = skip.iter().copied().filter(|&(a, b)| a < hi && b > lo).collect();
             let parts: Vec<(usize, usize)> = outside(lo, hi, near).into_iter().map(|(a, b)| (a - lo, b - lo)).collect();
             // SAFETY: inside the mapping (checked above), in a range
@@ -4813,6 +4970,493 @@ impl Shadow {
         }
         held
     }
+
+    // ---------------------------------------------------------------------
+    // Zero-fault working-set `GpuOnly` residency (`crate::gpu_only`)
+    // ---------------------------------------------------------------------
+
+    /// Lock-free check whether any 64 KiB piece of this copy is `GpuOnly`.
+    #[inline]
+    pub(crate) fn any_gpu_only(&self) -> bool {
+        self.card.as_ref().is_some_and(|c| c.gpu_only.any_gpu_only())
+    }
+
+    /// Lock-free check whether piece `piece` of this copy is `GpuOnly`.
+    #[inline]
+    pub(crate) fn is_gpu_only_piece(&self, piece: usize) -> bool {
+        self.card.as_ref().is_some_and(|c| c.gpu_only.is_gpu_only(piece))
+    }
+
+    /// Whether this copy satisfies Rule 1 (`carded() && len >= 64 KiB` and enabled).
+    #[inline]
+    pub(crate) fn gpu_only_eligible(&self) -> bool {
+        self.card.as_ref().is_some_and(|c| c.gpu_only.eligible())
+    }
+
+    /// Total 64 KiB pieces tracked by `gpu_only` on this copy (0 if ineligible).
+    #[inline]
+    pub(crate) fn gpu_only_pieces(&self) -> usize {
+        self.card.as_ref().map_or(0, |c| c.gpu_only.piece_count())
+    }
+
+    /// Splits title-address range `[from, to)` to exclude all `GpuOnly` pieces
+    /// (lock-free), returning `(non_gpu_only_title_ranges, skipped_pieces)`.
+    pub(crate) fn non_gpu_only_title_ranges(&self, from: usize, to: usize) -> (Vec<(usize, usize)>, usize) {
+        match &self.card {
+            Some(c) => c.gpu_only.non_gpu_only_ranges(from, to),
+            None => {
+                let a = from.max(self.start as usize);
+                let b = to.min((self.start + self.len) as usize);
+                if a < b { (vec![(a, b)], 0) } else { (Vec::new(), 0) }
+            }
+        }
+    }
+
+    /// Byte offsets `(lo, hi)` within this copy for piece `piece`.
+    pub(crate) fn gpu_only_piece_offsets(&self, piece: usize) -> (usize, usize) {
+        self.piece(piece)
+    }
+
+    /// Records a CPU step (`Copy`/`Placed`/`Fill`/`Texture`/`Plane`/`Host`)
+    /// overlapping `[from, to)` and atomically returns any overlapping `GpuOnly`
+    /// pieces that must be demoted first.
+    pub(crate) fn gpu_only_note_step(&self, from: usize, to: usize, frame: u64) -> Vec<usize> {
+        match &self.card {
+            Some(c) if c.gpu_only.eligible() => c.gpu_only.note_step_and_collect_gpu_only(from, to, frame),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Atomically transitions `pieces` from `GpuOnly -> Pinned` and returns the
+    /// pieces that actually transitioned and need lossless GPU readback.
+    pub(crate) fn gpu_only_demote_and_pin(&self, pieces: &[usize], reason: crate::gpu_only::DemoteReason) -> Vec<usize> {
+        match &self.card {
+            Some(c) => c.gpu_only.demote_and_pin(pieces, reason),
+            None => Vec::new(),
+        }
+    }
+
+    /// Atomically pins all pieces overlapping `[from, to)` and returns any
+    /// pieces that were `GpuOnly`.
+    fn gpu_only_pin_range(&self, from: usize, to: usize, reason: crate::gpu_only::DemoteReason) -> Vec<usize> {
+        match &self.card {
+            Some(c) if c.gpu_only.eligible() => c.gpu_only.pin_range_and_demote(from, to, reason),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Lock-free list of all currently active `GpuOnly` pieces on this copy.
+    pub(crate) fn gpu_only_all_pieces(&self) -> Vec<usize> {
+        match &self.card {
+            Some(c) => c.gpu_only.all_gpu_only_pieces(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Lock-free collection of up to `limit` active `GpuOnly` `(piece, block)`
+    /// pairs starting at `start_piece` for the rotating working-set watchdog.
+    pub(crate) fn gpu_only_watchdog_candidates(&self, start_piece: usize, limit: usize) -> Vec<(usize, usize)> {
+        match &self.card {
+            Some(c) => c.gpu_only.collect_watchdog_candidates(start_piece, limit),
+            None => Vec::new(),
+        }
+    }
+
+    fn note_cpu_write_title(&self, from_addr: usize, to_addr: usize) {
+        if let Some(c) = &self.card
+            && c.gpu_only.eligible()
+            && from_addr < to_addr
+        {
+            c.gpu_only.note_cpu_write(from_addr, to_addr, crate::frame::current());
+        }
+    }
+
+    fn note_cpu_write_offsets(&self, runs: &[(usize, usize)]) {
+        let Some(c) = &self.card else {
+            return;
+        };
+        if !c.gpu_only.eligible() || runs.is_empty() {
+            return;
+        }
+        let start = self.start as usize;
+        let frame = crate::frame::current();
+        for &(lo, hi) in runs {
+            if lo < hi {
+                c.gpu_only.note_cpu_write(start + lo, start + hi, frame);
+            }
+        }
+    }
+
+    fn piece_is_copied(&self, piece: usize) -> bool {
+        self.copied.lock().unwrap_or_else(|e| e.into_inner()).get(piece).is_some_and(|&at| at != 0)
+    }
+
+    fn has_dirty_in_piece(&self, piece: usize) -> bool {
+        let Some(card) = &self.card else {
+            return false;
+        };
+        let (lo, hi) = self.piece(piece);
+        card.dirty.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, b)| a < hi && b > lo)
+    }
+
+    fn has_landing_in_piece(&self, piece: usize) -> bool {
+        if !self.landing.load(Ordering::Acquire) {
+            return false;
+        }
+        let (lo, hi) = self.piece(piece);
+        let first = self.start as usize / KERNEL_PAGE;
+        let start_p = (self.start as usize + lo) / KERNEL_PAGE - first;
+        let end_p = (self.start as usize + hi).div_ceil(KERNEL_PAGE) - first;
+        let bits = self.landings.lock().unwrap_or_else(|e| e.into_inner());
+        (start_p..end_p).any(|p| bits.get(p / 64).is_some_and(|w| (w >> (p % 64)) & 1 != 0))
+    }
+
+    fn clear_landing_in_piece(&self, piece: usize) {
+        if !self.landing.load(Ordering::Acquire) {
+            return;
+        }
+        let (lo, hi) = self.piece(piece);
+        let first = self.start as usize / KERNEL_PAGE;
+        let start_p = (self.start as usize + lo) / KERNEL_PAGE - first;
+        let end_p = (self.start as usize + hi).div_ceil(KERNEL_PAGE) - first;
+        let mut bits = self.landings.lock().unwrap_or_else(|e| e.into_inner());
+        for p in start_p..end_p {
+            if let Some(w) = bits.get_mut(p / 64) {
+                *w &= !(1u64 << (p % 64));
+            }
+        }
+    }
+
+    fn gpu_only_probe_before_read_piece(&self, piece: usize, frame: u64) {
+        let Some(card) = &self.card else {
+            return;
+        };
+        let Some(block) = card.gpu_only.piece_block_if_whole(piece) else {
+            return;
+        };
+        let Some(saved_changes) = card.gpu_only.needs_probe_before_read(piece, frame) else {
+            return;
+        };
+        let touched = crate::gpu_only::query_working_set_block(block).map(|(t, _)| t);
+        let changes_ok = crate::watch::changes() == saved_changes;
+        card.gpu_only.apply_probe_result(piece, frame, touched, changes_ok, true);
+    }
+
+    /// Probes previously trimmed pieces right before a landing reads/writes title memory.
+    pub(crate) fn gpu_only_before_land(&self, lo: usize, hi: usize) {
+        if !crate::gpu_only::enabled() || !self.gpu_only_eligible() || lo >= hi {
+            return;
+        }
+        let frame = crate::frame::current();
+        for piece in self.pieces(lo, hi) {
+            self.gpu_only_probe_before_read_piece(piece, frame);
+        }
+    }
+
+    /// After landing completes (and `Notes::flush` has updated `copied` for
+    /// view memory): trims candidate pieces via `VirtualUnlock` and promotes
+    /// pieces satisfying all 5 rules to `GpuOnly`.
+    pub(crate) fn gpu_only_after_land(&self, pieces: &[(usize, usize, bool)]) {
+        if !crate::gpu_only::enabled() || !self.gpu_only_eligible() {
+            return;
+        }
+        let watched = self.watched.load(Ordering::Relaxed);
+        if !matches!(watched, 1 | GUARDED) {
+            return;
+        }
+        let Some(card) = &self.card else {
+            return;
+        };
+        let frame = crate::frame::current();
+        for &(lo, hi, wrote_title) in pieces {
+            if lo >= hi {
+                continue;
+            }
+            for piece in self.pieces(lo, hi) {
+                let Some(block) = card.gpu_only.piece_block_if_whole(piece) else {
+                    continue;
+                };
+                if !self.piece_is_copied(piece) {
+                    continue;
+                }
+                // For private `MEM_WRITE_WATCH` memory (`watched == 1`) where
+                // landing just wrote title memory directly, defer promotion to
+                // `copy_stale` right after `take_landed` clears the echo and
+                // advances `copied`, so the next frame's write-watch sees clean.
+                let can_promote_here = watched == GUARDED || (!wrote_title && !self.has_landing_in_piece(piece));
+                if can_promote_here
+                    && card.gpu_only.ready_to_promote(piece, frame, false)
+                    && !self.has_dirty_in_piece(piece)
+                    && crate::inplace::pages_of(block).len() <= 1
+                    && !has_other_live_shadow_overlapping(self.id, block as u64, (block + PIECE) as u64)
+                    && crate::gpu_only::trim_block(block)
+                    && card.gpu_only.try_promote(piece, frame, false)
+                {
+                    continue;
+                }
+                if card.gpu_only.needs_trim(piece, frame) && crate::inplace::pages_of(block).len() <= 1 {
+                    let changes = crate::watch::changes();
+                    if crate::gpu_only::trim_block(block) {
+                        card.gpu_only.mark_trimmed(piece, frame, changes, false);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Promotes private `MEM_WRITE_WATCH` pieces right after `copy_stale` +
+    /// `take_landed` verified pure landing echo and advanced `copied`.
+    fn gpu_only_try_promote_private(&self, whole_pages: &[usize], base: usize) {
+        let Some(card) = &self.card else {
+            return;
+        };
+        let frame = crate::frame::current();
+        for &page in whole_pages {
+            let piece = page - base;
+            if !card.gpu_only.ready_to_promote(piece, frame, false) {
+                continue;
+            }
+            let Some(block) = card.gpu_only.piece_block_if_whole(piece) else {
+                continue;
+            };
+            if self.has_landing_in_piece(piece)
+                || self.has_dirty_in_piece(piece)
+                || crate::inplace::pages_of(block).len() > 1
+                || has_other_live_shadow_overlapping(self.id, block as u64, (block + PIECE) as u64)
+            {
+                continue;
+            }
+            if crate::gpu_only::trim_block(block) {
+                let _ = card.gpu_only.try_promote(piece, frame, false);
+            }
+        }
+    }
+
+    /// Probes or trims a declared-but-unflagged piece (`CARD_COMPARE` proved
+    /// its GPU hash unchanged). Returns `true` if it performed an OS working-set
+    /// operation (consuming 1 budget unit).
+    pub(crate) fn gpu_only_probe_unflagged(&self, piece: usize, frame: u64) -> bool {
+        use crate::gpu_only::{ProbeOutcome, UnflaggedAction};
+        let Some(card) = &self.card else {
+            return false;
+        };
+        if !card.gpu_only.eligible() {
+            return false;
+        }
+        let watched = self.watched.load(Ordering::Relaxed);
+        if !matches!(watched, 1 | GUARDED) {
+            return false;
+        }
+        let Some(block) = card.gpu_only.piece_block_if_whole(piece) else {
+            return false;
+        };
+        match card.gpu_only.unflagged_action(piece, frame) {
+            UnflaggedAction::Skip => false,
+            UnflaggedAction::NeedTrim => {
+                if !self.piece_is_copied(piece)
+                    || self.has_dirty_in_piece(piece)
+                    || self.has_landing_in_piece(piece)
+                    || crate::inplace::pages_of(block).len() > 1
+                {
+                    return false;
+                }
+                let changes = crate::watch::changes();
+                if crate::gpu_only::trim_block(block) {
+                    card.gpu_only.mark_trimmed(piece, frame, changes, true);
+                }
+                true
+            }
+            UnflaggedAction::NeedQuery { trimmed_watch_changes } => {
+                let touched = crate::gpu_only::query_working_set_block(block).map(|(t, _)| t);
+                let changes_ok = crate::watch::changes() == trimmed_watch_changes;
+                let outcome = card.gpu_only.apply_probe_result(piece, frame, touched, changes_ok, false);
+                if matches!(outcome, ProbeOutcome::Untouched(_))
+                    && card.gpu_only.ready_to_promote(piece, frame, true)
+                    && self.piece_is_copied(piece)
+                    && !self.has_dirty_in_piece(piece)
+                    && !self.has_landing_in_piece(piece)
+                    && crate::inplace::pages_of(block).len() <= 1
+                    && !has_other_live_shadow_overlapping(self.id, block as u64, (block + PIECE) as u64)
+                {
+                    let _ = card.gpu_only.try_promote(piece, frame, true);
+                }
+                true
+            }
+        }
+    }
+
+    /// Returns all `GpuOnly` pieces overlapping `[from_addr, to_addr)` that
+    /// have a CPU write (or are unwatched/uncopied) and must be demoted BEFORE
+    /// `refresh_front` / `Shadow::update` runs.
+    pub(crate) fn gpu_only_written_pieces(&self, from_addr: usize, to_addr: usize) -> Vec<usize> {
+        let Some(card) = &self.card else {
+            return Vec::new();
+        };
+        let pieces = card.gpu_only.gpu_only_pieces_in(from_addr, to_addr);
+        if pieces.is_empty() {
+            return Vec::new();
+        }
+        if !matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED) {
+            return pieces;
+        }
+        let start = self.start as usize;
+        let base = start / PAGE;
+        let first_p = *pieces.first().unwrap_or(&0);
+        let last_p = *pieces.last().unwrap_or(&0);
+        let (lo_off, _) = self.piece(first_p);
+        let (_, hi_off) = self.piece(last_p);
+        let Some((now, written)) = crate::watch::writes(start + lo_off, start + hi_off, true) else {
+            return pieces;
+        };
+        let mut stale = Vec::new();
+        let mut echo_confirmed: Vec<usize> = Vec::new();
+        {
+            let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            for &piece in &pieces {
+                let taken = copied.get(piece).copied().unwrap_or(0);
+                let page = base + piece;
+                let write = written
+                    .binary_search_by_key(&page, |&(p, _)| p)
+                    .ok()
+                    .map_or(0, |i| written[i].1);
+                if taken == 0 || write > taken {
+                    stale.push(piece);
+                }
+            }
+        }
+        if stale.is_empty() {
+            return Vec::new();
+        }
+        // Filter out harmless leftover private-memory landing echoes where
+        // title memory still equals our pre-GpuOnly snapshot `shadow.data`.
+        let mut real_writes = Vec::new();
+        let mut scratch = Vec::new();
+        for piece in stale {
+            if self.has_landing_in_piece(piece)
+                && let Some(block) = card.gpu_only.piece_block_if_whole(piece)
+            {
+                let (lo, hi) = self.piece(piece);
+                scratch.resize(hi - lo, 0);
+                if crate::host::read_into((start + lo) as *const u8, &mut scratch) {
+                    // SAFETY: inside `self.data`, `piece` is `GpuOnly` so
+                    // neither `relay_worker` nor refresh is writing `self.data[lo..hi]`.
+                    let held = unsafe { std::slice::from_raw_parts(self.data.add(lo).cast_const(), hi - lo) };
+                    if scratch == held {
+                        self.clear_landing_in_piece(piece);
+                        let _ = crate::gpu_only::trim_block(block);
+                        echo_confirmed.push(piece);
+                        continue;
+                    }
+                }
+            }
+            real_writes.push(piece);
+        }
+        if !echo_confirmed.is_empty() {
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            for piece in echo_confirmed {
+                if let Some(at) = copied.get_mut(piece) {
+                    *at = (*at).max(now);
+                }
+            }
+        }
+        real_writes
+    }
+
+    /// Losslessly merges synchronously read-back GPU bytes `gpu` for demoted
+    /// piece `piece` with title memory and `self.data`. Preserves BOTH CPU
+    /// writes made while `GpuOnly` (marked dirty for `card_before` upload) and
+    /// GPU writes on untouched offsets (written back to title memory via
+    /// `put_changed`).
+    pub(crate) fn demote_merge_piece(&self, piece: usize, gpu: &[u8]) {
+        if self.card.is_none() {
+            return;
+        }
+        let (lo, hi) = self.piece(piece);
+        let n = (hi - lo).min(gpu.len());
+        if n == 0 {
+            return;
+        }
+        let start = self.start as usize;
+        let title_addr = start + lo;
+        let _merging = self.lock_merging_write(stripe_mask_range(title_addr, title_addr + n));
+        // SAFETY: inside `self.data` (`lo + n <= self.len`); submission lock
+        // and exclusive `merging` stripe lock are held, GPU is settled.
+        let data_slice = unsafe { std::slice::from_raw_parts_mut(self.data.add(lo), n) };
+        let mut title = vec![0u8; n];
+        if !crate::host::read_into(title_addr as *const u8, &mut title) {
+            data_slice.copy_from_slice(&gpu[..n]);
+            self.changed(lo, lo + n);
+            return;
+        }
+        let res = crate::gpu_only::merge_demoted_piece(&gpu[..n], data_slice, &title);
+        data_slice.copy_from_slice(&res.merged);
+        if res.title_changed {
+            put_changed(title_addr, &title, &res.merged);
+            self.note_landing(lo, lo + n);
+        }
+        if !res.cpu_dirty_runs.is_empty() {
+            self.card_changed_runs(res.cpu_dirty_runs.into_iter().map(|(a, b)| (lo + a, lo + b)));
+        }
+        self.changed(lo, lo + n);
+    }
+}
+
+/// Checks Rule 2: whether any OTHER live `Shadow` in `BUFFERS`, `LOOSE`, or
+/// `EXACT` overlaps `[from, to)`. Acquires each table lock briefly and
+/// individually (never nested) so it is deadlock-free.
+fn has_other_live_shadow_overlapping(self_id: u64, from: u64, to: u64) -> bool {
+    {
+        let map = buffers_read();
+        if map
+            .range(..(to, 0))
+            .any(|(_, e)| e.end > from && e.shadow.as_ref().is_some_and(|s| s.id != self_id))
+        {
+            return true;
+        }
+    }
+    {
+        let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+        if map
+            .iter()
+            .any(|(&(s, l), sh)| sh.id != self_id && s < to && s.saturating_add(l) > from)
+        {
+            return true;
+        }
+    }
+    {
+        let guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+        if guard
+            .1
+            .iter()
+            .any(|(&(s, l), (sh, _))| sh.id != self_id && s < to && s.saturating_add(l) > from)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Called after inserting a new `Shadow` (`new_id`, `[start, start + len)`)
+/// with all map locks dropped: pins overlapping pieces on any existing carded
+/// `Shadow` and queues any `GpuOnly` pieces for immediate lossless demotion at
+/// the start of the next `Host::submit`.
+fn notify_new_shadow_overlap(new_id: u64, start: u64, len: u64) {
+    if !crate::gpu_only::enabled() || len == 0 {
+        return;
+    }
+    let end = start.saturating_add(len);
+    for shadow in carded_copies() {
+        if shadow.id == new_id || !shadow.gpu_only_eligible() {
+            continue;
+        }
+        if shadow.start >= end || shadow.start.saturating_add(shadow.len) <= start {
+            continue;
+        }
+        let demoted = shadow.gpu_only_pin_range(start as usize, end as usize, crate::gpu_only::DemoteReason::Alias);
+        if !demoted.is_empty() {
+            crate::gpu_only::queue_demotion(shadow, demoted, crate::gpu_only::DemoteReason::Alias, true);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4827,7 +5471,7 @@ mod land_tests {
         // SAFETY: the mapping, `len` bytes.
         unsafe { std::ptr::write_bytes(data, 0, len) };
         let mut shadow = Shadow::new(buffer.clone(), data, 0, title as u64, len as u64);
-        shadow.card = Some(Card::new(buffer, len as u64));
+        shadow.card = Some(Card::new(buffer, len as u64, title as u64, len as u64));
         Some(shadow)
     }
 
@@ -5131,7 +5775,16 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
+    let removed = buffers().remove(&(start, resource));
+    if let Some(shadow) = removed.and_then(|e| e.shadow)
+        && shadow.any_gpu_only()
+    {
+        let (s, l) = (shadow.start as usize, shadow.len as usize);
+        let demoted = shadow.gpu_only_pin_range(s, s.saturating_add(l), crate::gpu_only::DemoteReason::Alias);
+        if !demoted.is_empty() {
+            crate::gpu_only::queue_demotion(shadow, demoted, crate::gpu_only::DemoteReason::Alias, true);
+        }
+    }
 }
 
 /// The title buffer holding `address`, as (start, length), without making
@@ -5174,6 +5827,15 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     let n = gone.len() as u64;
     for shadow in gone {
         crate::host::retire(shadow);
+    }
+    if crate::gpu_only::enabled() && len > 0 {
+        for shadow in carded_copies() {
+            if shadow.gpu_only_eligible() && shadow.start < end && shadow.start.saturating_add(shadow.len) > at {
+                // Memory is being unmapped/remapped: clear `GpuOnly` & pin
+                // without writing stale bytes over the new mapping.
+                let _ = shadow.gpu_only_pin_range(at as usize, end as usize, crate::gpu_only::DemoteReason::Alias);
+            }
+        }
     }
     n
 }
@@ -5275,12 +5937,20 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // Renderer port 1 (`crate::port`, `VICTORY_PORT_CONSTANTS=1`): the
         // title's 32-bit graphics heap in place, big or not.
         if let Some(placed) = crate::port::place_for(key.0, len, false) {
-            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
-            return entry.shadow.clone();
+            let shadow = Arc::new(Shadow::placed(placed, key.0, len, false));
+            let id = shadow.id;
+            entry.shadow = Some(shadow.clone());
+            drop(map);
+            notify_new_shadow_overlap(id, key.0, len);
+            return Some(shadow);
         }
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
-            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
-            return entry.shadow.clone();
+            let shadow = Arc::new(Shadow::placed(placed, key.0, len, false));
+            let id = shadow.id;
+            entry.shadow = Some(shadow.clone());
+            drop(map);
+            notify_new_shadow_overlap(id, key.0, len);
+            return Some(shadow);
         }
         let (buffer, data, card) = match card_for(size) {
             Some(on_card) => {
@@ -5295,7 +5965,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     len,
                     "a buffer's host copy is in the card's memory"
                 );
-                (on_card, data, Some(Card::new(staging, size)))
+                (on_card, data, Some(Card::new(staging, size, key.0, len)))
             }
             None => {
                 let (buffer, data) = host()?.shared_buffer(size)?;
@@ -5321,10 +5991,14 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
         shadow.card = card;
         let shadow = Arc::new(shadow);
+        let new_id = shadow.id;
         if shadow.card.is_some() {
             register_carded(&shadow);
         }
-        entry.shadow = Some(shadow);
+        entry.shadow = Some(shadow.clone());
+        drop(map);
+        notify_new_shadow_overlap(new_id, key.0, len);
+        return Some(shadow);
     }
     entry.shadow.clone()
 }
@@ -5529,9 +6203,10 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
     shadow.changes_only.store(true, Ordering::Relaxed);
-    shadow.card = Some(Card::new(staging, len));
+    shadow.card = Some(Card::new(staging, len, start, len));
     let shadow = Arc::new(shadow);
     register_carded(&shadow);
+    notify_new_shadow_overlap(shadow.id, start, len);
     Some(shadow)
 }
 
@@ -5589,8 +6264,11 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         .or_else(|| crate::inplace::place_for(start, len, true))
     {
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
+        let id = shadow.id;
         note(&shadow);
         map.insert((start, len), shadow.clone());
+        drop(map);
+        notify_new_shadow_overlap(id, start, len);
         return Some(shadow);
     }
     // One buffer in the card's memory, filled by the CPU through the bus.
@@ -5602,8 +6280,11 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         shadow.window = true;
         shadow.mapped = true;
         let shadow = Arc::new(shadow);
+        let id = shadow.id;
         note(&shadow);
         map.insert((start, len), shadow.clone());
+        drop(map);
+        notify_new_shadow_overlap(id, start, len);
         return Some(shadow);
     }
     // With room for windows on the card (`window_card_most`): shaders get a
@@ -5616,7 +6297,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             };
             crate::host::name(&staging, || format!("title memory {start:#x}+{len:#x}"));
             crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
-            (on_card, data, Some(Card::new(staging, len)))
+            (on_card, data, Some(Card::new(staging, len, start, len)))
         }
         None => {
             // Drop `LOOSE.write()` before `shared_buffer()` so `CreateCommittedResource`
@@ -5634,6 +6315,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             let mut shadow = Shadow::new(buffer, data, gpu, start, len);
             shadow.window = true;
             let shadow = Arc::new(shadow);
+            let new_id = shadow.id;
             let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
             if let Some(existing) = map.get(&(start, len)) {
                 note(existing);
@@ -5641,6 +6323,8 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             }
             note(&shadow);
             map.insert((start, len), shadow.clone());
+            drop(map);
+            notify_new_shadow_overlap(new_id, start, len);
             return Some(shadow);
         }
     };
@@ -5655,11 +6339,14 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     shadow.window = true;
     shadow.card = card;
     let shadow = Arc::new(shadow);
+    let new_id = shadow.id;
     if shadow.card.is_some() {
         register_carded(&shadow);
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());
+    drop(map);
+    notify_new_shadow_overlap(new_id, start, len);
     Some(shadow)
 }
 
@@ -5733,6 +6420,7 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     }
     guard.1.insert((address, len), (shadow.clone(), now));
     drop(guard);
+    notify_new_shadow_overlap(shadow.id, address, len);
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     OWN_MADE.fetch_add(1, Ordering::Relaxed);
     Some(shadow)
@@ -5907,7 +6595,7 @@ mod window_tests {
             let (staging, data) = host.shared_buffer_private(4096).expect("staging");
             let on_card = host.uav_buffer_private(4096).expect("card");
             let mut s = super::Shadow::new(on_card, data, 0, addr, 4096);
-            s.card = Some(super::Card::new(staging, 4096));
+            s.card = Some(super::Card::new(staging, 4096, addr, 4096));
             let s = std::sync::Arc::new(s);
             super::register_carded(&s);
             s
@@ -6016,6 +6704,32 @@ mod window_tests {
         shadow.copy_back_done(&[(0x30_0400, 0x30_0500)]);
         assert_eq!(shadow.pending_count.load(Ordering::Acquire), 0);
         assert!(!shadow.writes_pending());
+    }
+
+    #[test]
+    fn flights_split_and_unsplit_fifo_releases_cleanly() {
+        let mut flights = super::Flights::default();
+        let orig = (0x1000_0000usize, 0x1005_0000usize);
+        // Flight 1 declares orig unsplit.
+        flights.declare(orig, 1);
+        // Flight 2 declares orig split around GpuOnly piece 2.
+        let split2 = vec![(0x1000_0000, 0x1002_0000), (0x1003_0000, 0x1005_0000)];
+        assert_eq!(flights.declare_split(orig, split2.clone(), 2, true), Some(split2.clone()));
+        // Duplicate declaration in the same submission 2 is ignored.
+        assert_eq!(flights.declare_split(orig, split2.clone(), 2, true), None);
+        // Flight 1 finishes first -> pops Flight 1's unsplit range, split2 remains held.
+        let (norm1, freed1) = flights.done_split(&[orig]);
+        assert!(norm1.is_empty());
+        assert_eq!(freed1, vec![orig]);
+        assert!(flights.still_held(&split2[0]));
+        assert!(flights.still_held(&split2[1]));
+        // Flight 2 finishes -> pops split2, everything cleanly emptied.
+        let (norm2, freed2) = flights.done_split(&[orig]);
+        assert!(norm2.is_empty());
+        assert_eq!(freed2, split2);
+        assert!(!flights.still_held(&split2[0]));
+        assert!(!flights.still_held(&split2[1]));
+        assert!(flights.normal.is_empty() && flights.splits.is_empty() && flights.split_subs.is_empty());
     }
 }
 

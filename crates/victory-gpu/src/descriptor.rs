@@ -827,6 +827,8 @@ pub(crate) fn constant_slots_batch(
     }
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     let mut last: Option<(usize, &host::HostHeap)> = None;
+    let mut batch = host::CopyBatch::new();
+    let mut retired = Vec::new();
     for &(heap, index, gpu, size) in slots {
         let host = match last {
             Some((h, host)) if h == heap => Some(host),
@@ -844,9 +846,12 @@ pub(crate) fn constant_slots_batch(
             }
         };
         if let Some(host) = host {
-            host.constant_at(index, buffer, gpu, size);
+            host.constant_at_batched(index, buffer, gpu, size, &mut batch, &mut retired);
         }
     }
+    batch.flush();
+    drop(heaps);
+    crate::host::retire_resources(retired);
 }
 
 #[cfg(windows)]

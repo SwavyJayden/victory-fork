@@ -197,8 +197,6 @@ pub(crate) fn log(frames: f64) {
 
 /// Threads kept for landing, and the work they are at.
 struct Pool {
-    /// Monotonically bumped on every new batch (polled lock-free by spinning helpers).
-    generation: AtomicU64,
     /// Lock-free work index claimed via `fetch_add(1, Relaxed)`.
     next: AtomicUsize,
     /// Items in the current batch (0 when idle or aborted on caller panic).
@@ -211,14 +209,12 @@ struct Pool {
     /// One batch at a time.
     turn: Mutex<()>,
     threads: usize,
-    /// Microseconds helpers spin-wait on `generation` before sleeping on `more`.
-    spin_us: u64,
 }
 
 struct State {
     /// What to do with each number below `count` (`None` when idle or aborted).
     work: Option<Work>,
-    /// Batch number matching [`Pool::generation`] when `work` is `Some`.
+    /// Bumped on every new batch so helpers never re-enter a finished batch.
     generation: u64,
     /// Helpers currently inside a batch.
     running: usize,
@@ -237,12 +233,7 @@ impl Pool {
     }
 
     fn new(name: &'static str, threads: usize) -> &'static Pool {
-        Pool::with_spin(name, threads, 0)
-    }
-
-    fn with_spin(name: &'static str, threads: usize, spin_us: u64) -> &'static Pool {
         let pool: &'static Pool = Box::leak(Box::new(Pool {
-            generation: AtomicU64::new(0),
             next: AtomicUsize::new(0),
             count: AtomicUsize::new(0),
             panicked: AtomicBool::new(false),
@@ -251,7 +242,6 @@ impl Pool {
             idle: Condvar::new(),
             turn: Mutex::new(()),
             threads,
-            spin_us,
         }));
         for i in 1..threads {
             // (A helper that is not there is only missed.)
@@ -305,19 +295,6 @@ impl Pool {
             if state.running == 0 {
                 self.idle.notify_all();
             }
-            if self.spin_us > 0 && (state.work.is_none() || state.generation == seen_gen) {
-                drop(state);
-                let began = std::time::Instant::now();
-                let mut spins = 0u32;
-                while self.generation.load(Ordering::Acquire) == seen_gen {
-                    spins = spins.wrapping_add(1);
-                    if spins.is_multiple_of(64) && began.elapsed().as_micros() as u64 >= self.spin_us {
-                        break;
-                    }
-                    std::hint::spin_loop();
-                }
-                state = self.state();
-            }
         }
     }
 
@@ -334,13 +311,11 @@ impl Pool {
         // it does not before no helper is inside `f` and none can enter.
         let work = Work(unsafe { std::mem::transmute::<*const (dyn Fn(usize) + Sync + '_), *const (dyn Fn(usize) + Sync + 'static)>(f) });
         let mut state = self.state();
-        let next_gen = state.generation + 1;
-        state.generation = next_gen;
+        state.generation += 1;
         state.work = Some(work);
         self.next.store(0, Ordering::Relaxed);
         self.count.store(count, Ordering::Relaxed);
         self.panicked.store(false, Ordering::Relaxed);
-        self.generation.store(next_gen, Ordering::Release);
         drop(state);
         if count > self.threads {
             self.more.notify_all();
@@ -389,7 +364,7 @@ pub(crate) fn each_under(count: usize, f: &(dyn Fn(usize) + Sync)) {
         let logical = std::thread::available_parallelism().map_or(12, |n| n.get());
         let default = (logical / 3).clamp(2, 6);
         let threads = std::env::var("VICTORY_UNDER_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default);
-        Pool::with_spin("victory-under", threads.clamp(1, 16), 25)
+        Pool::new("victory-under", threads.clamp(1, 16))
     })
     .each(count, f);
 }
