@@ -33,6 +33,22 @@ use std::sync::Mutex;
 pub(crate) const PAGE: usize = 64 << 10;
 /// The kernel's page, the unit of its answers.
 const KERNEL_PAGE: usize = 4096;
+/// The parts of a page.
+const PARTS: usize = PAGE / KERNEL_PAGE;
+/// All of them.
+const WHOLE: u16 = u16::MAX;
+
+/// Whether the parts of a page that the kernel names are kept, and a refresh
+/// copies those (`VICTORY_PAGE_PARTS=0`: the 64 KiB page, as before).
+///
+/// The kernel says which 4 KiB pages were written, and a copy took the 64 KiB
+/// around each: keeping which 4 KiB parts changed since each copy last took
+/// the page avoids re-copying and re-uploading untouched 4 KiB sub-pages.
+/// What is checked stays a page.
+fn parts_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PAGE_PARTS").is_none_or(|v| v != "0"))
+}
 
 /// A title-memory range whose changed pages another subsystem needs to read.
 pub(crate) struct Tracked {
@@ -60,6 +76,10 @@ struct Journal {
     asked: u64,
     /// Page number → the asking that last found it written.
     written: BTreeMap<usize, u64>,
+    /// The same for each of a page's sixteen parts ([`KERNEL_PAGE`]), where
+    /// the parts are known ([`parts_on`]); a page that is not here was
+    /// written whole, as far as anyone knows.
+    parts: std::collections::HashMap<usize, [u64; PARTS], std::hash::BuildHasherDefault<PageHash>>,
     /// Room for the kernel's answer.
     found: Vec<usize>,
     /// Page ranges asked ahead for a submission's refreshes ([`ask_ahead`])
@@ -73,9 +93,93 @@ struct Journal {
     kept: bool,
 }
 
+impl Journal {
+    /// Page `page` was found written by asking `now`: the parts in `parts`
+    /// (a bit each). The asking that found it written before (0: none).
+    fn note_with(&mut self, page: usize, parts: u16, now: u64, track_parts: bool) -> u64 {
+        let before = self.written.insert(page, now).unwrap_or(0);
+        if parts == WHOLE || !track_parts {
+            self.parts.remove(&page);
+            return before;
+        }
+        let all = self.parts.entry(page).or_insert([before; PARTS]);
+        for (k, at) in all.iter_mut().enumerate() {
+            if parts >> k & 1 != 0 {
+                *at = now;
+            }
+        }
+        before
+    }
+
+    fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
+        self.note_with(page, parts, now, parts_on())
+    }
+
+    /// Notes the `count` 4 KiB addresses in `self.found` under asking `now`,
+    /// folding adjacent addresses in the same 64 KiB page into one part mask.
+    fn note_found(&mut self, count: usize, now: u64) {
+        let track_parts = parts_on();
+        let mut cur: Option<(usize, u16)> = None;
+        for k in 0..count {
+            let at = self.found[k];
+            let (page, part) = (at / PAGE, 1u16 << (at % PAGE / KERNEL_PAGE));
+            match cur {
+                Some((p, parts)) if p == page => cur = Some((p, parts | part)),
+                Some((p, parts)) => {
+                    self.note_with(p, parts, now, track_parts);
+                    cur = Some((page, part));
+                }
+                None => cur = Some((page, part)),
+            }
+        }
+        if let Some((p, parts)) = cur {
+            self.note_with(p, parts, now, track_parts);
+        }
+    }
+
+    /// The parts of `page` written by an asking after `taken`.
+    fn parts_since(&self, page: usize, taken: u64) -> u16 {
+        match self.parts.get(&page) {
+            Some(all) => all
+                .iter()
+                .enumerate()
+                .filter(|(_, at)| **at > taken)
+                .fold(0, |m, (k, _)| m | (1 << k)),
+            None => WHOLE,
+        }
+    }
+}
+
+/// Of the pages of a copy that were written after it took them (page number,
+/// the asking it took the page at): the parts to take again, a bit for each
+/// 4 KiB, in the same order.
+pub(crate) fn parts_written(pages: &[(usize, u64)]) -> Vec<u16> {
+    if pages.is_empty() {
+        return Vec::new();
+    }
+    if !parts_on() {
+        return vec![WHOLE; pages.len()];
+    }
+    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    pages.iter().map(|&(page, taken)| j.parts_since(page, taken)).collect()
+}
+
+/// Removes test-owned pages from `JOURNAL` after freeing a private
+/// `VirtualAlloc(..., MEM_WRITE_WATCH)` so reused virtual addresses do not
+/// leak dirty journal timestamps into subsequent tests in the same process.
+#[cfg(test)]
+pub(crate) fn forget_test_pages(start: usize, end: usize) {
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    for page in start / PAGE..end.div_ceil(PAGE) {
+        j.written.remove(&page);
+        j.parts.remove(&page);
+    }
+}
+
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
     written: BTreeMap::new(),
+    parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
     found: Vec::new(),
     ahead: Vec::new(),
     ahead_asked: 0,
@@ -276,19 +380,19 @@ pub(crate) fn wrote(at: usize, len: usize) {
     // (fxceless/victory-fork#410).
     j.ahead_asked = now;
     for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
-        j.written.insert(page, now);
+        j.note(page, WHOLE, now);
     }
 }
 
-/// We wrote the 64 KiB page numbered `page` of title memory through a
-/// view of our own (`crate::inplace::write_own`): no guard was opened and
-/// no kernel write-watch bit set, so the journal is told here. The page,
-/// and the same physical page at its other title addresses (`others`,
-/// page numbers), count as written at a new asking, which every host copy
-/// that holds them takes at its next refresh. Returns the asking that had
-/// last found `page` written (0: never) and the new one, for the copy
-/// that wrote to note itself current.
-pub(crate) fn wrote_own(page: usize, others: &[usize]) -> (u64, u64) {
+/// We wrote the 64 KiB page numbered `page` of title memory (specifically the
+/// 4 KiB parts in `parts`) through a view of our own
+/// (`crate::inplace::write_own`): no guard was opened and no kernel
+/// write-watch bit set, so the journal is told here. The page, and the same
+/// physical page at its other title addresses (`others`, page numbers), count
+/// as written at a new asking, which every host copy that holds them takes at
+/// its next refresh. Returns the asking that had last found `page` written
+/// (0: never) and the new one, for the copy that wrote to note itself current.
+pub(crate) fn wrote_own(page: usize, parts: u16, others: &[usize]) -> (u64, u64) {
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     j.asked += 1;
@@ -299,10 +403,10 @@ pub(crate) fn wrote_own(page: usize, others: &[usize]) -> (u64, u64) {
     if j.kept || !j.ahead.is_empty() {
         j.ahead_asked = now;
     }
-    let before = j.written.insert(page, now).unwrap_or(0);
+    let before = j.note(page, parts, now);
     for &other in others {
         if other != page {
-            j.written.insert(other, now);
+            j.note(other, WHOLE, now);
         }
     }
     (before, now)
@@ -359,10 +463,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         slow(started.elapsed().as_micros() as u64);
     }
     let now = j.ahead_asked;
-    for k in 0..count {
-        let page = j.found[k] / PAGE;
-        j.written.insert(page, now);
-    }
+    j.note_found(count, now);
     true
 }
 
@@ -458,9 +559,9 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
-        j.written.insert(page, now);
+    j.note_found(count, now);
+    for page in guarded {
+        j.note(page, WHOLE, now);
     }
     Some((
         now,
@@ -1670,13 +1771,27 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         // that the next asking about each range went to the kernel twice
         // (run 235: 266 to 565 failed askings a frame with the blocks
         // remembered from their guards alone, no fewer than without).
-        g.viewed.insert_all(range);
-        return;
+        g.viewed.insert_all(range.clone());
+    } else {
+        // What the range shows is new: no longer known to be a view.
+        let viewed: Vec<usize> = g.viewed.range(range.clone()).collect();
+        for block in viewed {
+            g.viewed.remove(block);
+        }
     }
-    // What the range shows is new: no longer known to be a view.
-    let viewed: Vec<usize> = g.viewed.range(range).collect();
-    for block in viewed {
-        g.viewed.remove(block);
+    drop(g);
+    // Clear any partial 4 KiB masks for remapped pages so new mappings start whole.
+    {
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        if !j.parts.is_empty() {
+            if range.end.saturating_sub(range.start) <= j.parts.len() {
+                for page in range {
+                    j.parts.remove(&page);
+                }
+            } else {
+                j.parts.retain(|page, _| !range.contains(page));
+            }
+        }
     }
 }
 
@@ -1753,6 +1868,85 @@ fn writable(at: usize) -> bool {
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
     n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE
+}
+
+#[cfg(test)]
+mod parts_tests {
+    use super::*;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
+
+    #[test]
+    fn the_parts_of_a_page_written_since_it_was_taken() {
+        let mut j = Journal {
+            asked: 0,
+            written: BTreeMap::new(),
+            parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+            found: Vec::new(),
+            ahead: Vec::new(),
+            ahead_asked: 0,
+            kept: false,
+        };
+        assert_eq!(j.parts_since(7, 0), WHOLE);
+        assert_eq!(j.note_with(7, WHOLE, 3, true), 0);
+        // Parts 0 and 5 at 4, part 5 again at 6: at 2 the whole page is due.
+        assert_eq!(j.note_with(7, 0b10_0001, 4, true), 3);
+        assert_eq!(j.note_with(7, 0b10_0000, 6, true), 4);
+        assert_eq!(j.parts_since(7, 2), WHOLE);
+        assert_eq!(j.parts_since(7, 3), 0b10_0001);
+        assert_eq!(j.parts_since(7, 4), 0b10_0000);
+        assert_eq!(j.parts_since(7, 5), 0b10_0000);
+        assert_eq!(j.parts_since(7, 6), 0);
+        // Written whole: all of it, whoever took it before.
+        assert_eq!(j.note_with(7, WHOLE, 8, true), 6);
+        assert_eq!(j.parts_since(7, 7), WHOLE);
+        // A page never written before: what was not named was never written.
+        assert_eq!(j.note_with(9, 0b100, 9, true), 0);
+        assert_eq!(j.parts_since(9, 5), 0b100);
+        // When `VICTORY_PAGE_PARTS=0` (track_parts=false), any write falls back to WHOLE.
+        assert_eq!(j.note_with(9, 0b10, 10, false), 9);
+        assert_eq!(j.parts_since(9, 9), WHOLE);
+        // Out-of-order kernel addresses in `found` still fold into accurate part masks.
+        j.found = vec![
+            11 * PAGE + 2 * KERNEL_PAGE,
+            12 * PAGE + 15 * KERNEL_PAGE,
+            11 * PAGE + 7 * KERNEL_PAGE,
+        ];
+        j.note_found(3, 12);
+        assert_eq!(j.parts_since(11, 10), (1 << 2) | (1 << 7));
+        assert_eq!(j.parts_since(12, 10), 1 << 15);
+    }
+
+    #[test]
+    fn kernel_write_watch_reports_4kib_page_parts() {
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        // SAFETY: private write-watched 64 KiB allocation owned by this test.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        let page = p / PAGE;
+        let (taken, _) = writes(p, p + PAGE, false).expect("write-watched");
+        // Write only 4 KiB parts 3 and 14.
+        // SAFETY: inside our committed 64 KiB allocation.
+        unsafe {
+            ((p + 3 * KERNEL_PAGE + 16) as *mut u8).write_volatile(0x11);
+            ((p + 14 * KERNEL_PAGE + 32) as *mut u8).write_volatile(0x22);
+        }
+        let (now, written) = writes(p, p + PAGE, false).expect("write-watched");
+        assert!(written.iter().any(|&(pg, w)| pg == page && w == now));
+        let mask = parts_written(&[(page, taken)]);
+        assert_eq!(mask, [if parts_on() { (1 << 3) | (1 << 14) } else { WHOLE }]);
+        // SAFETY: release our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        forget_test_pages(p, p + PAGE);
+    }
 }
 
 #[cfg(test)]
@@ -2186,6 +2380,7 @@ mod tests {
         use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
         for &view in views {
             title_memory_remapped(view, bytes);
+            forget_test_pages(view, view + bytes);
             // SAFETY: a view of the section mapped by `two_views`.
             unsafe {
                 UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {

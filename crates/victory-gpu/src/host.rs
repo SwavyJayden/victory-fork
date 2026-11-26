@@ -2352,6 +2352,32 @@ enum Step {
     },
 }
 
+/// Fast non-cryptographic hasher for addresses, pointers, and integer keys in
+/// per-list and per-submission maps (`Deferred`, `Batch`, `fill_ahead`).
+#[derive(Default)]
+pub(crate) struct AddressHash(u64);
+
+impl std::hash::Hasher for AddressHash {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_usize(usize::from(b));
+        }
+    }
+    fn write_usize(&mut self, n: usize) {
+        let h = (self.0.rotate_left(5) ^ n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        self.0 = h ^ (h >> 32);
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.write_usize(n as usize);
+    }
+    fn write_u32(&mut self, n: u32) {
+        self.write_usize(n as usize);
+    }
+}
+
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
 /// the upload buffers its GPU commands read, kept until the list is reset.
@@ -2367,21 +2393,21 @@ struct Deferred {
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
     /// The pipelines [`HostList::bind_pipeline`] kept, by address.
-    bound: std::collections::HashSet<usize>,
+    bound: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
-    refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    refreshed: std::collections::HashSet<(usize, usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
     /// Ranges declared written by shaders since the list last wrote title
     /// memory (host copy, address, bytes): declaring them again would
     /// change nothing.
-    gpu_written: std::collections::HashSet<(usize, usize, usize)>,
+    gpu_written: std::collections::HashSet<(usize, usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
     /// Scratch memory [`HostList::fill_scratch`] fills since the list last
     /// wrote title memory (source, bytes): its host address.
-    filled: std::collections::HashMap<(usize, usize), u64>,
+    filled: std::collections::HashMap<(usize, usize), u64, std::hash::BuildHasherDefault<AddressHash>>,
     /// Textures whose contents the list brings up to date.
-    textures: std::collections::HashSet<usize>,
+    textures: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Last GPU source copied into each aliased host texture in this list.
-    texture_aliases: std::collections::HashMap<usize, usize>,
+    texture_aliases: std::collections::HashMap<usize, usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -3142,6 +3168,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
     if written.is_empty() {
         return None;
     }
+    let mut pending: Vec<(usize, usize)> = Vec::new();
     for list in runs {
         for step in &list.deferred().copies {
             match step {
@@ -3155,8 +3182,8 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         // frame) and neither side had other bytes after
                         // one. A copy INTO such a range still waits.
                         if !touches(written, dst, dst + len) && fill_ahead::can_read_ahead(src, len) {
-                            if count {
-                                fill_ahead::read(src, len);
+                            if count && len > 0 {
+                                pending.push((src, len));
                             }
                             continue;
                         }
@@ -3173,8 +3200,8 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         // Not waited for, and checked when the flights land
                         // (`fill_ahead`).
                         if fill_ahead::can_read_ahead(src, len) {
-                            if count {
-                                fill_ahead::read(src, len);
+                            if count && len > 0 {
+                                pending.push((src, len));
                             }
                             continue;
                         }
@@ -3209,6 +3236,9 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                 Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) => {}
             }
         }
+    }
+    if !pending.is_empty() {
+        fill_ahead::read_batch(&pending);
     }
     None
 }
@@ -3258,6 +3288,12 @@ mod fill_ahead {
     /// it at most (flights are settled at 256 lists in the air, and by
     /// every present that waits).
     const KEEP: u64 = 16;
+    /// Cap distinct tracked `(from, to)` fills per 64 KiB piece so `wrote()`
+    /// stays fast even under heavy ring-buffer churn (256 covers every
+    /// 256-byte-aligned CBV slot in a 64 KiB page).
+    const MAX_FILLS_PER_PIECE: usize = 256;
+
+    type ReadMap = HashMap<usize, Piece, std::hash::BuildHasherDefault<super::AddressHash>>;
 
     /// Global kill switch: a flight changed bytes in legacy mode, or more than
     /// [`GLOBAL_TRIP_PIECES`] distinct 64 KiB pieces tripped in scoped mode.
@@ -3282,10 +3318,46 @@ mod fill_ahead {
     struct Piece {
         /// The frame its old fills were last dropped in.
         pruned: u64,
-        /// From, to, frame, and the number of the last submission started
-        /// when it read: the flights in the air then have that number or
-        /// a lower one, and only their writes can be ones it missed.
+        /// Sorted by `(from, to)`: from, to, frame, and the number of the last
+        /// submission started when it read: the flights in the air then have
+        /// that number or a lower one, and only their writes can be ones it
+        /// missed.
         fills: Vec<(usize, usize, u64, u64)>,
+    }
+
+    impl Piece {
+        /// Records `(from, to)` at `(frame, started)`, deduplicating identical
+        /// `(from, to)` ranges in place (updating `frame` and `started` to the
+        /// latest) and capping per-piece entries at [`MAX_FILLS_PER_PIECE`] by
+        /// evicting the oldest entry.
+        fn record(&mut self, from: usize, to: usize, frame: u64, started: u64) {
+            if self.pruned != frame {
+                self.pruned = frame;
+                self.fills.retain(|f| f.2 + KEEP >= frame);
+            }
+            match self.fills.binary_search_by_key(&(from, to), |f| (f.0, f.1)) {
+                Ok(idx) => {
+                    let entry = &mut self.fills[idx];
+                    entry.2 = entry.2.max(frame);
+                    entry.3 = entry.3.max(started);
+                }
+                Err(idx) => {
+                    if self.fills.len() < MAX_FILLS_PER_PIECE {
+                        self.fills.insert(idx, (from, to, frame, started));
+                    } else if let Some((oldest_idx, oldest)) = self
+                        .fills
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, f)| (f.2, f.3))
+                        && (frame, started) >= (oldest.2, oldest.3)
+                    {
+                        self.fills.remove(oldest_idx);
+                        let insert_at = if oldest_idx < idx { idx - 1 } else { idx };
+                        self.fills.insert(insert_at, (from, to, frame, started));
+                    }
+                }
+            }
+        }
     }
 
     /// The lowest submission number among the flights the landing thread
@@ -3299,7 +3371,32 @@ mod fill_ahead {
         LANDING.store(first, Ordering::Relaxed);
     }
 
-    static READ: Mutex<Option<HashMap<usize, Piece>>> = Mutex::new(None);
+    static READ: Mutex<Option<ReadMap>> = Mutex::new(None);
+
+    /// Records a batch of `(src, len)` fills into `read_map` under a single
+    /// mutex acquisition, deduplicating locally first so duplicate entries
+    /// within one submission never touch the map twice.
+    fn record_batch(read_map: &Mutex<Option<ReadMap>>, reads: &[(usize, usize)], frame: u64, started: u64) {
+        let mut unique: Vec<(usize, usize)> = reads.iter().copied().filter(|&(_, len)| len > 0).collect();
+        if unique.is_empty() {
+            return;
+        }
+        if unique.len() > 1 {
+            unique.sort_unstable();
+            unique.dedup();
+        }
+        let mut read = read_map.lock().unwrap_or_else(|e| e.into_inner());
+        let map = read.get_or_insert_with(ReadMap::default);
+        for (src, len) in unique {
+            let end = src.saturating_add(len);
+            if end <= src {
+                continue;
+            }
+            for piece in src / PIECE..=(end - 1) / PIECE {
+                map.entry(piece).or_default().record(src, end, frame, started);
+            }
+        }
+    }
 
     fn wait_pieces() -> &'static RwLock<HashSet<usize>> {
         WAIT_PIECES.get_or_init(|| RwLock::new(HashSet::new()))
@@ -3448,18 +3545,31 @@ mod fill_ahead {
             }
         }
         /// Core mismatch detector shared by [`wrote`] and unit tests.
+        #[cfg(test)]
         fn check_wrote(
             &self,
             (force_wait, scoped_on): (bool, bool),
-            read_map: &Mutex<Option<HashMap<usize, Piece>>>,
+            read_map: &Mutex<Option<ReadMap>>,
             (landing, frame): (u64, u64),
             (at, new): (usize, &[u8]),
+            on_mismatch: impl Fn(usize, usize, u64, usize, &TripOutcome),
+        ) -> usize {
+            self.check_wrote_on_hits((force_wait, scoped_on), read_map, (landing, frame), (at, new), || {}, on_mismatch)
+        }
+
+        fn check_wrote_on_hits(
+            &self,
+            (force_wait, scoped_on): (bool, bool),
+            read_map: &Mutex<Option<ReadMap>>,
+            (landing, frame): (u64, u64),
+            (at, new): (usize, &[u8]),
+            on_hits: impl FnOnce(),
             on_mismatch: impl Fn(usize, usize, u64, usize, &TripOutcome),
         ) -> usize {
             if new.is_empty() || force_wait || self.wait.load(Ordering::Relaxed) {
                 return 0;
             }
-            let hits: Vec<(usize, usize, u64)> = {
+            let mut hits: Vec<(usize, usize, u64)> = {
                 let read = read_map.lock().unwrap_or_else(|e| e.into_inner());
                 let Some(map) = read.as_ref() else { return 0 };
                 let end = at + new.len();
@@ -3473,6 +3583,11 @@ mod fill_ahead {
             if hits.is_empty() {
                 return 0;
             }
+            if hits.len() > 1 {
+                hits.sort_unstable();
+                hits.dedup();
+            }
+            on_hits();
             let mut mismatches = 0usize;
             let mut now = Vec::new();
             for (from, to, read_in) in hits {
@@ -3502,24 +3617,18 @@ mod fill_ahead {
         global_blacklist().can_read_ahead(global_wait_override(), src, len)
     }
 
-    /// A fill reads `len` bytes at `src` ahead of flights that may write
-    /// them.
-    pub(super) fn read(src: usize, len: usize) {
-        if len == 0 {
+    /// Fills of a submission read `(src, len)` ranges ahead of flights that
+    /// may write them: recorded in one mutex acquisition with deduplication
+    /// and per-piece capping.
+    pub(super) fn read_batch(reads: &[(usize, usize)]) {
+        let valid = reads.iter().filter(|&&(_, len)| len > 0).count();
+        if valid == 0 {
             return;
         }
-        COUNT[0].fetch_add(1, Ordering::Relaxed);
+        COUNT[0].fetch_add(valid as u64, Ordering::Relaxed);
         let frame = crate::frame::current();
-        let mut read = READ.lock().unwrap_or_else(|e| e.into_inner());
-        let map = read.get_or_insert_with(HashMap::new);
-        for piece in src / PIECE..=(src + len - 1) / PIECE {
-            let p = map.entry(piece).or_default();
-            if p.pruned != frame {
-                p.pruned = frame;
-                p.fills.retain(|f| f.2 + KEEP >= frame);
-            }
-            p.fills.push((src, src + len, frame, super::STARTED.load(Ordering::Relaxed)));
-        }
+        let started = super::STARTED.load(Ordering::Relaxed);
+        record_batch(&READ, reads, frame, started);
     }
 
     /// A landing is about to put `new` into title memory at `at`: bytes
@@ -3535,21 +3644,15 @@ mod fill_ahead {
         let landing = LANDING.load(Ordering::Relaxed);
         let scoped_on = scoped();
         let bl = global_blacklist();
-        let had_hits = {
-            let read = READ.lock().unwrap_or_else(|e| e.into_inner());
-            read.as_ref().is_some_and(|map| {
-                let end = at + new.len();
-                (at / PIECE..=(end - 1) / PIECE)
-                    .filter_map(|piece| map.get(&piece))
-                    .flat_map(|p| p.fills.iter())
-                    .any(|f| f.0 < end && f.1 > at && f.2 + KEEP >= frame && (landing == 0 || landing <= f.3))
-            })
-        };
-        if !had_hits {
-            return;
-        }
-        COUNT[1].fetch_add(1, Ordering::Relaxed);
-        bl.check_wrote((force_wait, scoped_on), &READ, (landing, frame), (at, new), |from, to, read_in, first_diff, outcome| {
+        bl.check_wrote_on_hits(
+            (force_wait, scoped_on),
+            &READ,
+            (landing, frame),
+            (at, new),
+            || {
+                COUNT[1].fetch_add(1, Ordering::Relaxed);
+            },
+            |from, to, read_in, first_diff, outcome| {
             let n = COUNT[2].fetch_add(1, Ordering::Relaxed) + 1;
             if !scoped_on {
                 if outcome.tripped_global {
@@ -3631,7 +3734,7 @@ mod fill_ahead {
             has_pieces: AtomicBool,
             pieces: RwLock<HashSet<usize>>,
             cells: RwLock<HashSet<usize>>,
-            read_map: Mutex<Option<HashMap<usize, Piece>>>,
+            read_map: Mutex<Option<ReadMap>>,
         }
 
         impl Fixture {
@@ -3663,11 +3766,7 @@ mod fill_ahead {
             }
 
             fn record_read(&self, src: usize, len: usize, frame: u64, started: u64) {
-                let mut guard = self.read_map.lock().unwrap();
-                let map = guard.get_or_insert_with(HashMap::new);
-                for piece in src / PIECE..=(src + len - 1) / PIECE {
-                    map.entry(piece).or_default().fills.push((src, src + len, frame, started));
-                }
+                record_batch(&self.read_map, &[(src, len)], frame, started);
             }
         }
 
@@ -3844,6 +3943,46 @@ mod fill_ahead {
             assert!(!f.can_read(false, base, 16));
             assert!(!f.can_read(false, base + PIECE, 16));
             assert!(f.can_read(false, base + 2 * PIECE, 16));
+        }
+
+        #[test]
+        fn read_batch_deduplicates_updates_in_place_and_caps_per_piece() {
+            let f = Fixture::new();
+            let base = 0x7000_0000usize;
+            // Batch with duplicates and zero-length reads collapses to 2 distinct entries.
+            record_batch(
+                &f.read_map,
+                &[(base + 64, 256), (base + 64, 256), (base + 512, 128), (base + 64, 0), (base + 512, 128)],
+                10,
+                100,
+            );
+            {
+                let guard = f.read_map.lock().unwrap();
+                let piece = &guard.as_ref().unwrap()[&(base / PIECE)];
+                assert_eq!(piece.fills, vec![(base + 64, base + 320, 10, 100), (base + 512, base + 640, 10, 100)]);
+            }
+            // Re-recording the same range on a newer frame/submission updates in place without growing.
+            record_batch(&f.read_map, &[(base + 64, 256)], 12, 140);
+            {
+                let guard = f.read_map.lock().unwrap();
+                let piece = &guard.as_ref().unwrap()[&(base / PIECE)];
+                assert_eq!(piece.fills, vec![(base + 64, base + 320, 12, 140), (base + 512, base + 640, 10, 100)]);
+            }
+            // Flooding one piece with more than `MAX_FILLS_PER_PIECE` distinct ranges stays capped,
+            // evicting older entries in favor of newer ones.
+            let piece2 = base + PIECE;
+            let flood: Vec<(usize, usize)> = (0..MAX_FILLS_PER_PIECE + 40).map(|i| (piece2 + i * 16, 16)).collect();
+            record_batch(&f.read_map, &flood[..MAX_FILLS_PER_PIECE], 20, 200);
+            record_batch(&f.read_map, &flood[MAX_FILLS_PER_PIECE..], 21, 210);
+            {
+                let guard = f.read_map.lock().unwrap();
+                let piece = &guard.as_ref().unwrap()[&(piece2 / PIECE)];
+                assert_eq!(piece.fills.len(), MAX_FILLS_PER_PIECE);
+                // All 40 newest entries from frame 21 are retained.
+                assert_eq!(piece.fills.iter().filter(|entry| entry.2 == 21 && entry.3 == 210).count(), 40);
+                // Remains sorted by `(from, to)`.
+                assert!(piece.fills.windows(2).all(|w| (w[0].0, w[0].1) < (w[1].0, w[1].1)));
+            }
         }
     }
 }
@@ -4043,6 +4182,10 @@ mod fill_check {
     }
 }
 
+/// Since the last frame-rate line, ns spent scanning lists' refreshes for
+/// copies shaders may be writing (`stale_under_flights`).
+static UNDER_SCAN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// With flights in the air, after the submission's write-watch asking:
 /// whether `runs` refresh a range of a host copy that a flight's shaders
 /// may write and that the title wrote since it was last copied. The
@@ -4051,6 +4194,7 @@ mod fill_check {
 fn stale_under_flights(runs: &[&HostList]) -> bool {
     // Per copy, the disjoint refreshed spans (a flush brings those ranges up
     // to date without spanning unrelated gaps between them).
+    let scanning = std::time::Instant::now();
     let mut spans = Batch::default();
     for list in runs {
         for step in &list.deferred().copies {
@@ -4061,6 +4205,7 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
             }
         }
     }
+    UNDER_SCAN.fetch_add(scanning.elapsed().as_nanos() as u64, Ordering::Relaxed);
     stale_under_flights_spans(&spans)
 }
 
@@ -4576,6 +4721,23 @@ fn late_line(frames: f64) {
             gave_up[2],
             gave_up[3]
         );
+        let u = crate::shadow::under_stats().map(|n| n as f64 / frames);
+        let ms = |i: usize| u[i] / 1e6;
+        tracing::info!(
+            "of those, ms a frame: {:.2} finding copies in the lists' refreshes, {:.0} calls: {:.2} asking what was written, \
+             {:.2} finding the pages, {:.2} waiting for the locks, {:.2} comparing pages (threads together: {:.2} reading title \
+             memory, {:.2} comparing and putting in), {:.2} noting the runs; {:.0} stale pages",
+            UNDER_SCAN.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames,
+            u[9],
+            ms(0),
+            ms(1),
+            ms(2),
+            ms(3),
+            ms(5),
+            ms(6),
+            ms(4),
+            u[8],
+        );
     }
     crate::shadow::lookup_cache_line(frames);
     crate::gpu_detile::line(frames);
@@ -4689,10 +4851,17 @@ fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
         && (d.checked_add(all).is_some_and(|end| end <= s) || s.checked_add(all).is_some_and(|end| end <= d))
 }
 
+/// See [`HostList::defer_gpu_write`].
+fn declare_once() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_DECLARE_ONCE").map_or(true, |v| v != "0"))
+}
+
 /// The ranges the shaders of `runs` may write, per host copy, deduplicated.
 /// One list's lock at a time: a submission may name a list twice.
 fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
-    let mut index: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut index: std::collections::HashMap<usize, usize, std::hash::BuildHasherDefault<AddressHash>> =
+        std::collections::HashMap::default();
     let mut back: Vec<Declared> = Vec::new();
     for list in runs {
         for step in &list.deferred().copies {
@@ -4721,7 +4890,8 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
 /// Merges declared write lists from multiple flights into one deduplicated
 /// `Vec<Declared>` in O(N log N) instead of O(N^2) linear scans.
 fn merge_declared<'a>(sets: impl IntoIterator<Item = &'a [Declared]>) -> Vec<Declared> {
-    let mut index: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut index: std::collections::HashMap<usize, usize, std::hash::BuildHasherDefault<AddressHash>> =
+        std::collections::HashMap::default();
     let mut back: Vec<Declared> = Vec::new();
     for declared in sets {
         for (shadow, ranges) in declared {
@@ -4786,12 +4956,6 @@ pub(crate) fn walls_trace() -> bool {
 /// ([`late`]) did not, at any stage: the flights' lists were settled
 /// without it, so the title read a buffer nobody wrote, as before read-backs
 /// were made (the exposure metering's two small float targets, every frame).
-/// See [`HostList::defer_gpu_write`].
-fn declare_once() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_DECLARE_ONCE").map_or(true, |v| v != "0"))
-}
-
 fn read_backs(list: &HostList) {
     // Textures shaders wrote that the title reads on the CPU ([`crate::texback`]).
     for back in &list.deferred().texture_backs {
@@ -7014,6 +7178,7 @@ impl Host {
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         // Also collect pending-write spans in the same single pass when behind flights.
         if crate::watch::once() {
+            let scanning = behind.then(std::time::Instant::now);
             let mut spans = Batch::default();
             let mut pending_spans = Batch::default();
             for list in runs {
@@ -7027,6 +7192,9 @@ impl Host {
                         }
                     }
                 }
+            }
+            if let Some(scanning) = scanning {
+                UNDER_SCAN.fetch_add(scanning.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
             let ranges: Vec<(usize, usize)> = spans.iter().map(|(_, from, to)| (from, to)).collect();
             crate::watch::ask_once(&ranges);
@@ -8338,8 +8506,11 @@ impl HostList {
             return known;
         }
         let (gpu, to) = self.scratch(len)?;
-        self.defer_fill(to, src, len as usize);
-        self.deferred().filled.insert(key, gpu);
+        let mut deferred = self.deferred();
+        deferred
+            .copies
+            .push(Step::Fill(to as usize, src as usize, len as usize));
+        deferred.filled.insert(key, gpu);
         Some(gpu)
     }
 
@@ -8927,14 +9098,18 @@ struct Batch {
     /// the heap's buffers ready adds some 4,100 copies, and searching them
     /// for every refresh of a submission was tens of millions of
     /// comparisons a frame.
-    index: std::collections::HashMap<usize, usize>,
+    index: std::collections::HashMap<usize, usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// With [`refresh_once`], by copy (its address; the copy is held, so
     /// that the address names no other): the range of title addresses
     /// brought up to date in this submission that no step of ours has
     /// written since.
-    current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    current: std::collections::HashMap<
+        usize,
+        (std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+        std::hash::BuildHasherDefault<AddressHash>,
+    >,
     /// Staging buffers (by address) refreshed since the last title write.
-    textures: std::collections::HashSet<usize>,
+    textures: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Texture stagings with `uploads == true` seen during `run_deferred`,
     /// avoiding a second full scan of all lists' deferred steps after `Signal`.
     uploaded: Vec<std::sync::Arc<crate::texture::Staging>>,
@@ -8999,7 +9174,11 @@ impl Batch {
     /// up to date. Kept: its union with what was up to date if they touch,
     /// else the larger of the two.
     fn brought(
-        current: &mut std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+        current: &mut std::collections::HashMap<
+            usize,
+            (std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+            std::hash::BuildHasherDefault<AddressHash>,
+        >,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
         from: usize,
         to: usize,
