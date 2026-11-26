@@ -2673,6 +2673,45 @@ impl State {
             .is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores))
     }
 
+    /// What is about to be recorded may write arguments (`stores`: a
+    /// dispatch, or shaders that can store to buffers): the list's
+    /// gathering ends, whole, or with `crate::indirect::gather_by_copy`
+    /// only for the copies the shaders are declared to write as they are
+    /// prepared (`HostList::gather_wrote`), and whole for an unknown
+    /// pipeline or one whose shaders can store through an undeclared view
+    /// (picked from the view heap or by raw title address).
+    fn gather_ends(&self, list: &HostList, stores: bool, compute: bool) {
+        if !stores {
+            return;
+        }
+        // Whole, as before: without the switch, for a pipeline the layer
+        // does not know, and for shaders that can store through a view
+        // that is NOT declared where they are prepared: a buffer picked
+        // from the view heap by an index the shader computes
+        // (`State::heap_buffers`: what such a shader writes through a
+        // picked unordered access view is declared nowhere), and title
+        // memory by address (`crate::memory::ready` declares the numbered
+        // copies once per list; a copy another list numbers after that is
+        // reached through the directory and not declared in this list).
+        let pipeline = if compute {
+            crate::pipeline::host_pipeline(self.pipeline as This)
+        } else {
+            crate::pipeline::host_pipeline_for(self.pipeline as This, &self.target_formats)
+        };
+        let whole = !crate::indirect::gather_by_copy()
+            || pipeline.is_none_or(|p| {
+                p.stages.iter().any(|stage| {
+                    let t = stage.translated();
+                    t.stores
+                        && (t.host.root_srvs.contains(&victory_shader::emit::SLOT_STRIDES)
+                            || t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY))
+                })
+            });
+        if whole {
+            list.gather_close();
+        }
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(
         &mut self,
@@ -2685,7 +2724,7 @@ impl State {
         let _guard = crate::resource::NonListGuard::new();
         // It may write the arguments a window holds clamped.
         self.window = None;
-        list.gather_close();
+        self.gather_ends(list, true, true);
         // A dispatch that may write records ends the run (1: every one).
         let rules = crate::indirect::run_rules();
         if rules.on {
@@ -3125,9 +3164,7 @@ impl State {
         let _guard = crate::resource::NonListGuard::new();
         self.window = None;
         self.end_batch_if_stores(list);
-        if self.may_store() {
-            list.gather_close();
-        }
+        self.gather_ends(list, self.may_store(), false);
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = mesh_test() != 1
@@ -3682,9 +3719,7 @@ impl State {
         let _guard = crate::resource::NonListGuard::new();
         self.window = None;
         self.end_batch_if_stores(list);
-        if self.may_store() {
-            list.gather_close();
-        }
+        self.gather_ends(list, self.may_store(), false);
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
@@ -3793,9 +3828,7 @@ impl State {
         let _guard = crate::resource::NonListGuard::new();
         self.window = None;
         self.end_batch_if_stores(list);
-        if self.may_store() {
-            list.gather_close();
-        }
+        self.gather_ends(list, self.may_store(), false);
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         // Indexed rectangles are drawn by the rectangle geometry stage
@@ -3951,7 +3984,7 @@ impl State {
         if !can_batch {
             // A dispatch, multi-record/count-buffered call, or shaders that
             // store to buffers: arguments may be written from here on.
-            list.gather_close();
+            self.gather_ends(list, true, kind == DISPATCH);
         }
         // Diagnostics: why this command gets a pass of ours, if it does.
         #[cfg(feature = "diagnostics")]

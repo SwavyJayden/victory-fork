@@ -268,6 +268,7 @@ struct SyncPage {
 /// Processes a single dirty heap page: reads its bytes through the kernel,
 /// diffs against the host heap's last-seen records, mirrors non-tabled changes,
 /// and appends deferred constant/placed indices into `wait`.
+/// Adds per-phase microseconds `[read, walk, make]` into `parts`.
 #[cfg(windows)]
 fn sync_one_page(
     page: &SyncPage,
@@ -275,11 +276,15 @@ fn sync_one_page(
     page_bytes: &mut Vec<u8>,
     changed: &mut Vec<u32>,
     wait: &mut Vec<u32>,
+    parts: &mut [u64; 3],
 ) -> [u64; 5] {
     // SAFETY: `host` points to a registered live `HostHeap` under `SHADER_HEAPS`.
     let host = unsafe { &*(page.host as *const host::HostHeap) };
     page_bytes.resize(page.to - page.from, 0);
-    if !crate::host::read_into(page.from as *const u8, page_bytes) {
+    let reading = std::time::Instant::now();
+    let read = crate::host::read_into(page.from as *const u8, page_bytes);
+    parts[0] += reading.elapsed().as_micros() as u64;
+    if !read {
         return [0; 5];
     }
     let slots = changed_slots(page.from, page.to, page.start as usize, page.step, page.mirrored_count);
@@ -289,7 +294,10 @@ fn sync_one_page(
     };
     let count = (records.len() as u64 / page.step).min(slots.end.saturating_sub(first));
     changed.clear();
+    let walking = std::time::Instant::now();
     host.copied_changes(first as u32, &records[..(count * page.step) as usize], page.step as usize, changed);
+    let making = std::time::Instant::now();
+    parts[1] += (making - walking).as_micros() as u64;
     let (mut mirrored, mut tabled, mut later) = (0u64, 0u64, 0u64);
     for &index in changed.iter() {
         let at = (u64::from(index) - first) as usize * page.step as usize;
@@ -313,7 +321,21 @@ fn sync_one_page(
         host.mirror(index, page.start + u64::from(index) * page.step, false);
         mirrored += 1;
     }
+    parts[2] += making.elapsed().as_micros() as u64;
     [1, count, mirrored, tabled, later]
+}
+
+/// Scales thread-summed worker phase microseconds `[read, walk, make]` down
+/// proportionally when parallel execution (`VICTORY_SYNC_WIDE`) makes their
+/// sum exceed the wall-clock duration `wall_us`, so the reported parts align
+/// with the pass's wall-clock time rather than the threads' sum.
+#[cfg(any(windows, test))]
+fn scale_sync_parts(raw: [u64; 3], wall_us: u64) -> [u64; 3] {
+    let sum = raw[0].saturating_add(raw[1]).saturating_add(raw[2]);
+    if sum == 0 || sum <= wall_us {
+        return raw;
+    }
+    raw.map(|v| ((u128::from(v) * u128::from(wall_us)) / u128::from(sum)) as u64)
 }
 
 /// Mirrors records copied directly into placed shader-visible heaps. Calls
@@ -358,17 +380,25 @@ pub(crate) fn sync_heaps() {
         let mirrored_count = heap.desc.count.min(host.count());
         // The records of some frames ago that no draw read through a table
         // since: a shader may pick them by index.
-        for index in host.copied_before(frame) {
-            if host.copied_tabled(index, frame) {
-                tabled += 1;
-            } else {
-                host.mirror(index, start + u64::from(index) * step, false);
-                mirrored += 1;
+        let before_slots = host.copied_before(frame);
+        if !before_slots.is_empty() {
+            let making = std::time::Instant::now();
+            for index in before_slots {
+                if host.copied_tabled(index, frame) {
+                    tabled += 1;
+                } else {
+                    host.mirror(index, start + u64::from(index) * step, false);
+                    mirrored += 1;
+                }
             }
+            SYNC_PARTS[3].fetch_add(making.elapsed().as_micros() as u64, Relaxed);
         }
         let host_ptr = std::ptr::from_ref(host) as usize;
         let samplers = heap.samplers();
-        for (range_from, range_end) in written.take(start as usize, end as usize) {
+        let asking = std::time::Instant::now();
+        let ranges = written.take(start as usize, end as usize);
+        SYNC_PARTS[0].fetch_add(asking.elapsed().as_micros() as u64, Relaxed);
+        for (range_from, range_end) in ranges {
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
                 work.push(SyncPage {
@@ -394,17 +424,24 @@ pub(crate) fn sync_heaps() {
             std::sync::atomic::AtomicU64::new(0),
             std::sync::atomic::AtomicU64::new(0),
         ]);
+        let worker_parts = std::sync::Arc::new([
+            std::sync::atomic::AtomicU64::new(0),
+            std::sync::atomic::AtomicU64::new(0),
+            std::sync::atomic::AtomicU64::new(0),
+        ]);
         let deferred: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<usize, Vec<u32>>>> =
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let each = work.len().div_ceil(wide);
         let mut iter = work.into_iter();
         let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(wide);
+        let par_started = std::time::Instant::now();
         loop {
             let chunk: Vec<SyncPage> = iter.by_ref().take(each).collect();
             if chunk.is_empty() {
                 break;
             }
             let counts = counts.clone();
+            let worker_parts = worker_parts.clone();
             let deferred = deferred.clone();
             jobs.push(Box::new(move || {
                 let _guard = crate::resource::NonListGuard::new();
@@ -412,10 +449,18 @@ pub(crate) fn sync_heaps() {
                 let mut local_changed: Vec<u32> = Vec::new();
                 let mut local_wait: Vec<u32> = Vec::new();
                 let mut local_counts = [0u64; 5];
+                let mut local_parts = [0u64; 3];
                 let mut by_host: std::collections::HashMap<usize, Vec<u32>> = std::collections::HashMap::new();
                 for page in &chunk {
                     local_wait.clear();
-                    let c = sync_one_page(page, frame, &mut local_bytes, &mut local_changed, &mut local_wait);
+                    let c = sync_one_page(
+                        page,
+                        frame,
+                        &mut local_bytes,
+                        &mut local_changed,
+                        &mut local_wait,
+                        &mut local_parts,
+                    );
                     for i in 0..5 {
                         local_counts[i] += c[i];
                     }
@@ -426,6 +471,9 @@ pub(crate) fn sync_heaps() {
                 for i in 0..5 {
                     counts[i].fetch_add(local_counts[i], Relaxed);
                 }
+                for i in 0..3 {
+                    worker_parts[i].fetch_add(local_parts[i], Relaxed);
+                }
                 if !by_host.is_empty() {
                     let mut all = deferred.lock().unwrap_or_else(|e| e.into_inner());
                     for (h, slots) in by_host {
@@ -435,6 +483,17 @@ pub(crate) fn sync_heaps() {
             }));
         }
         crate::shadow::wide_run(jobs);
+        let scaled = scale_sync_parts(
+            [
+                worker_parts[0].load(Relaxed),
+                worker_parts[1].load(Relaxed),
+                worker_parts[2].load(Relaxed),
+            ],
+            par_started.elapsed().as_micros() as u64,
+        );
+        for (i, &us) in scaled.iter().enumerate() {
+            SYNC_PARTS[i + 1].fetch_add(us, Relaxed);
+        }
         pages += counts[0].load(Relaxed);
         looked += counts[1].load(Relaxed);
         mirrored += counts[2].load(Relaxed);
@@ -447,9 +506,10 @@ pub(crate) fn sync_heaps() {
     } else if !work.is_empty() {
         let mut by_host: std::collections::HashMap<usize, Vec<u32>> = std::collections::HashMap::new();
         let mut wait: Vec<u32> = Vec::new();
+        let mut seq_parts = [0u64; 3];
         for page in &work {
             wait.clear();
-            let c = sync_one_page(page, frame, &mut page_bytes, &mut changed, &mut wait);
+            let c = sync_one_page(page, frame, &mut page_bytes, &mut changed, &mut wait, &mut seq_parts);
             pages += c[0];
             looked += c[1];
             mirrored += c[2];
@@ -458,6 +518,9 @@ pub(crate) fn sync_heaps() {
             if !wait.is_empty() {
                 by_host.entry(page.host).or_default().extend_from_slice(&wait);
             }
+        }
+        for (i, &us) in seq_parts.iter().enumerate() {
+            SYNC_PARTS[i + 1].fetch_add(us, Relaxed);
         }
         for (h, slots) in by_host {
             // SAFETY: registered live `HostHeap` under `SHADER_HEAPS`.
@@ -471,6 +534,14 @@ pub(crate) fn sync_heaps() {
         count.fetch_add(n, Relaxed);
     }
 }
+
+/// Microseconds of [`sync_heaps`] by part, since its line last took them:
+/// asking the write tracking which pages changed, reading the pages, the
+/// walk over their records (`HostHeap::copied_changes`), and making the
+/// host slots of the records that changed.
+#[cfg(windows)]
+pub(crate) static SYNC_PARTS: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// Since the last frame line, of [`sync_heaps`]: changed pages of placed
 /// shader-visible heaps looked at, slots on them, slots whose record was
@@ -486,6 +557,9 @@ pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 6] = [const { std::sync
 pub(crate) fn sync_line(frames: f64) {
     let [pages, looked, mirrored, micros, tabled, later] =
         [0, 1, 2, 3, 4, 5].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    let parts = [0, 1, 2, 3].map(|i| {
+        SYNC_PARTS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e3 / frames
+    });
     if pages == 0 {
         return;
     }
@@ -499,6 +573,14 @@ pub(crate) fn sync_line(frames: f64) {
         tabled as f64 / frames,
         later as f64 / frames,
         micros as f64 / 1000.0 / frames
+    );
+    tracing::info!(
+        "the pass over the title's view heap by part, ms per frame: asking which pages changed {:.2}, reading the pages {:.2}, \
+         the walk over their records {:.2}, making the host slots of the changed records {:.2}",
+        parts[0],
+        parts[1],
+        parts[2],
+        parts[3]
     );
 }
 
@@ -529,6 +611,43 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
     {
         host.release(first, n);
+    }
+}
+
+/// Drains pending `levels_on_demand` texture view remakes across all live
+/// shader-visible view heaps when the GPU is quiet (`flying == 0`), called
+/// from [`host::finish_flips`] as submissions complete. Prevents
+/// `VICTORY_VIEWS_REMADE_QUIET=1` starvation under `VICTORY_LATE_WAIT=3` +
+/// `VICTORY_ASYNC_PRESENT=1` + `VICTORY_RELAY=2` and reduces in-flight
+/// descriptor rewrites even when quiet mode is off.
+#[cfg(windows)]
+pub(crate) fn drain_quiet_remade_views(finished: u64) {
+    if !host::has_reshown() {
+        return;
+    }
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let view_heaps: Vec<&host::HostHeap> = heaps
+        .iter()
+        .filter_map(|&(_, _, at)| {
+            // SAFETY: registered heaps stay alive while `SHADER_HEAPS` is read-locked.
+            let heap = unsafe { &*(at as *const Heap) };
+            (!heap.samplers())
+                .then(|| heap.host.get().and_then(Option::as_ref))
+                .flatten()
+        })
+        .collect();
+    if view_heaps.is_empty() {
+        return;
+    }
+    let Some(starts) = host::take_quiet_reshown(finished) else {
+        return;
+    };
+    let mut remade = 0usize;
+    for h in view_heaps {
+        remade += h.remake_starts(&starts);
+    }
+    if remade > 0 {
+        host::record_views_remade(remade, 0, true);
     }
 }
 
@@ -1884,5 +2003,15 @@ mod tests {
             // SAFETY: this allocation belongs to the test.
             unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
         }
+    }
+
+    #[test]
+    fn scale_sync_parts_bounds_parallel_sums_to_wall_time() {
+        // Under wall time: unchanged.
+        assert_eq!(scale_sync_parts([100, 200, 300], 1000), [100, 200, 300]);
+        assert_eq!(scale_sync_parts([0, 0, 0], 100), [0, 0, 0]);
+        // Parallel worker sum exceeds wall time (e.g. 4 workers x 1000 us = 4000 us vs 1000 us wall):
+        // scaled proportionally to preserve phase ratios within wall_us.
+        assert_eq!(scale_sync_parts([1000, 2000, 1000], 1000), [250, 500, 250]);
     }
 }
