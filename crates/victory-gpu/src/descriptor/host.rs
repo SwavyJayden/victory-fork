@@ -483,6 +483,10 @@ pub(crate) struct HostHeap {
     /// one of them stood in the queue of textures picked by index, ahead
     /// of or behind the ones shaders do pick by index.
     tabled: Vec<std::sync::atomic::AtomicU32>,
+    /// Per title slot, the null-view kind currently stored (1 = buffer SRV,
+    /// 2 = CBV, 3 = buffer UAV, 0 = other/non-null) so `VICTORY_SYNC_NULL_SKIP`
+    /// avoids recreating an identical null view.
+    nulls: Vec<AtomicU8>,
     /// The title memory each placed texture view of this heap describes,
     /// by slot and by address ([`Spans`]): which slots a newer view of
     /// other memory there makes stale, and which to look at again when the
@@ -536,6 +540,28 @@ pub(crate) fn first_viewed(start: u64) -> Option<u32> {
 /// whose first level with memory changed since a texture pass last took
 /// them ([`HostHeap::texture_views_remade`]).
 static RESHOWN: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+/// Since the start, of [`HostHeap::texture_views_remade`]: view slots made
+/// again, those of them made while a submission was in flight, and passes
+/// put off because one was (`VICTORY_VIEWS_REMADE_QUIET=1`).
+static VIEWS_REMADE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+fn views_remade_quiet_from(val: Option<&std::ffi::OsStr>) -> bool {
+    val.is_some_and(|v| v == "1")
+}
+
+/// Whether view slots of textures with levels on demand are made again
+/// only while no submission is in flight (`VICTORY_VIEWS_REMADE_QUIET=1`;
+/// off by default: at every texture pass, as before). A texture then
+/// shows its new level a pass or more later. After fork pull request
+/// #1219, whose author lost the device with slots rewritten under lists
+/// already sent; whether that is behind the losses here is not known.
+fn views_remade_quiet() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        views_remade_quiet_from(std::env::var_os("VICTORY_VIEWS_REMADE_QUIET").as_deref())
+    })
+}
 
 /// The first level with memory of the placed texture at `start` changed:
 /// its slots are made again at the next texture pass.
@@ -1521,6 +1547,9 @@ impl HostHeap {
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
+            nulls: (0..if sampler { 0 } else { count })
+                .map(|_| AtomicU8::new(0))
+                .collect(),
             placed: {
                 let spans = std::sync::Arc::<Mutex<Spans>>::default();
                 if !sampler {
@@ -2033,24 +2062,44 @@ impl HostHeap {
     const WAITING_A_PASS: usize = 128;
 
     pub(crate) fn texture_views_remade(&self) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
         if self.sampler {
             return 0;
         }
-        let starts = std::mem::take(&mut *RESHOWN.lock().unwrap_or_else(|e| e.into_inner()));
+        // The slots made again here are live slots of the heap the card
+        // reads, and the making is the layer's own, at a moment the title
+        // knows nothing of: a list already sent may be reading a slot while
+        // it is written (Direct3D 12 asks that a descriptor a submitted
+        // list reads is left alone until the list has run). Counted always;
+        // with `VICTORY_VIEWS_REMADE_QUIET=1` the pass is put off while a
+        // submission is in flight, and what is due stays due.
+        let (started, finished) = crate::host::submissions();
+        let flying = started.saturating_sub(finished);
+        if flying > 0 && views_remade_quiet() {
+            if !RESHOWN.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+                VIEWS_REMADE[2].fetch_add(1, Relaxed);
+            }
+            return 0;
+        }
+        let mut starts = std::mem::take(&mut *RESHOWN.lock().unwrap_or_else(|e| e.into_inner()));
         if starts.is_empty() {
             return 0;
         }
-        let slots: Vec<u32> = {
+        starts.sort_unstable();
+        starts.dedup();
+        let mut slots: Vec<u32> = {
             let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
             starts.iter().flat_map(|&start| placed.slots_at(start)).collect()
         };
+        slots.sort_unstable();
+        slots.dedup();
         let _guard = self.made_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut remade = 0;
         for slot in slots {
             let Some(entry) = self.made.get(slot as usize) else {
                 continue;
             };
-            let key = entry.load(Ordering::Relaxed);
+            let key = entry.load(Relaxed);
             if key == 0 {
                 continue;
             }
@@ -2061,6 +2110,21 @@ impl HostHeap {
                 self.keep(slot, kept);
                 remade += 1;
             }
+        }
+        let before = VIEWS_REMADE[0].fetch_add(remade as u64, Relaxed);
+        if flying > 0 {
+            VIEWS_REMADE[1].fetch_add(remade as u64, Relaxed);
+        }
+        // Said at every 1,024 slots made again.
+        if (before + remade as u64) / 1024 != before / 1024 {
+            tracing::info!(
+                "view slots of textures with levels on demand made again, since the start: {}, {} of them while a submission was in flight \
+                 (a list already sent may have been reading the slot); {} passes put off for that (VICTORY_VIEWS_REMADE_QUIET=1: {})",
+                before + remade as u64,
+                VIEWS_REMADE[1].load(Relaxed),
+                VIEWS_REMADE[2].load(Relaxed),
+                if views_remade_quiet() { "on" } else { "off" }
+            );
         }
         remade
     }
@@ -2485,6 +2549,9 @@ impl HostHeap {
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
         use windows::core::Interface;
+        if let Some(null) = self.nulls.get(index as usize) {
+            null.store(0, Ordering::Relaxed);
+        }
         let (shard, pos) = kept_slot(index);
         let old = {
             let mut kept = self.kept[shard].lock().unwrap_or_else(|e| e.into_inner());
@@ -2815,9 +2882,25 @@ impl HostHeap {
                 make(&view, self.cpu(index))
             };
             if kept.is_none() && !self.sampler {
+                let kind = null_kind(&view);
+                let null = self.nulls.get(index as usize);
+                if kind != 0
+                    && null_skip()
+                    && null.is_some_and(|n| n.load(Ordering::Relaxed) == kind)
+                {
+                    if !later {
+                        self.made[index as usize].store(key, Ordering::Release);
+                    }
+                    return Some(view);
+                }
                 null_for(&view, self.cpu(index));
+                self.keep(index, None);
+                if let Some(null) = null {
+                    null.store(kind, Ordering::Relaxed);
+                }
+            } else {
+                self.keep(index, kept.flatten());
             }
-            self.keep(index, kept.flatten());
             if !later {
                 self.made[index as usize].store(key, Ordering::Release);
             }
@@ -3773,6 +3856,31 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
     let texture = crate::resource::texture_at(address, resource)?;
     Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+}
+
+fn null_skip_from(val: Option<&std::ffi::OsStr>) -> bool {
+    val.is_none_or(|v| v != "0")
+}
+
+/// Whether an identical null view is skipped (`VICTORY_SYNC_NULL_SKIP=0` to
+/// recreate it as before; on by default).
+fn null_skip() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| null_skip_from(std::env::var_os("VICTORY_SYNC_NULL_SKIP").as_deref()))
+}
+
+/// Kind of null view for buffer/constant slots (1 = buffer SRV, 2 = CBV,
+/// 3 = buffer UAV, 0 = other).
+fn null_kind(view: &View) -> u8 {
+    let is_buffer = |r: &usize| crate::resource::buffer_bytes(*r as crate::object::This).is_some();
+    match view {
+        View::Constant(..) => 2,
+        View::Unordered(r, _, desc) if is_buffer(r) || desc.is_some_and(|d| d[1] == 1) => 3,
+        View::Placed(true, resource, _) if resource[0] == 1 => 3,
+        View::Shader(r, desc) if is_buffer(r) || desc.is_some_and(|d| d[1] == 1) => 1,
+        View::Placed(false, resource, _) if resource[0] == 1 => 1,
+        _ => 0,
+    }
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host
@@ -4887,6 +4995,51 @@ mod record_key_tests {
         assert!(heap.make_listed(rec, cbv_words, heap.count).is_none());
         assert!(listed_view(rec, cbv_words).is_none());
         clear_listed(rec);
+    }
+
+    #[test]
+    fn sync_null_skip_and_views_remade_quiet_switches() {
+        use std::ffi::OsStr;
+        // VICTORY_SYNC_NULL_SKIP defaults on, =0 disables.
+        assert!(null_skip_from(None));
+        assert!(null_skip_from(Some(OsStr::new("1"))));
+        assert!(!null_skip_from(Some(OsStr::new("0"))));
+        // VICTORY_VIEWS_REMADE_QUIET defaults off, =1 enables.
+        assert!(!views_remade_quiet_from(None));
+        assert!(!views_remade_quiet_from(Some(OsStr::new("0"))));
+        assert!(views_remade_quiet_from(Some(OsStr::new("1"))));
+
+        // `null_kind` classifies CBV=2, buffer SRV=1, buffer UAV=3, texture/sampler=0.
+        assert_eq!(null_kind(&View::Constant(0x1000, 256)), 2);
+        let mut buf_desc = [0u32; 10];
+        buf_desc[1] = 1; // BUFFER dimension
+        assert_eq!(null_kind(&View::Shader(0, Some(buf_desc))), 1);
+        assert_eq!(null_kind(&View::Unordered(0, 0, Some(buf_desc))), 3);
+        let mut placed_buf = [0u32; 14];
+        placed_buf[0] = 1;
+        assert_eq!(null_kind(&View::Placed(false, placed_buf, [0; 16])), 1);
+        assert_eq!(null_kind(&View::Placed(true, placed_buf, [0; 16])), 3);
+        let mut tex_desc = [0u32; 10];
+        tex_desc[1] = 4; // TEXTURE2D
+        assert_eq!(null_kind(&View::Shader(0, Some(tex_desc))), 0);
+        assert_eq!(null_kind(&View::Sampler([0; 13])), 0);
+
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let mut slots = [0u64; 16];
+        let base = slots.as_mut_ptr() as u64;
+        let at0 = base;
+        // Mirror two different CBVs into slot 0 without `for_draw`: slot tracks null kind 2.
+        super::super::create_cbv(std::ptr::null(), &[0x1000, 0, 256, 0], at0);
+        assert!(heap.mirror(0, at0, false).is_some());
+        assert_eq!(heap.nulls[0].load(Ordering::Relaxed), 2);
+        super::super::create_cbv(std::ptr::null(), &[0x2000, 0, 256, 0], at0);
+        assert!(heap.mirror(0, at0, false).is_some());
+        assert_eq!(heap.nulls[0].load(Ordering::Relaxed), 2);
+        // `make_null` writes a 2D null view and clears the tracked buffer null kind.
+        heap.make_null(0);
+        assert_eq!(heap.nulls[0].load(Ordering::Relaxed), 0);
     }
 }
 
