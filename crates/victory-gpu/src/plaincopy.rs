@@ -10,14 +10,18 @@
 //! frame inside `ZwReadVirtualMemory` for about 100 MB (3 GB a second),
 //! where the processor's own copy moves that much in a third of the time.
 //!
-//! Here the copy is one `rep movsb` in a function of ours that uses no
-//! stack. An exception handler, first in the line, looks at every access
-//! violation: one that is a READ and happened at exactly that instruction
-//! continues at the function's other exit, which returns 0, and the
+//! Here the copy runs in place in a leaf assembly routine that uses no
+//! stack and modifies no callee-saved registers: 256-bit AVX2 unrolled
+//! `vmovdqu` loops when AVX2 is available (`VICTORY_COPY_AVX2`, on by
+//! default unless `=0`, saturating 64-byte write-combining burst lines on
+//! Zen 3 instead of `rep movsb`), with a `rep movsb` fallback otherwise.
+//! An exception handler, first in the line, looks at every access
+//! violation: one that is a READ inside our copy routine's guarded range
+//! continues at the routine's fault exit, which returns 0, and the
 //! caller falls back to the kernel's copy as before (it says which page
-//! is gone and fills in zeros). A write that faults is not ours to take:
-//! the destination is host memory, which is always there; such a fault
-//! goes on to the handlers after this one.
+//! is gone and fills in zeros). A write that faults during a read copy is
+//! not ours to take: the destination is host memory, which is always
+//! there; such a fault goes on to the handlers after this one.
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
@@ -29,6 +33,14 @@ core::arch::global_asm!(
     ".globl victory_write_guarded",
     ".globl victory_write_guarded_at",
     ".globl victory_write_guarded_fault",
+    ".globl victory_copy_avx2",
+    ".globl victory_copy_avx2_try_start",
+    ".globl victory_copy_avx2_try_end",
+    ".globl victory_copy_avx2_fault",
+    ".globl victory_write_avx2",
+    ".globl victory_write_avx2_try_start",
+    ".globl victory_write_avx2_try_end",
+    ".globl victory_write_avx2_fault",
     "victory_copy_guarded:",
     // rcx: to, rdx: from, r8: bytes. rsi and rdi are the caller's: kept in
     // r9 and r10, which are ours to use, so nothing is on the stack.
@@ -65,6 +77,292 @@ core::arch::global_asm!(
     "    mov rdi, r10",
     "    xor eax, eax",
     "    ret",
+
+    // =========================================================================
+    // Fault-guarded 256-bit AVX2 read copy: title memory (`rdx`) -> host (`rcx`).
+    // Windows x64 leaf function: touches ONLY volatile registers (rax, rcx, rdx,
+    // r8, ymm0..ymm3), ZERO callee-saved registers, ZERO stack adjustments.
+    //
+    // Aligns `from` (`rdx`) to 8 bytes then 32 bytes before vector loads so no
+    // load ever straddles a 4096-byte page boundary; stores execute in strict
+    // ascending order, preserving exact prefix bytes before any faulting page.
+    // =========================================================================
+    ".p2align 4",
+    "victory_copy_avx2:",
+    "    cmp r8, 32",
+    "    jb .Lcopy_small_entry",
+    "victory_copy_avx2_try_start:",
+    "    test dl, 31",
+    "    jz .Lcopy_avx_check128",
+    // Align `from` (`rdx`) to 8 bytes (<= 7 bytes; r8 >= 32 -> r8 >= 25).
+    "    test dl, 7",
+    "    jz .Lcopy_align32_loop",
+    ".Lcopy_align8_loop:",
+    "    mov al, byte ptr [rdx]",
+    "    mov byte ptr [rcx], al",
+    "    inc rdx",
+    "    inc rcx",
+    "    dec r8",
+    "    test dl, 7",
+    "    jnz .Lcopy_align8_loop",
+    "    test dl, 31",
+    "    jz .Lcopy_after_align32",
+    // Align `from` (`rdx`) to 32 bytes using 8-byte aligned loads (<= 24 bytes; r8 >= 1).
+    ".Lcopy_align32_loop:",
+    "    mov rax, qword ptr [rdx]",
+    "    mov qword ptr [rcx], rax",
+    "    add rdx, 8",
+    "    add rcx, 8",
+    "    sub r8, 8",
+    "    test dl, 31",
+    "    jnz .Lcopy_align32_loop",
+    ".Lcopy_after_align32:",
+    // `from` is now 32-byte aligned and no YMM register has been touched yet.
+    "    cmp r8, 32",
+    "    jb .Lcopy_small_qword_check",
+    ".Lcopy_avx_check128:",
+    "    cmp r8, 128",
+    "    jb .Lcopy_avx32_loop",
+    ".p2align 4",
+    ".Lcopy_avx128_loop:",
+    "    vmovdqu ymm0, ymmword ptr [rdx]",
+    "    vmovdqu ymmword ptr [rcx], ymm0",
+    "    vmovdqu ymm1, ymmword ptr [rdx + 32]",
+    "    vmovdqu ymmword ptr [rcx + 32], ymm1",
+    "    vmovdqu ymm2, ymmword ptr [rdx + 64]",
+    "    vmovdqu ymmword ptr [rcx + 64], ymm2",
+    "    vmovdqu ymm3, ymmword ptr [rdx + 96]",
+    "    vmovdqu ymmword ptr [rcx + 96], ymm3",
+    "    add rdx, 128",
+    "    add rcx, 128",
+    "    sub r8, 128",
+    "    cmp r8, 128",
+    "    jae .Lcopy_avx128_loop",
+    "    test r8, r8",
+    "    jz .Lcopy_done_avx",
+    "    cmp r8, 32",
+    "    jb .Lcopy_avx_tail8_check",
+    ".Lcopy_avx32_loop:",
+    "    vmovdqu ymm0, ymmword ptr [rdx]",
+    "    vmovdqu ymmword ptr [rcx], ymm0",
+    "    add rdx, 32",
+    "    add rcx, 32",
+    "    sub r8, 32",
+    "    cmp r8, 32",
+    "    jae .Lcopy_avx32_loop",
+    "    test r8, r8",
+    "    jz .Lcopy_done_avx",
+    ".Lcopy_avx_tail8_check:",
+    "    cmp r8, 8",
+    "    jb .Lcopy_avx_tail1_loop",
+    ".Lcopy_avx_tail8_loop:",
+    "    mov rax, qword ptr [rdx]",
+    "    mov qword ptr [rcx], rax",
+    "    add rdx, 8",
+    "    add rcx, 8",
+    "    sub r8, 8",
+    "    cmp r8, 8",
+    "    jae .Lcopy_avx_tail8_loop",
+    "    test r8, r8",
+    "    jz .Lcopy_done_avx",
+    ".Lcopy_avx_tail1_loop:",
+    "    mov al, byte ptr [rdx]",
+    "    mov byte ptr [rcx], al",
+    "    inc rdx",
+    "    inc rcx",
+    "    dec r8",
+    "    jnz .Lcopy_avx_tail1_loop",
+    "    jmp .Lcopy_done_avx",
+    // Non-AVX small-copy path (< 32 bytes): avoids touching YMM & skips vzeroupper.
+    ".Lcopy_small_entry:",
+    "    cmp r8, 8",
+    "    jb .Lcopy_small_byte_check",
+    "    test dl, 7",
+    "    jz .Lcopy_small_qword_loop",
+    ".Lcopy_small_align8_loop:",
+    "    mov al, byte ptr [rdx]",
+    "    mov byte ptr [rcx], al",
+    "    inc rdx",
+    "    inc rcx",
+    "    dec r8",
+    "    test dl, 7",
+    "    jnz .Lcopy_small_align8_loop",
+    ".Lcopy_small_qword_check:",
+    "    cmp r8, 8",
+    "    jb .Lcopy_small_byte_check",
+    ".Lcopy_small_qword_loop:",
+    "    mov rax, qword ptr [rdx]",
+    "    mov qword ptr [rcx], rax",
+    "    add rdx, 8",
+    "    add rcx, 8",
+    "    sub r8, 8",
+    "    cmp r8, 8",
+    "    jae .Lcopy_small_qword_loop",
+    ".Lcopy_small_byte_check:",
+    "    test r8, r8",
+    "    jz .Lcopy_done_no_avx",
+    ".Lcopy_small_byte_loop:",
+    "    mov al, byte ptr [rdx]",
+    "    mov byte ptr [rcx], al",
+    "    inc rdx",
+    "    inc rcx",
+    "    dec r8",
+    "    jnz .Lcopy_small_byte_loop",
+    "victory_copy_avx2_try_end:",
+    ".Lcopy_done_no_avx:",
+    "    mov eax, 1",
+    "    ret",
+    ".Lcopy_done_avx:",
+    "    vzeroupper",
+    "    mov eax, 1",
+    "    ret",
+    "victory_copy_avx2_fault:",
+    "    vzeroupper",
+    "    xor eax, eax",
+    "    ret",
+
+    // =========================================================================
+    // Fault-guarded 256-bit AVX2 write-back: host (`rdx`) -> title memory (`rcx`).
+    // Windows x64 leaf function: touches ONLY volatile registers (rax, rcx, rdx,
+    // r8, ymm0..ymm3), ZERO callee-saved registers, ZERO stack adjustments.
+    //
+    // Aligns `to` (`rcx`) to 8 bytes then 32 bytes before vector stores so no
+    // store ever straddles a 4096-byte page boundary; writes execute in strict
+    // ascending order, preserving exact prefix bytes before any faulting page.
+    // =========================================================================
+    ".p2align 4",
+    "victory_write_avx2:",
+    "    cmp r8, 32",
+    "    jb .Lwrite_small_entry",
+    "victory_write_avx2_try_start:",
+    "    test cl, 31",
+    "    jz .Lwrite_avx_check128",
+    // Align `to` (`rcx`) to 8 bytes (<= 7 bytes; r8 >= 32 -> r8 >= 25).
+    "    test cl, 7",
+    "    jz .Lwrite_align32_loop",
+    ".Lwrite_align8_loop:",
+    "    mov al, byte ptr [rdx]",
+    "    mov byte ptr [rcx], al",
+    "    inc rdx",
+    "    inc rcx",
+    "    dec r8",
+    "    test cl, 7",
+    "    jnz .Lwrite_align8_loop",
+    "    test cl, 31",
+    "    jz .Lwrite_after_align32",
+    // Align `to` (`rcx`) to 32 bytes using 8-byte aligned stores (<= 24 bytes; r8 >= 1).
+    ".Lwrite_align32_loop:",
+    "    mov rax, qword ptr [rdx]",
+    "    mov qword ptr [rcx], rax",
+    "    add rdx, 8",
+    "    add rcx, 8",
+    "    sub r8, 8",
+    "    test cl, 31",
+    "    jnz .Lwrite_align32_loop",
+    ".Lwrite_after_align32:",
+    // `to` is now 32-byte aligned and no YMM register has been touched yet.
+    "    cmp r8, 32",
+    "    jb .Lwrite_small_qword_check",
+    ".Lwrite_avx_check128:",
+    "    cmp r8, 128",
+    "    jb .Lwrite_avx32_loop",
+    ".p2align 4",
+    ".Lwrite_avx128_loop:",
+    "    vmovdqu ymm0, ymmword ptr [rdx]",
+    "    vmovdqu ymmword ptr [rcx], ymm0",
+    "    vmovdqu ymm1, ymmword ptr [rdx + 32]",
+    "    vmovdqu ymmword ptr [rcx + 32], ymm1",
+    "    vmovdqu ymm2, ymmword ptr [rdx + 64]",
+    "    vmovdqu ymmword ptr [rcx + 64], ymm2",
+    "    vmovdqu ymm3, ymmword ptr [rdx + 96]",
+    "    vmovdqu ymmword ptr [rcx + 96], ymm3",
+    "    add rdx, 128",
+    "    add rcx, 128",
+    "    sub r8, 128",
+    "    cmp r8, 128",
+    "    jae .Lwrite_avx128_loop",
+    "    test r8, r8",
+    "    jz .Lwrite_done_avx",
+    "    cmp r8, 32",
+    "    jb .Lwrite_avx_tail8_check",
+    ".Lwrite_avx32_loop:",
+    "    vmovdqu ymm0, ymmword ptr [rdx]",
+    "    vmovdqu ymmword ptr [rcx], ymm0",
+    "    add rdx, 32",
+    "    add rcx, 32",
+    "    sub r8, 32",
+    "    cmp r8, 32",
+    "    jae .Lwrite_avx32_loop",
+    "    test r8, r8",
+    "    jz .Lwrite_done_avx",
+    ".Lwrite_avx_tail8_check:",
+    "    cmp r8, 8",
+    "    jb .Lwrite_avx_tail1_loop",
+    ".Lwrite_avx_tail8_loop:",
+    "    mov rax, qword ptr [rdx]",
+    "    mov qword ptr [rcx], rax",
+    "    add rdx, 8",
+    "    add rcx, 8",
+    "    sub r8, 8",
+    "    cmp r8, 8",
+    "    jae .Lwrite_avx_tail8_loop",
+    "    test r8, r8",
+    "    jz .Lwrite_done_avx",
+    ".Lwrite_avx_tail1_loop:",
+    "    mov al, byte ptr [rdx]",
+    "    mov byte ptr [rcx], al",
+    "    inc rdx",
+    "    inc rcx",
+    "    dec r8",
+    "    jnz .Lwrite_avx_tail1_loop",
+    "    jmp .Lwrite_done_avx",
+    // Non-AVX small-write path (< 32 bytes): avoids touching YMM & skips vzeroupper.
+    ".Lwrite_small_entry:",
+    "    cmp r8, 8",
+    "    jb .Lwrite_small_byte_check",
+    "    test cl, 7",
+    "    jz .Lwrite_small_qword_loop",
+    ".Lwrite_small_align8_loop:",
+    "    mov al, byte ptr [rdx]",
+    "    mov byte ptr [rcx], al",
+    "    inc rdx",
+    "    inc rcx",
+    "    dec r8",
+    "    test cl, 7",
+    "    jnz .Lwrite_small_align8_loop",
+    ".Lwrite_small_qword_check:",
+    "    cmp r8, 8",
+    "    jb .Lwrite_small_byte_check",
+    ".Lwrite_small_qword_loop:",
+    "    mov rax, qword ptr [rdx]",
+    "    mov qword ptr [rcx], rax",
+    "    add rdx, 8",
+    "    add rcx, 8",
+    "    sub r8, 8",
+    "    cmp r8, 8",
+    "    jae .Lwrite_small_qword_loop",
+    ".Lwrite_small_byte_check:",
+    "    test r8, r8",
+    "    jz .Lwrite_done_no_avx",
+    ".Lwrite_small_byte_loop:",
+    "    mov al, byte ptr [rdx]",
+    "    mov byte ptr [rcx], al",
+    "    inc rdx",
+    "    inc rcx",
+    "    dec r8",
+    "    jnz .Lwrite_small_byte_loop",
+    "victory_write_avx2_try_end:",
+    ".Lwrite_done_no_avx:",
+    "    mov eax, 1",
+    "    ret",
+    ".Lwrite_done_avx:",
+    "    vzeroupper",
+    "    mov eax, 1",
+    "    ret",
+    "victory_write_avx2_fault:",
+    "    vzeroupper",
+    "    xor eax, eax",
+    "    ret",
 );
 
 #[cfg(target_arch = "x86_64")]
@@ -75,6 +373,14 @@ unsafe extern "C" {
     fn victory_write_guarded(to: *mut u8, from: *const u8, len: usize) -> u32;
     static victory_write_guarded_at: u8;
     static victory_write_guarded_fault: u8;
+    fn victory_copy_avx2(to: *mut u8, from: *const u8, len: usize) -> u32;
+    static victory_copy_avx2_try_start: u8;
+    static victory_copy_avx2_try_end: u8;
+    static victory_copy_avx2_fault: u8;
+    fn victory_write_avx2(to: *mut u8, from: *const u8, len: usize) -> u32;
+    static victory_write_avx2_try_start: u8;
+    static victory_write_avx2_try_end: u8;
+    static victory_write_avx2_fault: u8;
 }
 
 #[cfg(test)]
@@ -108,6 +414,29 @@ pub(crate) fn copy_stats() -> (u64, u64, u64) {
     (COUNT[0].load(Relaxed), COUNT[1].load(Relaxed), COUNT[2].load(Relaxed))
 }
 
+/// Whether 256-bit AVX2 fault-guarded copies/writes are enabled by env
+/// (`VICTORY_COPY_AVX2`, default ON unless `=0`).
+#[cfg(target_arch = "x86_64")]
+fn parse_avx2(val: Option<&str>) -> bool {
+    val.is_none_or(|v| v.trim() != "0")
+}
+
+/// Whether the 256-bit AVX2 path is active on this CPU (`VICTORY_COPY_AVX2`,
+/// default ON when AVX2 is supported unless `=0`).
+#[cfg(target_arch = "x86_64")]
+fn avx2_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::is_x86_feature_detected!("avx2")
+            && parse_avx2(std::env::var("VICTORY_COPY_AVX2").ok().as_deref())
+    })
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn avx2_on() -> bool {
+    false
+}
+
 /// Whether copies of title memory into host memory are made in place
 /// (`VICTORY_COPY_PLAIN=1`).
 pub(crate) fn on() -> bool {
@@ -121,9 +450,10 @@ pub(crate) fn on() -> bool {
         let on = cfg!(target_arch = "x86_64") && std::env::var_os("VICTORY_COPY_PLAIN").is_some_and(|v| v == "1");
         if on {
             install();
+            let mode = if avx2_on() { ", avx2" } else { "" };
             tracing::info!(
                 "copies of title memory into host buffers are made in place, with the kernel's copy behind them for a \
-                 page that is not there (VICTORY_COPY_PLAIN=1)"
+                 page that is not there (VICTORY_COPY_PLAIN=1{mode})"
             );
         }
         on
@@ -136,20 +466,20 @@ pub(crate) fn on() -> bool {
 /// under [`least`] bytes, since the last line.
 static COUNT: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
-/// Default fewest bytes copied in place (`VICTORY_COPY_PLAIN_MIN`, 32). A
-/// read of a byte or a word is how the layer ASKS whether a page is there
-/// (a texture's first page, a record): it is expected to fail, and a failed
-/// kernel read costs a microsecond where a fault and its handler cost tens.
-/// Live benchmarks showed thousands of 32-255 byte copies per frame falling
-/// back to `NtReadVirtualMemory` at 256 bytes, so the default threshold is
-/// 32 bytes.
-const DEFAULT_LEAST: usize = 32;
+/// Default fewest bytes copied in place (`VICTORY_COPY_PLAIN_MIN`, 16). A
+/// read of a byte or a word (1-8 bytes) is how the layer ASKS whether a page
+/// is there (a texture's first page, a record): it is expected to fail, and a
+/// failed kernel read costs a microsecond where a fault and its handler cost
+/// tens. Live benchmarks showed ~1,500 16-31 byte constant copies per frame
+/// still falling back to `ReadProcessMemory` at 32 bytes, so the default
+/// threshold is 16 bytes.
+const DEFAULT_LEAST: usize = 16;
 
 fn parse_least(val: Option<&str>) -> usize {
     val.and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(DEFAULT_LEAST)
 }
 
-/// Minimum byte length copied in place (`VICTORY_COPY_PLAIN_MIN`, default 32).
+/// Minimum byte length copied in place (`VICTORY_COPY_PLAIN_MIN`, default 16).
 fn least() -> usize {
     static LEAST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *LEAST.get_or_init(|| parse_least(std::env::var("VICTORY_COPY_PLAIN_MIN").ok().as_deref()))
@@ -210,23 +540,51 @@ fn install() {
         // SAFETY: the system passes the exception being dispatched and the
         // context it will continue with.
         let (r, context) = unsafe { (&*(*info).ExceptionRecord, &mut *(*info).ContextRecord) };
-        // Only at our own copy/write instructions.
-        if context.Rip == (&raw const victory_copy_guarded_at) as u64 {
-            const READ: usize = 0;
+        let rip = context.Rip;
+        const READ: usize = 0;
+        const WRITE: usize = 1;
+
+        // Only at our own copy instructions (read faults from title memory;
+        // a write fault to host memory MUST NOT be swallowed).
+        let in_copy_rep = rip == (&raw const victory_copy_guarded_at) as u64;
+        let in_copy_avx2 = !in_copy_rep
+            && rip >= (&raw const victory_copy_avx2_try_start) as u64
+            && rip < (&raw const victory_copy_avx2_try_end) as u64;
+        if in_copy_rep || in_copy_avx2 {
             let read = r.NumberParameters >= 1 && r.ExceptionInformation[0] == READ;
-            let gone = (r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION || r.ExceptionCode == EXCEPTION_IN_PAGE_ERROR) && read;
-            if gone || r.ExceptionCode == EXCEPTION_GUARD_PAGE {
-                context.Rip = (&raw const victory_copy_guarded_fault) as u64;
+            let gone =
+                (r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION || r.ExceptionCode == EXCEPTION_IN_PAGE_ERROR) && read;
+            let guard =
+                r.ExceptionCode == EXCEPTION_GUARD_PAGE && (r.NumberParameters == 0 || r.ExceptionInformation[0] == READ);
+            if gone || guard {
+                context.Rip = if in_copy_avx2 {
+                    (&raw const victory_copy_avx2_fault) as u64
+                } else {
+                    (&raw const victory_copy_guarded_fault) as u64
+                };
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
             return EXCEPTION_CONTINUE_SEARCH;
         }
-        if context.Rip == (&raw const victory_write_guarded_at) as u64 {
-            const WRITE: usize = 1;
+
+        // Only at our own write-back instructions (write faults to title memory;
+        // a read fault from host memory MUST NOT be swallowed).
+        let in_write_rep = rip == (&raw const victory_write_guarded_at) as u64;
+        let in_write_avx2 = !in_write_rep
+            && rip >= (&raw const victory_write_avx2_try_start) as u64
+            && rip < (&raw const victory_write_avx2_try_end) as u64;
+        if in_write_rep || in_write_avx2 {
             let write = r.NumberParameters >= 1 && r.ExceptionInformation[0] == WRITE;
-            let gone = (r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION || r.ExceptionCode == EXCEPTION_IN_PAGE_ERROR) && write;
-            if gone || r.ExceptionCode == EXCEPTION_GUARD_PAGE {
-                context.Rip = (&raw const victory_write_guarded_fault) as u64;
+            let gone =
+                (r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION || r.ExceptionCode == EXCEPTION_IN_PAGE_ERROR) && write;
+            let guard =
+                r.ExceptionCode == EXCEPTION_GUARD_PAGE && (r.NumberParameters == 0 || r.ExceptionInformation[0] == WRITE);
+            if gone || guard {
+                context.Rip = if in_write_avx2 {
+                    (&raw const victory_write_avx2_fault) as u64
+                } else {
+                    (&raw const victory_write_guarded_fault) as u64
+                };
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
         }
@@ -243,16 +601,24 @@ fn install() {
 fn install() {}
 
 /// Copies `len` bytes from `from` to `to` in place; false if a page of the
-/// source was not there (then some of `to` may have been written).
+/// source was not there (then the prefix before the faulting page has been
+/// written into `to`).
 ///
 /// `to` must be writable memory of `len` bytes that is ours (host memory);
 /// `from` may be anything.
 #[cfg(target_arch = "x86_64")]
 fn guarded(to: *mut u8, from: *const u8, len: usize) -> bool {
     install();
-    // SAFETY: the destination is the caller's to write; a source page that
-    // is not there ends the copy with 0 instead of a fault ([`install`]).
-    unsafe { victory_copy_guarded(to, from, len) != 0 }
+    if avx2_on() {
+        // SAFETY: CPU supports AVX2 (verified by [`avx2_on`]); `to` is the
+        // caller's writable host buffer and any unmapped/inaccessible source
+        // page ends the copy with 0 via [`install`].
+        unsafe { victory_copy_avx2(to, from, len) != 0 }
+    } else {
+        // SAFETY: the destination is the caller's to write; a source page that
+        // is not there ends the copy with 0 instead of a fault ([`install`]).
+        unsafe { victory_copy_guarded(to, from, len) != 0 }
+    }
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -265,9 +631,16 @@ fn guarded(_: *mut u8, _: *const u8, _: usize) -> bool {
 #[cfg(target_arch = "x86_64")]
 fn guarded_write(to: *mut u8, from: *const u8, len: usize) -> bool {
     install();
-    // SAFETY: `from` is our readable host buffer; any unmapped or read-only
-    // destination page ends the write with 0 via [`install`].
-    unsafe { victory_write_guarded(to, from, len) != 0 }
+    if avx2_on() {
+        // SAFETY: CPU supports AVX2 (verified by [`avx2_on`]); `from` is our
+        // readable host buffer and any unmapped or read-only destination page
+        // ends the write with 0 via [`install`].
+        unsafe { victory_write_avx2(to, from, len) != 0 }
+    } else {
+        // SAFETY: `from` is our readable host buffer; any unmapped or read-only
+        // destination page ends the write with 0 via [`install`].
+        unsafe { victory_write_guarded(to, from, len) != 0 }
+    }
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -355,10 +728,11 @@ pub(crate) fn line(frames: f64) {
         return;
     }
     let min = least();
+    let mode = if avx2_on() { ", avx2" } else { "" };
     let [copies, bytes, gone, lately, small] = [0, 1, 2, 3, 4].map(|i| COUNT[i].swap(0, Relaxed) as f64 / frames);
     let [writes, wbytes, wgone] = [0, 1, 2].map(|i| WRITE_COUNT[i].swap(0, Relaxed) as f64 / frames);
     tracing::info!(
-        "copies of title memory made in place per frame (VICTORY_COPY_PLAIN=1): {copies:.0}, {:.1} MB; {gone:.1} met a page \
+        "copies of title memory made in place per frame (VICTORY_COPY_PLAIN=1{mode}): {copies:.0}, {:.1} MB; {gone:.1} met a page \
          that was not there and went through the kernel's copy; left to the kernel's copy untried: {lately:.0} whose source \
          faulted in the last two seconds, {small:.0} of under {min} bytes; writes back in place: {writes:.0}, {:.1} MB, \
          {wgone:.1} fell back",
@@ -486,19 +860,30 @@ mod tests {
     }
 
     #[test]
-    fn copy_plain_min_parsing_defaults_to_32_and_honors_overrides() {
-        assert_eq!(parse_least(None), 32);
-        assert_eq!(parse_least(Some("")), 32);
-        assert_eq!(parse_least(Some("not-a-number")), 32);
+    fn copy_plain_min_parsing_defaults_to_16_and_honors_overrides() {
+        assert_eq!(parse_least(None), 16);
+        assert_eq!(parse_least(Some("")), 16);
+        assert_eq!(parse_least(Some("not-a-number")), 16);
+        assert_eq!(parse_least(Some("32")), 32);
         assert_eq!(parse_least(Some("64")), 64);
         assert_eq!(parse_least(Some(" 256 ")), 256);
         assert_eq!(parse_least(Some("0")), 0);
     }
 
     #[test]
-    fn small_32_and_64_byte_guarded_copies_and_writes_work_and_handle_faults() {
+    fn avx2_env_parsing_defaults_on_unless_zero() {
+        assert!(parse_avx2(None));
+        assert!(parse_avx2(Some("")));
+        assert!(parse_avx2(Some("1")));
+        assert!(parse_avx2(Some("true")));
+        assert!(!parse_avx2(Some("0")));
+        assert!(!parse_avx2(Some(" 0 ")));
+    }
+
+    #[test]
+    fn small_16_32_and_64_byte_guarded_copies_and_writes_work_and_handle_faults() {
         use windows_sys::Win32::System::Memory::PAGE_READONLY;
-        for size in [32usize, 64usize] {
+        for size in [16usize, 32usize, 64usize] {
             let src: Vec<u8> = (0..size).map(|i| (i * 13 + 5) as u8).collect();
             let mut dst = vec![0u8; size];
             assert!(guarded(dst.as_mut_ptr(), src.as_ptr(), size), "copy {size}B");
@@ -510,7 +895,7 @@ mod tests {
             assert!(!unsafe { VirtualAlloc(base.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE) }.is_null());
             assert!(!unsafe { VirtualAlloc(base.wrapping_add(2 * PAGE).cast(), PAGE, MEM_COMMIT, PAGE_READONLY) }.is_null());
 
-            // Valid 32B/64B write into page 0 and read back.
+            // Valid 16B/32B/64B write into page 0 and read back.
             assert!(guarded_write(base, src.as_ptr(), size), "write {size}B");
             dst.fill(0);
             assert!(guarded(dst.as_mut_ptr(), base, size), "read back {size}B");
@@ -533,7 +918,7 @@ mod tests {
             // Write to read-only page 2 fails cleanly.
             assert!(!guarded_write(base.wrapping_add(2 * PAGE), src.as_ptr(), size));
 
-            // Valid 32B/64B copy/write still work after faults.
+            // Valid 16B/32B/64B copy/write still work after faults.
             assert!(guarded_write(base, src.as_ptr(), size));
             assert!(guarded(dst.as_mut_ptr(), base, size));
             assert_eq!(dst, src);
@@ -541,6 +926,324 @@ mod tests {
             // SAFETY: the test's reservation.
             unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
         }
+    }
+
+    #[test]
+    fn avx2_try_ranges_are_well_formed_and_disjoint() {
+        let c_start = (&raw const victory_copy_avx2_try_start) as usize;
+        let c_end = (&raw const victory_copy_avx2_try_end) as usize;
+        let c_fault = (&raw const victory_copy_avx2_fault) as usize;
+        let w_start = (&raw const victory_write_avx2_try_start) as usize;
+        let w_end = (&raw const victory_write_avx2_try_end) as usize;
+        let w_fault = (&raw const victory_write_avx2_fault) as usize;
+
+        assert!(c_start < c_end, "copy try range must be non-empty");
+        assert!(w_start < w_end, "write try range must be non-empty");
+        assert!(c_fault < c_start || c_fault >= c_end, "copy fault label outside try range");
+        assert!(w_fault < w_start || w_fault >= w_end, "write fault label outside try range");
+        assert!(c_end <= w_start || w_end <= c_start, "copy and write try ranges must be disjoint");
+    }
+
+    #[test]
+    fn avx2_copy_and_write_exact_across_sizes_and_unaligned_offsets() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        install();
+
+        // 1. Exhaustive unaligned (src_off, dst_off) in 0..32 across all loop boundaries.
+        const GUARD: usize = 64;
+        const MATRIX_SIZES: &[usize] = &[
+            0, 1, 2, 3, 7, 8, 9, 15, 16, 17, 24, 31, 32, 33, 47, 48, 63, 64, 65, 95, 96, 127, 128, 129, 159, 160, 255,
+            256, 257, 513,
+        ];
+        let max_small = *MATRIX_SIZES.last().unwrap() + 32 + 2 * GUARD;
+        let src_buf: Vec<u8> = (0..max_small).map(|i| ((i * 29 + 11) & 0xFF) as u8).collect();
+        let mut dst_buf = vec![0xA5u8; max_small];
+
+        for &len in MATRIX_SIZES {
+            for src_off in 0..32usize {
+                for dst_off in 0..32usize {
+                    let s = GUARD + src_off;
+                    let d = GUARD + dst_off;
+                    // Test `victory_copy_avx2`.
+                    dst_buf[d - 8..d + len + 8].fill(0xA5);
+                    // SAFETY: `s..s+len` and `d..d+len` are in bounds of distinct allocations; AVX2 checked.
+                    let ok = unsafe { victory_copy_avx2(dst_buf.as_mut_ptr().add(d), src_buf.as_ptr().add(s), len) };
+                    assert_eq!(ok, 1, "copy_avx2 failed len={len} src_off={src_off} dst_off={dst_off}");
+                    assert_eq!(&dst_buf[d..d + len], &src_buf[s..s + len]);
+                    assert!(dst_buf[d - 8..d].iter().all(|&b| b == 0xA5), "copy underrun");
+                    assert!(dst_buf[d + len..d + len + 8].iter().all(|&b| b == 0xA5), "copy overrun");
+
+                    // Test `victory_write_avx2`.
+                    dst_buf[d - 8..d + len + 8].fill(0x5A);
+                    // SAFETY: distinct valid allocations; AVX2 checked.
+                    let ok = unsafe { victory_write_avx2(dst_buf.as_mut_ptr().add(d), src_buf.as_ptr().add(s), len) };
+                    assert_eq!(ok, 1, "write_avx2 failed len={len} src_off={src_off} dst_off={dst_off}");
+                    assert_eq!(&dst_buf[d..d + len], &src_buf[s..s + len]);
+                    assert!(dst_buf[d - 8..d].iter().all(|&b| b == 0x5A), "write underrun");
+                    assert!(dst_buf[d + len..d + len + 8].iter().all(|&b| b == 0x5A), "write overrun");
+                }
+            }
+        }
+
+        // 2. Every length 0..=260 plus key sizes up to 131_072 with rotating unaligned offsets 0..31.
+        const MAX_LEN: usize = 131_072;
+        let big_src: Vec<u8> = (0..MAX_LEN + 64 + 2 * GUARD).map(|i| ((i * 53 + 7) & 0xFF) as u8).collect();
+        let mut big_dst = vec![0xCCu8; MAX_LEN + 64 + 2 * GUARD];
+        let mut sizes: Vec<usize> = (0..=260).collect();
+        sizes.extend_from_slice(&[
+            300, 511, 512, 513, 1023, 1024, 1025, 2047, 2048, 2049, 4095, 4096, 4097, 8191, 8192, 8193, 16_384, 32_767,
+            32_768, 32_769, 65_535, 65_536, 65_537, 131_071, 131_072,
+        ]);
+        for (idx, &len) in sizes.iter().enumerate() {
+            let src_off = idx % 32;
+            let dst_off = (idx * 7 + 3) % 32;
+            let s = GUARD + src_off;
+            let d = GUARD + dst_off;
+
+            big_dst[d - 16..d + len + 16].fill(0xCC);
+            // SAFETY: distinct valid buffers; AVX2 checked.
+            let ok = unsafe { victory_copy_avx2(big_dst.as_mut_ptr().add(d), big_src.as_ptr().add(s), len) };
+            assert_eq!(ok, 1, "big copy_avx2 len={len}");
+            assert_eq!(&big_dst[d..d + len], &big_src[s..s + len], "big copy mismatch len={len}");
+            assert!(big_dst[d - 16..d].iter().all(|&b| b == 0xCC));
+            assert!(big_dst[d + len..d + len + 16].iter().all(|&b| b == 0xCC));
+
+            big_dst[d - 16..d + len + 16].fill(0x33);
+            // SAFETY: distinct valid buffers; AVX2 checked.
+            let ok = unsafe { victory_write_avx2(big_dst.as_mut_ptr().add(d), big_src.as_ptr().add(s), len) };
+            assert_eq!(ok, 1, "big write_avx2 len={len}");
+            assert_eq!(&big_dst[d..d + len], &big_src[s..s + len], "big write mismatch len={len}");
+            assert!(big_dst[d - 16..d].iter().all(|&b| b == 0x33));
+            assert!(big_dst[d + len..d + len + 16].iter().all(|&b| b == 0x33));
+        }
+
+        // 3. Also verify legacy `rep movsb` routines still match cleanly.
+        let mut rep_dst = vec![0u8; 4096];
+        // SAFETY: valid buffers.
+        assert_eq!(unsafe { victory_copy_guarded(rep_dst.as_mut_ptr(), big_src.as_ptr(), 4096) }, 1);
+        assert_eq!(&rep_dst[..], &big_src[..4096]);
+        rep_dst.fill(0);
+        // SAFETY: valid buffers.
+        assert_eq!(unsafe { victory_write_guarded(rep_dst.as_mut_ptr(), big_src.as_ptr(), 4096) }, 1);
+        assert_eq!(&rep_dst[..], &big_src[..4096]);
+    }
+
+    #[test]
+    fn avx2_fault_recovery_all_loops_and_page_protections() {
+        use windows_sys::Win32::System::Memory::{PAGE_GUARD, PAGE_READONLY, VirtualProtect};
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        install();
+
+        // Pairs of (valid_prefix_bytes_before_fault_page, total_len) covering every loop stage:
+        // - immediate fault (prefix=0) in 1B, 8B, 32B, 128B loops
+        // - 128B unrolled AVX2 loop at lanes +0, +32, +64, +96 (1st & 2nd iter, aligned & unaligned)
+        // - 32B AVX2 loop (direct & after 128B loop, aligned & unaligned)
+        // - 8B loop (small non-AVX path, after align32 prologue, and AVX tail)
+        // - 1B tail (small non-AVX path, align8 prologue, and AVX tail)
+        const CASES: &[(usize, usize)] = &[
+            (0, 1),
+            (0, 7),
+            (0, 8),
+            (0, 16),
+            (0, 31),
+            (0, 32),
+            (0, 64),
+            (0, 128),
+            (0, 512),
+            // 1B / 8B small non-AVX paths
+            (1, 5),
+            (3, 7),
+            (5, 12),
+            (8, 16),
+            (11, 24),
+            (16, 31),
+            // Align prologue into small non-AVX tail (< 32B remaining)
+            (16, 32),
+            (24, 32),
+            (31, 35),
+            (31, 40),
+            // 32B AVX2 loop (direct & unaligned)
+            (32, 64),
+            (64, 96),
+            (37, 90),
+            // 128B AVX2 loop: all 4 lanes (+0, +32, +64, +96) in 1st & 2nd iterations
+            (32, 256),
+            (64, 256),
+            (96, 256),
+            (128, 256),
+            (128 + 32, 384),
+            (128 + 64, 384),
+            (128 + 96, 384),
+            // Unaligned entry into 128B AVX2 loop
+            (131, 300),
+            (199, 400),
+            // AVX2 32B / 8B / 1B tails after 128B / 32B loops
+            (32, 35),
+            (32, 40),
+            (128, 133),
+            (128, 136),
+            (128 + 8, 139),
+            (128 + 8, 144),
+            (128 + 32, 192),
+            (128 + 32 + 8, 175),
+        ];
+
+        // Mode: 0 = uncommitted (reserved), 1 = committed PAGE_NOACCESS, 2 = PAGE_GUARD, 3 = PAGE_READONLY (write only).
+        for mode in 0..=3u32 {
+            // SAFETY: private 2-page reservation; page 0 is RW, page 1 has the fault mode under test.
+            let base = unsafe { VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_NOACCESS) } as *mut u8;
+            assert!(!base.is_null());
+            assert!(!unsafe { VirtualAlloc(base.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+            let page1 = base.wrapping_add(PAGE);
+            match mode {
+                0 => {} // leave page 1 reserved/uncommitted
+                1 => {
+                    assert!(!unsafe { VirtualAlloc(page1.cast(), PAGE, MEM_COMMIT, PAGE_NOACCESS) }.is_null());
+                }
+                2 => {
+                    assert!(!unsafe { VirtualAlloc(page1.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+                }
+                3 => {
+                    assert!(!unsafe { VirtualAlloc(page1.cast(), PAGE, MEM_COMMIT, PAGE_READONLY) }.is_null());
+                }
+                _ => unreachable!(),
+            }
+
+            let pattern: Vec<u8> = (0..PAGE).map(|i| ((i * 31 + 17) & 0xFF) as u8).collect();
+            const PAD: usize = 32;
+            let mut host_buf = vec![0u8; 1024 + 2 * PAD];
+
+            for &(prefix, len) in CASES {
+                let page_off = PAGE - prefix;
+
+                // 1. Test `victory_copy_avx2` (read fault) for modes 0 (unmapped), 1 (NOACCESS), 2 (GUARD).
+                if mode != 3 {
+                    if mode == 2 {
+                        let mut old = 0u32;
+                        // SAFETY: re-arm one-shot PAGE_GUARD on page 1 before each fault test.
+                        assert_ne!(
+                            unsafe { VirtualProtect(page1.cast(), PAGE, PAGE_READWRITE | PAGE_GUARD, &mut old) },
+                            0
+                        );
+                    }
+                    // SAFETY: page 0 is committed RW.
+                    unsafe { std::slice::from_raw_parts_mut(base, PAGE) }.copy_from_slice(&pattern);
+                    host_buf.fill(0xFE);
+                    let dst_off = PAD + (prefix * 5) % 31;
+                    // SAFETY: `host_buf` is writable; fault at `page1` handled by VEH.
+                    let ok = unsafe {
+                        victory_copy_avx2(host_buf.as_mut_ptr().add(dst_off), base.add(page_off), len)
+                    };
+                    assert_eq!(ok, 0, "copy_avx2 should fault: mode={mode} prefix={prefix} len={len}");
+                    assert_eq!(
+                        &host_buf[dst_off..dst_off + prefix],
+                        &pattern[page_off..PAGE],
+                        "copy_avx2 prefix mismatch: mode={mode} prefix={prefix} len={len}"
+                    );
+                    assert!(
+                        host_buf[dst_off + prefix..dst_off + len].iter().all(|&b| b == 0xFE),
+                        "copy_avx2 wrote past fault boundary: mode={mode} prefix={prefix} len={len}"
+                    );
+                    assert!(host_buf[dst_off - 16..dst_off].iter().all(|&b| b == 0xFE));
+                    assert!(host_buf[dst_off + len..dst_off + len + 16].iter().all(|&b| b == 0xFE));
+                }
+
+                // 2. Test `victory_write_avx2` (write fault) for all 4 modes (unmapped, NOACCESS, GUARD, READONLY).
+                if mode == 2 {
+                    let mut old = 0u32;
+                    // SAFETY: re-arm one-shot PAGE_GUARD on page 1 before each fault test.
+                    assert_ne!(
+                        unsafe { VirtualProtect(page1.cast(), PAGE, PAGE_READWRITE | PAGE_GUARD, &mut old) },
+                        0
+                    );
+                }
+                // SAFETY: page 0 is committed RW.
+                unsafe { std::slice::from_raw_parts_mut(base, PAGE) }.fill(0xEE);
+                let src_off = PAD + (prefix * 3) % 31;
+                for (i, b) in host_buf[src_off..src_off + len].iter_mut().enumerate() {
+                    *b = ((i * 43 + 9) & 0xFF) as u8;
+                }
+                // SAFETY: `host_buf` is readable; fault at `page1` handled by VEH.
+                let ok = unsafe {
+                    victory_write_avx2(base.add(page_off), host_buf.as_ptr().add(src_off), len)
+                };
+                assert_eq!(ok, 0, "write_avx2 should fault: mode={mode} prefix={prefix} len={len}");
+                // SAFETY: page 0 is committed RW.
+                let page0 = unsafe { std::slice::from_raw_parts(base, PAGE) };
+                assert_eq!(
+                    &page0[page_off..PAGE],
+                    &host_buf[src_off..src_off + prefix],
+                    "write_avx2 prefix mismatch: mode={mode} prefix={prefix} len={len}"
+                );
+                assert!(
+                    page0[..page_off].iter().all(|&b| b == 0xEE),
+                    "write_avx2 corrupted bytes before destination: mode={mode} prefix={prefix} len={len}"
+                );
+            }
+
+            // Verify normal copy & write still work cleanly after all faults (callee-saved registers intact).
+            // SAFETY: page 0 is committed RW.
+            unsafe { std::slice::from_raw_parts_mut(base, PAGE) }.copy_from_slice(&pattern);
+            let mut verify = vec![0u8; PAGE];
+            // SAFETY: valid buffers.
+            assert_eq!(unsafe { victory_copy_avx2(verify.as_mut_ptr(), base, PAGE) }, 1);
+            assert_eq!(verify, pattern);
+            let write_pat: Vec<u8> = (0..PAGE).map(|i| (i ^ 0xA5) as u8).collect();
+            // SAFETY: valid buffers.
+            assert_eq!(unsafe { victory_write_avx2(base, write_pat.as_ptr(), PAGE) }, 1);
+            // SAFETY: page 0 is committed RW.
+            assert_eq!(unsafe { std::slice::from_raw_parts(base, PAGE) }, &write_pat[..]);
+
+            // SAFETY: private test reservation.
+            unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
+        }
+    }
+
+    #[test]
+    fn avx2_non_overlapping_and_throughput_sanity() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        install();
+
+        // Non-overlapping regions within a single larger buffer: neighboring slices stay intact.
+        let mut arena: Vec<u8> = (0..32_768usize).map(|i| ((i * 19 + 3) & 0xFF) as u8).collect();
+        let expected_src = arena[4096..12_288].to_vec();
+        let expected_before = arena[12_288..16_384].to_vec();
+        let expected_after = arena[24_576..32_768].to_vec();
+        // SAFETY: `[4096..12_288)` and `[16_384..24_576)` are non-overlapping in bounds.
+        assert_eq!(
+            unsafe { victory_copy_avx2(arena.as_mut_ptr().add(16_384), arena.as_ptr().add(4096), 8192) },
+            1
+        );
+        assert_eq!(&arena[16_384..24_576], &expected_src[..]);
+        assert_eq!(&arena[12_288..16_384], &expected_before[..]);
+        assert_eq!(&arena[24_576..32_768], &expected_after[..]);
+
+        // Multi-megabyte throughput sanity check (16 * 4 MiB = 64 MiB).
+        const CHUNK: usize = 4 << 20;
+        const ITERS: usize = 16;
+        let src: Vec<u8> = (0..CHUNK).map(|i| ((i * 11 + 5) & 0xFF) as u8).collect();
+        let mut dst = vec![0u8; CHUNK];
+        // Warm up pages.
+        // SAFETY: distinct 4 MiB buffers.
+        assert_eq!(unsafe { victory_copy_avx2(dst.as_mut_ptr(), src.as_ptr(), CHUNK) }, 1);
+        assert_eq!(dst, src);
+
+        let started = std::time::Instant::now();
+        for _ in 0..ITERS {
+            // SAFETY: distinct 4 MiB buffers.
+            assert_eq!(unsafe { victory_copy_avx2(dst.as_mut_ptr(), src.as_ptr(), CHUNK) }, 1);
+        }
+        let elapsed = started.elapsed().as_secs_f64().max(1e-9);
+        let gb_per_s = ((CHUNK * ITERS) as f64 / 1e9) / elapsed;
+        assert_eq!(dst[0], src[0]);
+        assert_eq!(dst[CHUNK - 1], src[CHUNK - 1]);
+        assert!(gb_per_s > 0.1, "unexpectedly low AVX2 copy throughput: {gb_per_s:.2} GB/s");
     }
 
     #[test]
