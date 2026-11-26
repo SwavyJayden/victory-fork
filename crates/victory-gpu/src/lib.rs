@@ -24,6 +24,8 @@ mod cardmeter;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod faultbook;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
