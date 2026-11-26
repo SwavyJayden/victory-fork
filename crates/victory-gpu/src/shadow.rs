@@ -2944,6 +2944,13 @@ impl Shadow {
         address - self.start + self.place.as_ref().map_or(0, |place| place.1)
     }
 
+    #[cfg(test)]
+    pub(crate) fn byte_at(&self, offset: usize) -> u8 {
+        assert!(offset < self.len as usize);
+        // SAFETY: `offset` is bounds-checked inside `self.data` of length `self.len`.
+        unsafe { *self.data.add(offset) }
+    }
+
     /// Title memory `[start, start + len)` in place: `placed` is a buffer
     /// over it in a heap opened on it. Shaped as a copy so that everything
     /// that binds, views or keeps a copy works on it unchanged; what

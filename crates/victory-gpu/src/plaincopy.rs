@@ -77,9 +77,45 @@ unsafe extern "C" {
     static victory_write_guarded_fault: u8;
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Forces [`on`] to return true on the current thread during tests without
+    /// mutating process-wide environment variables or [`OnceLock`].
+    static FORCE_ON_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) struct ForceOnForTest(bool);
+
+#[cfg(test)]
+impl Drop for ForceOnForTest {
+    fn drop(&mut self) {
+        FORCE_ON_IN_TEST.set(self.0);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn force_on_for_test() -> ForceOnForTest {
+    let prev = FORCE_ON_IN_TEST.replace(true);
+    if cfg!(target_arch = "x86_64") {
+        install();
+    }
+    ForceOnForTest(prev)
+}
+
+#[cfg(test)]
+pub(crate) fn copy_stats() -> (u64, u64, u64) {
+    (COUNT[0].load(Relaxed), COUNT[1].load(Relaxed), COUNT[2].load(Relaxed))
+}
+
 /// Whether copies of title memory into host memory are made in place
 /// (`VICTORY_COPY_PLAIN=1`).
 pub(crate) fn on() -> bool {
+    #[cfg(test)]
+    if cfg!(target_arch = "x86_64") && FORCE_ON_IN_TEST.get() {
+        install();
+        return true;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         let on = cfg!(target_arch = "x86_64") && std::env::var_os("VICTORY_COPY_PLAIN").is_some_and(|v| v == "1");
@@ -291,6 +327,28 @@ pub(crate) fn copy(to: *mut u8, from: *const u8, len: usize) -> bool {
     whole
 }
 
+/// With [`on`]: copies title memory at `from` into host memory at `to` in
+/// place without checking [`RECENT`] or [`least`]. Intended for regions the
+/// caller has already confirmed are committed (e.g. `VirtualQuery` in
+/// `host::read_sparse`) so committed islands in a sparse buffer whose outer
+/// bulk copy faulted into [`RECENT`] still avoid `ReadProcessMemory`. If a
+/// concurrent unmap races before the copy finishes, our VEH handler catches
+/// the fault cleanly and returns `false` so the caller can fall back.
+pub(crate) fn copy_committed(to: *mut u8, from: *const u8, len: usize) -> bool {
+    if !on() {
+        return false;
+    }
+    let whole = guarded(to, from, len);
+    if whole {
+        COUNT[0].fetch_add(1, Relaxed);
+        COUNT[1].fetch_add(len as u64, Relaxed);
+    } else {
+        COUNT[2].fetch_add(1, Relaxed);
+        note_fault(from as usize, len);
+    }
+    whole
+}
+
 /// With the frame line: what [`copy`] did per frame over `frames`.
 pub(crate) fn line(frames: f64) {
     if !on() {
@@ -483,5 +541,39 @@ mod tests {
             // SAFETY: the test's reservation.
             unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
         }
+    }
+
+    #[test]
+    fn copy_committed_bypasses_recent_and_handles_concurrent_unmapped_faults() {
+        let _on = force_on_for_test();
+        // SAFETY: memory of the test's own (page 0 committed, page 1 uncommitted).
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_NOACCESS) } as *mut u8;
+        assert!(!base.is_null());
+        assert!(!unsafe { VirtualAlloc(base.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+        // SAFETY: page 0 is committed and writable.
+        unsafe { std::slice::from_raw_parts_mut(base, PAGE) }.fill(0xCD);
+        let mut to = vec![0u8; 2 * PAGE];
+
+        // Bulk copy across page 0 + uncommitted page 1 faults and marks the 64 KiB block in RECENT.
+        assert!(!copy(to.as_mut_ptr(), base, 2 * PAGE));
+        assert!(faulted_lately(base as usize, PAGE));
+        // Regular `copy` now skips page 0 because its 64 KiB block faulted lately.
+        assert!(!copy(to.as_mut_ptr(), base, PAGE));
+
+        // `copy_committed` bypasses RECENT and copies the committed page in place (even < least()).
+        to.fill(0);
+        let (copies_before, bytes_before, _) = copy_stats();
+        assert!(copy_committed(to.as_mut_ptr(), base, PAGE));
+        assert!(to[..PAGE].iter().all(|&b| b == 0xCD));
+        assert!(copy_committed(to.as_mut_ptr(), base, 8));
+        let (copies_after, bytes_after, _) = copy_stats();
+        assert!(copies_after >= copies_before + 2);
+        assert!(bytes_after >= bytes_before + PAGE as u64 + 8);
+
+        // If a mapping races and turns out unmapped, `copy_committed` still returns false cleanly.
+        assert!(!copy_committed(to.as_mut_ptr(), base.wrapping_add(PAGE), PAGE));
+
+        // SAFETY: the test's reservation.
+        unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
     }
 }

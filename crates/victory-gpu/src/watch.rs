@@ -1215,12 +1215,15 @@ fn cover(g: &mut Guards, from: usize, to: usize, rest: std::time::Duration) -> b
         ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         g.aliased.insert(block);
         let mut covered = true;
-        for other in others {
+        for &other in &others {
             covered &= protect_alias(g, other / BLOCK, rest);
         }
         if !covered {
             all = false;
             g.clean.remove(block);
+            for &other in &others {
+                g.clean.remove(other / BLOCK);
+            }
         }
     }
     all
@@ -1237,8 +1240,8 @@ fn cover(g: &mut Guards, from: usize, to: usize, rest: std::time::Duration) -> b
 /// Returns whether `block` is read-only now.
 fn protect_alias(g: &mut Guards, block: usize, rest: std::time::Duration) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
-    g.aliased.insert(block);
     if g.protected.contains(block) {
+        g.aliased.insert(block);
         return true;
     }
     if g.rests(block, rest) {
@@ -1251,6 +1254,7 @@ fn protect_alias(g: &mut Guards, block: usize, rest: std::time::Duration) -> boo
     let done = unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0;
     if done && matches!(old, PAGE_READWRITE | PAGE_READONLY) {
         g.protected.insert(block);
+        g.aliased.insert(block);
         if view_known() {
             g.viewed.insert(block);
         }
@@ -1405,6 +1409,7 @@ fn unguard_blocks(g: &mut Guards, blocks: &[usize]) -> usize {
     for &block in blocks {
         if g.protected.remove(block) {
             g.clean.remove(block);
+            g.aliased.remove(block);
             unique.push(block);
         }
     }
@@ -1435,7 +1440,11 @@ pub fn writing(at: usize, len: usize) {
     let (first, last) = (at / BLOCK, end.div_ceil(BLOCK));
     if first < last && PROTECTED.any(first, last) {
         let mut g = guards();
+        let opening: Vec<usize> = g.protected.range(first..last).collect();
         let opened = open(&mut g, at, end);
+        for block in opening {
+            g.opened(block);
+        }
         #[cfg(feature = "diagnostics")]
         crate::faultbook::note(crate::faultbook::What::Ours, first, last, opened as u64);
         #[cfg(not(feature = "diagnostics"))]
@@ -2366,6 +2375,64 @@ mod tests {
         assert!(!writable(two) && !writable(one));
         assert_eq!(guard(one, one + BLOCK), Some(Vec::new()));
         drop_views(section, &[one, two], BLOCK);
+    }
+
+    /// A page whose alias cannot be guarded (another protection we must not
+    /// touch, or opened for a kernel/DirectStorage write while resting) stays
+    /// marked changed across repeated takes, and aliasing a new unguardable
+    /// view onto a guarded page marks the guarded page changed.
+    #[test]
+    fn an_unguardable_or_busy_alias_leaves_the_page_changed() {
+        use windows_sys::Win32::System::Memory::{
+            FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, PAGE_NOACCESS,
+            UnmapViewOfFile, VirtualProtect,
+        };
+        let (section, a, b) = two_views(BLOCK);
+        let page_a = a / PAGE;
+        let t = track(a, BLOCK, true).expect("views are tracked");
+        assert_eq!(t.take(a, a + BLOCK), [(a, a + BLOCK)]);
+        assert!(t.take(a, a + BLOCK).is_empty(), "clean once both aliases are guarded");
+        assert!(clean(page_a));
+
+        // 1. A kernel/DirectStorage write opens `b` and rests it: `a` stays
+        //    changed across repeated takes until `b` stops resting.
+        let rests = |on: bool| REST_IN_TEST.set(std::time::Duration::from_secs(if on { 3600 } else { 0 }));
+        rests(true);
+        writing(b, 16);
+        assert!(!clean(page_a), "writing through an alias marks the tracked view dirty");
+        assert!(writable(b), "the alias stays open for the write");
+        assert_eq!(t.take(a, a + BLOCK), [(a, a + BLOCK)]);
+        assert!(!clean(page_a), "taking while the alias rests must leave the page changed");
+        assert!(writable(b), "taking `a` must not re-guard a busy/resting alias");
+        // SAFETY: `b` is committed and kept open while resting.
+        unsafe { (b as *mut u32).write_volatile(0x1234) };
+        assert_eq!(t.take(a, a + BLOCK), [(a, a + BLOCK)]);
+        rests(false);
+        assert_eq!(t.take(a, a + BLOCK), [(a, a + BLOCK)]);
+        assert!(t.take(a, a + BLOCK).is_empty(), "taken once the write/rest ended");
+        assert!(clean(page_a));
+
+        // 2. An alias with a protection we must not guard (e.g. PAGE_NOACCESS)
+        //    leaves the tracked page changed every time until the alias becomes RW.
+        // SAFETY: maps a third view of the same section with PAGE_NOACCESS protection.
+        let c = unsafe { MapViewOfFile(section as _, FILE_MAP_WRITE, 0, 0, BLOCK).Value as usize };
+        assert_ne!(c, 0);
+        let mut old = 0;
+        assert_ne!(unsafe { VirtualProtect(c as *const _, BLOCK, PAGE_NOACCESS, &mut old) }, 0);
+        crate::inplace::title_memory_view(c, BLOCK, section, 0);
+        assert!(!clean(page_a), "aliasing a new view marks the guarded page changed");
+        assert_eq!(t.take(a, a + BLOCK), [(a, a + BLOCK)]);
+        assert!(!clean(page_a), "an unguardable alias keeps the page changed");
+        assert_eq!(t.take(a, a + BLOCK), [(a, a + BLOCK)]);
+        assert_ne!(unsafe { VirtualProtect(c as *const _, BLOCK, PAGE_READWRITE, &mut old) }, 0);
+        assert_eq!(t.take(a, a + BLOCK), [(a, a + BLOCK)]);
+        assert!(t.take(a, a + BLOCK).is_empty(), "taken once all aliases can be guarded");
+        assert!(clean(page_a));
+
+        title_memory_remapped(c, BLOCK);
+        // SAFETY: our third view.
+        unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: c as *mut _ }) };
+        drop_views(section, &[a, b], BLOCK);
     }
 
     /// A write or mapping that runs past the end of the address space (a
