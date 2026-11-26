@@ -148,6 +148,11 @@ pub(crate) struct Translated {
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// Per [`Translated::used`] entry: a store or atomic names that table
+    /// UAV descriptor. Empty when the code is not known.
+    pub(crate) used_written: Vec<bool>,
+    /// A buffer store whose descriptor could not be matched to `used`.
+    pub(crate) write_unknown: bool,
 }
 
 #[cfg(windows)]
@@ -263,21 +268,27 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         }
         _ => None,
     });
-    let used = programs
-        .into_iter()
-        .find(|p| {
-            matches!(
-                p.stage,
-                HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
-            )
-        })
-        .map(|p| p.used)
-        .unwrap_or_default();
+    let chosen = programs.iter().find(|p| {
+        matches!(
+            p.stage,
+            HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
+        )
+    });
+    let used = chosen.map(|p| p.used.to_vec()).unwrap_or_default();
+    let (used_written, mut write_unknown) = chosen
+        .map(|p| written_used(p, &used))
+        .unwrap_or((Vec::new(), !programs.is_empty()));
+    if programs.len() > 1 {
+        // Another stage's table store could name the same descriptor.
+        write_unknown = true;
+    }
     Ok(Translated {
         host,
         compute_threads,
         used,
         stores,
+        used_written,
+        write_unknown,
     })
 }
 
@@ -632,6 +643,212 @@ fn stores(program: &victory_shader::NativeProgram) -> bool {
     })
 }
 
+/// Which [`Translated::used`] table UAV buffer descriptors a store or atomic
+/// names. Traces each store/atomic instruction's descriptor through the SSA IR
+/// (`victory_shader::ir::build` + `victory_shader::resource::track`) back to
+/// its root parameter and table offset, matching `used` the same way lowering
+/// does (`user_data` and `table_offset_dwords`).
+///
+/// Any store whose target cannot be tied to a known table UAV entry or root
+/// descriptor (untracked IR, flat/global stores, indirect jumps, bindless
+/// `ResourceHeap` stores, raw memory addresses) leaves
+/// [`Translated::write_unknown`] set so the draw path conservatively falls back
+/// to `stores`.
+#[cfg(windows)]
+fn written_used(
+    program: &victory_shader::NativeProgram,
+    used: &[victory_shader::UsedResource],
+) -> (Vec<bool>, bool) {
+    use victory_shader::gfx10::Encoding;
+    use victory_shader::resource::{Role, Source};
+    use victory_shader::{ResourceType, RootType};
+
+    let has_table_uav = used
+        .iter()
+        .any(|u| u.root == RootType::Table && u.kind == ResourceType::Uav);
+    if !has_table_uav || !stores(program) {
+        return (vec![false; used.len()], false);
+    }
+
+    let Ok(ir) = victory_shader::ir::build(&program.code, program.wave64, program.vgprs) else {
+        return (vec![true; used.len()], true);
+    };
+    let tracked = victory_shader::resource::track(&ir, &program.layout, program.stage, None)
+        .or_else(|_| {
+            victory_shader::structure::structure(&ir).and_then(|st| {
+                victory_shader::resource::track(&ir, &program.layout, program.stage, Some(&st))
+            })
+        });
+    let Ok(res) = tracked else {
+        return (vec![true; used.len()], true);
+    };
+
+    let scalar: HashMap<victory_shader::resource::Site, victory_shader::resource::Address> =
+        res.scalar.iter().copied().collect();
+    let descriptors: HashMap<victory_shader::resource::Site, &Source> = res
+        .descriptors
+        .iter()
+        .filter(|d| d.role == Role::Resource)
+        .map(|d| (d.site, &d.source))
+        .collect();
+
+    let mut written = vec![false; used.len()];
+    let mut unknown = false;
+
+    for (b, block) in ir.blocks.iter().enumerate() {
+        for (i, inst) in block.insts.iter().enumerate() {
+            let name = inst.machine.name();
+            match inst.machine.encoding {
+                Encoding::Mubuf | Encoding::Mtbuf => {
+                    let is_store = name.is_none_or(|n| {
+                        (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
+                    });
+                    if !is_store {
+                        continue;
+                    }
+                }
+                Encoding::Smem => {
+                    let is_store = name.is_none_or(|n| {
+                        (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
+                    });
+                    if !is_store {
+                        continue;
+                    }
+                    // Scalar memory stores without a buffer descriptor (`s_store_*`)
+                    // are tracked in `res.scalar` rather than `res.descriptors`.
+                    if !name.is_some_and(|n| n.starts_with("s_buffer_")) {
+                        match scalar
+                            .get(&(b, i))
+                            .and_then(|a| program.layout.get(a.param))
+                        {
+                            Some(rp) if rp.root == RootType::Descriptor => continue,
+                            _ => {
+                                unknown = true;
+                                continue;
+                            }
+                        }
+                    }
+                }
+                Encoding::Flat | Encoding::Global => {
+                    if name.is_none_or(|n| {
+                        (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
+                    }) {
+                        unknown = true;
+                    }
+                    continue;
+                }
+                Encoding::Sop1 => {
+                    if name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")) {
+                        unknown = true;
+                    }
+                    continue;
+                }
+                _ => continue,
+            }
+
+            let Some(source) = descriptors.get(&(b, i)) else {
+                unknown = true;
+                continue;
+            };
+            let leaves = source.leaves();
+            if leaves.is_empty() {
+                unknown = true;
+                continue;
+            }
+            for leaf in leaves {
+                match leaf {
+                    Source::Loaded { load, first } | Source::Fetched { load, first } => {
+                        let Some(a) = scalar.get(load) else {
+                            unknown = true;
+                            continue;
+                        };
+                        let Some(rp) = program.layout.get(a.param) else {
+                            unknown = true;
+                            continue;
+                        };
+                        if rp.root == RootType::Descriptor {
+                            // Root descriptor writeback is handled via `stage.root_uavs`.
+                            continue;
+                        }
+                        if rp.root != RootType::Table {
+                            unknown = true;
+                            continue;
+                        }
+                        if a.dynamic.is_some() {
+                            // Dynamically indexed table store: mark every table UAV
+                            // in this root table slot (and fall back to unknown if
+                            // none are listed in `used`).
+                            let mut any = false;
+                            for (idx, resource) in used.iter().enumerate() {
+                                if resource.root == RootType::Table
+                                    && resource.kind == ResourceType::Uav
+                                    && resource.user_data == rp.user_data
+                                {
+                                    written[idx] = true;
+                                    any = true;
+                                }
+                            }
+                            if !any {
+                                unknown = true;
+                            }
+                            continue;
+                        }
+                        if !a.offset.is_multiple_of(4) {
+                            unknown = true;
+                            continue;
+                        }
+                        let dword = (a.offset / 4) + u32::from(*first);
+                        let matched_offset = used
+                            .iter()
+                            .filter(|u| {
+                                u.root == RootType::Table
+                                    && u.user_data == rp.user_data
+                                    && u.table_offset_dwords <= dword
+                            })
+                            .map(|u| u.table_offset_dwords)
+                            .max();
+                        let Some(offset) = matched_offset else {
+                            unknown = true;
+                            continue;
+                        };
+                        let mut hit = false;
+                        for (idx, resource) in used.iter().enumerate() {
+                            if resource.root == RootType::Table
+                                && resource.kind == ResourceType::Uav
+                                && resource.user_data == rp.user_data
+                                && resource.table_offset_dwords == offset
+                            {
+                                written[idx] = true;
+                                hit = true;
+                            }
+                        }
+                        if !hit {
+                            unknown = true;
+                        }
+                    }
+                    Source::Built { address, .. } => {
+                        match program.layout.get(address.param) {
+                            Some(rp) if rp.root == RootType::Descriptor => {
+                                // Store through a root UAV; does not name a table UAV.
+                            }
+                            _ => unknown = true,
+                        }
+                    }
+                    Source::Constant(_)
+                    | Source::Phi { .. }
+                    | Source::Select { .. }
+                    | Source::Lanes { .. }
+                    | Source::LanePhi { .. } => {
+                        unknown = true;
+                    }
+                }
+            }
+        }
+    }
+
+    (written, unknown)
+}
+
 #[repr(C)]
 struct Pipeline {
     object: Object,
@@ -683,6 +900,27 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
         return None;
     }
     make::ready(&pipeline(this).host)
+}
+
+/// As [`host_pipeline`], for a draw into render target and depth views of
+/// the formats `bound`: if a bound view has another format than the title's
+/// pipeline declares for its slot (`host::formats_differ`), the host
+/// pipeline of the same shaders and state made for the bound formats
+/// (`make::for_formats`). A draw whose views are as declared pays one
+/// comparison of the nine words.
+#[cfg(windows)]
+pub(crate) fn host_pipeline_for<'a>(
+    this: This,
+    bound: &host::TargetFormats,
+) -> Option<&'a host::HostPipeline> {
+    if this.is_null() {
+        return None;
+    }
+    let p = &pipeline(this).host;
+    if p.formats != *bound && host::formats_differ(&p.formats, bound) {
+        return make::for_formats(p, bound);
+    }
+    make::ready(p)
 }
 
 /// Host pipelines queued and not made yet.
@@ -1053,6 +1291,95 @@ mod tests {
 
     use super::*;
     use crate::object::{S_OK, slot};
+
+    #[cfg(windows)]
+    #[test]
+    fn a_store_marks_only_the_table_descriptor_it_names() {
+        let make_program = |words: &[u32]| victory_shader::NativeProgram {
+            stage: victory_shader::HwStage::Cs,
+            wave64: false,
+            vgprs: 16,
+            layout: vec![victory_shader::RootParam {
+                root: victory_shader::RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            }],
+            used: vec![
+                victory_shader::UsedResource {
+                    kind: victory_shader::ResourceType::Uav,
+                    root: victory_shader::RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 4,
+                    user_data: 4,
+                    slot: 1,
+                },
+                victory_shader::UsedResource {
+                    kind: victory_shader::ResourceType::Uav,
+                    root: victory_shader::RootType::Table,
+                    table_offset_dwords: 8,
+                    // Deliberately equals the SGPR index (8) used by the load
+                    // of the first UAV to prove matching tracks table offsets
+                    // rather than confusing SGPR indices with HLSL registers.
+                    lower_bound: 8,
+                    stride: 0,
+                    dwords: 4,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            io: victory_shader::native::StageIo::Cs(victory_shader::native::ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [32, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+
+        // Load UAV at table byte offset 0 (dword 0) into s[8:11], then store through s[8:11].
+        let store_first = make_program(&[
+            0xBE85_0380, // s_mov_b32 s5, 0
+            (0x3D << 26) | (0x02 << 18) | (8 << 6) | 2,
+            125 << 25, // s_load_dwordx4 s[8:11], s[4:5], 0
+            (0x38 << 26) | (0x1C << 18),
+            (0x80 << 24) | (2 << 16), // buffer_store_dword v0, off, s[8:11], 0
+            0xBF81_0000,              // s_endpgm
+        ]);
+        let (written, unknown) = super::written_used(&store_first, &store_first.used);
+        assert_eq!(written, [true, false]);
+        assert!(!unknown);
+
+        // Load UAV at table byte offset 32 (dword 8) into s[8:11], then store through s[8:11].
+        let store_second = make_program(&[
+            0xBE85_0380, // s_mov_b32 s5, 0
+            (0x3D << 26) | (0x02 << 18) | (8 << 6) | 2,
+            (125 << 25) | 32, // s_load_dwordx4 s[8:11], s[4:5], 0x20
+            (0x38 << 26) | (0x1C << 18),
+            (0x80 << 24) | (2 << 16), // buffer_store_dword v0, off, s[8:11], 0
+            0xBF81_0000,              // s_endpgm
+        ]);
+        let (written, unknown) = super::written_used(&store_second, &store_second.used);
+        assert_eq!(written, [false, true]);
+        assert!(!unknown);
+
+        // Read-only shader with no stores marks neither UAV.
+        let read_only = make_program(&[0xBF81_0000]);
+        let (written, unknown) = super::written_used(&read_only, &read_only.used);
+        assert_eq!(written, [false, false]);
+        assert!(!unknown);
+
+        // Unmatched/untracked store conservatively marks `unknown`.
+        let untracked = make_program(&[
+            (0x38 << 26) | (0x1C << 18),
+            (0x80 << 24) | (2 << 16), // buffer_store_dword with uninitialized s[8:11]
+            0xBF81_0000,
+        ]);
+        let (_, unknown) = super::written_used(&untracked, &untracked.used);
+        assert!(unknown);
+    }
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)

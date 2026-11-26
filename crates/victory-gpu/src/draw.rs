@@ -66,6 +66,10 @@ thread_local! {
     /// While a stage's tables are walked (`State::tables`): whether that
     /// stage's shader can store to buffers (`Translated::stores`).
     static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// While a table descriptor is bound: whether this binding may be
+    /// written. Derived from the store instruction's descriptor when known;
+    /// falls back to `STORES` (the whole stage).
+    static BINDING_WRITES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     /// While `State::early_textures` runs the texture pass: the
     /// milliseconds, the bytes, and whether this pass is for a bake draw, in
     /// place of the pass's own per frame.
@@ -519,6 +523,10 @@ pub(crate) struct State {
     target_handles: Vec<u64>,
     depth_handle: u64,
     targets_set: bool,
+    /// The formats of the views [`State::set_targets`] bound on the host
+    /// list: a draw's pipeline is one for them
+    /// (`crate::pipeline::host_pipeline_for`).
+    target_formats: crate::pipeline::host::TargetFormats,
     /// The render target views and the depth view the host list has, once
     /// it has any ([`State::set_targets`]): per view the host texture (0:
     /// a null view) and what its descriptor says.
@@ -922,7 +930,7 @@ impl State {
     /// Whether the bound pipeline's shaders can store to buffer memory
     /// (one without a host pipeline runs nothing, so writes nothing).
     fn pipeline_stores(&self) -> bool {
-        crate::pipeline::host_pipeline(self.pipeline as This)
+        crate::pipeline::host_pipeline_for(self.pipeline as This, &self.target_formats)
             .is_some_and(|p| p.stages.iter().any(|stage| stage.translated().stores))
     }
 
@@ -1021,6 +1029,8 @@ impl State {
         self.depth_handle = depth;
         self.targets_set = true;
         self.targets.clear();
+        // The formats of the host views, for the draws' pipelines.
+        let mut formats = [0; 9];
         let mut views = Vec::with_capacity(handles.len());
         let mut keys = Vec::with_capacity(handles.len());
         for &h in handles {
@@ -1042,6 +1052,9 @@ impl State {
                     .desc()
                     .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
                 if let Some(desc) = null {
+                    if views.len() < 8 {
+                        formats[views.len()] = desc.Format.0 as u32;
+                    }
                     views.push((None, Some(desc)));
                     keys.push((0, record.key()));
                 }
@@ -1050,7 +1063,11 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            views.push((Some(texture), record.desc()));
+            let desc = record.desc();
+            if views.len() < 8 {
+                formats[views.len()] = bound_format(texture, desc.as_ref().map(|d| d.Format));
+            }
+            views.push((Some(texture), desc));
             keys.push((texture.as_raw() as usize, record.key()));
         }
         self.depth = 0;
@@ -1058,18 +1075,21 @@ impl State {
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
             let texture = crate::resource::host_resource(record.resource)?;
             self.depth = record.resource as usize;
-            self.depth_state = depth_state(texture, record.depth_desc().as_ref());
+            let desc = record.depth_desc();
+            self.depth_state = depth_state(texture, desc.as_ref());
+            formats[8] = bound_format(texture, desc.as_ref().map(|d| d.Format));
             if crate::resource::depth_and_unordered(record.resource) {
                 crate::resource::DEPTH_UNORDERED[1].fetch_add(1, Ordering::Relaxed);
             }
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            Some((texture, record))
+            Some((texture, record, desc))
         });
+        self.target_formats = formats;
         let now = (
             keys,
             dsv.as_ref()
-                .map(|(texture, record)| (texture.as_raw() as usize, record.key())),
+                .map(|(texture, record, _)| (texture.as_raw() as usize, record.key())),
         );
         static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *CACHE.get_or_init(|| std::env::var("VICTORY_BIND_CACHE").map_or(true, |v| v != "0"))
@@ -1082,7 +1102,7 @@ impl State {
             .iter()
             .map(|(texture, desc)| host.rtv(*texture, desc.as_ref()))
             .collect();
-        let dsv = dsv.map(|(texture, record)| host.dsv(texture, record.depth_desc().as_ref()));
+        let dsv = dsv.map(|(texture, _, desc)| host.dsv(texture, desc.as_ref()));
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(
@@ -1319,7 +1339,7 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
         }
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, &self.target_formats) else {
             return false;
         };
         if p.compute || p.mesh != mesh {
@@ -1467,7 +1487,16 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
-            let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+            BINDING_WRITES.set(t.stores);
+            let made = self.tables(
+                list,
+                &t.used,
+                &t.host.root_indexed_views,
+                &t.used_written,
+                t.write_unknown,
+                compute,
+            );
+            BINDING_WRITES.set(true);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -2640,7 +2669,8 @@ impl State {
     /// (`crate::indirect::gather`). The same test keeps such a draw out of
     /// a window ([`windows`]).
     fn may_store(&self) -> bool {
-        crate::pipeline::host_pipeline(self.pipeline as This).is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores))
+        crate::pipeline::host_pipeline_for(self.pipeline as This, &self.target_formats)
+            .is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores))
     }
 
     /// Runs a dispatch on the host.
@@ -2840,7 +2870,12 @@ impl State {
     #[cfg(feature = "diagnostics")]
     fn op_text(&self, kind: String, compute: bool) -> String {
         use std::fmt::Write;
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let p = if compute {
+            crate::pipeline::host_pipeline(self.pipeline as This)
+        } else {
+            crate::pipeline::host_pipeline_for(self.pipeline as This, &self.target_formats)
+        };
+        let Some(p) = p else {
             return kind;
         };
         let mut text = format!("{kind} {}", p.name);
@@ -3232,9 +3267,20 @@ impl State {
         list: &HostList,
         used: &[UsedResource],
         indexed: &[RootIndexedView],
+        written: &[bool],
+        unknown_write: bool,
         compute: bool,
     ) -> Few<(u8, u32), 16> {
         let _guard = crate::resource::NonListGuard::new();
+        let writes = |u: &UsedResource| -> bool {
+            if unknown_write {
+                return true;
+            }
+            used.iter()
+                .position(|x| std::ptr::eq(x, u))
+                .and_then(|i| written.get(i).copied())
+                .unwrap_or(true)
+        };
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Few<u8, 16> = Few::default();
         for u in used.iter().filter(tables).filter(|u| u.kind == ResourceType::Cbv) {
@@ -3266,6 +3312,7 @@ impl State {
         fresh.sort_unstable();
         for u in used.iter().filter(tables) {
             if !fresh.contains(&u.slot) {
+                BINDING_WRITES.set(writes(u));
                 self.table_entry(list, u, compute);
             }
         }
@@ -3280,6 +3327,14 @@ impl State {
                 places.push(i as u16);
             }
             let entries = || places.iter().map(|&i| &used[usize::from(i)]);
+            let slot_writes = |k: u32, matched: Option<&UsedResource>| -> bool {
+                if matched.is_none() {
+                    return STORES.get();
+                }
+                entries()
+                    .filter(|u| u.table_offset_dwords / 8 == k)
+                    .any(writes)
+            };
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
@@ -3352,6 +3407,7 @@ impl State {
                 for u in entries().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
+                        BINDING_WRITES.set(writes(u));
                         readable(list, u.kind, &view);
                     }
                 }
@@ -3363,6 +3419,7 @@ impl State {
                     if let Some(view) = crate::descriptor::view(handle)
                         && let Some(kind) = view_kind(&view)
                     {
+                        BINDING_WRITES.set(STORES.get());
                         readable(list, kind, &view);
                     }
                 }
@@ -3422,8 +3479,8 @@ impl State {
                     && let Some(words) = crate::descriptor::record_at(table + u64::from(k) * 32)
                     && let Some(mut listed) = host.make_listed(recording, words, index)
                 {
-                    let kind = entries()
-                        .find(|u| u.table_offset_dwords / 8 == k)
+                    let used_entry = entries().find(|u| u.table_offset_dwords / 8 == k);
+                    let kind = used_entry
                         .map(|u| u.kind)
                         .or_else(|| selected.binary_search(&k).ok().and(listed.kind));
                     let was = (listed.ready, listed.tabled);
@@ -3439,6 +3496,7 @@ impl State {
                             }
                         } else if let Some(view) = crate::descriptor::host::listed_view(recording, words) {
                             TESTED_DEPTH.set((tested.0, false));
+                            BINDING_WRITES.set(slot_writes(k, used_entry));
                             readable(list, kind, &view);
                             let depth = TESTED_DEPTH.get().1;
                             TESTED_DEPTH.set((tested.0, tested.1 || depth));
@@ -3512,6 +3570,7 @@ impl State {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
                         if let Some(kind) = kind {
+                            BINDING_WRITES.set(slot_writes(k, used));
                             readable(list, kind, &view);
                         }
                         // The title's slot is a table's: out of the queue
@@ -3584,7 +3643,12 @@ impl State {
     /// builds).
     #[cfg(feature = "diagnostics")]
     fn reads(&self, compute: bool) -> Vec<String> {
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let p = if compute {
+            crate::pipeline::host_pipeline(self.pipeline as This)
+        } else {
+            crate::pipeline::host_pipeline_for(self.pipeline as This, &self.target_formats)
+        };
+        let Some(p) = p else {
             return vec!["no host pipeline".into()];
         };
         let mut out = Vec::new();
@@ -3654,13 +3718,14 @@ impl State {
     /// Whether the bound pipeline completes rectangles itself, in the
     /// geometry stage rectangle pipelines get (`HostPipeline::rects`).
     fn completes_rects(&self) -> bool {
-        crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.rects)
+        crate::pipeline::host_pipeline_for(self.pipeline as This, &self.target_formats)
+            .is_some_and(|p| p.rects)
     }
 
     /// Binds vertex buffers holding the rectangles of vertices `first..first
     /// + count` as triangles, made when the list is submitted.
     fn rectangles(&self, list: &HostList, count: u32, first: u32) -> bool {
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, &self.target_formats) else {
             return false;
         };
         let rects = u64::from(count / 3);
@@ -3797,7 +3862,12 @@ impl State {
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let p = if kind == DISPATCH {
+            crate::pipeline::host_pipeline(self.pipeline as This)
+        } else {
+            crate::pipeline::host_pipeline_for(self.pipeline as This, &self.target_formats)
+        };
+        let Some(p) = p else {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
@@ -4233,6 +4303,17 @@ pub(crate) fn view_kind(view: &View) -> Option<ResourceType> {
     }
 }
 
+/// The format of a host view of `texture` whose description names
+/// `described` (none without a description): that one, or the texture's
+/// own, which is what the host gives a view without a format.
+fn bound_format(texture: &ID3D12Resource, described: Option<DXGI_FORMAT>) -> u32 {
+    match described {
+        Some(format) if format.0 != 0 => format.0 as u32,
+        // SAFETY: a live texture.
+        _ => unsafe { texture.GetDesc() }.Format.0 as u32,
+    }
+}
+
 /// The host state a depth view needs of its texture: the read state if the
 /// view writes no plane the format has (the title's read-only flags), else
 /// the write state.
@@ -4387,9 +4468,10 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
     if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
         shadow.refresh(list, address, len);
         if kind == ResourceType::Uav {
-            // A shader that cannot store to buffers leaves the range as
-            // the title has it: nothing to find afterwards.
-            if STORES.get() || !write_skip() {
+            // A shader that cannot store to buffers (or whose stores only name
+            // other descriptors) leaves the range as the title has it: nothing
+            // to find afterwards.
+            if (BINDING_WRITES.get() && STORES.get()) || !write_skip() {
                 shadow.gpu_writes(list, address, len);
                 crate::resource::note_draw_epoch_bump();
             } else {
