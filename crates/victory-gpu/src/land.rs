@@ -52,7 +52,7 @@ fn threads() -> usize {
     static THREADS: OnceLock<usize> = OnceLock::new();
     *THREADS.get_or_init(|| {
         let asked = std::env::var("VICTORY_LAND_THREADS").ok().and_then(|v| v.trim().parse().ok());
-        asked.unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get() / 4).clamp(1, 4)).clamp(1, 16)
+        asked.unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get() / 3).clamp(2, 6)).clamp(1, 16)
     })
 }
 
@@ -455,13 +455,19 @@ impl Had {
     }
 }
 
-/// Whether a piece is put through a view of ours while the runtime changes
-/// a mapping too (`VICTORY_LAND_ANYTIME=0`: through the title's address, as
-/// before).
+/// Whether a piece is put through a refcounted whole-section view of ours
+/// ([`crate::inplace::beside_held`]) even while the runtime changes another
+/// mapping (`VICTORY_LAND_ANYTIME=0`: fall back to guarded title address).
 ///
-/// While the world streams a change is under way nearly all the time (pages
-/// are mapped in groups, eight threads side by side: 28 of 1,620 pieces a
-/// frame went through a view of ours in run textures-4, 630 in run n03). Put
+/// Safe against section teardown because [`crate::inplace::WholeView`] stays
+/// mapped via `Arc` until the merge finishes; avoids hundreds of per-frame
+/// `VirtualProtect` kernel locks that otherwise stall both landing and
+/// `GetWriteWatch` heap sync.
+fn anytime() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_ANYTIME").is_none_or(|v| v != "0"))
+}
+
 /// What a job wrote beside the guards, to be noted ([`Notes::flush`]).
 #[derive(Default)]
 pub(crate) struct Notes {
@@ -570,13 +576,16 @@ unsafe fn piece_at(
     let Some(end) = parts.last().map(|p| p.1) else {
         return 0;
     };
-    // From here until the piece is put the runtime changes no mapping: our
-    // view's address stays where the title sees `title`. Only write through
-    // `beside` while holding `title_memory_reading` so `title_memory_section_gone`
-    // cannot unmap the section view mid-write; if a remap is active, fall back
-    // to the guarded title-address path.
+    // Hold `Arc<WholeView>` across the entire merge so `title_memory_section_gone`
+    // cannot unmap the whole-section view mid-write, allowing lock-free `beside`
+    // writes even when unrelated remaps are active (`anytime()`).
     let reading = beside.then(crate::watch::title_memory_reading_now).flatten();
-    let beside = if reading.is_some() { crate::inplace::beside(title, end) } else { None };
+    let held_beside = if reading.is_some() || (beside && anytime()) {
+        crate::inplace::beside_held(title, end)
+    } else {
+        None
+    };
+    let beside = held_beside.as_ref().map(|&(_, addr)| addr);
     count(stat::PIECES, 1);
     count(if beside.is_some() { stat::BESIDE } else { stat::DIRECT }, 1);
     // The pages that differ, before any is written: none, and the guard

@@ -37,6 +37,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Foundation::HANDLE;
@@ -263,6 +264,23 @@ pub(crate) fn place(device: &ID3D12Device, heap: &ID3D12Heap, offset: u64, size:
 // census needs them to say which view memory is one run of a section (one
 // placed buffer could show it) and which is scattered pages.
 
+/// Reference-counted whole-section mapping kept alive while any worker writes
+/// through [`beside_held`], so [`title_memory_section_gone`] can never unmap a
+/// section view out from under an in-flight landing merge.
+pub(crate) struct WholeView {
+    base: usize,
+}
+
+impl Drop for WholeView {
+    fn drop(&mut self) {
+        if self.base != 0 {
+            // SAFETY: mapping created by `MapViewOfFile` in `beside_held`, now
+            // unreferenced by both `VIEWS.whole` and every active landing job.
+            unsafe { mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: self.base as *mut c_void }) };
+        }
+    }
+}
+
 struct Views {
     /// By address: bytes, the section's handle, the offset in it.
     views: BTreeMap<usize, (usize, usize, u64)>,
@@ -275,9 +293,9 @@ struct Views {
     pages_twice: usize,
     /// Sections by handle: bytes, and whether made committed.
     sections: Vec<(usize, u64, bool)>,
-    /// Our own view of a whole section, by its handle (0: the host gave
-    /// none), made when first asked for ([`beside`]) and kept.
-    whole: Vec<(usize, usize)>,
+    /// Our own view of a whole section, by its handle (`None`: the host gave
+    /// none), made when first asked for ([`beside_held`]) and kept via `Arc`.
+    whole: Vec<(usize, Option<Arc<WholeView>>)>,
 }
 
 /// Read by many threads at once (write faults, landings), changed when the
@@ -301,16 +319,28 @@ fn views_mut() -> std::sync::RwLockWriteGuard<'static, Views> {
 /// The runtime made a section of `bytes` for physical pages; `committed`
 /// if with `SEC_COMMIT` (only such a section can be opened as a heap).
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
-    let mut v = views_mut();
-    v.sections.retain(|s| s.0 != section);
-    // A handle's number given out again: the view was of the section that
-    // had it before (it stays mapped: someone may be writing through it).
-    v.whole.retain(|w| w.0 != section);
-    v.sections.push((section, bytes, committed));
+    let mut dropped = Vec::new();
+    {
+        let mut v = views_mut();
+        v.sections.retain(|s| s.0 != section);
+        // A handle's number given out again: drop our map entry outside the lock;
+        // any active writer's `Arc<WholeView>` keeps the old mapping alive safely.
+        let mut i = 0;
+        while i < v.whole.len() {
+            if v.whole[i].0 == section {
+                dropped.push(v.whole.swap_remove(i).1);
+            } else {
+                i += 1;
+            }
+        }
+        v.sections.push((section, bytes, committed));
+    }
+    drop(dropped);
 }
 
 /// The runtime lets go of a section, and of its handle: no view the title
-/// sees is of it any more, and [`beside`]'s view goes.
+/// sees is of it any more, and [`beside_held`]'s view is unmapped once any
+/// in-flight writer drops its `Arc<WholeView>`.
 pub fn title_memory_section_gone(section: usize) {
     let whole = {
         let mut v = views_mut();
@@ -318,12 +348,7 @@ pub fn title_memory_section_gone(section: usize) {
         let at = v.whole.iter().position(|w| w.0 == section);
         at.map(|i| v.whole.swap_remove(i).1)
     };
-    if let Some(base) = whole.filter(|&base| base != 0) {
-        // SAFETY: a view of ours. Who writes through it found the section
-        // in a view the title saw and holds off its unmapping
-        // (`crate::watch::title_memory_reading`), which came before this.
-        unsafe { mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: base as *mut c_void }) };
-    }
+    drop(whole);
 }
 
 /// The runtime mapped `[at, at + len)` as a view of `section` from
@@ -530,40 +555,55 @@ pub(crate) fn cover(at: usize, len: usize) -> Cover {
 /// the title's pages, all of it one run of a section: in a view of ours of
 /// the whole section, which is never guarded (`crate::watch`) nor changed.
 ///
-/// The section's pages are reserved and the runtime commits each before it
-/// shows it, which holds for every view of the section. The caller holds
-/// `crate::watch::title_memory_reading`: until it lets go the title sees
-/// the same pages at `at`.
-pub(crate) fn beside(at: usize, len: usize) -> Option<usize> {
+/// Returns an [`Arc<WholeView>`] that keeps the mapping pinned in memory until
+/// dropped, so callers can safely write even while the runtime remaps views or
+/// releases the section handle concurrently.
+pub(crate) fn beside_held(at: usize, len: usize) -> Option<(Arc<WholeView>, usize)> {
     let known = {
         let v = views();
         let Cover::Run(section, offset) = cover_in(&v.views, at, len) else {
             return None;
         };
-        v.whole.iter().find(|w| w.0 == section).map(|w| (w.1, offset))
+        v.whole.iter().find(|w| w.0 == section).map(|w| (w.1.clone(), offset))
     };
-    if let Some((base, offset)) = known {
-        return (base != 0).then(|| base + offset as usize);
+    if let Some((whole, offset)) = known {
+        return whole.map(|w| {
+            let addr = w.base + offset as usize;
+            (w, addr)
+        });
     }
     let mut v = views_mut();
     let Cover::Run(section, offset) = cover_in(&v.views, at, len) else {
         return None;
     };
-    let base = match v.whole.iter().find(|w| w.0 == section) {
-        Some(w) => w.1,
+    let whole = match v.whole.iter().find(|w| w.0 == section) {
+        Some(w) => w.1.clone(),
         None => {
             let &(_, bytes, _) = v.sections.iter().find(|s| s.0 == section)?;
             // SAFETY: the whole of a section the runtime made; a view the
             // title sees is of it, so its handle is open.
             let base = unsafe { mem::MapViewOfFile(section as _, mem::FILE_MAP_WRITE, 0, 0, bytes as usize) }.Value as usize;
-            if base == 0 {
+            let mapped = if base == 0 {
                 tracing::warn!(error = %std::io::Error::last_os_error(), "no view of the title's pages beside its own");
-            }
-            v.whole.push((section, base));
-            base
+                None
+            } else {
+                Some(Arc::new(WholeView { base }))
+            };
+            v.whole.push((section, mapped.clone()));
+            mapped
         }
     };
-    (base != 0).then(|| base + offset as usize)
+    whole.map(|w| {
+        let addr = w.base + offset as usize;
+        (w, addr)
+    })
+}
+
+/// Raw address form of [`beside_held`] for callers already holding
+/// `crate::watch::title_memory_reading`.
+#[cfg(test)]
+pub(crate) fn beside(at: usize, len: usize) -> Option<usize> {
+    beside_held(at, len).map(|(_, addr)| addr)
 }
 
 /// Our own address of the 64 KiB page the title sees at `page` ([`beside`]),
@@ -584,10 +624,10 @@ pub(crate) fn beside_page(page: usize) -> Option<(usize, [usize; 8])> {
                 let mut shown = [0; 8];
                 let all = v.pages.get(&(section, offset))?;
                 shown.get_mut(..all.len())?.copy_from_slice(all);
-                return (whole.1 != 0).then(|| (whole.1 + offset as usize, shown));
+                return whole.1.as_ref().map(|w| (w.base + offset as usize, shown));
             }
         }
-        if asked || beside(page, K64).is_none() {
+        if asked || beside_held(page, K64).is_none() {
             return None;
         }
     }
