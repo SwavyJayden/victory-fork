@@ -78,6 +78,20 @@ static RETIRED: Mutex<Vec<(u64, Retired)>> = Mutex::new(Vec::new());
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Microseconds of a submission's preparing by part, since the frame-rate
+/// line last took them: the asking and the look under flights, the lists'
+/// steps, the flush of refreshes, the snapshots and the wait for card
+/// results, `card_before`, the hand-over to the card. An instrument: the
+/// frame line's "preparing" had 19 to 23 ms a frame no line split (run 282).
+static PREP_PARTS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// Adds the time since `since` to part `i` of [`PREP_PARTS`]; now.
+fn prep_part(i: usize, since: std::time::Instant) -> std::time::Instant {
+    let now = std::time::Instant::now();
+    PREP_PARTS[i].fetch_add((now - since).as_micros() as u64, Ordering::Relaxed);
+    now
+}
+
 /// A retired object, dropped on whatever thread finishes the submission.
 struct Retired(#[allow(dead_code)] Box<dyn std::any::Any>);
 // SAFETY: what is retired is D3D12 objects (free-threaded) and the
@@ -3137,7 +3151,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         // buffer of its own, four a frame, 43 to 60 ms a
                         // frame) and neither side had other bytes after
                         // one. A copy INTO such a range still waits.
-                        if !touches(written, dst, dst + len) && fill_ahead::on() {
+                        if !touches(written, dst, dst + len) && fill_ahead::can_read_ahead(src, len) {
                             if count {
                                 fill_ahead::read(src, len);
                             }
@@ -3155,7 +3169,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, src, src + len) {
                         // Not waited for, and checked when the flights land
                         // (`fill_ahead`).
-                        if fill_ahead::on() {
+                        if fill_ahead::can_read_ahead(src, len) {
                             if count {
                                 fill_ahead::read(src, len);
                             }
@@ -3219,19 +3233,43 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
 /// there, over every fill that read ahead of them) and from then on fills
 /// wait as before. `VICTORY_FILL_WAIT=1`: they wait from the start.
 mod fill_ahead {
-    use std::collections::HashMap;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
-    use std::sync::{Mutex, OnceLock};
+    use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock, RwLock};
 
-    /// Fills are looked up by the 64 KiB of title memory they read.
+    /// Fills are looked up and blacklisted by the 64 KiB piece of title memory
+    /// they read.
     const PIECE: usize = 1 << 16;
+    /// Shift from a 64 KiB piece index (`addr >> 16`) to its 1 MiB cell index
+    /// (`addr >> 20`).
+    const CELL_SHIFT_FROM_PIECE: usize = 4;
+    /// A 1 MiB cell holds 16 pieces of 64 KiB; if more than this many distinct
+    /// pieces in one 1 MiB cell trip, the entire 1 MiB cell is blacklisted.
+    const CELL_ESCALATE_PIECES: usize = 4;
+    /// Global safety valve: if more than this many distinct 64 KiB pieces trip
+    /// across the whole address space, flip global `WAIT = true`.
+    const GLOBAL_TRIP_PIECES: usize = 64;
+    /// Cap per-region blacklist warning messages so logs stay clean.
+    const WARN_CAP: u64 = 16;
     /// A fill is checked against flights that land this many frames after
     /// it at most (flights are settled at 256 lists in the air, and by
     /// every present that waits).
     const KEEP: u64 = 16;
 
-    /// A flight changed bytes a fill had read ahead of it: fills wait.
+    /// Global kill switch: a flight changed bytes in legacy mode, or more than
+    /// [`GLOBAL_TRIP_PIECES`] distinct 64 KiB pieces tripped in scoped mode.
     static WAIT: AtomicBool = AtomicBool::new(false);
+    /// Fast-path gate: `false` while no piece has been blacklisted in scoped
+    /// mode, so `can_read_ahead` pays zero lock cost in the common empty case.
+    static HAS_WAIT_PIECES: AtomicBool = AtomicBool::new(false);
+    /// Blacklisted 64 KiB piece indices (`addr / PIECE`) in scoped mode.
+    static WAIT_PIECES: OnceLock<RwLock<HashSet<usize>>> = OnceLock::new();
+    /// Blacklisted 1 MiB cell indices (`addr >> 20`) escalated when more than
+    /// [`CELL_ESCALATE_PIECES`] distinct pieces in one cell trip.
+    static WAIT_CELLS: OnceLock<RwLock<HashSet<usize>>> = OnceLock::new();
+    /// Number of scoped blacklist warning messages emitted so far (capped at
+    /// [`WARN_CAP`]).
+    static WARNED: AtomicU64 = AtomicU64::new(0);
     /// Since the last frame line: fills that read ahead; landings' writes
     /// that touched one's piece. Since the start: fills that read bytes a
     /// flight then changed.
@@ -3255,14 +3293,210 @@ mod fill_ahead {
     static LANDING: AtomicU64 = AtomicU64::new(0);
 
     pub(super) fn landing(first: u64) {
-        LANDING.store(first, Relaxed);
+        LANDING.store(first, Ordering::Relaxed);
     }
 
     static READ: Mutex<Option<HashMap<usize, Piece>>> = Mutex::new(None);
 
-    pub(super) fn on() -> bool {
-        static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_WAIT").is_none_or(|v| v != "1")) && !WAIT.load(Relaxed)
+    fn wait_pieces() -> &'static RwLock<HashSet<usize>> {
+        WAIT_PIECES.get_or_init(|| RwLock::new(HashSet::new()))
+    }
+
+    fn wait_cells() -> &'static RwLock<HashSet<usize>> {
+        WAIT_CELLS.get_or_init(|| RwLock::new(HashSet::new()))
+    }
+
+    fn parse_fill_wait(val: Option<&str>) -> bool {
+        val.is_some_and(|v| v.trim() == "1")
+    }
+
+    fn parse_scoped(val: Option<&str>) -> bool {
+        val.is_none_or(|v| v.trim() != "0")
+    }
+
+    /// Whether `VICTORY_FILL_WAIT=1` forces all fills and read-copies to wait.
+    fn global_wait_override() -> bool {
+        static FORCE_WAIT: OnceLock<bool> = OnceLock::new();
+        *FORCE_WAIT.get_or_init(|| parse_fill_wait(std::env::var("VICTORY_FILL_WAIT").ok().as_deref()))
+    }
+
+    /// Whether mismatches blacklist only the affected 64 KiB pieces / 1 MiB
+    /// cells (`VICTORY_FILL_AHEAD_SCOPED`, default ON; `=0` restores the
+    /// legacy global kill switch).
+    fn scoped() -> bool {
+        static SCOPED: OnceLock<bool> = OnceLock::new();
+        *SCOPED.get_or_init(|| parse_scoped(std::env::var("VICTORY_FILL_AHEAD_SCOPED").ok().as_deref()))
+    }
+
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct TripOutcome {
+        new_pieces: usize,
+        new_cells: usize,
+        total_pieces: usize,
+        total_cells: usize,
+        tripped_global: bool,
+    }
+
+    struct Blacklist<'a> {
+        wait: &'a AtomicBool,
+        has_pieces: &'a AtomicBool,
+        pieces: &'a RwLock<HashSet<usize>>,
+        cells: &'a RwLock<HashSet<usize>>,
+    }
+
+    fn global_blacklist() -> Blacklist<'static> {
+        Blacklist {
+            wait: &WAIT,
+            has_pieces: &HAS_WAIT_PIECES,
+            pieces: wait_pieces(),
+            cells: wait_cells(),
+        }
+    }
+
+    impl Blacklist<'_> {
+        fn can_read_ahead(&self, force_wait: bool, src: usize, len: usize) -> bool {
+            if force_wait || self.wait.load(Ordering::Relaxed) {
+                return false;
+            }
+            if len == 0 {
+                return true;
+            }
+            if !self.has_pieces.load(Ordering::Acquire) {
+                return true;
+            }
+            let end = src.saturating_add(len);
+            let last = end - 1;
+            let first_cell = src >> 20;
+            let last_cell = last >> 20;
+            {
+                let cells = self.cells.read().unwrap_or_else(|e| e.into_inner());
+                if !cells.is_empty() && (first_cell..=last_cell).any(|cell| cells.contains(&cell)) {
+                    return false;
+                }
+            }
+            let first_piece = src / PIECE;
+            let last_piece = last / PIECE;
+            let pieces = self.pieces.read().unwrap_or_else(|e| e.into_inner());
+            !(first_piece..=last_piece).any(|piece| pieces.contains(&piece))
+        }
+
+        fn trip(&self, scoped_on: bool, fill: (usize, usize), overlap: (usize, usize)) -> TripOutcome {
+            if !scoped_on {
+                return TripOutcome {
+                    tripped_global: !self.wait.swap(true, Ordering::Relaxed),
+                    ..Default::default()
+                };
+            }
+            let mut new_pieces = 0usize;
+            let mut escalated: Vec<usize> = Vec::new();
+            let total_pieces = {
+                let mut pieces = self.pieces.write().unwrap_or_else(|e| e.into_inner());
+                let mut touched_cells: Vec<usize> = Vec::new();
+                for (lo, hi) in [fill, overlap] {
+                    if lo >= hi {
+                        continue;
+                    }
+                    for piece in lo / PIECE..=(hi - 1) / PIECE {
+                        if pieces.insert(piece) {
+                            new_pieces += 1;
+                            let cell = piece >> CELL_SHIFT_FROM_PIECE;
+                            if !touched_cells.contains(&cell) {
+                                touched_cells.push(cell);
+                            }
+                        }
+                    }
+                }
+                for cell in touched_cells {
+                    let base = cell << CELL_SHIFT_FROM_PIECE;
+                    let in_cell = (base..base + (1 << CELL_SHIFT_FROM_PIECE))
+                        .filter(|p| pieces.contains(p))
+                        .count();
+                    if in_cell > CELL_ESCALATE_PIECES {
+                        escalated.push(cell);
+                    }
+                }
+                pieces.len()
+            };
+            let (new_cells, total_cells) = {
+                if escalated.is_empty() {
+                    let cells = self.cells.read().unwrap_or_else(|e| e.into_inner());
+                    (0, cells.len())
+                } else {
+                    let mut cells = self.cells.write().unwrap_or_else(|e| e.into_inner());
+                    let mut added = 0usize;
+                    for cell in escalated {
+                        if cells.insert(cell) {
+                            added += 1;
+                        }
+                    }
+                    (added, cells.len())
+                }
+            };
+            if total_pieces > 0 {
+                self.has_pieces.store(true, Ordering::Release);
+            }
+            let tripped_global = total_pieces > GLOBAL_TRIP_PIECES && !self.wait.swap(true, Ordering::Relaxed);
+            TripOutcome {
+                new_pieces,
+                new_cells,
+                total_pieces,
+                total_cells,
+                tripped_global,
+            }
+        }
+        /// Core mismatch detector shared by [`wrote`] and unit tests.
+        fn check_wrote(
+            &self,
+            (force_wait, scoped_on): (bool, bool),
+            read_map: &Mutex<Option<HashMap<usize, Piece>>>,
+            (landing, frame): (u64, u64),
+            (at, new): (usize, &[u8]),
+            on_mismatch: impl Fn(usize, usize, u64, usize, &TripOutcome),
+        ) -> usize {
+            if new.is_empty() || force_wait || self.wait.load(Ordering::Relaxed) {
+                return 0;
+            }
+            let hits: Vec<(usize, usize, u64)> = {
+                let read = read_map.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(map) = read.as_ref() else { return 0 };
+                let end = at + new.len();
+                (at / PIECE..=(end - 1) / PIECE)
+                    .filter_map(|piece| map.get(&piece))
+                    .flat_map(|p| p.fills.iter().copied())
+                    .filter(|f| f.0 < end && f.1 > at && f.2 + KEEP >= frame && (landing == 0 || landing <= f.3))
+                    .map(|f| (f.0, f.1, f.2))
+                    .collect()
+            };
+            if hits.is_empty() {
+                return 0;
+            }
+            let mut mismatches = 0usize;
+            let mut now = Vec::new();
+            for (from, to, read_in) in hits {
+                let (a, b) = (from.max(at), to.min(at + new.len()));
+                now.clear();
+                now.resize(b - a, 0);
+                // Title memory as it is, which is what the fill read unless the
+                // title wrote it since; not there: nothing to say.
+                if !super::read_into(a as *const u8, &mut now) || now[..] == new[a - at..b - at] {
+                    continue;
+                }
+                mismatches += 1;
+                let first = now.iter().zip(&new[a - at..b - at]).position(|(x, y)| x != y).unwrap_or(0);
+                let outcome = self.trip(scoped_on, (from, to), (a, b));
+                on_mismatch(from, to, read_in, a + first, &outcome);
+                if !scoped_on || outcome.tripped_global {
+                    break;
+                }
+            }
+            mismatches
+        }
+    }
+
+    /// Whether a fill or read-only title copy of `len` bytes at `src` may read
+    /// ahead of flights in the air without waiting for them to land.
+    pub(super) fn can_read_ahead(src: usize, len: usize) -> bool {
+        global_blacklist().can_read_ahead(global_wait_override(), src, len)
     }
 
     /// A fill reads `len` bytes at `src` ahead of flights that may write
@@ -3271,7 +3505,7 @@ mod fill_ahead {
         if len == 0 {
             return;
         }
-        COUNT[0].fetch_add(1, Relaxed);
+        COUNT[0].fetch_add(1, Ordering::Relaxed);
         let frame = crate::frame::current();
         let mut read = READ.lock().unwrap_or_else(|e| e.into_inner());
         let map = read.get_or_insert_with(HashMap::new);
@@ -3281,62 +3515,84 @@ mod fill_ahead {
                 p.pruned = frame;
                 p.fills.retain(|f| f.2 + KEEP >= frame);
             }
-            p.fills.push((src, src + len, frame, super::STARTED.load(Relaxed)));
+            p.fills.push((src, src + len, frame, super::STARTED.load(Ordering::Relaxed)));
         }
     }
 
     /// A landing is about to put `new` into title memory at `at`: bytes
-    /// shaders wrote, merged into the title's.
+    /// shaders wrote, merged into the title's. Still checks active fills even
+    /// after `HAS_WAIT_PIECES` is true; skipped only once global `WAIT` (or
+    /// `VICTORY_FILL_WAIT=1`) is set.
     pub(crate) fn wrote(at: usize, new: &[u8]) {
-        if new.is_empty() || WAIT.load(Relaxed) {
+        let force_wait = global_wait_override();
+        if new.is_empty() || force_wait || WAIT.load(Ordering::Relaxed) {
             return;
         }
         let frame = crate::frame::current();
-        let landing = LANDING.load(Relaxed);
-        let hits: Vec<(usize, usize, u64)> = {
+        let landing = LANDING.load(Ordering::Relaxed);
+        let scoped_on = scoped();
+        let bl = global_blacklist();
+        let had_hits = {
             let read = READ.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(map) = read.as_ref() else { return };
-            let end = at + new.len();
-            (at / PIECE..=(end - 1) / PIECE)
-                .filter_map(|piece| map.get(&piece))
-                .flat_map(|p| p.fills.iter().copied())
-                .filter(|f| f.0 < end && f.1 > at && f.2 + KEEP >= frame && (landing == 0 || landing <= f.3))
-                .map(|f| (f.0, f.1, f.2))
-                .collect()
+            read.as_ref().is_some_and(|map| {
+                let end = at + new.len();
+                (at / PIECE..=(end - 1) / PIECE)
+                    .filter_map(|piece| map.get(&piece))
+                    .flat_map(|p| p.fills.iter())
+                    .any(|f| f.0 < end && f.1 > at && f.2 + KEEP >= frame && (landing == 0 || landing <= f.3))
+            })
         };
-        if hits.is_empty() {
+        if !had_hits {
             return;
         }
-        COUNT[1].fetch_add(1, Relaxed);
-        let mut now = Vec::new();
-        for (from, to, read_in) in hits {
-            let (a, b) = (from.max(at), to.min(at + new.len()));
-            now.clear();
-            now.resize(b - a, 0);
-            // Title memory as it is, which is what the fill read unless the
-            // title wrote it since; not there: nothing to say.
-            if !super::read_into(a as *const u8, &mut now) || now[..] == new[a - at..b - at] {
-                continue;
-            }
-            let n = COUNT[2].fetch_add(1, Relaxed) + 1;
-            let first = now.iter().zip(&new[a - at..b - at]).position(|(x, y)| x != y).unwrap_or(0);
-            if !WAIT.swap(true, Relaxed) {
+        COUNT[1].fetch_add(1, Ordering::Relaxed);
+        bl.check_wrote((force_wait, scoped_on), &READ, (landing, frame), (at, new), |from, to, read_in, first_diff, outcome| {
+            let n = COUNT[2].fetch_add(1, Ordering::Relaxed) + 1;
+            if !scoped_on {
+                if outcome.tripped_global {
+                    tracing::warn!(
+                        "a fill of upload memory read {} bytes at {from:#x} in frame {read_in} ahead of a flight whose shaders changed \
+                         them (first at {first_diff:#x}, landed in frame {frame}): the lists of that submission drew with the bytes from before. \
+                         Fills wait for flights again from here on, as with VICTORY_FILL_WAIT=1 ({n} such fills)",
+                        to - from,
+                    );
+                }
+            } else if outcome.tripped_global {
                 tracing::warn!(
-                    "a fill of upload memory read {} bytes at {from:#x} in frame {read_in} ahead of a flight whose shaders changed \
-                     them (first at {:#x}, landed in frame {frame}): the lists of that submission drew with the bytes from before. \
-                     Fills wait for flights again from here on, as with VICTORY_FILL_WAIT=1 ({n} such fills)",
+                    "scoped fill_ahead tripped global safety valve ({} distinct 64 KiB pieces > {GLOBAL_TRIP_PIECES}, {} 1 MiB cells) \
+                     after fill of {} bytes at {from:#x} (frame {read_in}, first diff at {first_diff:#x}, landed in frame {frame}): all fills \
+                     wait for flights from here on ({n} such fills)",
+                    outcome.total_pieces,
+                    outcome.total_cells,
                     to - from,
-                    a + first
+                );
+            } else if (outcome.new_pieces > 0 || outcome.new_cells > 0) && WARNED.fetch_add(1, Ordering::Relaxed) < WARN_CAP {
+                tracing::warn!(
+                    "scoped fill_ahead blacklisted +{} 64 KiB piece(s) / +{} 1 MiB cell(s) (total {} pieces, {} cells) after fill of \
+                     {} bytes at {from:#x} in frame {read_in} read ahead of shader write (first diff at {first_diff:#x}, landed in frame {frame}; \
+                     {n} such fills): only blacklisted regions wait for flights",
+                    outcome.new_pieces,
+                    outcome.new_cells,
+                    outcome.total_pieces,
+                    outcome.total_cells,
+                    to - from,
                 );
             }
-            return;
-        }
+        });
     }
 
     /// With the frame line.
     pub(super) fn line(frames: f64) {
-        let [ahead, looked] = [0, 1].map(|i| COUNT[i].swap(0, Relaxed));
-        if ahead == 0 && looked == 0 {
+        let [ahead, looked] = [0, 1].map(|i| COUNT[i].swap(0, Ordering::Relaxed));
+        let (blacklisted_pieces, blacklisted_cells) = if HAS_WAIT_PIECES.load(Ordering::Acquire) {
+            (
+                wait_pieces().read().unwrap_or_else(|e| e.into_inner()).len(),
+                wait_cells().read().unwrap_or_else(|e| e.into_inner()).len(),
+            )
+        } else {
+            (0, 0)
+        };
+        if ahead == 0 && looked == 0 && blacklisted_pieces == 0 {
             return;
         }
         let kept = {
@@ -3351,14 +3607,241 @@ mod fill_ahead {
             })
         };
         tracing::info!(
-            "fills of upload memory that read title memory flights may write, not waited for (VICTORY_FILL_WAIT=1 waits): {:.1} per \
-             frame; {:.1} landings' writes per frame fell in the same 64 KiB as one and were compared with it; fills that read \
-             bytes a flight then changed, since the start: {}{}; {kept} fills kept to check",
+            "fills of upload memory that read title memory flights may write, not waited for (VICTORY_FILL_WAIT=1 waits, \
+             VICTORY_FILL_AHEAD_SCOPED={}): {:.1} per frame; {:.1} landings' writes per frame fell in the same 64 KiB as one and \
+             were compared with it; fills that read bytes a flight then changed, since the start: {}{}; blacklisted: \
+             {blacklisted_pieces} 64 KiB pieces, {blacklisted_cells} 1 MiB cells; {kept} fills kept to check",
+            u8::from(scoped()),
             ahead as f64 / frames,
             looked as f64 / frames,
-            COUNT[2].load(Relaxed),
-            if WAIT.load(Relaxed) { " (fills wait again)" } else { "" }
+            COUNT[2].load(Ordering::Relaxed),
+            if WAIT.load(Ordering::Relaxed) { " (fills wait again)" } else { "" }
         );
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        struct Fixture {
+            wait: AtomicBool,
+            has_pieces: AtomicBool,
+            pieces: RwLock<HashSet<usize>>,
+            cells: RwLock<HashSet<usize>>,
+            read_map: Mutex<Option<HashMap<usize, Piece>>>,
+        }
+
+        impl Fixture {
+            fn new() -> Self {
+                Self {
+                    wait: AtomicBool::new(false),
+                    has_pieces: AtomicBool::new(false),
+                    pieces: RwLock::new(HashSet::new()),
+                    cells: RwLock::new(HashSet::new()),
+                    read_map: Mutex::new(None),
+                }
+            }
+
+            fn blacklist(&self) -> Blacklist<'_> {
+                Blacklist {
+                    wait: &self.wait,
+                    has_pieces: &self.has_pieces,
+                    pieces: &self.pieces,
+                    cells: &self.cells,
+                }
+            }
+
+            fn can_read(&self, force_wait: bool, src: usize, len: usize) -> bool {
+                self.blacklist().can_read_ahead(force_wait, src, len)
+            }
+
+            fn trip(&self, scoped_on: bool, from: usize, to: usize, a: usize, b: usize) -> TripOutcome {
+                self.blacklist().trip(scoped_on, (from, to), (a, b))
+            }
+
+            fn record_read(&self, src: usize, len: usize, frame: u64, started: u64) {
+                let mut guard = self.read_map.lock().unwrap();
+                let map = guard.get_or_insert_with(HashMap::new);
+                for piece in src / PIECE..=(src + len - 1) / PIECE {
+                    map.entry(piece).or_default().fills.push((src, src + len, frame, started));
+                }
+            }
+        }
+
+        #[test]
+        fn scoped_isolation_blocks_tripped_piece_only() {
+            let f = Fixture::new();
+            let piece_a = 0x0000_dbe0_0000_usize;
+            let piece_b = 0x0000_3b81_0000_usize;
+            assert!(f.can_read(false, piece_a + 0xdf60, 2048));
+            assert!(f.can_read(false, piece_b, 20_480));
+            assert!(!f.has_pieces.load(Ordering::Relaxed));
+
+            let out = f.trip(true, piece_a + 0xdf60, piece_a + 0xdf60 + 2048, piece_a + 0xdf60, piece_a + 0xdf60 + 2048);
+            assert_eq!(out.new_pieces, 1);
+            assert_eq!(out.new_cells, 0);
+            assert_eq!(out.total_pieces, 1);
+            assert!(!out.tripped_global);
+            assert!(f.has_pieces.load(Ordering::Relaxed));
+            assert!(!f.wait.load(Ordering::Relaxed));
+
+            // Tripped 64 KiB piece waits; unrelated piece and sibling piece in the same 1 MiB cell still read ahead.
+            assert!(!f.can_read(false, piece_a, 64));
+            assert!(!f.can_read(false, piece_a + 0xdf60, 2048));
+            assert!(f.can_read(false, piece_a + PIECE, 2048));
+            assert!(f.can_read(false, piece_b, 20_480));
+            // Zero-length read is always allowed when not globally waiting.
+            assert!(f.can_read(false, piece_a, 0));
+        }
+
+        #[test]
+        fn cross_piece_range_touching_tripped_piece_returns_false() {
+            let f = Fixture::new();
+            let base = 0x1000_0000usize;
+            let piece_a = base + 3 * PIECE;
+            f.trip(true, piece_a + 128, piece_a + 256, piece_a + 128, piece_a + 256);
+
+            // Starts in piece A-1, extends into piece A.
+            assert!(!f.can_read(false, piece_a - 16, 32));
+            // Starts in piece A, extends into piece A+1.
+            assert!(!f.can_read(false, piece_a + PIECE - 16, 32));
+            // Spans across piece A from A-1 to A+2.
+            assert!(!f.can_read(false, piece_a - PIECE, 3 * PIECE));
+            // Adjacent ranges right before and right after piece A remain free.
+            assert!(f.can_read(false, piece_a - 64, 64));
+            assert!(f.can_read(false, piece_a + PIECE, 64));
+        }
+
+        #[test]
+        fn cell_escalation_after_four_distinct_pieces_in_same_mib() {
+            let f = Fixture::new();
+            let cell0 = 0x2000_0000usize; // 1 MiB aligned
+            let cell1 = cell0 + (1 << 20);
+            // Trip 4 distinct 64 KiB pieces in cell0: should NOT escalate yet.
+            for p in 0..4 {
+                let addr = cell0 + p * PIECE;
+                let out = f.trip(true, addr, addr + 256, addr, addr + 256);
+                assert_eq!(out.new_cells, 0, "piece {p} must not escalate cell0");
+                assert_eq!(out.total_cells, 0);
+            }
+            // Untouched piece 15 in cell0 still reads ahead at 4 tripped pieces.
+            assert!(f.can_read(false, cell0 + 15 * PIECE, 256));
+
+            // 5th distinct piece (> 4) escalates the entire 1 MiB cell.
+            let addr4 = cell0 + 4 * PIECE;
+            let out = f.trip(true, addr4, addr4 + 256, addr4, addr4 + 256);
+            assert_eq!(out.new_pieces, 1);
+            assert_eq!(out.new_cells, 1);
+            assert_eq!(out.total_cells, 1);
+            assert!(!out.tripped_global);
+
+            // Every piece in cell0 (even untouched piece 15) now returns false.
+            for p in 0..16 {
+                assert!(!f.can_read(false, cell0 + p * PIECE, 256), "cell0 piece {p} should wait");
+            }
+            // Adjacent 1 MiB cell1 stays unaffected.
+            assert!(f.can_read(false, cell1, 256));
+            // Cross-cell range touching cell0 returns false.
+            assert!(!f.can_read(false, cell1 - 16, 32));
+        }
+
+        #[test]
+        fn global_safety_valve_trips_after_sixty_four_distinct_pieces() {
+            let f = Fixture::new();
+            let untouched = 0x9000_0000usize;
+            // Spread 64 tripped pieces across 64 separate 1 MiB cells so cell escalation never interferes.
+            for i in 0..64 {
+                let addr = 0x3000_0000usize + i * (1 << 20);
+                let out = f.trip(true, addr, addr + 64, addr, addr + 64);
+                assert!(!out.tripped_global, "piece {i} must not trip global valve");
+                assert!(!f.wait.load(Ordering::Relaxed));
+            }
+            assert!(f.can_read(false, untouched, 64));
+
+            // 65th distinct piece (> 64) trips global WAIT safety valve.
+            let addr64 = 0x3000_0000usize + 64 * (1 << 20);
+            let out = f.trip(true, addr64, addr64 + 64, addr64, addr64 + 64);
+            assert!(out.tripped_global);
+            assert_eq!(out.total_pieces, 65);
+            assert!(f.wait.load(Ordering::Relaxed));
+            assert!(!f.can_read(false, untouched, 64));
+        }
+
+        #[test]
+        fn fill_wait_override_and_legacy_scoped_off_behavior() {
+            assert!(!parse_fill_wait(None));
+            assert!(!parse_fill_wait(Some("0")));
+            assert!(parse_fill_wait(Some("1")));
+            assert!(parse_fill_wait(Some(" 1 ")));
+
+            assert!(parse_scoped(None));
+            assert!(parse_scoped(Some("1")));
+            assert!(!parse_scoped(Some("0")));
+            assert!(!parse_scoped(Some(" 0 ")));
+
+            // VICTORY_FILL_WAIT=1 forces wait even with no tripped pieces.
+            let f = Fixture::new();
+            assert!(!f.can_read(true, 0x4000_0000, 256));
+            assert!(!f.can_read(true, 0x4000_0000, 0));
+
+            // VICTORY_FILL_AHEAD_SCOPED=0 trips global WAIT on the very first mismatch.
+            let out = f.trip(false, 0x4000_0000, 0x4000_0100, 0x4000_0000, 0x4000_0100);
+            assert!(out.tripped_global);
+            assert!(f.wait.load(Ordering::Relaxed));
+            assert!(!f.has_pieces.load(Ordering::Relaxed));
+            assert!(!f.can_read(false, 0x5000_0000, 256));
+        }
+
+        #[test]
+        fn wrote_keeps_checking_active_fills_after_first_scoped_blacklist() {
+            let f = Fixture::new();
+            // Allocate 3 pieces so we can pick two guaranteed distinct 64 KiB pieces.
+            let buf = vec![0x11u8; 3 * PIECE];
+            let base = buf.as_ptr() as usize;
+            let p1 = (base + PIECE) & !(PIECE - 1);
+            let p2 = p1 + PIECE;
+            assert!(p1 >= base && p2 + 64 <= base + buf.len());
+
+            f.record_read(p1, 64, 10, 5);
+            f.record_read(p2, 64, 10, 5);
+
+            let changed = [0x22u8; 64];
+            let bl = f.blacklist();
+            // First mismatch blacklists p1 only; p2 stays readable ahead.
+            let hits1 = bl.check_wrote((false, true), &f.read_map, (5, 10), (p1, &changed), |_, _, _, _, _| {});
+            assert_eq!(hits1, 1);
+            assert!(f.has_pieces.load(Ordering::Relaxed));
+            assert!(!f.wait.load(Ordering::Relaxed));
+            assert!(!f.can_read(false, p1, 64));
+            assert!(f.can_read(false, p2, 64));
+
+            // A newer submission (landing=6 > started=5) must NOT falsely trip p2.
+            let false_hits = bl.check_wrote((false, true), &f.read_map, (6, 10), (p2, &changed), |_, _, _, _, _| {});
+            assert_eq!(false_hits, 0);
+            assert!(f.can_read(false, p2, 64));
+
+            // With HAS_WAIT_PIECES=true, a real mismatch on p2 is STILL caught and blacklisted.
+            let hits2 = bl.check_wrote((false, true), &f.read_map, (5, 10), (p2, &changed), |_, _, _, _, _| {});
+            assert_eq!(hits2, 1);
+            assert!(!f.can_read(false, p2, 64));
+            assert!(!f.wait.load(Ordering::Relaxed));
+        }
+
+        #[test]
+        fn trip_covers_both_fill_and_overlap_ranges_and_stays_idempotent() {
+            let f = Fixture::new();
+            let base = 0x6000_0000usize;
+            // Repeat trip on the same piece does not inflate counts or double-count pieces.
+            let first = f.trip(true, base, base + 128, base + PIECE, base + PIECE + 128);
+            assert_eq!(first.new_pieces, 2);
+            assert_eq!(first.total_pieces, 2);
+            let again = f.trip(true, base, base + 128, base + PIECE, base + PIECE + 128);
+            assert_eq!(again.new_pieces, 0);
+            assert_eq!(again.total_pieces, 2);
+            assert!(!f.can_read(false, base, 16));
+            assert!(!f.can_read(false, base + PIECE, 16));
+            assert!(f.can_read(false, base + 2 * PIECE, 16));
+        }
     }
 }
 
@@ -4078,10 +4561,27 @@ fn late_line(frames: f64) {
     }
     if late_exact() {
         let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
+        // Merge hookup (ac255498): once W11-B adds `crate::shadow::merge_gave_up()`,
+        // append its four give-up counts to this log line.
         tracing::info!(
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
              {runs:.0} changed runs, {:.2} MB",
             bytes / (1 << 20) as f64
+        );
+    }
+    {
+        let parts = [0, 1, 2, 3, 4, 5].map(|i| PREP_PARTS[i].swap(0, Ordering::Relaxed) as f64 / 1e3 / frames);
+        tracing::info!(
+            "a submission's preparing by part, ms per frame: the write-watch asking and the look for title bytes under flights \
+             (settles for them included) {:.1}; the lists' steps (title copies, fills, preludes; refreshes are only noted) {:.1}; \
+             the refreshes (the flush) {:.1}; snapshots and the wait for card results {:.1}; the card copies' send and hash lists \
+             (card_before) {:.1}; handing the lists to the card and signalling {:.1}",
+            parts[0],
+            parts[1],
+            parts[2],
+            parts[3],
+            parts[4],
+            parts[5]
         );
     }
 }
@@ -5192,7 +5692,7 @@ impl Host {
     fn relay_card_back(&self, plans: &[(u64, &CardPlan)], fetch: &mut Option<RelayFetch>, behind: u64, landed: u64) {
         if inflight_fetch() {
             let only: Vec<&CardPlan> = plans.iter().map(|p| p.1).collect();
-            let taken = self.relay_card_inflight(&only, fetch, behind);
+            let taken = self.relay_card_inflight(plans, fetch, behind, landed);
             inflight_tickets_landed(&only);
             if taken {
                 return;
@@ -5486,8 +5986,24 @@ impl Host {
     /// on the landing thread's copy queue, behind `behind` (the host fence
     /// value behind the last of these flights, reached already), and
     /// waited for, before the merge and before the tickets are landed.
-    fn relay_card_inflight(&self, plans: &[&CardPlan], fetch: &mut Option<RelayFetch>, behind: u64) -> bool {
+    fn relay_card_inflight(&self, plans: &[(u64, &CardPlan)], fetch: &mut Option<RelayFetch>, behind: u64, landed: u64) -> bool {
         use std::sync::Arc;
+        // If a prior fallback copy-queue fetch ran beside later flights
+        // (`VICTORY_QUEUE2` bit 1 + `VICTORY_CARD_FETCH_INFLIGHT=2`), any
+        // unflagged piece noted in `BESIDE` for one of these flights is not
+        // in its inflight slot and must fall back so `BESIDE` refetches it.
+        let beside = crate::queue2::second().is_some_and(|s| s.fetches()) && refetch();
+        let noted: std::collections::HashMap<(usize, u32), u64> = if beside {
+            BESIDE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .filter(|m| !m.is_empty())
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            Default::default()
+        };
         // (copy, offsets, the piece's place in the slots' buffer, "fetched after").
         let mut pieces: Vec<InflightPiece> = Vec::new();
         let ring: (ID3D12Resource, usize);
@@ -5512,7 +6028,7 @@ impl Host {
             };
             let slots = inflight.fetched.2;
             ring = (inflight.fetched.0.clone(), inflight.fetched.1);
-            for plan in plans {
+            for &(number, plan) in plans {
                 if plan.ranges.is_empty() {
                     continue;
                 }
@@ -5541,6 +6057,15 @@ impl Host {
                         }
                         flags.push((copy, r.span.first + p, flag != 0));
                     }
+                }
+                if !noted.is_empty()
+                    && flags.iter().any(|&(copy, piece, flagged)| {
+                        !flagged
+                            && !tickets.contains_key(&(copy, piece))
+                            && fetched_beside(noted.get(&(copy, piece)).copied(), number)
+                    })
+                {
+                    return false;
                 }
                 let fetched = flagged_pieces(&flags);
                 let mut seen = std::collections::HashSet::new();
@@ -5602,7 +6127,7 @@ impl Host {
             written += shadow.card_merge_relay(*lo, gpu, *after, &mut title);
             bytes += (hi - lo) as u64;
         }
-        for plan in plans {
+        for &(_, plan) in plans {
             for r in &plan.ranges {
                 crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
             }
@@ -5610,8 +6135,14 @@ impl Host {
         copy_back(1, written as u64);
         INFLIGHT_STATS[0].fetch_add(pieces.len() as u64, Ordering::Relaxed);
         INFLIGHT_STATS[1].fetch_add(bytes, Ordering::Relaxed);
+        if !noted.is_empty() {
+            let mut all = BESIDE.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(map) = all.as_mut() {
+                note_beside(map, &[], landed, landed);
+            }
+        }
         // The next merge is of a later plan, or a fetch the old way sent now.
-        if let Some(last) = plans.iter().map(|p| p.sent_as).max() {
+        if let Some(last) = plans.iter().map(|p| p.1.sent_as).max() {
             crate::shadow::relay_fetched(last);
         }
         true
@@ -5620,7 +6151,8 @@ impl Host {
     /// [`Host::relay_card_inflight`] with [`inflight_on_card`]: `pieces`'
     /// bytes, at their places in the slots' buffer `ring`, are copied one
     /// after the other into the landing thread's buffer in the PC's memory
-    /// ([`RelayFetch::buffer`]) on its copy queue, which first waits on the
+    /// ([`RelayFetch::buffer`]) on its copy queue (sharing `queue2::second`'s
+    /// down lane when `VICTORY_QUEUE2` bit 1 is on), which first waits on the
     /// host fence for `behind`; and waited for. The mapping of the buffer,
     /// or `None` (the landing then goes the old way) if the queue or the
     /// memory cannot be had.
@@ -5631,40 +6163,55 @@ impl Host {
         fetch: &mut Option<RelayFetch>,
         behind: u64,
     ) -> Option<usize> {
-        let started = std::time::Instant::now();
-        if fetch.is_none() {
-            *fetch = self.make_relay_fetch();
+        if pieces.is_empty() {
+            return Some(0);
         }
-        let f = fetch.as_mut()?;
+        let started = std::time::Instant::now();
         let copies = slots_down(pieces.iter().map(|(_, lo, hi, at, _)| (*at as u64, (hi - lo) as u64)));
         let total: u64 = copies.iter().map(|c| c.2).sum();
         if total == 0 {
             return Some(0);
         }
+        if fetch.is_none() {
+            *fetch = self.make_relay_fetch();
+        }
+        let f = fetch.as_mut()?;
         if f.buffer.as_ref().is_none_or(|b| b.2 < total) {
             let size = total.next_multiple_of(16 << 20);
             f.buffer = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
         }
         let (buffer, data, _) = f.buffer.clone()?;
-        let (queue, allocator, list) = self.relay_copy_lane(f)?;
-        f.sent += 1;
-        let (fence, event, sent) = (f.fence.clone(), f.event, f.sent);
-        // SAFETY: the list's last run was waited for by this thread; live
-        // buffers; the queue, fence and event are this thread's; the host
-        // fence is ours.
-        let ran = unsafe {
+        let ran = if let Some(second) = crate::queue2::second().filter(|s| s.fetches()) {
+            let event = f.event;
             (|| -> windows::core::Result<()> {
-                allocator.Reset()?;
-                list.Reset(&allocator, None)?;
-                record_slots_down(&list, &buffer, ring, &copies);
-                list.Close()?;
-                queue.Wait(&self.fence, behind)?;
-                queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>()?)]);
-                queue.Signal(&fence, sent)?;
-                fence.SetEventOnCompletion(sent, event)?;
-                WaitForSingleObject(event, INFINITE);
+                let copy = second.down.list()?;
+                record_slots_down(&copy.1, &buffer, ring, &copies);
+                let job = second.down.send(copy, &[(&self.fence, behind)], total)?;
+                second.down.wait(job, event)?;
+                second.down.stats.waited_us.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
                 Ok(())
             })()
+        } else {
+            let (queue, allocator, list) = self.relay_copy_lane(f)?;
+            f.sent += 1;
+            let (fence, event, sent) = (f.fence.clone(), f.event, f.sent);
+            // SAFETY: the list's last run was waited for by this thread; live
+            // buffers; the queue, fence and event are this thread's; the host
+            // fence is ours.
+            unsafe {
+                (|| -> windows::core::Result<()> {
+                    allocator.Reset()?;
+                    list.Reset(&allocator, None)?;
+                    record_slots_down(&list, &buffer, ring, &copies);
+                    list.Close()?;
+                    queue.Wait(&self.fence, behind)?;
+                    queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>()?)]);
+                    queue.Signal(&fence, sent)?;
+                    fence.SetEventOnCompletion(sent, event)?;
+                    WaitForSingleObject(event, INFINITE);
+                    Ok(())
+                })()
+            }
         };
         if let Err(e) = ran {
             fail(format_args!("the slots of the fetch inside flights could not be copied down ({e}, VICTORY_CARD_FETCH_INFLIGHT=2)"));
@@ -5772,7 +6319,8 @@ impl Host {
             if flights > 0 && !items.iter().any(|l| matches!(l, Late::Run(_))) {
                 RELAY_STATS[0].fetch_add(1, Ordering::Relaxed);
             }
-            landed.extend(self.relay_tell(ahead, landing));
+            let has_more = !items.is_empty();
+            landed.extend(self.relay_tell(ahead, landing, has_more));
         }
         {
             let flights: Vec<&Flight> = items
@@ -5806,7 +6354,7 @@ impl Host {
                 RELAY_STATS[1].fetch_add(flights.len() as u64, Ordering::Relaxed);
             }
         }
-        landed.extend(self.relay_tell(items, landing));
+        landed.extend(self.relay_tell(items, landing, false));
         self.log_messages();
         fill_ahead::landing(0);
         RELAY_STATS[4].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -5848,10 +6396,27 @@ impl Host {
     /// [`relay`], landing: what tells the title the card is done with
     /// `items`, in the order given (each flight's read-backs, its
     /// bottom-of-pipe writes, the fence signals behind it). `landing` is
-    /// when the relay took them. Returns the flights' host lists.
-    fn relay_tell(&self, items: Vec<Late>, landing: std::time::Instant) -> Vec<(Vec<crate::list::Detached>, Vec<usize>)> {
+    /// when the relay took them. `flush_in_hand` trims completed writes from
+    /// `LINE.in_hand` when more flights remain in this landing so early
+    /// signals cannot leave stale writes visible to `late_met`. Returns the
+    /// flights' host lists.
+    fn relay_tell(
+        &self,
+        items: Vec<Late>,
+        landing: std::time::Instant,
+        flush_in_hand: bool,
+    ) -> Vec<(Vec<crate::list::Detached>, Vec<usize>)> {
         let mut last = 0;
         let mut landed = Vec::new();
+        let mut writes_done = 0usize;
+        let drain_writes = |writes_done: &mut usize| {
+            if *writes_done > 0 {
+                let mut line = line();
+                let n = (*writes_done).min(line.in_hand.len());
+                line.in_hand.drain(..n);
+                *writes_done = 0;
+            }
+        };
         // Keep each flight's declared ranges (without deduplicating across
         // flights so `Shadow::flights` refcounts decrement once per flight)
         // and release `shadow.pending` only after all read-backs, writes, and
@@ -5870,8 +6435,12 @@ impl Host {
                     back_done.extend(flight.back);
                     landed.push((flight.lists, flight.order));
                 }
-                Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
+                Late::Write(at, what, bytes) => {
+                    what.write(at as *mut u8, bytes);
+                    writes_done += 1;
+                }
                 Late::Signal(fence, value) => {
+                    drain_writes(&mut writes_done);
                     crate::fence::set(fence as crate::object::This, value);
                     let us = landing.elapsed().as_micros() as u64;
                     EARLY[1].fetch_add(1, Ordering::Relaxed);
@@ -5879,6 +6448,9 @@ impl Host {
                     EARLY[3].fetch_max(us, Ordering::Relaxed);
                 }
             }
+        }
+        if flush_in_hand {
+            drain_writes(&mut writes_done);
         }
         for (shadow, ranges) in &back_done {
             shadow.copy_back_done(ranges);
@@ -6255,6 +6827,15 @@ impl Host {
                 }
                 submitting(3, flights);
                 let copying = std::time::Instant::now();
+                let first_flight = items
+                    .iter()
+                    .filter_map(|item| match item {
+                        Late::Run(flight) => Some(flight.number),
+                        _ => None,
+                    })
+                    .min()
+                    .unwrap_or(0);
+                fill_ahead::landing(first_flight);
                 let mut seen = std::collections::HashSet::new();
                 for item in &items {
                     if let Late::Run(flight) = item
@@ -6268,6 +6849,7 @@ impl Host {
                     _ => None,
                 }));
                 hand_back(&back);
+                fill_ahead::landing(0);
                 copy_back(0, copying.elapsed().as_micros() as u64);
             }
             // In the order given: what tells the title the card is done.
@@ -6415,6 +6997,9 @@ impl Host {
         // wait for the card and the copy-back have their own places on the
         // frame line (run 92 showed them twice, "preparing" 250 ms for 135).
         let mut settled = std::time::Duration::ZERO;
+        // The parts of the preparing, for the line that splits it
+        // ([`PREP_PARTS`]).
+        let mut part = std::time::Instant::now();
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         // Also collect pending-write spans in the same single pass when behind flights.
@@ -6450,6 +7035,7 @@ impl Host {
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
         }
+        part = prep_part(0, part);
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -6458,8 +7044,10 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
+        part = prep_part(1, part);
         batch.flush();
         crate::watch::ask_once_end();
+        part = prep_part(2, part);
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
@@ -6481,10 +7069,12 @@ impl Host {
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
         }
+        part = prep_part(3, part);
         let card = self.card_before(&back, flown, *submitted);
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
+        prep_part(4, part);
         let prepared = std::time::Instant::now();
         if late {
             *submitted += 1;
@@ -6494,6 +7084,7 @@ impl Host {
                 self.queue.Signal(&self.fence, *submitted)
             };
             self.card_sent();
+            prep_part(5, prepared);
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
@@ -6614,12 +7205,17 @@ impl Host {
         // submission, however many dispatches declared it (the world's
         // passes declare the same big ranges dozens of times).
         let copying = std::time::Instant::now();
+        // Every earlier flight already settled before this synchronous
+        // submission ran: tag `LANDING` with `this_submission` so kept fills
+        // from earlier frames are not falsely blamed on this submission.
+        fill_ahead::landing(this_submission);
         // For copies in the card's memory the compare has run there: the
         // pieces that differ are fetched and merged.
         if let Some(card) = &card {
             self.card_back(card, &mut submitted, &mut std::collections::HashSet::new());
         }
         hand_back(&back);
+        fill_ahead::landing(0);
         if let Some(card) = card {
             self.card_done(card);
         }
@@ -6670,6 +7266,23 @@ impl Host {
         };
         let mut text = String::new();
         let mut fault_va = None;
+        // The runtime can classify a removal even when it supplies no fault
+        // address. Older runtimes still have the DRED1 report below.
+        match dred.cast::<ID3D12DeviceRemovedExtendedData2>() {
+            Ok(dred2) => {
+                // SAFETY: a query on the live DRED interface.
+                let state = unsafe { dred2.GetDeviceState() };
+                let name = match state {
+                    D3D12_DRED_DEVICE_STATE_HUNG => "hung",
+                    D3D12_DRED_DEVICE_STATE_FAULT => "fault",
+                    D3D12_DRED_DEVICE_STATE_PAGEFAULT => "page fault",
+                    D3D12_DRED_DEVICE_STATE_UNKNOWN => "unknown",
+                    _ => "unrecognized",
+                };
+                text.push_str(&format!("; DRED device state {name} ({})", state.0));
+            }
+            Err(e) => text.push_str(&format!("; DRED device state unavailable ({:#010X})", e.code().0)),
+        }
         // SAFETY: the outputs are the runtime's, valid while the device
         // lives; nodes are walked as linked, histories have their counts.
         unsafe {
@@ -10469,8 +11082,11 @@ void main() {
             eprintln!("queue2_tests: skipped, the host device is not the software adapter (VICTORY_D3D12_WARP=1, diagnostics)");
             return;
         }
-        if !relay() || !crate::queue2::second().is_some_and(|s| s.fetches()) {
-            eprintln!("queue2_tests: skipped, fetches do not go to a copy queue beside the relay (VICTORY_RELAY=1 VICTORY_QUEUE2=1)");
+        if !relay() || !crate::queue2::second().is_some_and(|s| s.fetches()) || inflight_fetch() {
+            eprintln!(
+                "queue2_tests: skipped, fetches do not read live card copies on a copy queue beside the relay \
+                 (needs VICTORY_RELAY=1/2 VICTORY_QUEUE2=1/3 without VICTORY_CARD_FETCH_INFLIGHT=2)"
+            );
             return;
         }
         const PIECE: usize = 64 << 10;
