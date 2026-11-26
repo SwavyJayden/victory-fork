@@ -2896,7 +2896,12 @@ impl HostHeap {
             if let Some(texture) = waiting {
                 super::wait_for(texture, handle);
             }
-            let later = !for_draw && (view.is_buffer() || waiting.is_some());
+            // Placed texture UAVs are mirrored eagerly so both table-bound and
+            // bindless (`ResourceDescriptorHeap[idx]`) compute writes hit a
+            // real host UAV texture instead of dropping into a null UAV.
+            let placed_uav_texture = matches!(view, View::Placed(true, resource, _) if resource[0] != 1)
+                && crate::resource::placed_texture_uav_enabled();
+            let later = !for_draw && !placed_uav_texture && (view.is_buffer() || waiting.is_some());
             // Another view of the placed texture the slot shows already (a
             // title that streams a texture in writes its view again with
             // more mips each time some arrive): the slot goes on showing
@@ -3861,6 +3866,16 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;
             }
+            if let Some(d) = &desc
+                && !uav_view_fits(texture, d)
+            {
+                once!(
+                    dimension = d.ViewDimension.0,
+                    format = d.Format.0,
+                    "unordered texture view does not fit its host texture"
+                );
+                return None;
+            }
             // SAFETY: a live texture and a slot of our heap.
             unsafe {
                 device.CreateUnorderedAccessView(
@@ -3895,9 +3910,8 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
-                // shortcut: unordered access to a texture the title placed
-                // itself is not mirrored; give it a resource as shader
-                // views of such textures get when a dispatch writes one.
+                // Disabled (`VICTORY_PLACED_TEXTURE_UAV=0`) or a placed texture
+                // shape/format PC D3D12 cannot mirror as a UAV.
                 once!(dimension = resource[0], "placed unordered texture view not mirrored");
                 return None;
             }
@@ -3943,19 +3957,111 @@ fn same_placed_texture(a: &View, b: &View) -> bool {
     }
 }
 
-/// A shader view of a texture the title placed in memory itself, as a view
-/// of the resource made for that memory (on first use).
+/// Whether `desc`'s view dimension, mip, slice, and plane indices fit within
+/// `texture` so `CreateUnorderedAccessView` cannot trigger D3D12 validation
+/// errors or device removal.
+fn uav_view_fits(texture: &ID3D12Resource, desc: &D3D12_UNORDERED_ACCESS_VIEW_DESC) -> bool {
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    let mips = u32::from(d.MipLevels.max(1));
+    let slices = u32::from(d.DepthOrArraySize.max(1));
+    match (d.Dimension, desc.ViewDimension) {
+        (D3D12_RESOURCE_DIMENSION_TEXTURE1D, D3D12_UAV_DIMENSION_TEXTURE1D) => {
+            // SAFETY: union member matches `ViewDimension`.
+            unsafe { desc.Anonymous.Texture1D.MipSlice < mips }
+        }
+        (D3D12_RESOURCE_DIMENSION_TEXTURE1D, D3D12_UAV_DIMENSION_TEXTURE1DARRAY) => {
+            // SAFETY: union member matches `ViewDimension`.
+            let v = unsafe { desc.Anonymous.Texture1DArray };
+            v.MipSlice < mips
+                && v.FirstArraySlice < slices
+                && (v.ArraySize == u32::MAX
+                    || (v.ArraySize > 0
+                        && v.FirstArraySlice.saturating_add(v.ArraySize) <= slices))
+        }
+        (D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_UAV_DIMENSION_TEXTURE2D) => {
+            // SAFETY: union member matches `ViewDimension`.
+            let v = unsafe { desc.Anonymous.Texture2D };
+            v.MipSlice < mips && v.PlaneSlice == 0
+        }
+        (D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_UAV_DIMENSION_TEXTURE2DARRAY) => {
+            // SAFETY: union member matches `ViewDimension`.
+            let v = unsafe { desc.Anonymous.Texture2DArray };
+            v.MipSlice < mips
+                && v.PlaneSlice == 0
+                && v.FirstArraySlice < slices
+                && (v.ArraySize == u32::MAX
+                    || (v.ArraySize > 0
+                        && v.FirstArraySlice.saturating_add(v.ArraySize) <= slices))
+        }
+        (D3D12_RESOURCE_DIMENSION_TEXTURE3D, D3D12_UAV_DIMENSION_TEXTURE3D) => {
+            // SAFETY: union member matches `ViewDimension`.
+            let v = unsafe { desc.Anonymous.Texture3D };
+            if v.MipSlice >= mips {
+                return false;
+            }
+            let depth = slices.checked_shr(v.MipSlice).unwrap_or(0).max(1);
+            v.FirstWSlice < depth
+                && (v.WSize == u32::MAX
+                    || (v.WSize > 0 && v.FirstWSlice.saturating_add(v.WSize) <= depth))
+        }
+        _ => false,
+    }
+}
+
+/// Extracts the 10-word `D3D12_UNORDERED_ACCESS_VIEW_DESC` from a placed UAV
+/// view description, filling in a default format or dimension from `resource`
+/// when the title leaves them zeroed.
+fn placed_uav_view_words(resource: &[u32; 14], desc: &[u32; 16]) -> [u32; 10] {
+    let mut words: [u32; 10] = desc[..10].try_into().unwrap_or([0; 10]);
+    if words[0] == 0 && resource[8] != 0 {
+        words[0] = resource[8];
+    }
+    if words[1] == 0 {
+        let slices = resource[7] & 0xffff;
+        match resource[0] {
+            2 if slices > 1 => {
+                words[1] = D3D12_UAV_DIMENSION_TEXTURE1DARRAY.0 as u32;
+                words[4] = slices;
+            }
+            2 => {
+                words[1] = D3D12_UAV_DIMENSION_TEXTURE1D.0 as u32;
+            }
+            3 if slices > 1 => {
+                words[1] = D3D12_UAV_DIMENSION_TEXTURE2DARRAY.0 as u32;
+                words[4] = slices;
+            }
+            3 => {
+                words[1] = D3D12_UAV_DIMENSION_TEXTURE2D.0 as u32;
+            }
+            4 => {
+                words[1] = D3D12_UAV_DIMENSION_TEXTURE3D.0 as u32;
+                words[4] = u32::MAX;
+            }
+            _ => {}
+        }
+    }
+    words
+}
+
+/// A shader or unordered access view of a texture the title placed in memory
+/// itself, as a view of the resource made for that memory (on first use).
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
     const BUFFER: u32 = 1;
-    let View::Placed(false, resource, desc) = view else {
-        return None;
-    };
-    if resource[0] == BUFFER {
-        return None;
+    match view {
+        View::Placed(false, resource, desc) if resource[0] != BUFFER => {
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            let texture = crate::resource::texture_at(address, resource)?;
+            Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+        }
+        View::Placed(true, resource, desc) if resource[0] != BUFFER => {
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            let texture = crate::resource::unordered_texture_at(address, resource)?;
+            let words = placed_uav_view_words(resource, desc);
+            Some(View::Unordered(texture as usize, 0, Some(words)))
+        }
+        _ => None,
     }
-    let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-    let texture = crate::resource::texture_at(address, resource)?;
-    Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
 }
 
 fn null_skip_from(val: Option<&std::ffi::OsStr>) -> bool {
@@ -5173,6 +5279,133 @@ mod record_key_tests {
             had
         };
         assert!(left, "empty heap must not drain global REMAPPED ranges");
+    }
+
+    #[test]
+    fn placed_2d_and_3d_texture_uavs_mirror_and_reject_unsupported_cleanly() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 16) else {
+            return;
+        };
+        let make_res = |dim: u32, w: u32, h: u32, depth: u16, mips: u16, fmt: u32| -> [u32; 14] {
+            [
+                dim,
+                0,
+                0,
+                0,
+                w,
+                0,
+                h,
+                u32::from(depth) | (u32::from(mips) << 16),
+                fmt,
+                1,
+                0,
+                0,
+                0,
+                0,
+            ]
+        };
+        let make_uav_desc = |fmt: u32, view_dim: u32, w2: u32, w3: u32, w4: u32, addr: u64| -> [u32; 16] {
+            let mut d = [0u32; 16];
+            d[0] = fmt;
+            d[1] = view_dim;
+            d[2] = w2;
+            d[3] = w3;
+            d[4] = w4;
+            d[10] = addr as u32;
+            d[11] = (addr >> 32) as u32;
+            d
+        };
+
+        let mut backing2d = vec![0u8; 64 << 10];
+        let va2d = backing2d.as_mut_ptr() as u64;
+        let res2d = make_res(3, 16, 16, 1, 1, 3); // TEXTURE2D 16x16 R32G32B32A32_UINT
+        let uav2d = make_uav_desc(3, 4, 0, 0, 0, va2d); // D3D12_UAV_DIMENSION_TEXTURE2D = 4
+        let view2d = View::Placed(true, res2d, uav2d);
+        let kept2d = make(&view2d, heap.cpu(0));
+        assert!(matches!(kept2d, Some(Some(_))), "2D placed UAV must mirror to real host UAV");
+        let Some(View::Unordered(tex2d_ptr, 0, Some(_))) = placed_texture(&view2d) else {
+            panic!("placed_texture must unwrap placed 2D UAV");
+        };
+
+        // Placed BC7 SRV (64x64) at the same VA must alias the mirrored placed UAV.
+        let bc7_res = make_res(3, 64, 64, 1, 1, 98);
+        let bc7_srv_tex = crate::resource::texture_at(va2d, &bc7_res).expect("placed BC7 SRV");
+        assert_eq!(
+            crate::resource::alias_of(bc7_srv_tex),
+            Some(tex2d_ptr as crate::object::This),
+            "placed 64x64 BC7 SRV must alias placed 16x16 R32G32B32A32_UINT UAV"
+        );
+
+        // Eager mirroring via HostHeap::mirror(..., for_draw = false) must NOT queue
+        // placed UAVs into CPU-streamed heap_textures or Spans.
+        let mut slots = [0u64; 16];
+        let slot_at = slots.as_mut_ptr() as u64;
+        super::super::create_placed_uav(std::ptr::null(), &res2d, &uav2d, slot_at);
+        assert!(heap.mirror(3, slot_at, false).is_some());
+        assert!(heap.made(3), "placed texture UAV must mirror eagerly");
+        assert_eq!(heap.queued_texture_count(), 0, "placed UAV must not queue into heap_textures");
+        assert!(!heap.has_placed_spans(), "placed UAV must not enter CPU-streamed Spans");
+
+        // 3D placed UAV texture (dimension = 4, UAV dim = 8 TEXTURE3D, WSize = u32::MAX).
+        let mut backing3d = vec![0u8; 64 << 10];
+        let va3d = backing3d.as_mut_ptr() as u64;
+        let res3d = make_res(4, 8, 8, 4, 1, 28); // TEXTURE3D 8x8x4 R8G8B8A8_UNORM
+        let uav3d = make_uav_desc(28, 8, 0, 0, u32::MAX, va3d);
+        let view3d = View::Placed(true, res3d, uav3d);
+        assert!(matches!(make(&view3d, heap.cpu(1)), Some(Some(_))), "3D placed UAV must mirror");
+        let Some(View::Unordered(tex3d_ptr, 0, Some(_))) = placed_texture(&view3d) else {
+            panic!("placed_texture must unwrap placed 3D UAV");
+        };
+
+        // sRGB placed UAV texture (format = 29, promoted to typeless + linear UAV view).
+        let mut backing_srgb = vec![0u8; 64 << 10];
+        let va_srgb = backing_srgb.as_mut_ptr() as u64;
+        let res_srgb = make_res(3, 16, 16, 1, 1, 29);
+        let uav_srgb = make_uav_desc(29, 4, 0, 0, 0, va_srgb);
+        let view_srgb = View::Placed(true, res_srgb, uav_srgb);
+        assert!(
+            matches!(make(&view_srgb, heap.cpu(2)), Some(Some(_))),
+            "sRGB placed UAV must mirror cleanly"
+        );
+        let Some(View::Unordered(tex_srgb_ptr, 0, Some(_))) = placed_texture(&view_srgb) else {
+            panic!("placed_texture must unwrap sRGB placed UAV");
+        };
+
+        // Out-of-bounds mip slice on the valid 1-mip texture must fail cleanly (None).
+        let bad_mip = View::Placed(true, res2d, make_uav_desc(3, 4, 5, 0, 0, va2d));
+        assert!(make(&bad_mip, heap.cpu(4)).is_none());
+
+        // Unsupported / BC / depth placed UAVs must return None without device removal.
+        for (slot, bad_fmt) in [(5u32, 98u32), (6, 40), (7, 45)] {
+            let bad_res = make_res(3, 16, 16, 1, 1, bad_fmt);
+            let bad_uav = make_uav_desc(bad_fmt, 4, 0, 0, 0, va_srgb + 0x1000);
+            let bad_view = View::Placed(true, bad_res, bad_uav);
+            assert!(
+                make(&bad_view, heap.cpu(slot)).is_none(),
+                "unsupported placed UAV format {bad_fmt} must return None"
+            );
+        }
+
+        if let Some(err) = host.log_messages() {
+            panic!("D3D12 debug layer error (placed UAV descriptors): {err}");
+        }
+        // SAFETY: plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+
+        // Release test-created placed UAV resources cleanly via COM vtable Release.
+        // SAFETY: valid COM resource pointers returned by `unordered_texture_at`.
+        unsafe {
+            type Release = unsafe extern "system" fn(crate::object::This) -> u32;
+            for ptr in [tex_srgb_ptr, tex3d_ptr, tex2d_ptr] {
+                let this = ptr as crate::object::This;
+                let vtbl = *(this as *const *const [*const (); 3]);
+                let release: Release = std::mem::transmute((*vtbl)[2]);
+                release(this);
+            }
+        }
     }
 }
 
