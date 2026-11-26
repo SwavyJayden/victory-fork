@@ -7185,14 +7185,16 @@ impl Host {
         }
         part = prep_part(0, part);
         let detile_batch = crate::gpu_detile::BatchGuard::begin();
+        let mut pending_fills = Vec::new();
         for list in runs {
-            list.run_deferred(&mut batch);
+            list.run_deferred_into(&mut batch, &mut pending_fills);
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
         }
+        flush_fills(&mut pending_fills);
         part = prep_part(1, part);
         batch.flush();
         crate::watch::ask_once_end();
@@ -8833,17 +8835,48 @@ impl HostList {
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges).
+    #[cfg(test)]
     fn run_deferred(&self, batch: &mut Batch) {
+        let mut pending_fills = Vec::new();
+        self.run_deferred_into(batch, &mut pending_fills);
+        flush_fills(&mut pending_fills);
+    }
+
+    /// Runs the list's submission-time steps, collecting `Step::Fill` copies
+    /// into `pending_fills` across side-effect-free steps (`Step::Refresh`,
+    /// `Step::GpuWrite`) and flushing them before any barrier step
+    /// (`Step::Copy`, `Step::Run`, `Step::Host`, `Step::Texture`).
+    ///
+    /// Callers must call [`flush_fills`] after the last list to execute any
+    /// trailing fills.
+    fn run_deferred_into(&self, batch: &mut Batch, pending_fills: &mut Vec<(usize, usize, usize)>) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
-        for step in &self.deferred().copies {
-            let started = std::time::Instant::now();
-            let copied = match step {
+        let deferred = self.deferred();
+        if deferred.copies.is_empty() {
+            return;
+        }
+        // Time `Step::Copy` work once per list rather than per step to avoid
+        // thousands of `QueryPerformanceCounter` + atomic RMW calls per frame.
+        // `Step::Fill` batches are timed once per batch inside `flush_fills`.
+        let mut copy_started: Option<std::time::Instant> = None;
+        let mut copy_before_us = 0u64;
+        let mut copy_bytes = 0usize;
+        #[cfg(feature = "diagnostics")]
+        let mut copy_count = 0u64;
+        let mut excluded_us = 0u64;
+
+        for step in &deferred.copies {
+            match step {
                 &Step::Copy(dst, src, len) => {
+                    flush_fills(pending_fills);
+                    if copy_started.is_none() {
+                        copy_before_us = PREPARING[0].load(Ordering::Relaxed);
+                        copy_started = Some(std::time::Instant::now());
+                    }
                     #[cfg(feature = "diagnostics")]
                     {
-                        add(C::Copies, 1);
-                        add(C::CopyBytes, len as u64);
+                        copy_count += 1;
                     }
                     batch.title_wrote(dst, len);
                     #[cfg(feature = "diagnostics")]
@@ -8851,17 +8884,13 @@ impl HostList {
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
-                    len
+                    copy_bytes += len;
                 }
                 &Step::Fill(dst, src, len) => {
-                    #[cfg(feature = "diagnostics")]
-                    {
-                        add(C::Copies, 1);
-                        add(C::CopyBytes, len as u64);
-                        fill_check::runs(src, len);
-                    }
-                    copy_mapped(dst as *mut u8, src as *const u8, len, false);
-                    len
+                    // Reads title memory and writes host upload memory only:
+                    // commutes with `Step::Refresh` and `Step::GpuWrite`, and is
+                    // flushed before any barrier step or submission handoff.
+                    pending_fills.push((dst, src, len));
                 }
                 Step::Refresh(shadow, address, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -8870,34 +8899,42 @@ impl HostList {
                         add(C::RefreshBytes, *len as u64);
                     }
                     batch.add(shadow, *address, *len);
-                    continue;
                 }
                 Step::Run(work) | Step::Host(work) => {
+                    flush_fills(pending_fills);
+                    #[cfg(feature = "diagnostics")]
+                    let run_started = std::time::Instant::now();
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
                     }
+                    let excl_started = copy_started.is_some().then(std::time::Instant::now);
                     work();
                     // It wrote title memory, where is not known here: the
                     // submission's one asking ends, later refreshes ask anew.
                     if matches!(step, Step::Run(_)) {
                         crate::watch::ask_once_end();
                     }
+                    if let Some(excl) = excl_started {
+                        excluded_us += excl.elapsed().as_micros() as u64;
+                    }
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Runs, 1);
-                        add(C::RunUs, started.elapsed().as_micros() as u64);
+                        add(C::RunUs, run_started.elapsed().as_micros() as u64);
                     }
-                    continue;
                 }
                 Step::GpuWrite(shadow, address, len) => {
                     // The shaders start from the title's data: this copy's
                     // pending refresh first. The other copies' wait for
                     // the next flush of all (flushing all of them at every
                     // range a dispatch writes made thousands of write-watch
-                    // askings a frame).
+                    // askings a frame). Neither `flush_one` nor `writing`
+                    // mutates title memory or list upload buffers, so collected
+                    // `Step::Fill`s remain valid across it.
                     batch.flush_one(shadow);
                     #[cfg(feature = "diagnostics")]
                     let snapshot = std::time::Instant::now();
+                    let excl_started = copy_started.is_some().then(std::time::Instant::now);
                     if shadow.writing(*address, *len) {
                         batch.note_gpu_write(shadow, *address, *len);
                         #[cfg(feature = "diagnostics")]
@@ -8906,23 +8943,258 @@ impl HostList {
                             add(C::SnapshotUs, snapshot.elapsed().as_micros() as u64);
                         }
                     }
-                    continue;
+                    if let Some(excl) = excl_started {
+                        excluded_us += excl.elapsed().as_micros() as u64;
+                    }
                 }
                 Step::Texture { staging, upload_hold } => {
+                    flush_fills(pending_fills);
                     if upload_hold.is_some() {
                         staging.note_upload();
                         batch.uploaded.push(staging.clone());
                     }
                     if batch.texture_due(staging) {
+                        let excl_started = copy_started.is_some().then(std::time::Instant::now);
                         staging.refresh();
+                        if let Some(excl) = excl_started {
+                            excluded_us += excl.elapsed().as_micros() as u64;
+                        }
                     }
-                    continue;
                 }
-            };
-            preparing(0, started.elapsed().as_micros() as u64);
-            preparing(1, copied as u64);
+            }
+        }
+
+        if let Some(started) = copy_started {
+            #[cfg(feature = "diagnostics")]
+            {
+                add(C::Copies, copy_count);
+                add(C::CopyBytes, copy_bytes as u64);
+            }
+            let nested_us = PREPARING[0].load(Ordering::Relaxed).saturating_sub(copy_before_us);
+            let net_us = (started.elapsed().as_micros() as u64)
+                .saturating_sub(nested_us)
+                .saturating_sub(excluded_us);
+            preparing(0, net_us);
+            preparing(1, copy_bytes as u64);
         }
     }
+}
+
+/// Minimum fill count and total bytes to dispatch a disjoint `Step::Fill` batch
+/// across worker threads.
+const WIDE_FILL_MIN_COUNT: usize = 8;
+const WIDE_FILL_MIN_BYTES: usize = 128 << 10;
+/// Single (or very few) fills whose total size reaches this threshold also
+/// split across workers to saturate memory bandwidth.
+const WIDE_FILL_SINGLE_BYTES: usize = 1 << 20;
+/// Minimum piece size (bytes) when splitting an oversized `Step::Fill` across
+/// worker chunks, matching `copy_mapped`'s `read_sparse` threshold.
+const FILL_SPLIT_MIN: usize = 64 << 10;
+/// Alignment (bytes) for split offsets inside an oversized `Step::Fill`.
+const FILL_SPLIT_ALIGN: usize = 4 << 10;
+
+/// Whether batches of disjoint `Step::Fill` copies run across worker threads
+/// (on by default; `VICTORY_WIDE_FILL=0` turns it off).
+fn wide_fill() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_FILL").is_none_or(|v| v != "0"))
+}
+
+/// Target worker chunk count for parallel `Step::Fill` batches, matching
+/// `crate::shadow::wide_run`'s worker pool plus the submitting thread (3..=6).
+fn wide_fill_chunks() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        (std::thread::available_parallelism()
+            .map_or(4, |n| n.get() / 4)
+            .clamp(2, 6)
+            + 1)
+        .min(6)
+    })
+}
+
+/// Returns whether all non-empty destination intervals `[dst, dst + len)` in
+/// `fills` (`(dst, src, len)`) are pairwise disjoint without address overflow.
+///
+/// Uses an O(N) zero-allocation fast path for monotonically non-overlapping
+/// bump-allocated upload rings, falling back to a sorted interval check when
+/// destinations arrive out of order (for example across multiple upload chunks
+/// or command lists).
+fn fills_disjoint(fills: &[(usize, usize, usize)]) -> bool {
+    let mut prev_end = 0usize;
+    let mut monotonic = true;
+    let mut non_empty = 0usize;
+    for &(dst, _, len) in fills {
+        if len == 0 {
+            continue;
+        }
+        let Some(end) = dst.checked_add(len) else {
+            return false;
+        };
+        non_empty += 1;
+        if dst < prev_end {
+            monotonic = false;
+            break;
+        }
+        prev_end = end;
+    }
+    if monotonic || non_empty <= 1 {
+        return true;
+    }
+    let mut intervals: Vec<(usize, usize)> = Vec::with_capacity(fills.len());
+    for &(dst, _, len) in fills {
+        if len == 0 {
+            continue;
+        }
+        let Some(end) = dst.checked_add(len) else {
+            return false;
+        };
+        intervals.push((dst, end));
+    }
+    intervals.sort_unstable_by_key(|&(start, _)| start);
+    intervals.windows(2).all(|w| w[0].1 <= w[1].0)
+}
+
+/// Partitions `fills` (`(dst, src, len)`) into at most `max_chunks` non-empty
+/// byte-balanced chunks, preserving sequential order for upload write-combining
+/// locality and splitting oversized single fills at 4 KiB boundaries (with
+/// pieces >= 64 KiB) so one multi-MiB fill and hundreds of tiny fills balance
+/// evenly across worker threads.
+fn partition_fills_by_bytes(
+    fills: &[(usize, usize, usize)],
+    max_chunks: usize,
+) -> Vec<Vec<(usize, usize, usize)>> {
+    let max_chunks = max_chunks.max(1);
+    let total_bytes: usize = fills.iter().map(|&(_, _, len)| len).sum();
+    if total_bytes == 0 || max_chunks == 1 {
+        let non_empty: Vec<_> = fills.iter().copied().filter(|&(_, _, len)| len > 0).collect();
+        return if non_empty.is_empty() {
+            Vec::new()
+        } else {
+            vec![non_empty]
+        };
+    }
+
+    let mut chunks: Vec<Vec<(usize, usize, usize)>> = Vec::with_capacity(max_chunks);
+    let mut current: Vec<(usize, usize, usize)> = Vec::new();
+    let mut current_bytes = 0usize;
+    let mut remaining_bytes = total_bytes;
+
+    let flush_chunk = |chunks: &mut Vec<Vec<(usize, usize, usize)>>,
+                       current: &mut Vec<(usize, usize, usize)>,
+                       current_bytes: &mut usize| {
+        if !current.is_empty() {
+            chunks.push(std::mem::take(current));
+            *current_bytes = 0;
+        }
+    };
+
+    for &(mut dst, mut src, mut len) in fills {
+        if len == 0 {
+            continue;
+        }
+        while len > 0 {
+            let chunks_left = max_chunks - chunks.len();
+            if chunks_left <= 1 {
+                current.push((dst, src, len));
+                current_bytes += len;
+                remaining_bytes -= len;
+                break;
+            }
+            let goal = (current_bytes + remaining_bytes).div_ceil(chunks_left).max(1);
+            let room = goal.saturating_sub(current_bytes);
+
+            let min_add = if len >= 2 * FILL_SPLIT_MIN {
+                FILL_SPLIT_MIN
+            } else {
+                len
+            };
+            if !current.is_empty() && min_add > room {
+                let overshoot = min_add - room;
+                if overshoot > room && current_bytes >= room {
+                    flush_chunk(&mut chunks, &mut current, &mut current_bytes);
+                    continue;
+                }
+            }
+
+            if len > room && len >= 2 * FILL_SPLIT_MIN {
+                let desired = room.max(FILL_SPLIT_MIN);
+                let take = (desired & !(FILL_SPLIT_ALIGN - 1)).max(FILL_SPLIT_MIN);
+                if len > take && len - take >= FILL_SPLIT_MIN {
+                    current.push((dst, src, take));
+                    current_bytes += take;
+                    remaining_bytes -= take;
+                    dst += take;
+                    src += take;
+                    len -= take;
+                    flush_chunk(&mut chunks, &mut current, &mut current_bytes);
+                    continue;
+                }
+            }
+
+            current.push((dst, src, len));
+            current_bytes += len;
+            remaining_bytes -= len;
+            len = 0;
+            if current_bytes >= goal {
+                flush_chunk(&mut chunks, &mut current, &mut current_bytes);
+            }
+        }
+    }
+    flush_chunk(&mut chunks, &mut current, &mut current_bytes);
+    chunks
+}
+
+/// Executes all buffered `Step::Fill` copies, dispatching pairwise-disjoint
+/// batches across `crate::shadow::wide_run` in byte-balanced chunks when
+/// [`wide_fill`] is enabled and work exceeds the parallel threshold.
+fn flush_fills(fills: &mut Vec<(usize, usize, usize)>) {
+    if fills.is_empty() {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let total_bytes: usize = fills.iter().map(|&(_, _, len)| len).sum();
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::Copies, fills.len() as u64);
+        add(C::CopyBytes, total_bytes as u64);
+        for &(_, src, len) in fills.iter() {
+            fill_check::runs(src, len);
+        }
+    }
+    let run_wide = wide_fill()
+        && ((fills.len() >= WIDE_FILL_MIN_COUNT && total_bytes >= WIDE_FILL_MIN_BYTES)
+            || total_bytes >= WIDE_FILL_SINGLE_BYTES)
+        && fills_disjoint(fills);
+    if run_wide {
+        let max_chunks = wide_fill_chunks().min((total_bytes / (32 << 10)).max(1));
+        let chunks = partition_fills_by_bytes(fills, max_chunks);
+        if chunks.len() >= 2 {
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = chunks
+                .into_iter()
+                .map(|chunk| {
+                    Box::new(move || {
+                        for (dst, src, len) in chunk {
+                            copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                        }
+                    }) as Box<dyn FnOnce() + Send>
+                })
+                .collect();
+            crate::shadow::wide_run(jobs);
+        } else {
+            for &(dst, src, len) in fills.iter() {
+                copy_mapped(dst as *mut u8, src as *const u8, len, false);
+            }
+        }
+    } else {
+        for &(dst, src, len) in fills.iter() {
+            copy_mapped(dst as *mut u8, src as *const u8, len, false);
+        }
+    }
+    preparing(0, started.elapsed().as_micros() as u64);
+    preparing(1, total_bytes as u64);
+    fills.clear();
 }
 
 /// Whether a submission's refreshes of host copies run on several threads,
@@ -8933,13 +9205,23 @@ impl HostList {
 /// for and read through the kernel into the copy. That is the frame line's
 /// "copies", 45-50 ms a frame, and the copies have nothing to do with one
 /// another: each refresh writes its own copy and its own notes, and reads
-/// title memory. With the switch the copies of a flush (four or more) are
-/// spread over the threads kept for the snapshots (`crate::shadow::wide`).
+/// title memory. With the switch the copies of a flush (two or more copies
+/// totalling at least 64 KiB, sorted largest-first for LPT load balancing)
+/// are spread over the threads kept for the snapshots (`crate::shadow::wide`).
 /// The write-watch journal and the guards are behind their own locks, as
 /// they are for the title's threads.
 fn wide_refresh() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_some_and(|v| v == "1"))
+}
+
+/// Minimum combined refresh span bytes for parallel [`Batch::flush`].
+const WIDE_REFRESH_MIN_BYTES: usize = 64 << 10;
+
+/// Returns whether a [`Batch::flush`] with `count` distinct shadows and
+/// `total_bytes` combined span bytes should dispatch across `wide_run`.
+fn should_wide_refresh(wide_on: bool, count: usize, total_bytes: usize) -> bool {
+    wide_on && count >= 2 && total_bytes >= WIDE_REFRESH_MIN_BYTES
 }
 
 /// Whether a range of a host copy brought up to date in a submission is
@@ -9036,6 +9318,13 @@ impl Spans {
             Self::One(range) => std::slice::from_ref(range),
             Self::Many(ranges) => ranges.as_slice(),
         }
+    }
+
+    fn total_bytes(&self) -> usize {
+        self.as_slice()
+            .iter()
+            .map(|&(from, to)| to.saturating_sub(from))
+            .sum()
     }
 }
 
@@ -9250,6 +9539,9 @@ impl Batch {
 
     fn flush(&mut self) {
         self.index.clear();
+        if self.refreshes.is_empty() {
+            return;
+        }
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
         let ahead = self.refreshes.len() > 1
@@ -9268,12 +9560,23 @@ impl Batch {
             crate::watch::ask_ahead(&ranges);
             preparing(0, started.elapsed().as_micros() as u64);
         }
-        if wide_refresh() && self.refreshes.len() >= 4 {
+        let total_span_bytes: usize = self
+            .refreshes
+            .iter()
+            .map(|(_, spans)| spans.total_bytes())
+            .sum();
+        if should_wide_refresh(wide_refresh(), self.refreshes.len(), total_span_bytes) {
             // Each copy on its own, several at a time: a copy's refresh
             // writes that copy and reads title memory, nothing of another's.
+            // Keep per-shadow exclusivity (all disjoint spans of one shadow
+            // stay in one job) and sort largest-first (LPT scheduling) so the
+            // biggest buffer starts immediately on the first worker while
+            // smaller copies backfill remaining cores.
             // The time counted is the time it took, not the threads' sum.
             let started = std::time::Instant::now();
             let before = PREPARING[0].load(Ordering::Relaxed);
+            self.refreshes
+                .sort_unstable_by_key(|(_, spans)| std::cmp::Reverse(spans.total_bytes()));
             // Noted now: nothing reads the notes before the jobs are done.
             for (shadow, spans) in &self.refreshes {
                 for &(from, to) in spans.as_slice() {
@@ -11334,6 +11637,258 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         crate::shadow::unregister(start, start as u64);
         assert_ne!(unsafe { VirtualFree(start as _, 0, MEM_RELEASE) }, 0);
         crate::title_hints::clear_gpu_readonly_ranges();
+    }
+
+    #[test]
+    fn fills_disjoint_accepts_disjoint_and_rejects_overlaps() {
+        use super::fills_disjoint;
+
+        assert!(fills_disjoint(&[]));
+        assert!(fills_disjoint(&[(100, 0, 64)]));
+        // Strictly ascending and touching half-open intervals.
+        assert!(fills_disjoint(&[(100, 1, 64), (164, 2, 64), (300, 3, 128)]));
+        // Zero-length fills never write memory and do not conflict.
+        assert!(fills_disjoint(&[(100, 1, 200), (150, 2, 0), (300, 3, 64)]));
+        // Unsorted disjoint intervals (e.g. multiple upload chunks or lists).
+        assert!(fills_disjoint(&[
+            (2000, 10, 256),
+            (100, 20, 256),
+            (800, 30, 512),
+            (356, 40, 444),
+        ]));
+
+        // Rejects ascending overlap, unsorted overlap, identical destination,
+        // containment, and address overflow.
+        assert!(!fills_disjoint(&[(100, 1, 64), (163, 2, 64)]));
+        assert!(!fills_disjoint(&[(200, 1, 64), (150, 2, 64)]));
+        assert!(!fills_disjoint(&[(100, 1, 64), (100, 2, 64)]));
+        assert!(!fills_disjoint(&[(100, 1, 200), (120, 2, 16)]));
+        assert!(!fills_disjoint(&[(120, 1, 16), (100, 2, 200)]));
+        assert!(!fills_disjoint(&[(usize::MAX - 8, 1, 16)]));
+    }
+
+    #[test]
+    fn partition_fills_by_bytes_balances_giant_and_tiny_fills() {
+        use super::partition_fills_by_bytes;
+
+        assert!(partition_fills_by_bytes(&[], 4).is_empty());
+        assert!(partition_fills_by_bytes(&[(100, 200, 0), (300, 400, 0)], 4).is_empty());
+
+        let coalesce = |items: &[(usize, usize, usize)]| -> Vec<(usize, usize, usize)> {
+            let mut merged: Vec<(usize, usize, usize)> = Vec::new();
+            for &(dst, src, len) in items {
+                if len == 0 {
+                    continue;
+                }
+                if let Some(last) = merged.last_mut()
+                    && last.0 + last.2 == dst
+                    && last.1 + last.2 == src
+                {
+                    last.2 += len;
+                } else {
+                    merged.push((dst, src, len));
+                }
+            }
+            merged
+        };
+
+        let assert_exact_coverage = |input: &[(usize, usize, usize)], chunks: &[Vec<(usize, usize, usize)>]| {
+            // Reconstruct merged `(dst, src, len)` spans from all chunks and verify
+            // exact byte-for-byte identity with the non-empty input fills.
+            let got: Vec<(usize, usize, usize)> = chunks.iter().flatten().copied().collect();
+            assert!(got.iter().all(|&(_, _, len)| len > 0));
+            assert_eq!(coalesce(&got), coalesce(input));
+        };
+
+        // 1) One 4 MiB fill + 200 tiny 256 B fills in three orderings across 4 and 6 workers.
+        const GIANT: usize = 4 << 20;
+        const TINY_COUNT: usize = 200;
+        const TINY_LEN: usize = 256;
+
+        let build = |giant_pos: usize| {
+            let mut fills = Vec::with_capacity(TINY_COUNT + 1);
+            let mut dst = 0x1000_0000usize;
+            let mut src = 0x2000_0000usize;
+            for i in 0..=TINY_COUNT {
+                let len = if i == giant_pos { GIANT } else { TINY_LEN };
+                fills.push((dst, src, len));
+                dst += len.next_multiple_of(256);
+                src += len + 64; // Distinct src-dst offset per fill so only split pieces coalesce.
+            }
+            fills
+        };
+
+        for giant_pos in [0, TINY_COUNT / 2, TINY_COUNT] {
+            let fills = build(giant_pos);
+            let total: usize = fills.iter().map(|&(_, _, l)| l).sum();
+            for max_chunks in [4usize, 6] {
+                let chunks = partition_fills_by_bytes(&fills, max_chunks);
+                assert_eq!(chunks.len(), max_chunks);
+                assert_exact_coverage(&fills, &chunks);
+                let avg = total / max_chunks;
+                for chunk in &chunks {
+                    let bytes: usize = chunk.iter().map(|&(_, _, l)| l).sum();
+                    assert!(
+                        bytes >= avg * 9 / 10 && bytes <= avg * 11 / 10,
+                        "unbalanced chunk {bytes} vs avg {avg} (giant_pos={giant_pos}, max_chunks={max_chunks})"
+                    );
+                }
+            }
+        }
+
+        // 2) Uniform small fills (16 x 8 KiB) partition cleanly without splitting.
+        let uniform: Vec<_> = (0..16)
+            .map(|i| (0x10000 + i * 8192, 0x80000 + i * 8192, 8192))
+            .collect();
+        let chunks = partition_fills_by_bytes(&uniform, 4);
+        assert_eq!(chunks.len(), 4);
+        assert_exact_coverage(&uniform, &chunks);
+        for chunk in &chunks {
+            let bytes: usize = chunk.iter().map(|&(_, _, l)| l).sum();
+            assert_eq!(bytes, 32768);
+        }
+
+        // 3) Single chunk returns all non-empty fills intact.
+        let single = partition_fills_by_bytes(&uniform, 1);
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0], uniform);
+    }
+
+    #[test]
+    fn should_wide_refresh_threshold_and_spans_total_bytes() {
+        use super::{Spans, WIDE_REFRESH_MIN_BYTES, should_wide_refresh};
+
+        let mut spans = Spans::One((1000, 1000 + 4096));
+        assert_eq!(spans.total_bytes(), 4096);
+        spans.add(100_000, 100_000 + 8192);
+        assert_eq!(spans.total_bytes(), 4096 + 8192);
+
+        assert!(!should_wide_refresh(false, 4, 1 << 20));
+        assert!(!should_wide_refresh(true, 0, 0));
+        assert!(!should_wide_refresh(true, 1, 174 << 20));
+        assert!(!should_wide_refresh(true, 2, WIDE_REFRESH_MIN_BYTES - 1));
+        assert!(should_wide_refresh(true, 2, WIDE_REFRESH_MIN_BYTES));
+        assert!(should_wide_refresh(true, 3, 10 << 20));
+    }
+
+    #[test]
+    fn flush_fills_parallel_disjoint_and_serial_overlap() {
+        use super::flush_fills;
+
+        // Disjoint batch >= 8 fills and >= 128 KiB exercises `wide_run` directly.
+        const PIECE: usize = 16 << 10;
+        const COUNT: usize = 16;
+        let src: Vec<u8> = (0..COUNT * PIECE).map(|i| ((i * 13 + 7) & 0xFF) as u8).collect();
+        let mut dst = vec![0u8; COUNT * PIECE];
+        let mut fills: Vec<(usize, usize, usize)> = (0..COUNT)
+            .map(|i| {
+                // Reverse order to also exercise unsorted disjoint verification.
+                let idx = COUNT - 1 - i;
+                (
+                    dst.as_mut_ptr() as usize + idx * PIECE,
+                    src.as_ptr() as usize + idx * PIECE,
+                    PIECE,
+                )
+            })
+            .collect();
+        flush_fills(&mut fills);
+        assert!(fills.is_empty());
+        assert_eq!(dst, src);
+
+        // Overlapping fills to the same destination must stay strictly serial (last wins).
+        let sources: Vec<Vec<u8>> = (0..16u8).map(|k| vec![0x40 + k; PIECE]).collect();
+        let mut overlap_dst = vec![0u8; PIECE];
+        let mut overlap_fills: Vec<(usize, usize, usize)> = sources
+            .iter()
+            .map(|s| (overlap_dst.as_mut_ptr() as usize, s.as_ptr() as usize, PIECE))
+            .collect();
+        flush_fills(&mut overlap_fills);
+        assert!(overlap_fills.is_empty());
+        assert!(overlap_dst.iter().all(|&b| b == 0x4F));
+    }
+
+    #[test]
+    fn run_deferred_interleaved_fills_refreshes_and_copy_barrier_order() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+
+        let Some(host) = super::host() else {
+            return;
+        };
+
+        const PIECE: usize = 16 << 10;
+        const COUNT: usize = 16;
+        const TOTAL: usize = PIECE * COUNT; // 256 KiB (> 128 KiB wide-fill threshold)
+
+        // SAFETY: private anonymous RW pages freed before returning.
+        let title_src = unsafe {
+            VirtualAlloc(std::ptr::null(), TOTAL, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        } as *mut u8;
+        assert!(!title_src.is_null());
+        // Pre-copy title bytes: 0xAA; post-copy patch bytes: 0x55.
+        // SAFETY: committed allocation of `TOTAL` bytes.
+        unsafe { std::ptr::write_bytes(title_src, 0xAA, TOTAL) };
+        let patch = vec![0x55u8; TOTAL];
+
+        // Register a shadow over `title_src` to verify interleaved `Step::Refresh`
+        // commutes with `Step::Fill` and flushes before `Step::Copy`.
+        crate::shadow::register(title_src as usize, title_src as u64, TOTAL as u64);
+        let shadow = crate::shadow::find(title_src as u64, 1).unwrap();
+        // Overwrite title_src with 0xCC after shadow registration so a refresh must
+        // actually copy `0xCC` before `Step::Copy` overwrites it with `0x55`.
+        // SAFETY: committed allocation of `TOTAL` bytes.
+        unsafe { std::ptr::write_bytes(title_src, 0xCC, TOTAL) };
+
+        let mut pre_dst = vec![0u8; TOTAL];
+        let mut post_dst = vec![0u8; TOTAL];
+
+        let list = host.new_list().unwrap();
+        // Segment 1: 16 fills interleaved with refreshes BEFORE `Step::Copy`.
+        for i in 0..COUNT {
+            // SAFETY: distinct `PIECE`-byte slices inside `pre_dst` and `title_src`.
+            unsafe {
+                list.defer_fill(pre_dst.as_mut_ptr().add(i * PIECE), title_src.add(i * PIECE), PIECE);
+            }
+            list.defer_refresh(&shadow, title_src as usize + i * PIECE, PIECE);
+        }
+        // Barrier: `Step::Copy` overwrites `title_src` with `0x55`.
+        // Must flush Segment 1 fills AND refreshes BEFORE mutating `title_src`.
+        list.defer_copy(title_src, patch.as_ptr(), TOTAL);
+        // Segment 2: 16 fills interleaved with refreshes AFTER `Step::Copy`.
+        for i in 0..COUNT {
+            // SAFETY: distinct `PIECE`-byte slices inside `post_dst` and `title_src`.
+            unsafe {
+                list.defer_fill(post_dst.as_mut_ptr().add(i * PIECE), title_src.add(i * PIECE), PIECE);
+            }
+            list.defer_refresh(&shadow, title_src as usize + i * PIECE, PIECE);
+        }
+
+        let mut batch = Batch::default();
+        list.run_deferred(&mut batch);
+
+        // Segment 1 fills observed pre-copy bytes (`0xCC`).
+        assert!(
+            pre_dst.iter().all(|&b| b == 0xCC),
+            "fills before Step::Copy must observe pre-copy bytes"
+        );
+        // Segment 2 fills observed post-copy bytes (`0x55`).
+        assert!(
+            post_dst.iter().all(|&b| b == 0x55),
+            "fills after Step::Copy must observe post-copy bytes"
+        );
+        // Shadow refresh from Segment 1 flushed before `Step::Copy` -> currently holds `0xCC`;
+        // flushing `batch` applies Segment 2's refresh -> updates to `0x55`.
+        assert_eq!(shadow.byte_at(0), 0xCC);
+        batch.flush();
+        assert_eq!(shadow.byte_at(0), 0x55);
+        assert_eq!(shadow.byte_at(TOTAL - 1), 0x55);
+
+        drop(batch);
+        drop(list);
+        drop(shadow);
+        crate::shadow::unregister(title_src as usize, title_src as u64);
+        assert_ne!(unsafe { VirtualFree(title_src as _, 0, MEM_RELEASE) }, 0);
     }
 }
 
