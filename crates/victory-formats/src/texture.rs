@@ -581,8 +581,37 @@ impl Layout {
         self.mips.get(mip as usize).map_or(0, |m| m.depth)
     }
 
+    /// The bytes from the texture's start that mip `first` and the smaller
+    /// ones take: the smaller a mip, the nearer the start it lies, so a
+    /// title that streams textures has memory for the smaller mips only and
+    /// another texture right behind them. All of the layout where slices
+    /// follow each other (each holds its whole chain).
+    pub fn bytes_from(&self, first: u32) -> u64 {
+        let whole = first == 0
+            || self.slices != 1
+            || self.thick
+            || self.desc.dimension == Dimension::Tex3d
+            || self.desc.samples != 1
+            || first >= self.desc.mips;
+        if whole {
+            return self.size;
+        }
+        self.mips[first as usize..]
+            .iter()
+            .map(|m| match m.tail {
+                Some(_) => self.alignment,
+                None => {
+                    m.offset + u64::from(m.pitch) * u64::from(m.rows) * u64::from(self.desc.element_bytes)
+                }
+            })
+            .max()
+            .unwrap_or(self.size)
+            .min(self.size)
+    }
+
     /// Copies one subresource out of tiled memory (the whole texture,
-    /// [`Layout::size`] bytes) into linear rows: mip `mip` of array slice
+    /// [`Layout::size`] bytes, or the [`Layout::bytes_from`] of the mip)
+    /// into linear rows: mip `mip` of array slice
     /// `slice` (3D: every depth slice of the mip, `slice` 0). Rows are
     /// `row_pitch` bytes apart, depth slices `depth_pitch`.
     pub fn detile(
@@ -650,7 +679,7 @@ impl Layout {
         } else {
             (dst.len(), src.len())
         };
-        if tiled_len < self.size as usize || linear_len < need || row_pitch < bytes {
+        if tiled_len < self.bytes_from(mip) as usize || linear_len < need || row_pitch < bytes {
             return Err(Error::TooSmall);
         }
         let linear = self.desc.swizzle == Swizzle::LINEAR;
@@ -1175,5 +1204,79 @@ mod tests {
             Err(Error::TooSmall)
         );
         assert_eq!(l.offset(0, 64, 0, 0), Err(Error::Invalid));
+    }
+
+    #[test]
+    fn bytes_from_covers_partial_mip_tails_and_detiles_truncated_buffers() {
+        // 512x512 BC7 (128x128 16-byte elements), 10 mips, 4 KiB standard swizzle.
+        let d = Desc {
+            block: 4,
+            ..desc(512, 512, 10, 16, Swizzle::SW_4KB_S)
+        };
+        let l = Layout::new(&d).unwrap();
+        assert_eq!(l.bytes_from(0), l.size);
+        assert_eq!(l.bytes_from(10), l.size);
+        assert_eq!(l.bytes_from(99), l.size);
+
+        // Smaller mips lie closer to offset 0, so bytes_from is monotonically
+        // non-increasing and strictly smaller than full size for first > 0.
+        let mut prev = l.size;
+        for first in 1..d.mips {
+            let b = l.bytes_from(first);
+            assert!(b <= prev, "mip {first}: {b} > {prev}");
+            assert!(b >= l.alignment, "mip {first}: {b} < alignment {}", l.alignment);
+            prev = b;
+        }
+        assert!(l.bytes_from(1) < l.size);
+        // Every mip inside the tail fits in the first alignment block.
+        for tail_mip in l.first_tail_mip..d.mips {
+            assert_eq!(l.bytes_from(tail_mip), l.alignment, "tail mip {tail_mip}");
+        }
+
+        // Full tiled data, then detile every mip >= first from a buffer truncated
+        // to exactly bytes_from(first).
+        let full: Vec<u8> = (0..l.size as usize)
+            .map(|i| (i.wrapping_mul(37) ^ (i >> 8)) as u8)
+            .collect();
+        for first in 1..d.mips {
+            let truncated = &full[..l.bytes_from(first) as usize];
+            for mip in first..d.mips {
+                let m = l.mips[mip as usize];
+                let row_bytes = m.width as usize * d.element_bytes as usize;
+                let pitch = row_bytes.next_multiple_of(256);
+                let len = pitch * m.height as usize;
+                let mut from_full = vec![0u8; len];
+                let mut from_trunc = vec![0u8; len];
+                l.detile(&full, mip, 0, &mut from_full, pitch, len).unwrap();
+                l.detile(truncated, mip, 0, &mut from_trunc, pitch, len).unwrap();
+                assert_eq!(from_trunc, from_full, "first {first} mip {mip}");
+            }
+            // One byte shorter than bytes_from(first) must be refused for mip `first`.
+            let short = &full[..(l.bytes_from(first) as usize - 1)];
+            let m = l.mips[first as usize];
+            let pitch = (m.width as usize * d.element_bytes as usize).next_multiple_of(256);
+            let mut out = vec![0u8; pitch * m.height as usize];
+            assert_eq!(
+                l.detile(short, first, 0, &mut out, pitch, pitch * m.height as usize),
+                Err(Error::TooSmall)
+            );
+        }
+
+        // Arrays, 3D volumes, and MSAA textures return full size even when first > 0.
+        let array = Layout::new(&Desc { depth: 2, ..d }).unwrap();
+        assert_eq!(array.bytes_from(2), array.size);
+        let volume = Layout::new(&Desc {
+            dimension: Dimension::Tex3d,
+            depth: 16,
+            ..desc(64, 32, 5, 4, Swizzle::SW_4KB_S)
+        })
+        .unwrap();
+        assert_eq!(volume.bytes_from(1), volume.size);
+        let msaa = Layout::new(&Desc {
+            samples: 4,
+            ..desc(64, 64, 1, 4, Swizzle::SW_64KB_D)
+        })
+        .unwrap();
+        assert_eq!(msaa.bytes_from(1), msaa.size);
     }
 }
