@@ -1741,6 +1741,22 @@ impl HostHeap {
         self.strides.as_ref().map(|s| &s.0)
     }
 
+    /// Number of texture slots currently queued in this view heap.
+    pub(crate) fn queued_texture_count(&self) -> usize {
+        if self.sampler {
+            return 0;
+        }
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).slots.len()
+    }
+
+    /// Whether this view heap currently tracks any placed texture address spans.
+    pub(crate) fn has_placed_spans(&self) -> bool {
+        if self.sampler {
+            return false;
+        }
+        !self.placed.lock().unwrap_or_else(|e| e.into_inner()).by_start.is_empty()
+    }
+
     /// Up to `max` title slots whose texture view is due at `frame`, each
     /// with its write number, in the order to serve them
     /// ([`TextureQueue::due`]), and the queue's counts
@@ -1849,6 +1865,9 @@ impl HostHeap {
     /// whose pass runs first takes them (a title has one view heap).
     pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
+        if !self.has_placed_spans() {
+            return 0;
+        }
         self.texture_slots_page_written(frame);
         let mut ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
         if ranges.is_empty() {
@@ -2041,7 +2060,7 @@ impl HostHeap {
     /// how many slots it made due.
     /// shortcut: kept in one place for all heaps, as the starts below.
     pub(crate) fn texture_slots_waiting(&self, frame: u64) -> usize {
-        if self.sampler {
+        if self.sampler || !self.has_placed_spans() {
             return 0;
         }
         let starts: Vec<u64> = {
@@ -2087,7 +2106,7 @@ impl HostHeap {
 
     pub(crate) fn texture_views_remade(&self) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
-        if self.sampler {
+        if self.sampler || !self.has_placed_spans() {
             return 0;
         }
         // The slots made again here are live slots of the heap the card
@@ -2986,6 +3005,64 @@ impl HostHeap {
         }
         Some(text)
     }
+}
+
+/// Highest queued-texture count among all live, initialized shader-visible
+/// non-sampler view heaps.
+pub(crate) fn max_queued_textures() -> u64 {
+    let heaps = super::SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let mut most = 0u64;
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps stay alive until `Heap::drop`, which takes
+        // the `SHADER_HEAPS` write lock we hold for reading here.
+        let heap = unsafe { &*(at as *const super::Heap) };
+        if heap.samplers() {
+            continue;
+        }
+        if let Some(Some(host)) = heap.host.get() {
+            most = most.max(host.queued_texture_count() as u64);
+        }
+    }
+    most
+}
+
+/// Visits every live, initialized shader-visible non-sampler view heap that
+/// has queued textures or tracked placed texture spans, ordered by queued
+/// texture count descending (so a large world view heap drains ahead of any
+/// smaller UI view heap). Holds `super::SHADER_HEAPS` read-locked across the
+/// callback so `Heap::drop` cannot free a visited heap concurrently.
+///
+/// Never initializes an uncreated `HostHeap`, avoiding premature memory commit
+/// during early boot.
+pub(crate) fn for_each_waiting_view_heap(
+    mut f: impl FnMut(&super::Heap, &HostHeap, usize),
+) -> usize {
+    let heaps = super::SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let mut ready: Vec<(usize, usize)> = Vec::new();
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps stay alive until `Heap::drop`, which takes
+        // the `SHADER_HEAPS` write lock we hold for reading here.
+        let heap = unsafe { &*(at as *const super::Heap) };
+        if heap.samplers() {
+            continue;
+        }
+        let Some(Some(host)) = heap.host.get() else {
+            continue;
+        };
+        let queued = host.queued_texture_count();
+        if queued > 0 || host.has_placed_spans() {
+            ready.push((queued, at));
+        }
+    }
+    ready.sort_unstable_by_key(|a| std::cmp::Reverse(a.0));
+    for &(_, at) in &ready {
+        // SAFETY: `heaps` read lock is still held; `at` is a live registered `Heap`.
+        let heap = unsafe { &*(at as *const super::Heap) };
+        if let Some(Some(host)) = heap.host.get() {
+            f(heap, host, at);
+        }
+    }
+    ready.len()
 }
 
 /// Logs `what` the first time it happens.
@@ -5073,6 +5150,29 @@ mod record_key_tests {
         // `make_null` writes a 2D null view and clears the tracked buffer null kind.
         heap.make_null(0);
         assert_eq!(heap.nulls[0].load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn empty_view_heap_does_not_steal_global_remap_notifications() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        assert_eq!(heap.queued_texture_count(), 0);
+        assert!(!heap.has_placed_spans());
+        // Seed REMAPPED directly and verify an empty heap leaves it intact for
+        // whichever live view heap actually owns placed texture spans.
+        {
+            let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
+            ranges.push((0x1000_0000, 0x1001_0000));
+        }
+        assert_eq!(heap.texture_slots_remapped(10), 0);
+        let left = {
+            let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
+            let had = ranges.contains(&(0x1000_0000, 0x1001_0000));
+            ranges.retain(|&r| r != (0x1000_0000, 0x1001_0000));
+            had
+        };
+        assert!(left, "empty heap must not drain global REMAPPED ranges");
     }
 }
 
