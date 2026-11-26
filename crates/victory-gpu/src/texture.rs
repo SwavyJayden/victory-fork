@@ -118,6 +118,9 @@ pub(crate) struct Staging {
     mips: u32,
     /// The staging buffer's bytes (counted in `STAGED` while its [`UploadBuf`] lives).
     bytes: u64,
+    /// Made by the pass over textures picked by index, for one upload
+    /// ([`once`]): read when the list is submitted, and never looked at again.
+    once: std::sync::atomic::AtomicBool,
     memory: *const u8,
     last: Mutex<Last>,
     /// Whether the staging buffer was detiled since a submitted list last
@@ -267,7 +270,7 @@ fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resourc
 /// (memory not watched), or the write-watch asking it was detiled after.
 #[derive(Default)]
 struct Last {
-    hash: Option<blake3::Hash>,
+    hash: Option<Digest>,
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
@@ -468,6 +471,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     if !first && before.is_none() {
         return true;
     }
+    crate::resource::note_draw_epoch_bump();
     card_writes(list, placed, to, None);
     crate::list::ensure_state(list, placed, COPY_DEST);
     let part = |texture: &ID3D12Resource, index: usize| D3D12_TEXTURE_COPY_LOCATION {
@@ -955,6 +959,79 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
     unsafe { texture.GetDesc() }.Flags.0 & TARGET_DEPTH_UNORDERED == 0
 }
 
+thread_local! {
+    /// The thread records the upload of a texture picked by index, of which
+    /// that many bytes were found mapped just now (`u64::MAX`: not asked).
+    pub(crate) static PICKING: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether a staging buffer made for one upload of a texture picked by index
+/// is filled without asking the write watch and the guards
+/// (`VICTORY_TEXTURE_ONCE=0`: with, as before). What they say is for the next
+/// refresh, and there is none: the buffer goes with the upload. Asking guards
+/// the texture's blocks (a change of protection, under the lock every other
+/// refresh wants), and the title's next write there faults to open them.
+fn once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| once_from(std::env::var("VICTORY_TEXTURE_ONCE").ok().as_deref()))
+}
+
+fn once_from(value: Option<&str>) -> bool {
+    value.is_none_or(|v| v.trim() != "0")
+}
+
+/// A 128-bit digest of `bytes`, to tell a texture's memory changed: four
+/// lanes of folded multiplications over 64 bytes at a time. (Not a
+/// cryptographic one, which took 0.2 ms a megabyte, four times the detiling
+/// it was to spare; nobody makes up textures to collide.)
+pub(crate) fn digest(bytes: &[u8]) -> Digest {
+    const K: [u64; 8] = [
+        0xa076_1d64_78bd_642f,
+        0xe703_7ed1_a0b4_28db,
+        0x8ebc_6af0_9c88_c6e3,
+        0x5899_65cc_7537_4cc3,
+        0x1d8e_4e27_c47d_124f,
+        0xeb44_acca_b455_d165,
+        0x9e37_79b9_7f4a_7c15,
+        0xc2b2_ae3d_27d4_eb4f,
+    ];
+    let fold = |a: u64, b: u64| {
+        let p = u128::from(a) * u128::from(b);
+        p as u64 ^ (p >> 64) as u64
+    };
+    let word = |b: &[u8]| {
+        let mut w = [0; 8];
+        w[..b.len()].copy_from_slice(b);
+        u64::from_le_bytes(w)
+    };
+    let mut lanes = [K[0], K[1], K[2], K[3]];
+    let mut step = |block: &[u8; 64]| {
+        for (i, lane) in lanes.iter_mut().enumerate() {
+            let a = word(&block[16 * i..16 * i + 8]);
+            let b = word(&block[16 * i + 8..16 * i + 16]);
+            // (What went in is added again: a product with a factor of zero
+            // forgets neither the lane nor the block.)
+            *lane = fold(a ^ K[4 + i], b ^ *lane).wrapping_add(a.rotate_left(23) ^ lane.rotate_left(41)) ^ b;
+        }
+    };
+    let mut blocks = bytes.chunks_exact(64);
+    for block in &mut blocks {
+        step(block.try_into().unwrap_or(&[0; 64]));
+    }
+    let rest = blocks.remainder();
+    let mut last = [0u8; 64];
+    last[..rest.len()].copy_from_slice(rest);
+    step(&last);
+    let len = bytes.len() as u64;
+    let low = fold(lanes[0] ^ K[1], lanes[1] ^ len) ^ fold(lanes[2] ^ K[3], lanes[3] ^ K[5]);
+    let high = fold(lanes[0].rotate_left(32) ^ K[6], lanes[2] ^ len) ^ fold(lanes[1].rotate_left(32) ^ K[7], lanes[3] ^ K[2]);
+    Digest(u128::from(low) << 64 | u128::from(high))
+}
+
+/// See [`digest`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Digest(u128);
+
 /// Records, once per list, the copy of `resource`'s staging buffer into
 /// its host copy, and the detiling that refreshes the staging buffer at
 /// submission if the memory changed. Leaves the texture in the copy
@@ -974,6 +1051,10 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         return;
     };
     use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+    if PICKING.get().is_none() {
+        // A draw samples it through a table: kept and checked from here on.
+        staging.once.store(false, Relaxed);
+    }
     staging.used.store(crate::host::moment(), Relaxed);
     // Levels on demand: a view of the texture now starts at another
     // level, or another texture now starts inside its span, with no byte
@@ -1041,6 +1122,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     crate::copystat::add(crate::copystat::C::TexUploads, 1);
     crate::framelog::add(crate::framelog::T::Uploads, 1);
     const COPY_DEST: u32 = 0x400;
+    crate::resource::note_draw_epoch_bump();
     crate::list::ensure_state(list, resource, COPY_DEST);
     // Keep the upload buffer COM reference alive until the list is reset.
     list.keep(&buf);
@@ -1373,7 +1455,11 @@ impl Staging {
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
-        if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
+        let alone = self.once.load(std::sync::atomic::Ordering::Relaxed);
+        if alone && last.hash.is_some() {
+            return 0;
+        }
+        if !alone && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 ended(ends::UNWRITTEN);
                 return 0;
@@ -1401,7 +1487,8 @@ impl Staging {
         // texture's address, so the textures take turns.
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
+        if !alone
+            && *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
             const HASH_EVERY: u64 = 8;
@@ -1430,63 +1517,10 @@ impl Staging {
             ended(ends::PARTIAL_EARLY);
             return 0;
         }
-        // From here on the texture's memory may be read in place. Held until
-        // that read is done: the runtime changes what title memory shows
-        // only with this taken alone, so what `committed` finds mapped
-        // stays mapped (see `crate::watch::title_memory_reading`; without
-        // it a page went between the asking and the read in runs 71 and
-        // 74).
-        let _mapped = if no_wait() {
-            // Not waited for: while the runtime remaps title memory the
-            // texture is read through the kernel instead, whole or not at
-            // all (`no_wait`).
-            let Some(mapped) = crate::watch::title_memory_reading_now() else {
-                return self.refresh_unlocked(last, size);
-            };
-            mapped
-        } else {
-            wait_for_title_memory()
-        };
-        if !committed(self.memory, size) {
-            // Partly mapped: a streamed texture with only some mips' pages
-            // there, the usual state while it streams in. Read through the
-            // copy, which stands unmapped pages (zeros), and upload what
-            // is there; nothing at all mapped changes nothing.
-            // Re-check every `partial_cooldown()` frames (`VICTORY_PARTIAL_FRAMES`,
-            // default 6) so streamed cutscene mips pop in promptly without
-            // hashing on every frame.
-            let frame = crate::frame::current();
-            if last.partial.is_some_and(|at| frame < at + partial_cooldown()) {
-                ended(ends::PARTIAL_SKIPPED);
-                return 0;
-            }
-            ended(ends::PARTIAL_READ);
-            last.partial = Some(frame);
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-            let changed = with_read(size, |read| {
-                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                let hash = blake3::hash(read);
-                if last.hash == Some(hash) {
-                    return false;
-                }
-                last.hash = Some(hash);
-                if all_zero(read) {
-                    return false;
-                }
-                self.detile(read);
-                true
-            });
-            #[cfg(feature = "diagnostics")]
-            if changed {
-                crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
-            }
-            let _ = changed;
-            return size;
-        }
+        // Kernel copy reads safely without locking against remaps.
         if through_copy() {
             return with_title(self.memory, size, |tiled| {
-                let hash = blake3::hash(tiled);
+                let hash = digest(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if last.hash == Some(hash) {
@@ -1505,10 +1539,65 @@ impl Staging {
                 size
             });
         }
+        // From here on the texture's memory may be read in place. Held until
+        // that read is done: the runtime changes what title memory shows
+        // only with this taken alone, so what `committed` finds mapped
+        // stays mapped (see `crate::watch::title_memory_reading`; without
+        // it a page went between the asking and the read in runs 71 and
+        // 74).
+        let mapped = if no_wait() {
+            // Not waited for: while the runtime remaps title memory the
+            // texture is read through the kernel instead (`no_wait`).
+            let Some(mapped) = crate::watch::title_memory_reading_now() else {
+                return self.refresh_unlocked(last, size);
+            };
+            mapped
+        } else {
+            wait_for_title_memory()
+        };
+        if !committed(self.memory, size) {
+            // Kernel `copy_mapped` safely reads pages without holding the remap lock.
+            drop(mapped);
+            // Partly mapped: a streamed texture with only some mips' pages
+            // there, the usual state while it streams in. Read through the
+            // copy, which stands unmapped pages (zeros), and upload what
+            // is there; nothing at all mapped changes nothing.
+            // Re-check every `partial_cooldown()` frames (`VICTORY_PARTIAL_FRAMES`,
+            // default 6) so streamed cutscene mips pop in promptly without
+            // hashing on every frame.
+            let frame = crate::frame::current();
+            if last.partial.is_some_and(|at| frame < at + partial_cooldown()) {
+                ended(ends::PARTIAL_SKIPPED);
+                return 0;
+            }
+            ended(ends::PARTIAL_READ);
+            last.partial = Some(frame);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+            let changed = with_read(size, |read| {
+                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                let hash = digest(read);
+                if last.hash == Some(hash) {
+                    return false;
+                }
+                last.hash = Some(hash);
+                if all_zero(read) {
+                    return false;
+                }
+                self.detile(read);
+                true
+            });
+            #[cfg(feature = "diagnostics")]
+            if changed {
+                crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+            }
+            let _ = changed;
+            return size;
+        }
         // SAFETY: committed memory of the texture's layout size, and it
-        // stays committed while `_mapped` is held.
+        // stays committed while `mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = blake3::hash(tiled);
+        let hash = digest(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
@@ -1522,6 +1611,7 @@ impl Staging {
         }
         last.hash = Some(hash);
         self.detile(tiled);
+        drop(mapped);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         size
@@ -1529,17 +1619,29 @@ impl Staging {
 
     /// A refresh while the runtime is remapping title memory ([`no_wait`]):
     /// the texture is read through the kernel, which fails if a page of it
-    /// is not there at this moment. Then nothing is taken and the texture
-    /// is looked at again at its next refresh (what was learnt about writes
-    /// to it is forgotten, so that it is not passed over as unwritten).
-    /// Returns the bytes read.
+    /// is not there at this moment. If a staging buffer has never been filled
+    /// yet, kernel `copy_mapped` reads every page that is mapped (zeros for
+    /// the rest) so first uploads and bakes never stall or upload empty memory;
+    /// otherwise nothing is taken and the texture is looked at again at its
+    /// next refresh. Returns the bytes read.
     fn refresh_unlocked(&self, last: &mut Last, size: usize) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         let read = with_read(size, |read| {
             if !crate::host::read_into(self.memory, read) {
-                return false;
+                if last.hash.is_some() {
+                    return false;
+                }
+                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                if all_zero(read) {
+                    return false;
+                }
+                last.hash = Some(digest(read));
+                last.partial = Some(crate::frame::current());
+                last.asked = 0;
+                self.detile(read);
+                return true;
             }
-            let hash = blake3::hash(read);
+            let hash = digest(read);
             if last.hash != Some(hash) {
                 last.hash = Some(hash);
                 self.detile(read);
@@ -1701,14 +1803,14 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
         static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     }
     let len = crate::descriptor::host::texture_own_bytes(at, len) as usize;
-    let mut hasher = blake3::Hasher::new();
+    let mut print = 0u128;
     READ.with(|read| {
         let mut read = read.borrow_mut();
         read.resize(3 * WINDOW, 0);
         let mut take = |from: usize, bytes: usize| {
             read[..bytes].fill(0);
             crate::host::copy_mapped(read.as_mut_ptr(), (at as usize + from) as *const u8, bytes, false);
-            hasher.update(&read[..bytes]);
+            print = print.rotate_left(37) ^ digest(&read[..bytes]).0;
         };
         if len <= 3 * WINDOW {
             take(0, len);
@@ -1718,9 +1820,7 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
             take(len - WINDOW, WINDOW);
         }
     });
-    let hash = hasher.finalize();
-    let mut first = [0u8; 8];
-    first.copy_from_slice(&hash.as_bytes()[..8]);
+    let first = (print as u64 ^ (print >> 64) as u64).to_le_bytes();
     u64::from_le_bytes(first) | 1
 }
 
@@ -1743,13 +1843,14 @@ pub(crate) fn is_staged(resource: This) -> bool {
 
 /// The bytes of a title texture's memory, and whether all of it is mapped,
 /// if the texture has been staged for upload.
-pub(crate) fn staged(resource: This) -> Option<(u64, bool)> {
+/// (Whether it is mapped is asked only if `ask`; else it counts as mapped.)
+pub(crate) fn staged(resource: This, ask: bool) -> Option<(u64, bool)> {
     let s = {
         let map = STAGING.read().unwrap_or_else(|e| e.into_inner());
         map.as_ref()?.get(&(resource as usize))?.clone()
     };
     let size = s.layout.size as usize;
-    Some((size as u64, committed(s.memory, size)))
+    Some((size as u64, !ask || committed(s.memory, size)))
 }
 
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
@@ -2096,6 +2197,7 @@ fn new_staging(resource: This, texture: &ID3D12Resource, on_demand: bool) -> Opt
         layout,
         mips: u32::from(d.MipLevels),
         bytes: total,
+        once: std::sync::atomic::AtomicBool::new(once() && !on_demand && PICKING.get().is_some()),
         memory,
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),
@@ -2159,6 +2261,7 @@ mod title_memory_tests {
             layout,
             mips: 1,
             bytes: BYTES,
+            once: AtomicBool::new(false),
             memory: std::ptr::null(),
             last: Mutex::default(),
             dirty: AtomicBool::new(true),
@@ -2505,5 +2608,45 @@ mod hot_texture_tests {
         assert_eq!(super::parse_partial_cooldown(Some("bad")), 6);
         assert_eq!(super::parse_partial_cooldown(Some(" 4 ")), 4);
         assert_eq!(super::parse_partial_cooldown(Some("30")), 30);
+    }
+
+    #[test]
+    fn texture_once_toggle_defaults_on_and_zero_disables() {
+        use super::once_from;
+        assert!(once_from(None));
+        assert!(once_from(Some("1")));
+        assert!(once_from(Some("yes")));
+        assert!(!once_from(Some("0")));
+        assert!(!once_from(Some(" 0 ")));
+    }
+
+    /// The digest tells every length and every changed byte apart, zeros
+    /// among them.
+    #[test]
+    fn a_digest_tells_bytes_apart() {
+        use super::digest;
+        let zeros = [0u8; 400];
+        let mut seen: Vec<super::Digest> = (0..400).map(|n| digest(&zeros[..n])).collect();
+        for at in 0..400 {
+            for value in [1u8, 0x80, 0xff] {
+                let mut bytes = zeros;
+                bytes[at] = value;
+                seen.push(digest(&bytes));
+            }
+        }
+        let text: Vec<u8> = (0..400u32).map(|i| ((i * 37) >> 2) as u8).collect();
+        for at in 0..399 {
+            let mut bytes = text.clone();
+            bytes.swap(at, at + 1);
+            if bytes != text {
+                seen.push(digest(&bytes));
+            }
+        }
+        seen.push(digest(&text));
+        let n = seen.len();
+        seen.sort_unstable_by_key(|d| d.0);
+        seen.dedup();
+        assert_eq!(seen.len(), n);
+        assert_eq!(digest(&text), digest(&text.clone()));
     }
 }

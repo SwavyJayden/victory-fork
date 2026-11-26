@@ -375,7 +375,6 @@ pub(crate) fn finish_flips(finished: u64) {
             }
         }
         if let Some(kept) = make(&view, heap.cpu(f.index)) {
-            heap.set_null_cbv(f.index, false);
             heap.keep(f.index, kept);
             slot.store(f.key, Ordering::Release);
             let frames = crate::frame::current().saturating_sub(f.since);
@@ -419,34 +418,17 @@ pub(crate) struct HostHeap {
     /// behind `made_lock`.
     made: Vec<AtomicU64>,
     made_lock: Mutex<()>,
-    /// With [`null_skip`]: per title slot, whether the host slot holds the
-    /// null constant buffer view `null_for` writes for one and nothing was
-    /// written there since (set and cleared under `made_lock`, by every
-    /// writer of a title slot: `mirror`, `unmake`, `make_null`,
-    /// `texture_views_remade`). Empty without the switch.
-    null_cbv: Vec<std::sync::atomic::AtomicBool>,
-    /// A fingerprint of the record each slot held when the pass over
-    /// records copied in as bytes last looked at it
-    /// ([`HostHeap::mirror_copied_many`]; 0: never looked at). Made on first use.
-    copied: Mutex<Vec<u64>>,
-    /// Records the pass over records copied in as bytes left to the draws
-    /// that read their slots through tables (`VICTORY_HEAP_SYNC_TABLES=2`
-    /// or `3`): title slot, record key (as `made` keeps it) and the frame
-    /// from which a later pass mirrors it after all if no draw made the
-    /// slot from that record by then ([`HostHeap::take_left`]), and the
-    /// sync that left it ([`SYNC_SEQ`]).
-    left: Mutex<Vec<(u32, u64, u64, u32)>>,
-    /// Per title slot, the sync ([`SYNC_SEQ`]) during which a draw last
-    /// read it through a fresh table, which makes its records in slots of
-    /// its own and not the title's (`VICTORY_HEAP_SYNC_TABLES=2`, `3`;
-    /// empty otherwise): a record left to tables' draws before that sync
-    /// began was read by one.
-    drawn: Vec<AtomicU32>,
-    /// Per title slot, the record key (as `made` keeps it; 0: not a record
-    /// of ours) the draw that last stamped [`HostHeap::drawn`] read there:
-    /// a changed record a draw read through a fresh table since the sync
-    /// before was taken in by that draw already ([`drawn_before`]).
-    drawn_key: Vec<AtomicU64>,
+    /// The records of the title's heap as the pass over records copied in
+    /// as bytes last saw them ([`HostHeap::copied_changes`]). Made on first
+    /// use.
+    copied: Mutex<Vec<u8>>,
+    /// New ones of them that wait for a draw ([`HostHeap::copied_wait`]),
+    /// by the frame they were found in.
+    waiting: Mutex<std::collections::VecDeque<(u64, Vec<u32>)>>,
+    /// The slots made from a texture whose memory was found away, with what
+    /// they were made from and when that was
+    /// ([`HostHeap::texture_slot_gone`]).
+    away: Mutex<std::collections::HashMap<u32, (u64, u64)>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -952,6 +934,14 @@ const TABLED_FRAMES: u64 = 240;
 /// (435 begun in the 353 s of run 52's, for some 140 presented).
 const TABLED_GRACE: u64 = 8;
 
+/// Frames for which a record copied into a slot a draw read through a
+/// table is left to such a draw ([`HostHeap::copied_tabled`]).
+const COPIED_FRAMES: u32 = 8;
+
+/// Frames a record copied into any other slot waits for one, before it is
+/// taken for one shaders pick by index ([`HostHeap::copied_wait`]).
+const COPIED_GRACE: u64 = 4;
+
 /// In [`HostHeap::tabled`]: a draw read the slot in that frame.
 const TABLED_READ: u32 = 1 << 31;
 
@@ -1393,6 +1383,30 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
+fn dynamic_slots_with(count: u32, null: u32, most: u32) -> u32 {
+    if null < PORTABLE_VIEWS {
+        return DYNAMIC;
+    }
+    null.saturating_sub(count).min(most).max(DYNAMIC)
+}
+
+/// [`DYNAMIC`] for a heap of `count` title slots whose null slot is `null`
+/// (0: none): up to four times as many where the host heap has the room (a
+/// host that takes more than [`PORTABLE_VIEWS`]; `VICTORY_DYNAMIC_SLOTS`
+/// sets the most). 2^18 ran out in the title's bigger places (session
+/// play-1125-0127: 27,000 to 35,000 tables a frame, up to 3,285 of them
+/// refused, with 2,639 indirect draws and dispatches).
+fn dynamic_slots(count: u32, null: u32) -> u32 {
+    static MOST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let most = *MOST.get_or_init(|| {
+        std::env::var("VICTORY_DYNAMIC_SLOTS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(DYNAMIC << 2)
+    });
+    dynamic_slots_with(count, null, most)
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -1413,7 +1427,6 @@ impl HostHeap {
                     })
             }
         };
-        let extra = if sampler { 0 } else { DYNAMIC };
         // A view heap ends at the null slot shaders clamp view indices to
         // (`probe_view_limit`), whatever the title's own count: the title's
         // slots, then the dynamic ones, then null up to and with that slot.
@@ -1425,6 +1438,7 @@ impl HostHeap {
         } else {
             victory_shader::emit::view_heap_limit()
         };
+        let extra = if sampler { 0 } else { dynamic_slots(count, null) };
         let (heap, count, size) = if null == 0 {
             match make(count + extra) {
                 Ok(heap) => (heap, count, count + extra),
@@ -1490,17 +1504,9 @@ impl HostHeap {
             sampler,
             made: (0..count).map(|_| AtomicU64::new(0)).collect(),
             made_lock: Mutex::new(()),
-            null_cbv: (0..if sampler || !(null_skip() || cfg!(test)) { 0 } else { count })
-                .map(|_| std::sync::atomic::AtomicBool::new(false))
-                .collect(),
             copied: Mutex::new(Vec::new()),
-            left: Mutex::new(Vec::new()),
-            drawn: (0..if sampler || sync_tables() < 2 { 0 } else { count })
-                .map(|_| AtomicU32::new(0))
-                .collect(),
-            drawn_key: (0..if sampler || sync_tables() < 2 { 0 } else { count })
-                .map(|_| AtomicU64::new(0))
-                .collect(),
+            waiting: Mutex::default(),
+            away: Mutex::default(),
             kept: make_kept((count + extra) as usize),
             next: Mutex::new(DynamicBits::new(extra)),
             free: AtomicU32::new(extra),
@@ -1692,6 +1698,14 @@ impl HostHeap {
         PAGE_BEHIND[0].store(behind, Ordering::Relaxed);
         PAGE_BEHIND[1].store(oldest, Ordering::Relaxed);
         (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
+    }
+
+    /// A number that changes when a slot is written or made due anew, and
+    /// whether memory was noted since a pass last took the notes.
+    pub(crate) fn texture_news(&self) -> (u64, bool) {
+        let writes = self.textures.lock().unwrap_or_else(|e| e.into_inner()).writes;
+        let noted = |ranges: &Mutex<Vec<(u64, u64)>>| !ranges.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
+        (writes, noted(&REMAPPED) || noted(&PAGE_WRITTEN))
     }
 
     /// Every title slot of the queue that is due at `frame`, and whether
@@ -1917,7 +1931,6 @@ impl HostHeap {
             if shown == 0 || !old.is_some_and(|old| same_placed_texture(&old, &view)) {
                 self.made[index as usize].store(0, Ordering::Release);
                 let kept = neutral_for(&view, self.cpu(index));
-                self.set_null_cbv(index, false);
                 LATE[3].fetch_add(u64::from(kept.is_some()), Ordering::Relaxed);
                 self.keep(index, kept);
             }
@@ -2045,7 +2058,6 @@ impl HostHeap {
                 continue;
             };
             if let Some(kept) = make(&view, self.cpu(slot)) {
-                self.set_null_cbv(slot, false);
                 self.keep(slot, kept);
                 remade += 1;
             }
@@ -2057,14 +2069,58 @@ impl HostHeap {
     /// (any more): a host slot made from it becomes null again, so that
     /// the host copy can be let go (`crate::resource::let_go_idle`; a slot
     /// keeps what it views). True if the slot was made.
+    ///
+    /// Not at the first look: a title that moves a texture in its streaming
+    /// memory unmaps it before it maps it again, and what was shown went
+    /// black for the pictures in between (session play-1125-0127: faces,
+    /// books, posters and sleeves for 0.3 to 2 s). Only when it is still
+    /// away `AWAY_MS` after it was first found away
+    /// (`VICTORY_TEXTURE_AWAY_MS`; 0: at once, as before).
     pub(crate) fn texture_slot_gone(&self, index: u32) -> bool {
+        const AWAY_MS: u64 = 3000;
+        static WAIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let wait = *WAIT.get_or_init(|| {
+            std::env::var("VICTORY_TEXTURE_AWAY_MS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(AWAY_MS)
+        });
         let _guard = self.made_lock.lock().unwrap_or_else(|e| e.into_inner());
-        if self.made.get(index as usize).is_none_or(|m| m.load(Ordering::Relaxed) == 0) {
+        let Some(key) = self
+            .made
+            .get(index as usize)
+            .map(|m| m.load(Ordering::Relaxed))
+            .filter(|&key| key != 0)
+        else {
             return false;
+        };
+        let now = crate::host::now_ms();
+        {
+            let mut away = self.away.lock().unwrap_or_else(|e| e.into_inner());
+            match away.get(&index) {
+                Some(&(was, since)) if was == key && now.saturating_sub(since) < wait => return false,
+                Some(&(was, _)) if was == key => {
+                    away.remove(&index);
+                }
+                _ if wait == 0 => {}
+                _ => {
+                    away.insert(index, (key, now));
+                    return false;
+                }
+            }
         }
         self.unmake(index);
         STALE[4].fetch_add(1, Ordering::Relaxed);
         true
+    }
+
+    /// The memory of the texture title slot `index` views is there (again):
+    /// see [`HostHeap::texture_slot_gone`].
+    pub(crate) fn texture_slot_here(&self, index: u32) {
+        let mut away = self.away.lock().unwrap_or_else(|e| e.into_inner());
+        if !away.is_empty() {
+            away.remove(&index);
+        }
     }
 
     /// Makes host slot `index` null again, as it is before its view is
@@ -2078,65 +2134,10 @@ impl HostHeap {
             return;
         }
         match view_at(key as u32, (key >> 32) as u32) {
-            Some(view) => {
-                null_for(&view, self.cpu(index));
-                self.set_null_cbv(index, matches!(view, View::Constant(..)));
-            }
-            None => {
-                null_view(self.cpu(index));
-                self.set_null_cbv(index, false);
-            }
+            Some(view) => null_for(&view, self.cpu(index)),
+            None => null_view(self.cpu(index)),
         }
         self.keep(index, None);
-    }
-
-    /// [`HostHeap::null_cbv`] for title slot `index` (nothing for dynamic
-    /// slots or without the switch).
-    fn set_null_cbv(&self, index: u32, null_cbv: bool) {
-        if let Some(flag) = self.null_cbv.get(index as usize) {
-            flag.store(null_cbv, Ordering::Relaxed);
-        }
-    }
-
-    /// [`null_skip`]: of the constant buffer view records `items` (an
-    /// opaque tag, title slot), the tags of those whose `mirror` (not for a
-    /// draw) would only write what is there already: the slot is made from
-    /// nothing (`self.made`, caller holds `made_lock`), its host slot
-    /// holds the null constant buffer view `mirror` would write again
-    /// ([`HostHeap::null_cbv`]), and it is in none of the sets
-    /// `note_buffer` would take it out of (the texture queue, the placed
-    /// spans, the buffer slots: so no stride to clear and no buffer change
-    /// to note either). `kept` is empty for a slot made from nothing.
-    /// Each set's lock is taken once for all of `items`, one after the
-    /// other (never two at once), under `made_lock` as `mirror` takes them.
-    fn cbv_noops(&self, items: &[(usize, u32)]) -> Vec<usize> {
-        if self.null_cbv.is_empty() {
-            return Vec::new();
-        }
-        let mut found: Vec<(usize, u32)> = items
-            .iter()
-            .copied()
-            .filter(|&(_, index)| {
-                self.made.get(index as usize).is_some_and(|m| m.load(Ordering::Relaxed) == 0)
-                    && self.null_cbv.get(index as usize).is_some_and(|f| f.load(Ordering::Relaxed))
-            })
-            .collect();
-        if found.is_empty() {
-            return Vec::new();
-        }
-        {
-            let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-            found.retain(|&(_, index)| !textures.slots.contains_key(&index) && !textures.behind.contains_key(&index));
-        }
-        if !found.is_empty() {
-            let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
-            found.retain(|&(_, index)| !placed.by_slot.contains_key(&index) && !placed.first.contains_key(&index));
-        }
-        if !found.is_empty() {
-            let buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
-            found.retain(|&(_, index)| !buffers.contains(&index));
-        }
-        found.into_iter().map(|(tag, _)| tag).collect()
     }
 
     /// Title slot `index` is a table's ([`HostHeap::tabled`]). `read`: a
@@ -2146,6 +2147,12 @@ impl HostHeap {
     /// pass would have, for a shader that picks it by index all the same.
     pub(crate) fn texture_slot_tabled(&self, index: u32, read: bool) {
         self.tabled_in(index, read, crate::frame::current());
+    }
+
+    /// Title slot `index` lies in a table a draw reads or had made afresh:
+    /// what it holds is the draw's to make ([`HostHeap::copied_tabled`]).
+    pub(crate) fn slot_tabled(&self, index: u32) {
+        self.tabled_in(index, false, crate::frame::current());
     }
 
     /// [`HostHeap::texture_slot_tabled`] in frame `frame`.
@@ -2408,6 +2415,63 @@ impl HostHeap {
         self.keep(index, kept.flatten());
     }
 
+    /// Makes slot `index` (a dynamic one) the view the record `words` names,
+    /// from this thread's descriptor of it if the recording `recording` has
+    /// made one, else as [`HostHeap::make_at`] does, and keeps that
+    /// ([`ListViews`]). What is known of the record in this recording;
+    /// `None` (the slot is not made): not a view kept so.
+    pub(crate) fn make_listed(&self, recording: u64, words: [u32; 3], index: u32) -> Option<Listed> {
+        if self.sampler {
+            return None;
+        }
+        LIST_VIEWS.with(|views| {
+            let mut views = views.borrow_mut();
+            if views.is_none() {
+                *views = Some(ListViews::new()?);
+            }
+            let views = views.as_mut()?;
+            if views.recording != recording {
+                views.recording = recording;
+                views.made.clear();
+            }
+            if !views.made.contains_key(&words) {
+                let view = super::view_at(words[1], words[2])?;
+                let at = views.made.len() as u32;
+                // (A constant buffer's bytes are copied for each draw.)
+                if at >= ListViews::SLOTS || matches!(view, View::Constant(..)) {
+                    return None;
+                }
+                let kept = make(&view, views.slot(at))?;
+                let listed = Listed {
+                    kind: crate::draw::view_kind(&view),
+                    texture: is_texture_view(&view),
+                    ready: (0, 0, false),
+                    tabled: None,
+                };
+                views.made.insert(words, ListView { view, at, kept, listed });
+            }
+            let made = &views.made[&words];
+            self.copy_from(index, views.slot(made.at));
+            self.keep(index, made.kept.clone());
+            Some(made.listed)
+        })
+    }
+
+    /// Copies one CBV/SRV/UAV descriptor from CPU-only slot `from` into host
+    /// slot `to`.
+    fn copy_from(&self, to: u32, from: D3D12_CPU_DESCRIPTOR_HANDLE) {
+        let Some(host) = host() else { return };
+        // SAFETY: a slot of our heap, and one of this thread's heap.
+        unsafe {
+            host.device.CopyDescriptorsSimple(
+                1,
+                self.cpu(to),
+                from,
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            );
+        }
+    }
+
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
     pub(crate) fn make_null(&self, index: u32) {
         if self.sampler {
@@ -2415,17 +2479,23 @@ impl HostHeap {
         } else {
             null_view(self.cpu(index));
         }
-        self.set_null_cbv(index, false);
         self.keep(index, None);
     }
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+        use windows::core::Interface;
         let (shard, pos) = kept_slot(index);
         let old = {
             let mut kept = self.kept[shard].lock().unwrap_or_else(|e| e.into_inner());
-            kept.get_mut(pos)
-                .and_then(|slot| std::mem::replace(slot, resource))
+            let Some(slot) = kept.get_mut(pos) else {
+                return;
+            };
+            // The same again: nothing to retire.
+            if slot.as_ref().map(Interface::as_raw) == resource.as_ref().map(Interface::as_raw) {
+                return;
+            }
+            std::mem::replace(slot, resource)
         };
         // A running submission may still read the old resource through
         // this slot; retire outside the shard lock.
@@ -2557,10 +2627,10 @@ impl HostHeap {
         }
     }
 
-    /// For a slot on a page of the title's heap that changed with no call
+    /// For a run of records of the title's heap from slot `first`, `step`
+    /// bytes each, on a page that changed with no call
     /// (`super::sync_heaps`: the title copies records into its heap as
-    /// bytes): [`HostHeap::mirror`], if the record bytes are not the ones
-    /// this last saw there.
+    /// bytes): the slots whose record is not the one this last saw there.
     ///
     /// The page says only that something on it was written, and `mirror`
     /// by itself would take every buffer or placed-texture record on it for
@@ -2568,377 +2638,87 @@ impl HostHeap {
     /// or a pass uses it): the texture queue's entry for the slot would
     /// start again, and the buffer pass would look at 2,048 slots for one
     /// that changed.
-    /// `record`: the record's bytes as the caller read them (through the
+    /// `records`: their bytes as the caller read them (through the
     /// kernel, which fails on a page the title unmapped meanwhile where a
     /// read in place would fault: the title unmaps heap pages too).
-    ///
-    /// For several records `(index, handle, record)`, the records last seen
-    /// taken under one lock (once per record before: `sync_heaps`' jobs met
-    /// there): returns the count mirrored. A slot draws read through a
-    /// table lately is left to its draws (`VICTORY_HEAP_SYNC_TABLES=1`:
-    /// mirrored too; `=2`/`=3`: deferred).
-    ///
-    /// `prints`: optional precomputed fingerprints ([`record_prints`]), one
-    /// per record in order; else they are computed here.
-    pub(crate) fn mirror_copied_many(&self, records: &[(u32, u64, &[u8])], prints: Option<&[u64]>) -> u64 {
-        use std::sync::atomic::Ordering::Relaxed;
-        let frame = crate::frame::current();
-        let mode = sync_tables();
-        let began = std::time::Instant::now();
-        let prints = prints.filter(|p| p.len() == records.len());
-        // Title slot, handle, the record's key (0: not a record of ours).
-        let mut made: Vec<(u32, u64, u64)> = Vec::new();
-        let mut unchanged = 0u64;
-        {
-            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-            if copied.is_empty() && !records.is_empty() {
-                copied.resize(self.count as usize, 0);
-            }
-            for (n, &(index, handle, record)) in records.iter().enumerate() {
-                if index >= self.count {
-                    continue;
-                }
-                let print = match prints {
-                    Some(p) => p[n],
-                    None => record_print(record) | 1,
-                };
-                let Some(last) = copied.get_mut(index as usize) else {
-                    continue;
-                };
-                if *last == print || (*last == 0 && record_is_zero(record)) {
-                    unchanged += 1;
-                    continue;
-                }
-                // Upstream's order (`mirror_copied_page`): a record seen
-                // last time is done with before the question whether its
-                // slot was a table's lately, so "left to the draws" counts
-                // changed records only. The same records are mirrored.
-                if mode == 0 && self.tabled_lately(index, frame) {
-                    COPIED_TABLED.fetch_add(1, Relaxed);
-                    continue;
-                }
-                *last = print;
-                made.push((index, handle, record_key(record)));
-            }
+    pub(crate) fn copied_changes(&self, first: u32, records: &[u8], step: usize, out: &mut Vec<u32>) {
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        if copied.is_empty() {
+            // Nothing there: a slot never looked at that holds nothing is
+            // as it was.
+            copied.resize(self.count as usize * step, 0);
         }
-        // What a draw (or a view call) made the host slot from already:
-        // `mirror` would find the same key there and do nothing, after
-        // looking the view up. Under one take of `made_lock` (and of the views,
-        // in `mirror`'s order) for the page; a record whose view went is
-        // left to `mirror`, which makes its slot null.
-        // And bytes that are no record of ours, in a slot made from none:
-        // `mirror` (not for a draw) finds no view, has nothing to make
-        // null, and does nothing else (`VICTORY_SYNC_NONE_SKIP=0`: each
-        // goes through it all the same).
-        let mut skipped = 0u64;
-        let mut none_skipped = 0u64;
-        // And with `VICTORY_SYNC_NULL_SKIP=1` a constant buffer view in a
-        // slot made from nothing whose host slot holds the null view
-        // `mirror` would write again ([`HostHeap::cbv_noops`]).
-        let mut null_skipped = 0u64;
-        if (made_skip() || none_skip() || null_skip()) && !made.is_empty() {
-            let _guard = self.made_lock.lock().unwrap_or_else(|e| e.into_inner());
-            let mut gone = vec![false; made.len()];
-            let mut same: Vec<usize> = Vec::new();
-            let mut nulls: Vec<(usize, u32)> = Vec::new();
-            for (n, &(index, _, key)) in made.iter().enumerate() {
-                let slot = self.made.get(index as usize).map(|m| m.load(Relaxed));
-                if key == 0 {
-                    if none_skip() && slot == Some(0) {
-                        gone[n] = true;
-                        none_skipped += 1;
-                    }
-                } else if made_skip() && slot == Some(key) {
-                    same.push(n);
-                } else if null_skip() && slot == Some(0) && key_class(key) == super::CONSTANT {
-                    nulls.push((n, index));
-                }
-            }
-            if !same.is_empty() {
-                let live = super::records_live(same.iter().map(|&n| key_words(made[n].2)));
-                for (&n, live) in same.iter().zip(live) {
-                    gone[n] = live;
-                    skipped += u64::from(live);
-                }
-            }
-            if !nulls.is_empty() {
-                for n in self.cbv_noops(&nulls) {
-                    gone[n] = true;
-                    null_skipped += 1;
-                }
-            }
-            drop(_guard);
-            if skipped + none_skipped + null_skipped > 0 {
-                let mut n = 0;
-                made.retain(|_| {
-                    n += 1;
-                    !gone[n - 1]
-                });
-            }
-        }
-        // Tables' slots: what the draws that read them make is left to
-        // them (`VICTORY_HEAP_SYNC_TABLES=2`: records that name a constant
-        // buffer or placed memory, which `mirror` here would only make null
-        // and leave to a draw or a pass anyway; `3`: every record); a
-        // later pass mirrors what no draw made meanwhile.
-        // Of those, the ones a draw read through a fresh table since the
-        // sync before (the title writes a table, then records the draw
-        // that reads it, then submits: by this sync the draw is behind
-        // it, and the later pass finds none made by a draw): counted;
-        // `VICTORY_SYNC_DRAWN_BEFORE=1` mirrors them now instead of a
-        // frame later, `2` passes over the constant buffer views among
-        // them whose host slot is made from nothing (as the later pass
-        // does for one a draw read after), `3` the views of placed memory
-        // too.
-        let mut deferred = 0u64;
-        let (mut before, mut before_passed) = (0u64, 0u64);
-        if mode >= 2 && !made.is_empty() {
-            let due = frame + left_frames();
-            let seq = SYNC_SEQ.load(Relaxed);
-            let mut left = Vec::new();
-            let what = drawn_before();
-            let _guard = (what >= 2).then(|| self.made_lock.lock().unwrap_or_else(|e| e.into_inner()));
-            made.retain(|&(index, _, key)| {
-                let class = key_class(key);
-                let defer = key != 0
-                    && (mode == 3 || class == super::CONSTANT || class == super::PLACED)
-                    && self.tabled_lately(index, frame);
-                if !defer {
-                    return true;
-                }
-                let read = self.drawn_since(index, key, seq);
-                before += u64::from(read);
-                if read && what != 0 {
-                    let passed = (class == super::CONSTANT || (what == 3 && class == super::PLACED))
-                        && self.made.get(index as usize).is_some_and(|m| m.load(Relaxed) == 0);
-                    before_passed += u64::from(passed);
-                    // Mirrored now, or passed over.
-                    return !passed;
-                }
-                left.push((index, key, due, seq));
-                false
-            });
-            drop(_guard);
-            deferred = left.len() as u64;
-            if !left.is_empty() {
-                self.left.lock().unwrap_or_else(|e| e.into_inner()).extend(left);
-            }
-        }
-        let printed = began.elapsed().as_micros() as u64;
-        // By kind of record, in the order they came (a newer placed view
-        // makes others of its memory stale: the order counts), timed by
-        // runs of one kind.
-        let mut class_us = [0u64; 4];
-        let mut class_n = [0u64; 4];
-        let mut run: Option<(usize, std::time::Instant)> = None;
-        SYNCING.set(true);
-        for &(index, handle, key) in &made {
-            let class = if key == 0 { 3 } else { (key_class(key) as usize).min(3) };
-            if run.is_none_or(|(c, _)| c != class) {
-                let now = std::time::Instant::now();
-                if let Some((c, at)) = run {
-                    class_us[c] += now.duration_since(at).as_micros() as u64;
-                }
-                run = Some((class, now));
-            }
-            class_n[class] += 1;
-            self.mirror(index, handle, false);
-        }
-        SYNCING.set(false);
-        if let Some((c, at)) = run {
-            class_us[c] += at.elapsed().as_micros() as u64;
-        }
-        let s = &SYNC_STATS;
-        s[S_UNCHANGED].fetch_add(unchanged, Relaxed);
-        s[S_SAME_MADE].fetch_add(skipped, Relaxed);
-        s[S_NONE_SKIPPED].fetch_add(none_skipped, Relaxed);
-        s[S_NULL_SKIPPED].fetch_add(null_skipped, Relaxed);
-        s[S_DRAWN_BEFORE].fetch_add(before, Relaxed);
-        s[S_DRAWN_PASSED].fetch_add(before_passed, Relaxed);
-        s[S_DEFERRED].fetch_add(deferred, Relaxed);
-        s[S_PRINT_US].fetch_add(printed, Relaxed);
-        for c in 0..4 {
-            s[S_CLASS_N + c].fetch_add(class_n[c], Relaxed);
-            s[S_CLASS_US + c].fetch_add(class_us[c], Relaxed);
-        }
-        made.len() as u64
-    }
-
-    /// The records left to tables' draws ([`HostHeap::left`]) that are due
-    /// by `frame`, but those a draw read meanwhile (its slot made from that
-    /// record, or read through a fresh table after the sync that left it):
-    /// `(title slot, record key)`, by slot, one per slot (the newest). The
-    /// caller reads each record again and mirrors the slot if it still
-    /// holds that record ([`HostHeap::mirror_left`]).
-    pub(crate) fn take_left(&self, frame: u64) -> Vec<(u32, u64)> {
-        use std::sync::atomic::Ordering::Relaxed;
-        let mut due: Vec<(u32, u64, u32)> = Vec::new();
-        {
-            let mut left = self.left.lock().unwrap_or_else(|e| e.into_inner());
-            if left.is_empty() {
-                return Vec::new();
-            }
-            left.retain(|&(index, key, at, seq)| {
-                let now = at <= frame;
-                if now {
-                    due.push((index, key, seq));
-                }
-                !now
-            });
-        }
-        if due.is_empty() {
-            return Vec::new();
-        }
-        // The newest of a slot's: pushed last, so first after the reverse
-        // (the sort is stable), and the one `dedup` keeps.
-        due.reverse();
-        due.sort_by_key(|&(index, _, _)| index);
-        due.dedup_by_key(|&mut (index, _, _)| index);
-        let mut drawn = vec![false; due.len()];
-        // Read through a fresh table during a later sync than the one that
-        // left it: after that sync read the record.
-        for (n, &(index, _, seq)) in due.iter().enumerate() {
-            if let Some(stamp) = self.drawn.get(index as usize) {
-                drawn[n] = (stamp.load(Relaxed).wrapping_sub(seq) as i32) > 0;
-            }
-        }
-        let _guard = self.made_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let same: Vec<usize> = (0..due.len())
-            .filter(|&n| {
-                !drawn[n]
-                    && self
-                        .made
-                        .get(due[n].0 as usize)
-                        .is_some_and(|m| m.load(Relaxed) == due[n].1)
-            })
-            .collect();
-        let live = super::records_live(same.iter().map(|&n| key_words(due[n].1)));
-        for (&n, live) in same.iter().zip(live) {
-            drawn[n] = live;
-        }
-        // `VICTORY_SYNC_NULL_SKIP=1`: a constant buffer view whose `mirror`
-        // would write only the null view its host slot holds
-        // ([`HostHeap::cbv_noops`]). Its record need not be read again
-        // either: changed since, the caller would not mirror it at all.
-        let mut nulled = vec![false; due.len()];
-        if null_skip() {
-            let nulls: Vec<(usize, u32)> = (0..due.len())
-                .filter(|&n| !drawn[n] && key_class(due[n].1) == super::CONSTANT)
-                .map(|n| (n, due[n].0))
-                .collect();
-            for n in self.cbv_noops(&nulls) {
-                nulled[n] = true;
-            }
-            SYNC_STATS[S_LEFT_NULL_SKIPPED].fetch_add(nulled.iter().filter(|&&d| d).count() as u64, Relaxed);
-        }
-        drop(_guard);
-        SYNC_STATS[S_LEFT_DRAWN].fetch_add(drawn.iter().filter(|&&d| d).count() as u64, Relaxed);
-        due.iter()
-            .zip(drawn.iter().zip(&nulled))
-            .filter(|&(_, (&d, &z))| !d && !z)
-            .map(|(&(index, key, _), _)| (index, key))
-            .collect()
-    }
-
-    /// A draw read title slot `index` through a fresh table (whose entries
-    /// it makes in slots of its own from the title's records), after it
-    /// took [`sync_seq`] as `seq`: what the heap sync left to tables' draws
-    /// there before that was read ([`HostHeap::drawn`]). `key`: the record
-    /// key the draw read there ([`HostHeap::drawn_key`]; 0: none of ours).
-    #[allow(dead_code)]
-    pub(crate) fn drawn_fresh(&self, index: u32, seq: u32, key: u64) {
-        if let Some(stamp) = self.drawn.get(index as usize) {
-            stamp.fetch_max(seq, Ordering::Relaxed);
-        }
-        if let Some(read) = self.drawn_key.get(index as usize) {
-            read.store(key, Ordering::Relaxed);
-        }
-    }
-
-    /// Whether a draw read the record `key` at title slot `index` through
-    /// a fresh table since the sync before the one numbered `seq` began
-    /// ([`HostHeap::drawn_fresh`]): it made its own slots from that very
-    /// record, as a draw after the sync would have.
-    fn drawn_since(&self, index: u32, key: u64, seq: u32) -> bool {
-        let (Some(stamp), Some(read)) = (self.drawn.get(index as usize), self.drawn_key.get(index as usize)) else {
-            return false;
+        let at = first as usize * step;
+        let end = (at + records.len()).min(copied.len());
+        let Some(last) = copied.get_mut(at..end) else {
+            return;
         };
-        key != 0
-            && read.load(Ordering::Relaxed) == key
-            && (stamp.load(Ordering::Relaxed).wrapping_sub(seq.wrapping_sub(1)) as i32) >= 0
-    }
-
-    /// [`HostHeap::mirror`] for the pass over records copied in as bytes,
-    /// of a slot it left to tables' draws that none made
-    /// ([`HostHeap::take_left`]).
-    pub(crate) fn mirror_left(&self, index: u32, handle: u64) {
-        SYNCING.set(true);
-        self.mirror(index, handle, false);
-        SYNCING.set(false);
-    }
-
-    /// The key [`HostHeap::mirror`] keeps for the record `bytes` (0: not a
-    /// record of ours).
-    pub(crate) fn record_key(bytes: &[u8]) -> u64 {
-        record_key(bytes)
-    }
-
-    /// Upstream's page-at-once mirror. `sync_heaps` uses
-    /// [`HostHeap::mirror_copied_many`] (one lock per page too, plus the
-    /// made/none/null/table skips); kept for reference.
-    #[allow(dead_code)]
-    pub(crate) fn mirror_copied_page(
-        &self,
-        slots: std::ops::Range<u64>,
-        (start, step): (u64, u64),
-        from: usize,
-        page: &[u8],
-        due: &mut Vec<(u32, u64)>,
-    ) -> (u64, u64) {
-        let (frame, tables) = (crate::frame::current(), sync_tables());
-        let mut looked = 0u64;
-        due.clear();
+        let records = &records[..last.len()];
+        if last == records {
+            return;
+        }
+        for (n, (old, new)) in last
+            .chunks_exact_mut(step)
+            .zip(records.chunks_exact(step))
+            .enumerate()
         {
-            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-            if copied.is_empty() {
-                copied.resize(self.count as usize, 0);
-            }
-            for index in slots {
-                let handle = start + index * step;
-                // A record that straddles the range's ends is left to the
-                // range that holds its first byte.
-                let Some(at) = (handle as usize).checked_sub(from) else {
-                    continue;
-                };
-                let Some(record) = page.get(at..at + step as usize) else {
-                    continue;
-                };
-                looked += 1;
-                // None past the host heap's slots, as `mirror_copied_many`.
-                let Some(last) = copied.get_mut(index as usize) else {
-                    continue;
-                };
-                // Never 0, which is "never looked at".
-                let print = record_print(record) | 1;
-                // The record last seen, or a slot never looked at that
-                // holds nothing: as it was.
-                if *last == print || (*last == 0 && record_is_zero(record)) {
-                    continue;
-                }
-                // A table's slot lately: left to its draws, and looked at
-                // again next time.
-                if tables == 0 && self.tabled_lately(index as u32, frame) {
-                    COPIED_TABLED.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-                *last = print;
-                due.push((index as u32, handle));
+            if old != new {
+                old.copy_from_slice(new);
+                out.push(first + n as u32);
             }
         }
-        for &(index, handle) in due.iter() {
-            self.mirror(index, handle, false);
+    }
+
+    /// Whether new records of draws' tables are left to the draws
+    /// (`VICTORY_HEAP_SYNC=all`: every new record is mirrored at once, as
+    /// it first was).
+    ///
+    /// The title builds each draw's tables in its heap by copying records
+    /// there as bytes: 60,000 to 210,000 a frame in its world (session
+    /// play-1125-0127), 0.9 microseconds each on the submitting thread and
+    /// 1.4 more in the buffer pass they were all handed to, 120 to 600 ms
+    /// of every frame, and the draws make what they read of them anyway.
+    pub(crate) fn copied_waits(&self) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC").is_none_or(|v| v != "all"))
+    }
+
+    /// Whether a draw read title slot `index` through a table within the
+    /// last few frames before `frame` ([`HostHeap::tabled`]): what it holds
+    /// is such a draw's to make.
+    pub(crate) fn copied_tabled(&self, index: u32, frame: u64) -> bool {
+        if !self.copied_waits() {
+            return false;
         }
-        (looked, due.len() as u64)
+        let stamp = self.tabled_stamp(index) & !TABLED_READ;
+        let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
+        stamp != 0 && now.wrapping_sub(stamp) & !TABLED_READ <= COPIED_FRAMES
+    }
+
+    /// New records the title copied into slots `slots` in `frame` wait for
+    /// the draw that may read them through a table.
+    pub(crate) fn copied_wait(&self, frame: u64, slots: Vec<u32>) {
+        self.waiting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back((frame, slots));
+    }
+
+    /// The slots that have waited long enough at `frame`
+    /// ([`HostHeap::copied_wait`]), each once.
+    pub(crate) fn copied_before(&self, frame: u64) -> Vec<u32> {
+        let mut waiting = self.waiting.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::new();
+        while waiting
+            .front()
+            .is_some_and(|(written, _)| written + COPIED_GRACE <= frame)
+        {
+            out.extend(waiting.pop_front().into_iter().flat_map(|(_, slots)| slots));
+        }
+        drop(waiting);
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 
     /// Makes host slot `index` from the record the title has at `handle`
@@ -2971,7 +2751,6 @@ impl HostHeap {
             && self.made[index as usize].load(Ordering::Acquire) == key
             && let Some(view) = view_at(i, generation)
         {
-            outcome(O_SAME);
             return Some(view);
         }
         let _guard = self.made_lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -2980,7 +2759,6 @@ impl HostHeap {
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
-            outcome(O_NONE);
             if current != 0 {
                 self.made[index as usize].store(0, Ordering::Release);
                 self.make_null(index);
@@ -3025,10 +2803,8 @@ impl HostHeap {
                     .is_some_and(|old| same_placed_texture(&old, &view))
             {
                 KEPT_VIEWS.fetch_add(1, Ordering::Relaxed);
-                outcome(O_KEPT);
                 return Some(view);
             }
-            outcome(if later { O_LATER } else { O_MADE });
             // Clear before writing descriptor + `keep` so concurrent fast-path
             // readers never observe `key` before the descriptor and resource
             // are both installed.
@@ -3041,13 +2817,10 @@ impl HostHeap {
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
             }
-            self.set_null_cbv(index, kept.is_none() && matches!(view, View::Constant(..)));
             self.keep(index, kept.flatten());
             if !later {
                 self.made[index as usize].store(key, Ordering::Release);
             }
-        } else {
-            outcome(O_SAME);
         }
         Some(view)
     }
@@ -3272,225 +3045,6 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
 
 /// The host resource a slot made by [`make`] views, if any.
 type Kept = Option<ID3D12Resource>;
-
-/// What the pass over records copied in as bytes does with slots that
-/// draws read through tables lately ([`HostHeap::mirror_copied_many`]),
-/// `VICTORY_HEAP_SYNC_TABLES`:
-/// - `0` (the default, upstream's): leaves them to their draws, unlooked at;
-/// - `1`: mirrors them as any other slot;
-/// - `2`: mirrors them, but a changed record that names a constant buffer
-///   or placed memory (one `mirror` makes null here, for a draw or a pass
-///   to make) is left to the draws for [`left_frames`] frames, and mirrored
-///   then only if no draw made its slot from it meanwhile;
-/// - `3`: as `2` for every changed record of a table's slot.
-pub(crate) fn sync_tables() -> u8 {
-    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("VICTORY_HEAP_SYNC_TABLES").as_deref() {
-        Ok("1") => 1,
-        Ok("2") => 2,
-        Ok("3") => 3,
-        _ => 0,
-    })
-}
-
-/// Heap syncs begun (`super::sync_heaps`), for [`HostHeap::drawn`].
-pub(crate) static SYNC_SEQ: AtomicU32 = AtomicU32::new(1);
-
-/// [`SYNC_SEQ`] now, taken by a draw before it reads the records of a fresh
-/// table ([`HostHeap::drawn_fresh`]).
-#[allow(dead_code)]
-pub(crate) fn sync_seq() -> u32 {
-    SYNC_SEQ.load(Ordering::Acquire)
-}
-
-/// Frames (as `crate::frame::current` counts them) a record left to
-/// tables' draws waits before a pass mirrors it after all
-/// (`VICTORY_HEAP_SYNC_TABLES_FRAMES`, 0 to 64; 1 by default).
-fn left_frames() -> u64 {
-    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("VICTORY_HEAP_SYNC_TABLES_FRAMES")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .map_or(1, |n| n.min(64))
-    })
-}
-
-/// Whether the pass over records copied in as bytes passes over a changed
-/// record whose slot was made from it already (by a draw or a view call)
-/// without looking its view up: `mirror` does nothing for one.
-/// `VICTORY_SYNC_MADE_SKIP=0`: each goes through `mirror`, as before.
-fn made_skip() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_MADE_SKIP").is_none_or(|v| v != "0"))
-}
-
-/// Whether the pass over records copied in as bytes passes over changed
-/// bytes that are no record of ours in a slot made from none: `mirror`
-/// does nothing for them (13,142 a frame in the world, 4.6 ms, run n31).
-/// `VICTORY_SYNC_NONE_SKIP=0`: each goes through `mirror`, as before.
-pub(crate) fn none_skip() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_NONE_SKIP").is_none_or(|v| v != "0"))
-}
-
-/// What the pass over records copied in as bytes does with a changed
-/// record it would leave to tables' draws (`VICTORY_HEAP_SYNC_TABLES=2`,
-/// `3`) that a draw read through a fresh table since the sync before
-/// ([`HostHeap::drawn_since`]), `VICTORY_SYNC_DRAWN_BEFORE`:
-/// - `0` (the default): leaves it, as before (the later pass mirrors it:
-///   it looks only for draws after this sync);
-/// - `1`: mirrors it now (what the later pass would do a frame on);
-/// - `2`: passes over a constant buffer view whose host slot is made from
-///   nothing (as the later pass does for one a draw read after this sync;
-///   `mirror` would only make it null, and tables holding one are always
-///   made afresh), else mirrors it now;
-/// - `3`: as `2` for views of placed memory too (their slots then do not
-///   join the buffer and texture passes for shaders that pick from the
-///   whole heap, as with `VICTORY_HEAP_SYNC_TABLES=0`).
-pub(crate) fn drawn_before() -> u8 {
-    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("VICTORY_SYNC_DRAWN_BEFORE").as_deref() {
-        Ok("1") => 1,
-        Ok("2") => 2,
-        Ok("3") => 3,
-        _ => 0,
-    })
-}
-
-/// Whether [`made_skip`] is on (for the parts line).
-pub(crate) fn made_skip_on() -> bool {
-    made_skip()
-}
-
-/// Whether the heap sync passes over a changed constant buffer view record
-/// whose `mirror` would write only what is there already
-/// (`VICTORY_SYNC_NULL_SKIP=1`; off by default): its slot is made from
-/// nothing, its host slot holds the null constant buffer view `mirror`
-/// would write again, and it is in none of the texture, placed or buffer
-/// sets `mirror` would take it out of ([`HostHeap::cbv_noops`]). Both in
-/// the pass over changed pages and among the records left to tables'
-/// draws that are due (which are then not read again either).
-pub(crate) fn null_skip() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_NULL_SKIP").is_some_and(|v| v == "1"))
-}
-
-/// The key `mirror` keeps in `made` for a record's bytes (generation and
-/// index); 0 for bytes that are not a record of ours.
-fn record_key(record: &[u8]) -> u64 {
-    let word = |n: usize| {
-        record
-            .get(4 * n..4 * n + 4)
-            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
-    };
-    match (word(0), word(1), word(2)) {
-        (Some(VIEW_TAG), Some(i), Some(generation)) => u64::from(generation) << 32 | u64::from(i),
-        _ => 0,
-    }
-}
-
-/// The key [`record_key`] gives a record whose first three words are
-/// `words` (tag, `i`, `generation`).
-#[allow(dead_code)]
-pub(crate) fn words_key([tag, i, generation]: [u32; 3]) -> u64 {
-    if tag == VIEW_TAG { u64::from(generation) << 32 | u64::from(i) } else { 0 }
-}
-
-/// A record key's words (`i`, `generation`).
-fn key_words(key: u64) -> [u32; 2] {
-    [key as u32, (key >> 32) as u32]
-}
-
-/// What kind of record a key names: 0 a table entry, `CONSTANT` a constant
-/// buffer view, `PLACED` a view of placed memory.
-fn key_class(key: u64) -> u32 {
-    ((key >> 32) as u32) >> super::KIND_SHIFT
-}
-
-std::thread_local! {
-    /// Set while the pass over records copied in as bytes calls `mirror`,
-    /// for [`SYNC_STATS`]' outcomes.
-    static SYNCING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Since the last frame line, of the pass over records copied in as bytes
-/// (`super::sync_line` prints them), at these indices.
-pub(crate) static SYNC_STATS: [AtomicU64; S_N] = [const { AtomicU64::new(0) }; S_N];
-/// Records whose bytes were the ones last seen.
-pub(crate) const S_UNCHANGED: usize = 0;
-/// Changed records whose slot was made from them already.
-pub(crate) const S_SAME_MADE: usize = 1;
-/// Changed records left to tables' draws (`VICTORY_HEAP_SYNC_TABLES=2`, `3`).
-pub(crate) const S_DEFERRED: usize = 2;
-/// Of those due, the ones a draw made meanwhile, the ones mirrored after
-/// all, the ones changed again since (or unreadable).
-pub(crate) const S_LEFT_DRAWN: usize = 3;
-pub(crate) const S_LEFT_MIRRORED: usize = 4;
-pub(crate) const S_LEFT_GONE: usize = 5;
-/// Microseconds fingerprinting, comparing and sorting records out.
-pub(crate) const S_PRINT_US: usize = 6;
-/// Records handed to `mirror`, by kind (table entry, constant buffer,
-/// placed memory, not ours), then the microseconds of each kind.
-pub(crate) const S_CLASS_N: usize = 7;
-pub(crate) const S_CLASS_US: usize = 11;
-/// What `mirror` did with them: nothing (the same record), a host view
-/// made, made null for a draw or a pass, an older view of the same placed
-/// texture kept, not a view.
-pub(crate) const S_OUTCOME: usize = 15;
-const O_SAME: usize = 0;
-const O_MADE: usize = 1;
-const O_LATER: usize = 2;
-const O_KEPT: usize = 3;
-const O_NONE: usize = 4;
-/// Microseconds reading heap pages, and their bytes; microseconds of the
-/// records left to tables' draws, read and mirrored after all.
-pub(crate) const S_READ_US: usize = 20;
-pub(crate) const S_READ_BYTES: usize = 21;
-pub(crate) const S_LEFT_US: usize = 22;
-/// Changed bytes that are no record of ours, in a slot made from none,
-/// passed over ([`none_skip`]).
-pub(crate) const S_NONE_SKIPPED: usize = 23;
-/// Records that would be left to tables' draws that a draw read through a
-/// fresh table since the sync before ([`drawn_before`]), and of them the
-/// ones passed over (`2`).
-pub(crate) const S_DRAWN_BEFORE: usize = 24;
-pub(crate) const S_DRAWN_PASSED: usize = 25;
-/// [`null_skip`]: changed records passed over, and due records left to
-/// tables' draws passed over.
-pub(crate) const S_NULL_SKIPPED: usize = 26;
-pub(crate) const S_LEFT_NULL_SKIPPED: usize = 27;
-pub(crate) const S_N: usize = 28;
-
-/// Counts what `mirror` did, when the sync called it.
-fn outcome(what: usize) {
-    if SYNCING.get() {
-        SYNC_STATS[S_OUTCOME + what].fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-/// Since the last frame line: slots on changed heap pages that
-/// [`HostHeap::mirror_copied_many`] left to their draws (tables' slots).
-pub(crate) static COPIED_TABLED: AtomicU64 = AtomicU64::new(0);
-
-/// A 64-bit fingerprint of a descriptor record's bytes (16 or 32 of them):
-/// equal records give equal prints, and two different records the same
-/// print about once in 2^64. Not a hash anyone can attack: the records
-/// are our own.
-fn record_print(record: &[u8]) -> u64 {
-    const K: u64 = 0x9e37_79b9_7f4a_7c15;
-    let mut h = K ^ record.len() as u64;
-    let mut words = record.chunks_exact(8);
-    for word in &mut words {
-        let w = u64::from_le_bytes(word.try_into().unwrap_or([0; 8]));
-        h = (h ^ w).wrapping_mul(K);
-        h ^= h >> 29;
-    }
-    for &b in words.remainder() {
-        h = (h ^ u64::from(b)).wrapping_mul(K);
-    }
-    h ^ (h >> 32)
-}
 
 /// Whether a buffer view off its buffer's elements gets a copy of its own
 /// bytes (`VICTORY_VIEW_OWN_COPY=0`: it is refused and reads zeros, as
@@ -5058,107 +4612,172 @@ mod tests {
     }
 }
 
+/// Fast multiplicative hasher for small fixed-width integer keys (record
+/// words and `(table, n, hash)` tuples) in thread-local/per-list maps.
+#[derive(Default)]
+pub(crate) struct WordHash(u64);
+
+impl std::hash::Hasher for WordHash {
+    fn finish(&self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        x ^= x >> 33;
+        x
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        const K: u64 = 0x9e37_79b9_7f4a_7c15;
+        let (chunks, tail) = bytes.as_chunks::<8>();
+        for c in chunks {
+            self.0 = (self.0 ^ u64::from_le_bytes(*c)).wrapping_mul(K);
+        }
+        for &b in tail {
+            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(K);
+        }
+    }
+
+    fn write_u32(&mut self, i: u32) {
+        self.0 = (self.0 ^ u64::from(i)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0 ^ i).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+
+    fn write_usize(&mut self, i: usize) {
+        self.write_u64(i as u64);
+    }
+}
+
+/// What is known of a record a list's tables hold, in that recording of the
+/// list ([`HostHeap::make_listed`]).
+#[derive(Clone, Copy)]
+pub(crate) struct Listed {
+    pub(crate) kind: Option<victory_shader::ResourceType>,
+    pub(crate) texture: bool,
+    /// Read at this epoch of the list with this depth target tested: up to
+    /// date; and whether it is that target's.
+    pub(crate) ready: (u64, usize, bool),
+    /// The title's slot last noted for it, and whether the draw read it.
+    pub(crate) tabled: Option<(u32, bool)>,
+}
+
+struct ListView {
+    view: View,
+    /// Its descriptor's slot in [`ListViews`].
+    at: u32,
+    kept: Kept,
+    listed: Listed,
+}
+
+/// The descriptors a thread made for one recording of a list, by the record
+/// they were made from, in a heap the card does not see.
+///
+/// The title's culling and lighting dispatches each bind a table of their own
+/// that differs in one constant buffer, and the same thirty views beside it:
+/// each was found, checked, made and brought up to date anew for every
+/// dispatch, some 2,500 indirect dispatches in the one recording job the
+/// frame waits for last. Here a list makes a view once, as it makes a table
+/// once (`crate::draw::State::tables`), and copies its descriptor.
+struct ListViews {
+    recording: u64,
+    heap: ID3D12DescriptorHeap,
+    step: usize,
+    start: usize,
+    made: std::collections::HashMap<[u32; 3], ListView, std::hash::BuildHasherDefault<WordHash>>,
+}
+
+impl ListViews {
+    const SLOTS: u32 = 8192;
+
+    fn new() -> Option<ListViews> {
+        let host = host()?;
+        // SAFETY: plain object creation.
+        unsafe {
+            let heap: ID3D12DescriptorHeap = host
+                .device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: Self::SLOTS,
+                    ..Default::default()
+                })
+                .ok()?;
+            let step = host
+                .device
+                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                as usize;
+            let start = heap.GetCPUDescriptorHandleForHeapStart().ptr;
+            Some(ListViews {
+                recording: 0,
+                heap,
+                step,
+                start,
+                made: Default::default(),
+            })
+        }
+    }
+
+    fn slot(&self, i: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        debug_assert!(i < Self::SLOTS && !windows::core::Interface::as_raw(&self.heap).is_null());
+        D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: self.start + i as usize * self.step,
+        }
+    }
+}
+
+thread_local! {
+    static LIST_VIEWS: std::cell::RefCell<Option<ListViews>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The view the record `words` names, as this thread made it for `recording`.
+pub(crate) fn listed_view(recording: u64, words: [u32; 3]) -> Option<View> {
+    LIST_VIEWS.with(|views| {
+        let views = views.borrow();
+        let views = views.as_ref().filter(|v| v.recording == recording)?;
+        views.made.get(&words).map(|m| m.view.clone())
+    })
+}
+
+/// Notes what is known of the record `words` in `recording`.
+pub(crate) fn note_listed(recording: u64, words: [u32; 3], listed: Listed) {
+    LIST_VIEWS.with(|views| {
+        if let Some(views) = views.borrow_mut().as_mut().filter(|v| v.recording == recording)
+            && let Some(made) = views.made.get_mut(&words)
+        {
+            made.listed = listed;
+        }
+    });
+}
+
+/// Drops cached per-recording descriptors for `recording` on this thread so
+/// idle threads never retain COM resource references past list reset/drop.
+pub(crate) fn clear_listed(recording: u64) {
+    if recording == 0 {
+        return;
+    }
+    LIST_VIEWS.with(|views| {
+        if let Some(views) = views.borrow_mut().as_mut().filter(|v| v.recording == recording) {
+            views.recording = 0;
+            views.made.clear();
+        }
+    });
+}
+
+fn list_views_from(val: Option<&std::ffi::OsStr>) -> bool {
+    val.is_none_or(|v| v != "0")
+}
+
+/// Whether a list makes a view its tables hold once (`VICTORY_LIST_VIEWS=0`:
+/// for every table).
+pub(crate) fn list_views() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| list_views_from(std::env::var_os("VICTORY_LIST_VIEWS").as_deref()))
+}
+
 #[cfg(test)]
 mod record_key_tests {
-    use super::{HostHeap, SYNC_SEQ, key_class, key_words, none_skip, record_key, words_key};
-
-    /// A record's key is what `mirror` keeps for it (generation above the
-    /// index); bytes without our tag have none.
-    #[test]
-    fn keys_of_records() {
-        let mut record = [0u8; 32];
-        record[..4].copy_from_slice(&super::VIEW_TAG.to_le_bytes());
-        record[4..8].copy_from_slice(&7u32.to_le_bytes());
-        let generation = super::super::CONSTANT << super::super::KIND_SHIFT | 5;
-        record[8..12].copy_from_slice(&generation.to_le_bytes());
-        let key = record_key(&record);
-        assert_eq!(key, u64::from(generation) << 32 | 7);
-        assert_eq!(key_words(key), [7, generation]);
-        assert_eq!(key_class(key), super::super::CONSTANT);
-        record[0] ^= 1;
-        assert_eq!(record_key(&record), 0);
-        assert_eq!(record_key(&record[..8]), 0);
-    }
-
-    /// The key of a record's first three words is the one its bytes give.
-    #[test]
-    fn keys_of_record_words() {
-        let words = [super::VIEW_TAG, 7, 5];
-        let mut record = [0u8; 16];
-        for (n, w) in words.iter().enumerate() {
-            record[4 * n..4 * n + 4].copy_from_slice(&w.to_le_bytes());
-        }
-        assert_eq!(words_key(words), record_key(&record));
-        assert_eq!(words_key([0, 7, 5]), 0);
-    }
-
-    /// Changed bytes that are no record of ours are passed over in a slot
-    /// made from none, and make null a slot made from a record.
-    #[test]
-    fn bytes_not_ours_are_passed_over_only_where_nothing_was_made() {
-        let Some(heap) = HostHeap::new(true, 8) else {
-            return; // no host GPU
-        };
-        // The title's heap: 8 records of 16 bytes.
-        let mut title = [0u64; 16];
-        let base = title.as_mut_ptr() as u64;
-        let at = |i: u32| base + u64::from(i) * 16;
-        let sampler = [21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
-        super::super::create_sampler(std::ptr::null(), &sampler, at(1));
-        // SAFETY: slot 2 of the array above.
-        unsafe { std::ptr::write_bytes(at(2) as *mut u8, 0xab, 16) };
-        let bytes = |i: u32| {
-            // SAFETY: a slot of the array above, read as the sync reads it.
-            unsafe { std::slice::from_raw_parts(at(i) as *const u8, 16) }.to_vec()
-        };
-        let (one, two) = (bytes(1), bytes(2));
-        let mirrored = heap.mirror_copied_many(&[(1, at(1), &one), (2, at(2), &two)], None);
-        assert_eq!(mirrored, 1 + u64::from(!none_skip()));
-        assert!(heap.made(1) && !heap.made(2));
-        // Slot 1 now made: bytes not ours there go through `mirror`.
-        // SAFETY: slot 1 of the array above.
-        unsafe { std::ptr::write_bytes(at(1) as *mut u8, 0xcd, 16) };
-        let one = bytes(1);
-        assert_eq!(heap.mirror_copied_many(&[(1, at(1), &one)], None), 1);
-        assert!(!heap.made(1));
-    }
-
-    /// `VICTORY_SYNC_NULL_SKIP`: a constant buffer view's slot that `mirror`
-    /// made null holds the null view it would write again (a no-op to pass
-    /// over); once anything else is written there, or the slot is made, it
-    /// does not.
-    #[test]
-    fn constant_views_made_null_are_known_null() {
-        let Some(heap) = HostHeap::new(false, 8) else {
-            return; // no host GPU
-        };
-        // The title's heap: 8 records of 32 bytes.
-        let mut title = [0u64; 32];
-        let base = title.as_mut_ptr() as u64;
-        let at = |i: u32| base + u64::from(i) * 32;
-        // Constant views of memory with no host copy (none in this test):
-        // `mirror` leaves them for a draw, null.
-        super::super::create_cbv(std::ptr::null(), &[0x1000, 1, 256, 0], at(3));
-        super::super::create_cbv(std::ptr::null(), &[0x2000, 1, 256, 0], at(4));
-        let noops = |items: &[(usize, u32)]| {
-            let _guard = heap.made_lock.lock().unwrap_or_else(|e| e.into_inner());
-            heap.cbv_noops(items)
-        };
-        // Never written by `mirror`: the slot holds the null 2D view every
-        // slot starts with, not a null constant view.
-        assert!(noops(&[(0, 3)]).is_empty());
-        heap.mirror(3, at(3), false);
-        heap.mirror(4, at(4), false);
-        assert!(!heap.made(3) && !heap.made(4));
-        assert_eq!(noops(&[(0, 3), (1, 4), (2, 5)]), vec![0, 1]);
-        // Another null written there: no more.
-        heap.make_null(4);
-        assert_eq!(noops(&[(0, 3), (1, 4)]), vec![0]);
-        // A slot in the buffer set (the buffer pass would hear of it) is
-        // not passed over either.
-        heap.buffers.lock().unwrap_or_else(|e| e.into_inner()).insert(3);
-        assert!(noops(&[(0, 3)]).is_empty());
-    }
+    use super::*;
 
     /// `VICTORY_HEAP_SLOT_CACHE`: `still_made` verifies both the atomic
     /// `made` key and the 64-sharded `kept` host resource.
@@ -5180,54 +4799,94 @@ mod record_key_tests {
         let base = title.as_mut_ptr() as u64;
         let at = |i: u32| base + u64::from(i) * 32;
         super::super::create_cbv(std::ptr::null(), &[0x1000, 1, 256, 0], at(2));
-        let key = words_key(super::super::record_at(at(2)));
+        let [_, i, generation] = super::super::record_at(at(2)).expect("cbv record");
+        let key = u64::from(generation) << 32 | u64::from(i);
         assert_ne!(key, 0);
         // Not made yet.
         assert_eq!(heap.still_made(&[(2, key, &buf_a)]), vec![false]);
         // Simulate made key + kept resource in shard.
         heap.keep(2, Some(buf_a.clone()));
         heap.made[2].store(key, std::sync::atomic::Ordering::Release);
-        assert_eq!(heap.still_made(&[(2, key, &buf_a), (2, key, &buf_b), (2, 0, &buf_a)]), vec![true, false, false]);
+        assert_eq!(
+            heap.still_made(&[(2, key, &buf_a), (2, key, &buf_b), (2, 0, &buf_a)]),
+            vec![true, false, false]
+        );
+        // Keeping the exact same raw COM resource again is a no-op.
+        heap.keep(2, Some(buf_a.clone()));
+        assert_eq!(heap.still_made(&[(2, key, &buf_a)]), vec![true]);
         // After unmake, `still_made` returns false.
         {
             let _guard = heap.made_lock.lock().unwrap_or_else(|e| e.into_inner());
             heap.unmake(2);
         }
         assert_eq!(heap.still_made(&[(2, key, &buf_a)]), vec![false]);
-        // `drawn_fresh` / `sync_seq` are safe when called even if `drawn` is empty.
-        let seq = SYNC_SEQ.load(std::sync::atomic::Ordering::Acquire);
-        heap.drawn_fresh(2, seq, key);
     }
-}
 
-#[inline]
-fn record_is_zero(record: &[u8]) -> bool {
-    let (chunks, tail) = record.as_chunks::<8>();
-    chunks.iter().all(|c| u64::from_ne_bytes(*c) == 0) && tail.iter().all(|&b| b == 0)
-}
-
-#[cfg(test)]
-mod record_print_tests {
-    use super::record_print;
-
-    /// Equal records print alike; a record that differs in any one byte,
-    /// or in its length, prints otherwise.
     #[test]
-    fn a_record_that_changed_prints_otherwise() {
-        let record: Vec<u8> = (0..32u8).map(|i| i.wrapping_mul(37).wrapping_add(5)).collect();
-        let print = record_print(&record);
-        assert_eq!(print, record_print(&record.clone()));
-        for at in 0..32 {
-            for bit in 0..8 {
-                let mut other = record.clone();
-                other[at] ^= 1 << bit;
-                assert_ne!(record_print(&other), print, "byte {at} bit {bit}");
-            }
-        }
-        assert_ne!(record_print(&record[..16]), print);
-        assert_ne!(record_print(&[0u8; 32]), record_print(&[0u8; 16]));
-        // A record of zeros is told from "never looked at" by the caller's `| 1`.
-        assert_ne!(record_print(&[0u8; 32]) | 1, 0);
+    fn dynamic_slots_with_respects_portable_limit_and_cap() {
+        // Capped (portable) heap keeps plain DYNAMIC.
+        assert_eq!(dynamic_slots_with(500_000, PORTABLE_VIEWS - 1, DYNAMIC << 2), DYNAMIC);
+        // Uncapped heap uses up to `most`, bounded by remaining room before `null`.
+        assert_eq!(dynamic_slots_with(1_000_000, UNCAPPED_VIEWS - 1, DYNAMIC << 2), DYNAMIC << 2);
+        assert_eq!(dynamic_slots_with(UNCAPPED_VIEWS - 1 - 400_000, UNCAPPED_VIEWS - 1, DYNAMIC << 2), 400_000);
+        assert_eq!(dynamic_slots_with(UNCAPPED_VIEWS - 100, UNCAPPED_VIEWS - 1, DYNAMIC << 2), DYNAMIC);
+    }
+
+    #[test]
+    fn copied_changes_and_deferred_tabled_slots() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let mut records = vec![0u8; 4 * 32];
+        let mut out = Vec::new();
+        // Zero records on first look report no changes.
+        heap.copied_changes(0, &records, 32, &mut out);
+        assert!(out.is_empty());
+        // Mutating slots 1 and 3 reports only [1, 3].
+        records[32] = 7;
+        records[3 * 32 + 12] = 9;
+        heap.copied_changes(0, &records, 32, &mut out);
+        assert_eq!(out, vec![1, 3]);
+        // Same bytes again report no changes.
+        out.clear();
+        heap.copied_changes(0, &records, 32, &mut out);
+        assert!(out.is_empty());
+        // Deferred copied slots become due after COPIED_GRACE frames, deduplicated.
+        heap.copied_wait(10, vec![3, 1, 3]);
+        assert!(heap.copied_before(10 + COPIED_GRACE - 1).is_empty());
+        assert_eq!(heap.copied_before(10 + COPIED_GRACE), vec![1, 3]);
+        assert!(heap.copied_before(10 + COPIED_GRACE).is_empty());
+        // `slot_tabled` marks a slot within COPIED_FRAMES (when copied_waits is on).
+        let now = crate::frame::current();
+        heap.slot_tabled(2);
+        assert_eq!(heap.copied_tabled(2, now), heap.copied_waits());
+        assert!(!heap.copied_tabled(2, now + u64::from(COPIED_FRAMES) + 1));
+        // `texture_news` advances when a texture write is queued.
+        let before = heap.texture_news().0;
+        heap.queue_texture(1, true, false, now);
+        assert_eq!(heap.texture_news().0, before + 1);
+        heap.texture_slot_here(1);
+    }
+
+    #[test]
+    fn list_views_caches_descriptor_once_per_recording() {
+        use std::ffi::OsStr;
+        assert!(list_views_from(None));
+        assert!(list_views_from(Some(OsStr::new("1"))));
+        assert!(!list_views_from(Some(OsStr::new("0"))));
+
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let mut slots = [0u64; 8];
+        let at0 = slots.as_mut_ptr() as u64;
+        // Constant buffer views are intentionally skipped by make_listed.
+        super::super::create_cbv(std::ptr::null(), &[0x1000, 0, 256, 0], at0);
+        let cbv_words = super::super::record_at(at0).expect("cbv record");
+        let rec = 0xfeed_face_u64;
+        assert!(heap.make_listed(rec, cbv_words, heap.count).is_none());
+        assert!(listed_view(rec, cbv_words).is_none());
+        clear_listed(rec);
     }
 }
 
