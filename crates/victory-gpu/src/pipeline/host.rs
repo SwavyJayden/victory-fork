@@ -177,6 +177,9 @@ fn integer_format(f: DXGI_FORMAT) -> bool {
 /// it: vkd3d-proton / NVIDIA / debug layer refuses such a pipeline with
 /// `E_INVALIDARG`, and its draws are lost. With one description for every
 /// target, each target gets its own copy so the others keep theirs.
+/// Non-integer states are returned bit-for-bit untouched, and `GraphicsState`
+/// keeps the title's original blend state intact so `library::name` and
+/// `with_formats` remain unchanged.
 fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D12_BLEND_DESC {
     let count = (targets.NumRenderTargets as usize).min(8);
     let per_target = blend.IndependentBlendEnable.as_bool();
@@ -188,20 +191,66 @@ fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D1
     if !(0..count).any(|i| integer_format(targets.RTFormats[i]) && blends(i)) {
         return *blend;
     }
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| {
+        tracing::info!(
+            "a pipeline of the title's blends into a render target of integers: blending is off for that target on the host (said once)"
+        );
+    });
     let mut host = *blend;
     if !per_target {
         host.IndependentBlendEnable = true.into();
         host.RenderTarget = [blend.RenderTarget[0]; 8];
+        // D3D12 forbids LogicOpEnable when IndependentBlendEnable is true;
+        // clear every slot (including count..8) so no inherited slot stays set.
+        for rt in &mut host.RenderTarget {
+            rt.LogicOpEnable = false.into();
+        }
     }
     for i in 0..count {
         if integer_format(targets.RTFormats[i]) {
             host.RenderTarget[i].BlendEnable = false.into();
             host.RenderTarget[i].LogicOpEnable = false.into();
-        } else if !per_target {
-            host.RenderTarget[i].LogicOpEnable = false.into();
         }
     }
     host
+}
+
+/// Reads `(WaveLaneCountMin, WaveLaneCountMax)` from a DXBC container's `PSV0`
+/// chunk (runtime info >= v1), for diagnosing compute PSO rejections such as
+/// `[WaveSize(64)]` on a 32-lane adapter. Returns `None` if absent or malformed.
+fn dxil_wave_size(dxil: &[u8]) -> Option<(u32, u32)> {
+    if dxil.len() < 32 || &dxil[..4] != b"DXBC" {
+        return None;
+    }
+    let count = u32::from_le_bytes(dxil[28..32].try_into().ok()?) as usize;
+    let table_end = 32usize.checked_add(count.checked_mul(4)?)?;
+    if table_end > dxil.len() {
+        return None;
+    }
+    for i in 0..count {
+        let off = u32::from_le_bytes(dxil[32 + 4 * i..36 + 4 * i].try_into().ok()?) as usize;
+        let hdr_end = off.checked_add(8)?;
+        if hdr_end > dxil.len() {
+            continue;
+        }
+        if &dxil[off..off + 4] != b"PSV0" {
+            continue;
+        }
+        let size = u32::from_le_bytes(dxil[off + 4..off + 8].try_into().ok()?) as usize;
+        let body = dxil.get(hdr_end..hdr_end.checked_add(size)?)?;
+        if body.len() < 4 + 24 {
+            return None;
+        }
+        let info_size = u32::from_le_bytes(body[0..4].try_into().ok()?) as usize;
+        if info_size < 24 || body.len() < 4 + info_size {
+            return None;
+        }
+        let min = u32::from_le_bytes(body[4 + 16..4 + 20].try_into().ok()?);
+        let max = u32::from_le_bytes(body[4 + 20..4 + 24].try_into().ok()?);
+        return Some((min, max));
+    }
+    None
 }
 
 impl GraphicsState {
@@ -719,7 +768,21 @@ impl HostPipeline {
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                    let wave = stages
+                        .first()
+                        .and_then(|(s, _)| s.translated())
+                        .and_then(|t| dxil_wave_size(&t.host.dxil))
+                        .filter(|&(min, _)| min > 0);
+                    match wave {
+                        Some((min, max)) => tracing::warn!(
+                            error = %e,
+                            ?shaders,
+                            wave_min = min,
+                            wave_max = max,
+                            "host pipeline refused"
+                        ),
+                        None => tracing::warn!(error = %e, ?shaders, "host pipeline refused"),
+                    }
                     host.log_messages();
                     return None;
                 }
@@ -1710,6 +1773,40 @@ mod tests {
         let mut t = rt_targets(&[DXGI_FORMAT_R8G8B8A8_UNORM]);
         t.RTFormats[1] = DXGI_FORMAT_R8_UINT;
         assert_eq!(host_blend(&rt_blending(false), &t), rt_blending(false));
+        // Expanding a non-independent blend state clears LogicOpEnable on all 8 slots.
+        let mut b = rt_blending(false);
+        b.RenderTarget[0].LogicOpEnable = true.into();
+        let t = rt_targets(&[DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8_UINT]);
+        let host = host_blend(&b, &t);
+        assert!(host.IndependentBlendEnable.as_bool());
+        assert!(!host.RenderTarget[1].BlendEnable.as_bool());
+        assert!(host.RenderTarget.iter().all(|rt| !rt.LogicOpEnable.as_bool()));
+    }
+
+    #[test]
+    fn dxil_wave_size_reads_psv0_bounds_and_rejects_malformed() {
+        assert_eq!(dxil_wave_size(&[]), None);
+        assert_eq!(dxil_wave_size(b"NOT_DXBC_HEADER_AT_ALL_0000000000"), None);
+        // Minimal DXBC container with one PSV0 chunk declaring wave_min=64, wave_max=64.
+        let mut psv_body = Vec::new();
+        psv_body.extend_from_slice(&48u32.to_le_bytes());
+        let mut info = [0u8; 48];
+        info[16..20].copy_from_slice(&64u32.to_le_bytes());
+        info[20..24].copy_from_slice(&64u32.to_le_bytes());
+        psv_body.extend_from_slice(&info);
+        let mut dxbc = Vec::new();
+        dxbc.extend_from_slice(b"DXBC");
+        dxbc.extend_from_slice(&[0u8; 16]); // hash
+        dxbc.extend_from_slice(&1u32.to_le_bytes()); // version
+        let chunk_offset = 36u32;
+        let total_size = chunk_offset + 8 + psv_body.len() as u32;
+        dxbc.extend_from_slice(&total_size.to_le_bytes());
+        dxbc.extend_from_slice(&1u32.to_le_bytes()); // 1 chunk
+        dxbc.extend_from_slice(&chunk_offset.to_le_bytes());
+        dxbc.extend_from_slice(b"PSV0");
+        dxbc.extend_from_slice(&(psv_body.len() as u32).to_le_bytes());
+        dxbc.extend_from_slice(&psv_body);
+        assert_eq!(dxil_wave_size(&dxbc), Some((64, 64)));
     }
 
     /// A draw needs another host pipeline only for a bound view whose
