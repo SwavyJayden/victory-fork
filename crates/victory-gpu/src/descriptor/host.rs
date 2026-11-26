@@ -3912,7 +3912,45 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             if resource[0] != BUFFER {
                 // Disabled (`VICTORY_PLACED_TEXTURE_UAV=0`) or a placed texture
                 // shape/format PC D3D12 cannot mirror as a UAV.
-                once!(dimension = resource[0], "placed unordered texture view not mirrored");
+                static UNMIRRORED: Mutex<std::collections::BTreeSet<[u64; 7]>> =
+                    Mutex::new(std::collections::BTreeSet::new());
+                let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                let width = u64::from(resource[4]) | u64::from(resource[5]) << 32;
+                let height = resource[6];
+                let layers = resource[7] & 0xffff;
+                let mips = resource[7] >> 16;
+                let res_fmt = resource[8];
+                let res_flags = resource[12];
+                let view_fmt = desc[0];
+                let view_dim = desc[1];
+                let view_mip = desc[2];
+                let key = [
+                    u64::from(resource[0]),
+                    width,
+                    u64::from(height),
+                    u64::from(resource[7]),
+                    u64::from(res_fmt),
+                    u64::from(res_flags),
+                    (u64::from(view_fmt) << 32) | u64::from(view_dim),
+                ];
+                let mut seen = UNMIRRORED.lock().unwrap_or_else(|e| e.into_inner());
+                if seen.len() < 64 && seen.insert(key) {
+                    tracing::warn!(
+                        frame = crate::frame::current(),
+                        address = format_args!("{address:#x}"),
+                        dimension = resource[0],
+                        width,
+                        height,
+                        layers,
+                        mips,
+                        res_fmt,
+                        res_flags = format_args!("{res_flags:#x}"),
+                        view_fmt,
+                        view_dim,
+                        view_mip,
+                        "placed unordered texture view not mirrored"
+                    );
+                }
                 return None;
             }
             // The resource description's width, after the alignment.

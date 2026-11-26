@@ -4548,110 +4548,259 @@ impl Shadow {
             updated_pages.clear();
             let mut changed: Vec<(usize, usize)> = Vec::new();
             let (mut runs_in, mut bytes_in) = (0u64, 0u64);
-            let exceeded = MERGE_TITLE.with(|buf| {
-                let mut buf = buf.borrow_mut();
-                if buf.len() < PAGE {
-                    buf.resize(PAGE, 0);
+            const WIDE_MERGE_UNDER_MIN_PAGES: usize = 16;
+            let exceeded = if self.card.is_some() && stale.len() >= WIDE_MERGE_UNDER_MIN_PAGES && !in_wide() {
+                let chunks = (stale.len() / 8).clamp(2, 5);
+                let step = stale.len().div_ceil(chunks);
+                let budget = std::sync::atomic::AtomicUsize::new(*runs_left);
+                let gave_up = std::sync::atomic::AtomicBool::new(false);
+                struct ChunkOut {
+                    changed: Vec<(usize, usize)>,
+                    updated: Vec<usize>,
+                    runs_in: u64,
+                    bytes_in: u64,
                 }
-                for page in stale {
-                    let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
-                    if lo >= hi {
-                        continue;
+                let slices: Vec<&[usize]> = stale.chunks(step).collect();
+                let outs: Vec<Mutex<Option<ChunkOut>>> = (0..slices.len()).map(|_| Mutex::new(None)).collect();
+                let self_addr = self as *const Self as usize;
+                let budget_addr = &budget as *const std::sync::atomic::AtomicUsize as usize;
+                let gave_up_addr = &gave_up as *const std::sync::atomic::AtomicBool as usize;
+                let outs_addr = outs.as_ptr() as usize;
+                let jobs: Vec<Job> = slices
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, pages_slice)| {
+                        let pages_ptr = pages_slice.as_ptr() as usize;
+                        let pages_len = pages_slice.len();
+                        Box::new(move || {
+                            // SAFETY: `wide_run` joins all workers before `self`, `stale`,
+                            // `budget`, `gave_up`, `outs`, and `side` leave scope. Pages in
+                            // `stale` are unique and sorted, so each worker writes strictly
+                            // disjoint `[at, at + n)` slices of `self.data`.
+                            let this = unsafe { &*(self_addr as *const Self) };
+                            let pages = unsafe { std::slice::from_raw_parts(pages_ptr as *const usize, pages_len) };
+                            let budget = unsafe { &*(budget_addr as *const std::sync::atomic::AtomicUsize) };
+                            let gave_up = unsafe { &*(gave_up_addr as *const std::sync::atomic::AtomicBool) };
+                            let slot = unsafe { &*(outs_addr as *const Mutex<Option<ChunkOut>>).add(idx) };
+                            let mut local_changed = Vec::new();
+                            let mut local_updated = Vec::with_capacity(pages.len());
+                            let (mut local_runs, mut local_bytes) = (0u64, 0u64);
+                            MERGE_TITLE.with(|buf| {
+                                let mut buf = buf.borrow_mut();
+                                if buf.len() < PAGE {
+                                    buf.resize(PAGE, 0);
+                                }
+                                for &page in pages {
+                                    if gave_up.load(Ordering::Relaxed) {
+                                        break;
+                                    }
+                                    let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
+                                    if lo >= hi {
+                                        continue;
+                                    }
+                                    let n = hi - lo;
+                                    let at = lo - start;
+                                    // SAFETY: inside `self.data`, disjoint per unique `page`, under `side.write()`.
+                                    let held_ptr = unsafe { this.data.add(at).cast_const() };
+                                    if let Some(diff) = crate::plaincopy::first_diff(lo as *const u8, held_ptr, n)
+                                        && diff >= n
+                                    {
+                                        MERGED[0].fetch_add(1, Ordering::Relaxed);
+                                        if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
+                                            local_updated.push(page);
+                                        }
+                                        continue;
+                                    }
+                                    let title = &mut buf[..n];
+                                    let tp = std::time::Instant::now();
+                                    if !crate::host::read_into(lo as *const u8, title) {
+                                        continue;
+                                    }
+                                    let tp = under_ns(5, tp);
+                                    let _compared = Compared(tp);
+                                    MERGED[0].fetch_add(1, Ordering::Relaxed);
+                                    // SAFETY: disjoint `[at, at + n)` inside `self.data`, under `side.write()`.
+                                    let held = unsafe { std::slice::from_raw_parts_mut(this.data.add(at), n) };
+                                    let avail = budget.load(Ordering::Relaxed);
+                                    let word_ok = fused_on && at.is_multiple_of(4) && lo.is_multiple_of(4) && n.is_multiple_of(4);
+                                    let consume = |used: usize, over: bool| -> bool {
+                                        let mut prev = 0usize;
+                                        let _ = budget.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                                            prev = cur;
+                                            Some(cur.saturating_sub(used))
+                                        });
+                                        over || used > prev
+                                    };
+                                    if word_ok && (is_relay || n / 8 < avail) {
+                                        let (runs, over) = word_runs_put_limited::<true>(title, held, gap, avail);
+                                        let hit = consume(runs.len(), over);
+                                        local_runs += runs.len() as u64;
+                                        local_bytes += runs.iter().map(|r| r.1 as u64).sum::<u64>();
+                                        local_changed.extend(runs.into_iter().map(|(r, m)| (at + r, at + r + m)));
+                                        if hit {
+                                            gave_up.store(true, Ordering::Relaxed);
+                                            break;
+                                        }
+                                    } else if word_ok {
+                                        let (runs, over) = word_runs_put_limited::<false>(title, held, gap, avail);
+                                        if over || consume(runs.len(), false) {
+                                            gave_up.store(true, Ordering::Relaxed);
+                                            break;
+                                        }
+                                        local_runs += runs.len() as u64;
+                                        for (r, m) in runs {
+                                            held[r..r + m].copy_from_slice(&title[r..r + m]);
+                                            local_changed.push((at + r, at + r + m));
+                                            local_bytes += m as u64;
+                                        }
+                                    } else {
+                                        let runs = joined_over(changed_runs(title, held), gap);
+                                        if runs.len() > avail || consume(runs.len(), false) {
+                                            gave_up.store(true, Ordering::Relaxed);
+                                            break;
+                                        }
+                                        local_runs += runs.len() as u64;
+                                        for (r, m) in runs {
+                                            held[r..r + m].copy_from_slice(&title[r..r + m]);
+                                            local_changed.push((at + r, at + r + m));
+                                            local_bytes += m as u64;
+                                        }
+                                    }
+                                    if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
+                                        local_updated.push(page);
+                                    }
+                                }
+                            });
+                            *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(ChunkOut {
+                                changed: local_changed,
+                                updated: local_updated,
+                                runs_in: local_runs,
+                                bytes_in: local_bytes,
+                            });
+                        }) as Job
+                    })
+                    .collect();
+                wide_run(jobs);
+                for slot in outs {
+                    if let Some(chunk) = slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                        changed.extend(chunk.changed);
+                        updated_pages.extend(chunk.updated);
+                        runs_in += chunk.runs_in;
+                        bytes_in += chunk.bytes_in;
                     }
-                    let n = hi - lo;
-                    let at = lo - start;
-                    // Zero-write AVX2 fast path for card copies: skip `read_into`
-                    // and word-run diffing completely when the stale page is
-                    // byte-identical to `self.data` (e.g. copy-back echo).
-                    if self.card.is_some() {
-                        // SAFETY: inside `self.data`, protected exclusively by `side`.
-                        let held_ptr = unsafe { self.data.add(at).cast_const() };
-                        if let Some(diff) = crate::plaincopy::first_diff(lo as *const u8, held_ptr, n)
-                            && diff >= n
-                        {
-                            MERGED[0].fetch_add(1, Ordering::Relaxed);
-                            if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
-                                updated_pages.push(page);
-                            }
+                }
+                *runs_left = budget.load(Ordering::Relaxed);
+                let hit = gave_up.load(Ordering::Relaxed);
+                if hit {
+                    MERGE_GAVE_UP[2].fetch_add(1, Ordering::Relaxed);
+                }
+                hit
+            } else {
+                MERGE_TITLE.with(|buf| {
+                    let mut buf = buf.borrow_mut();
+                    if buf.len() < PAGE {
+                        buf.resize(PAGE, 0);
+                    }
+                    for page in stale {
+                        let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
+                        if lo >= hi {
                             continue;
                         }
-                    }
-                    let title = &mut buf[..n];
-                    let tp = std::time::Instant::now();
-                    // A page that is not there is left as it is, and looked at
-                    // again next time.
-                    if !crate::host::read_into(lo as *const u8, title) {
-                        continue;
-                    }
-                    let tp = under_ns(5, tp);
-                    let _compared = Compared(tp);
-                    MERGED[0].fetch_add(1, Ordering::Relaxed);
-                    if self.card.is_some() {
-                        // SAFETY: inside the mapping of the copy's CPU side,
-                        // protected exclusively by `side` (`card.side.write()`).
-                        let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                        let word_ok = fused_on && at.is_multiple_of(4) && lo.is_multiple_of(4) && n.is_multiple_of(4);
-                        if word_ok && (is_relay || n / 8 < *runs_left) {
-                            let (runs, over) = word_runs_put_limited::<true>(title, held, gap, *runs_left);
-                            *runs_left -= runs.len();
-                            runs_in += runs.len() as u64;
-                            bytes_in += runs.iter().map(|r| r.1 as u64).sum::<u64>();
-                            changed.extend(runs.into_iter().map(|(r, m)| (at + r, at + r + m)));
-                            if over {
-                                MERGE_GAVE_UP[2].fetch_add(1, Ordering::Relaxed);
-                                return true;
+                        let n = hi - lo;
+                        let at = lo - start;
+                        // Zero-write AVX2 fast path for card copies: skip `read_into`
+                        // and word-run diffing completely when the stale page is
+                        // byte-identical to `self.data` (e.g. copy-back echo).
+                        if self.card.is_some() {
+                            // SAFETY: inside `self.data`, protected exclusively by `side`.
+                            let held_ptr = unsafe { self.data.add(at).cast_const() };
+                            if let Some(diff) = crate::plaincopy::first_diff(lo as *const u8, held_ptr, n)
+                                && diff >= n
+                            {
+                                MERGED[0].fetch_add(1, Ordering::Relaxed);
+                                if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
+                                    updated_pages.push(page);
+                                }
+                                continue;
                             }
-                        } else if word_ok {
-                            let (runs, over) = word_runs_put_limited::<false>(title, held, gap, *runs_left);
-                            if over {
-                                MERGE_GAVE_UP[2].fetch_add(1, Ordering::Relaxed);
-                                return true;
+                        }
+                        let title = &mut buf[..n];
+                        let tp = std::time::Instant::now();
+                        // A page that is not there is left as it is, and looked at
+                        // again next time.
+                        if !crate::host::read_into(lo as *const u8, title) {
+                            continue;
+                        }
+                        let tp = under_ns(5, tp);
+                        let _compared = Compared(tp);
+                        MERGED[0].fetch_add(1, Ordering::Relaxed);
+                        if self.card.is_some() {
+                            // SAFETY: inside the mapping of the copy's CPU side,
+                            // protected exclusively by `side` (`card.side.write()`).
+                            let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                            let word_ok = fused_on && at.is_multiple_of(4) && lo.is_multiple_of(4) && n.is_multiple_of(4);
+                            if word_ok && (is_relay || n / 8 < *runs_left) {
+                                let (runs, over) = word_runs_put_limited::<true>(title, held, gap, *runs_left);
+                                *runs_left -= runs.len();
+                                runs_in += runs.len() as u64;
+                                bytes_in += runs.iter().map(|r| r.1 as u64).sum::<u64>();
+                                changed.extend(runs.into_iter().map(|(r, m)| (at + r, at + r + m)));
+                                if over {
+                                    MERGE_GAVE_UP[2].fetch_add(1, Ordering::Relaxed);
+                                    return true;
+                                }
+                            } else if word_ok {
+                                let (runs, over) = word_runs_put_limited::<false>(title, held, gap, *runs_left);
+                                if over {
+                                    MERGE_GAVE_UP[2].fetch_add(1, Ordering::Relaxed);
+                                    return true;
+                                }
+                                *runs_left -= runs.len();
+                                runs_in += runs.len() as u64;
+                                for (r, m) in runs {
+                                    held[r..r + m].copy_from_slice(&title[r..r + m]);
+                                    changed.push((at + r, at + r + m));
+                                    bytes_in += m as u64;
+                                }
+                            } else {
+                                let runs = joined_over(changed_runs(title, held), gap);
+                                if runs.len() > *runs_left {
+                                    MERGE_GAVE_UP[2].fetch_add(1, Ordering::Relaxed);
+                                    return true;
+                                }
+                                *runs_left -= runs.len();
+                                runs_in += runs.len() as u64;
+                                for (r, m) in runs {
+                                    held[r..r + m].copy_from_slice(&title[r..r + m]);
+                                    changed.push((at + r, at + r + m));
+                                    bytes_in += m as u64;
+                                }
                             }
-                            *runs_left -= runs.len();
-                            runs_in += runs.len() as u64;
-                            for (r, m) in runs {
+                        } else if let Some(snapshot) = before.as_mut().and_then(|b| b.as_mut()) {
+                            // SAFETY: the snapshot's allocation holds the copy's
+                            // bytes at the copy's offsets (`writing`), and these
+                            // are in a declared range.
+                            let held = unsafe { std::slice::from_raw_parts_mut(snapshot.as_mut_ptr().add(at), n) };
+                            for (r, m) in changed_runs(title, held) {
+                                // SAFETY: inside the copy's mapping. The card may be
+                                // writing the copy beside these bytes; they are
+                                // written here and nothing around them.
+                                unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data.add(at + r), m) };
                                 held[r..r + m].copy_from_slice(&title[r..r + m]);
-                                changed.push((at + r, at + r + m));
-                                bytes_in += m as u64;
-                            }
-                        } else {
-                            let runs = joined_over(changed_runs(title, held), gap);
-                            if runs.len() > *runs_left {
-                                MERGE_GAVE_UP[2].fetch_add(1, Ordering::Relaxed);
-                                return true;
-                            }
-                            *runs_left -= runs.len();
-                            runs_in += runs.len() as u64;
-                            for (r, m) in runs {
-                                held[r..r + m].copy_from_slice(&title[r..r + m]);
-                                changed.push((at + r, at + r + m));
+                                runs_in += 1;
                                 bytes_in += m as u64;
                             }
                         }
-                    } else if let Some(snapshot) = before.as_mut().and_then(|b| b.as_mut()) {
-                        // SAFETY: the snapshot's allocation holds the copy's
-                        // bytes at the copy's offsets (`writing`), and these
-                        // are in a declared range.
-                        let held = unsafe { std::slice::from_raw_parts_mut(snapshot.as_mut_ptr().add(at), n) };
-                        for (r, m) in changed_runs(title, held) {
-                            // SAFETY: inside the copy's mapping. The card may be
-                            // writing the copy beside these bytes; they are
-                            // written here and nothing around them.
-                            unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data.add(at + r), m) };
-                            held[r..r + m].copy_from_slice(&title[r..r + m]);
-                            runs_in += 1;
-                            bytes_in += m as u64;
+                        // Taken, if the range holds all of the page that is in the
+                        // copy; else the rest of it is the refresh's, which notes
+                        // only whole pages, and the page is looked at again.
+                        if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
+                            updated_pages.push(page);
                         }
                     }
-                    // Taken, if the range holds all of the page that is in the
-                    // copy; else the rest of it is the refresh's, which notes
-                    // only whole pages, and the page is looked at again.
-                    if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
-                        updated_pages.push(page);
-                    }
-                }
-                false
-            });
+                    false
+                })
+            };
             let t = under_ns(3, t);
             MERGED[1].fetch_add(runs_in, Ordering::Relaxed);
             MERGED[2].fetch_add(bytes_in, Ordering::Relaxed);
@@ -6863,6 +7012,98 @@ mod card_merge_tests {
             *shadow.card.as_ref().unwrap().dirty.lock().unwrap(),
             vec![(super::PAGE + 128, super::PAGE + 128 + 256)]
         );
+        shadow.card = None;
+        drop(shadow);
+        // SAFETY: free our private write-watched allocation.
+        unsafe { VirtualFree(title as *mut _, 0, MEM_RELEASE) };
+        crate::watch::forget_test_pages(addr, addr + LEN);
+    }
+
+    #[test]
+    fn parallel_merge_under_writes_updates_all_pages_and_honors_run_budget() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let (Some(buffer), Some(staging)) = (warp_buffer(), warp_buffer()) else {
+            return;
+        };
+        const PAGES: usize = 24;
+        const LEN: usize = PAGES * super::PAGE;
+        // SAFETY: private write-watched allocation freed before returning.
+        let title = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                LEN,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as *mut u8;
+        assert!(!title.is_null());
+        // SAFETY: committed allocation of `LEN` bytes.
+        unsafe { std::ptr::write_bytes(title, 0x22, LEN) };
+        let mut side = vec![0u8; LEN];
+        let mut shadow = Shadow::new(buffer, side.as_mut_ptr(), 0, title as u64, LEN as u64);
+        shadow.card = Some(Card {
+            staging,
+            before: Mutex::new(None),
+            dirty: Mutex::default(),
+            sent: Mutex::default(),
+            side: std::sync::RwLock::new(()),
+            size: 0,
+            me: std::sync::OnceLock::new(),
+        });
+        let addr = title as usize;
+        assert_eq!(shadow.update(addr, LEN), LEN);
+        shadow.card.as_ref().unwrap().dirty.lock().unwrap().clear();
+
+        // Mark all 24 pages pending so `merge_under_writes` takes the parallel path (>= 16 pages).
+        // Even pages get same-byte echo writes (AVX2 first_diff fast path);
+        // odd pages get two disjoint 64-byte modified runs each (12 * 2 = 24 runs total).
+        shadow.pending.lock().unwrap().push((addr, addr + LEN));
+        for p in 0..PAGES {
+            let base = p * super::PAGE;
+            if p % 2 == 0 {
+                // SAFETY: inside page `p`.
+                unsafe { title.add(base + 16).write_volatile(0x22) };
+            } else {
+                for b in 0..64 {
+                    // SAFETY: inside page `p`.
+                    unsafe {
+                        title.add(base + 256 + b).write_volatile(0xA0 | (p as u8));
+                        title.add(base + 4096 + b).write_volatile(0xB0 | (p as u8));
+                    }
+                }
+            }
+        }
+        let mut runs_left = 128;
+        let gave_up = shadow.merge_under_writes(addr, LEN, &mut runs_left);
+        assert!(!gave_up);
+        assert_eq!(runs_left, 128 - 24);
+        let mut dirty = shadow.card.as_ref().unwrap().dirty.lock().unwrap().clone();
+        dirty.sort_unstable();
+        assert_eq!(dirty.len(), 24);
+        for p in 0..PAGES {
+            let base = p * super::PAGE;
+            if p % 2 == 0 {
+                assert_eq!(side[base + 16], 0x22);
+            } else {
+                assert_eq!(side[base + 256], 0xA0 | (p as u8));
+                assert_eq!(side[base + 4096], 0xB0 | (p as u8));
+                assert_eq!(side[base + 256 + 64], 0x22);
+            }
+        }
+
+        // Budget exhaustion across >= 16 dirty pages signals `gave_up = true`.
+        shadow.card.as_ref().unwrap().dirty.lock().unwrap().clear();
+        for p in 0..PAGES {
+            // SAFETY: inside page `p`.
+            unsafe { title.add(p * super::PAGE + 512).write_volatile(0xCC) };
+        }
+        let mut tiny_budget = 4;
+        assert!(shadow.merge_under_writes(addr, LEN, &mut tiny_budget));
+        assert_eq!(tiny_budget, 0);
+
         shadow.card = None;
         drop(shadow);
         // SAFETY: free our private write-watched allocation.
