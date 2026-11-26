@@ -17,7 +17,7 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_COMMITMENT_LIMIT, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, FILE_MAP_WRITE, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT,
+    CreateFileMappingW, FILE_MAP_WRITE, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_DECOMMIT,
     MEM_EXTENDED_PARAMETER, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER,
     MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS,
     MapViewOfFile, MapViewOfFile3, MemExtendedParameterAddressRequirements, PAGE_NOACCESS,
@@ -96,12 +96,219 @@ const PAGES_64K: u32 = PAGES_2M | PAGES_64K_BIT;
 /// adds GPU access bits (0x800-0x40000). Write-combining and uncached are
 /// dropped too: our GPU side reads this memory through the CPU.
 const HOST_PROTECTION: u32 = 0x1ff;
+/// Xbox GPU page protection bits carried in `XMemVirtualAlloc` `protect`.
+pub const PAGE_GRAPHICS_NOACCESS: u32 = 0x0800;
+pub const PAGE_GRAPHICS_READONLY: u32 = 0x1000;
+pub const PAGE_GRAPHICS_READWRITE: u32 = 0x2000;
+pub const PAGE_GRAPHICS_EXECUTE: u32 = 0x4000;
+pub const PAGE_GRAPHICS_EXECUTE_READ: u32 = 0x8000;
+pub const PAGE_GRAPHICS_EXECUTE_READWRITE: u32 = 0x1_0000;
+
+/// XMem flag bit for CPU-accessible memory.
+const XMEM_CPU: u64 = 1;
+/// XMem flag bit for GPU-accessible memory.
+const XMEM_GPU: u64 = 2;
 /// XMem flags of memory both processors reach: all of ours.
-const GRAPHICS: u64 = 3;
+const GRAPHICS: u64 = XMEM_CPU | XMEM_GPU;
 /// XMem flag bit of 32-bit graphics memory.
 const ADDRESS_32BIT: u64 = 4;
 /// The host's write watching (not in windows-sys' memory module).
 const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+/// Returns `true` when Xbox GPU protection flags grant GPU read (or
+/// execute+read) access without granting GPU write access.
+fn is_gpu_readonly(protect: u32) -> bool {
+    (protect & (PAGE_GRAPHICS_READONLY | PAGE_GRAPHICS_EXECUTE_READ)) != 0
+        && (protect & (PAGE_GRAPHICS_READWRITE | PAGE_GRAPHICS_EXECUTE_READWRITE)) == 0
+}
+
+/// Returns `true` for explicit CPU-only allocations (CPU bit set, GPU bit
+/// clear). `flags == 0` stays watched for backwards compatibility.
+fn is_cpu_only(flags: u64) -> bool {
+    (flags & XMEM_CPU != 0) && (flags & XMEM_GPU == 0)
+}
+
+/// Metadata recorded per non-overlapping `XMemVirtualAlloc` interval.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VirtualRegion {
+    size: usize,
+    flags: u64,
+    raw_protect: u32,
+}
+
+/// Non-overlapping tracked `XMemVirtualAlloc` intervals keyed by start address.
+static VIRTUAL_REGIONS: LazyLock<Mutex<BTreeMap<usize, VirtualRegion>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+fn virtual_regions() -> MutexGuard<'static, BTreeMap<usize, VirtualRegion>> {
+    VIRTUAL_REGIONS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Removes `[base, base + len)` from `regions`, splitting any enclosing entries.
+fn carve_virtual_regions(regions: &mut BTreeMap<usize, VirtualRegion>, base: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let end = base.saturating_add(len);
+    if end <= base {
+        return;
+    }
+    let mut overlapping: Vec<(usize, VirtualRegion)> = Vec::new();
+    if let Some((&start, &region)) = regions.range(..base).next_back()
+        && start.saturating_add(region.size) > base
+    {
+        overlapping.push((start, region));
+    }
+    for (&start, &region) in regions.range(base..end) {
+        overlapping.push((start, region));
+    }
+    for (start, region) in overlapping {
+        regions.remove(&start);
+        let region_end = start.saturating_add(region.size);
+        if start < base {
+            regions.insert(
+                start,
+                VirtualRegion {
+                    size: base - start,
+                    ..region
+                },
+            );
+        }
+        if region_end > end {
+            regions.insert(
+                end,
+                VirtualRegion {
+                    size: region_end - end,
+                    ..region
+                },
+            );
+        }
+    }
+}
+
+/// Records `[base, base + len)` with `(flags, raw_protect)` in `VIRTUAL_REGIONS`
+/// and forwards its GPU read-only status to `victory_gpu::title_hints`.
+fn record_virtual_region(
+    base: usize,
+    len: usize,
+    flags: u64,
+    raw_protect: u32,
+    preserve_zero_flags: bool,
+) {
+    if len == 0 {
+        return;
+    }
+    let mut regions = virtual_regions();
+    let effective_flags = if preserve_zero_flags && flags == 0 {
+        regions
+            .range(..=base)
+            .next_back()
+            .filter(|&(&start, r)| base < start.saturating_add(r.size))
+            .map_or(flags, |(_, r)| r.flags)
+    } else {
+        flags
+    };
+    carve_virtual_regions(&mut regions, base, len);
+    regions.insert(
+        base,
+        VirtualRegion {
+            size: len,
+            flags: effective_flags,
+            raw_protect,
+        },
+    );
+    victory_gpu::title_hints::set_gpu_memory_readonly(
+        base as u64,
+        len as u64,
+        is_gpu_readonly(raw_protect),
+    );
+}
+
+/// Clears `[base, base + len)` from `VIRTUAL_REGIONS` and clears its GPU
+/// read-only status in `victory_gpu::title_hints`.
+fn clear_virtual_region(base: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let mut regions = virtual_regions();
+    carve_virtual_regions(&mut regions, base, len);
+    victory_gpu::title_hints::set_gpu_memory_readonly(base as u64, len as u64, false);
+}
+
+/// Returns the tracked `flags` for the interval containing `addr`, if any.
+fn virtual_region_flags(addr: usize) -> Option<u64> {
+    let regions = virtual_regions();
+    regions
+        .range(..=addr)
+        .next_back()
+        .filter(|&(&start, r)| addr < start.saturating_add(r.size))
+        .map(|(_, r)| r.flags)
+}
+
+/// Measures `(aligned_base, clear_len, committed_bytes)` before `VirtualFree`.
+fn measure_free_range(base: usize, size: usize, free_type: u32) -> (usize, usize, usize) {
+    if free_type & MEM_RELEASE != 0 && size == 0 {
+        let mut queried_len = 0usize;
+        let mut committed = 0usize;
+        let mut cur = base;
+        loop {
+            let mut mbi = MEMORY_BASIC_INFORMATION::default();
+            // SAFETY: queries current process memory layout before release.
+            let got = unsafe {
+                VirtualQuery(
+                    cur as *const c_void,
+                    &mut mbi,
+                    size_of::<MEMORY_BASIC_INFORMATION>(),
+                )
+            };
+            if got == 0 || mbi.RegionSize == 0 || mbi.AllocationBase as usize != base {
+                break;
+            }
+            if mbi.State == MEM_COMMIT {
+                committed = committed.saturating_add(mbi.RegionSize);
+            }
+            queried_len = queried_len.saturating_add(mbi.RegionSize);
+            let Some(next) = cur.checked_add(mbi.RegionSize) else {
+                break;
+            };
+            cur = next;
+        }
+        let tracked_len = virtual_regions().get(&base).map_or(0, |r| r.size);
+        return (base, queried_len.max(tracked_len), committed);
+    }
+
+    if size == 0 {
+        return (base, 0, 0);
+    }
+    let aligned_base = base & !4095;
+    let aligned_end = base.saturating_add(size).next_multiple_of(4096);
+    let clear_len = aligned_end.saturating_sub(aligned_base);
+    let mut committed = 0usize;
+    let mut cur = aligned_base;
+    while cur < aligned_end {
+        let mut mbi = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: queries current process memory layout before decommit.
+        let got = unsafe {
+            VirtualQuery(
+                cur as *const c_void,
+                &mut mbi,
+                size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        if got == 0 || mbi.RegionSize == 0 {
+            break;
+        }
+        let span = mbi.RegionSize.min(aligned_end - cur);
+        if mbi.State == MEM_COMMIT {
+            committed = committed.saturating_add(span);
+        }
+        let Some(next) = cur.checked_add(span) else {
+            break;
+        };
+        cur = next;
+    }
+    (aligned_base, clear_len, committed)
+}
 
 /// The addresses XMem `flags` allow, first and last: the low 4 GiB for
 /// 32-bit memory; else from 4 GiB (kept for 32-bit requests, which the
@@ -136,6 +343,7 @@ pub extern "system" fn XMemVirtualAlloc(
             0
         },
     };
+    let raw_protect = protect;
     let mut protect = match protect & HOST_PROTECTION {
         0 => PAGE_NOACCESS,
         p => p,
@@ -148,11 +356,25 @@ pub extern "system" fn XMemVirtualAlloc(
     let placeholder = kind & PAGES_64K == PAGES_64K && kind & MEM_COMMIT == 0;
     if placeholder {
         if kind & MEM_REPLACE_PLACEHOLDER != 0 {
-            // Part of a placeholder the title split: it stays one.
+            // Part of a placeholder the title split: it stays one. Record the
+            // sub-pool's flags and Xbox GPU protection bits before returning.
+            if !base.is_null() && size > 0 {
+                let len = size.next_multiple_of(PAGE);
+                record_virtual_region(base as usize, len, flags, raw_protect, false);
+                tracing::debug!(
+                    base = format_args!("{base:p}"),
+                    size = len,
+                    flags = format_args!("{flags:#x}"),
+                    raw_protect = format_args!("{raw_protect:#x}"),
+                    gpu_readonly = is_gpu_readonly(raw_protect),
+                    "XMemVirtualAlloc placeholder replace"
+                );
+            }
             return base;
         }
         protect = PAGE_NOACCESS;
     }
+    let preserve_zero_flags = (kind & (MEM_RESERVE | MEM_REPLACE_PLACEHOLDER)) == 0 && !base.is_null();
     let mut kind = kind & !(PAGES_2M | PAGES_64K_BIT);
     if placeholder {
         kind |= MEM_RESERVE | MEM_RESERVE_PLACEHOLDER;
@@ -166,9 +388,18 @@ pub extern "system" fn XMemVirtualAlloc(
         kind |= MEM_RESERVE;
         // The GPU side copies only the pages the title wrote since its last
         // copy (`victory_gpu`, decision 0007); placeholders cannot be
-        // watched (their physical-page views are copied whole).
+        // watched (their physical-page views are copied whole), and explicit
+        // CPU-only allocations are never read by the GPU.
         if kind & MEM_RESERVE_PLACEHOLDER == 0 {
-            kind |= MEM_WRITE_WATCH;
+            if is_cpu_only(flags) {
+                tracing::debug!(
+                    size,
+                    flags = format_args!("{flags:#x}"),
+                    "XMemVirtualAlloc: skipping MEM_WRITE_WATCH on CPU-only allocation"
+                );
+            } else {
+                kind |= MEM_WRITE_WATCH;
+            }
         }
     }
     // SAFETY: the title's own arguments, cleaned of console bits; the
@@ -188,6 +419,25 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    if !at.is_null() {
+        let granularity = if placeholder { PAGE } else { 4096 };
+        let req_start = if base.is_null() {
+            at as usize
+        } else {
+            base as usize
+        };
+        let tracked_len = req_start
+            .saturating_add(size)
+            .next_multiple_of(granularity)
+            .saturating_sub(at as usize);
+        record_virtual_region(
+            at as usize,
+            tracked_len,
+            flags,
+            raw_protect,
+            preserve_zero_flags,
+        );
+    }
     if !at.is_null() && !placeholder && (kind & MEM_COMMIT != 0) {
         TITLE_VIRTUAL_COMMITTED.fetch_add(size.next_multiple_of(4096), Ordering::Relaxed);
     }
@@ -212,11 +462,55 @@ pub extern "system" fn XMemVirtualAlloc(
             size,
             kind = format_args!("{kind:#x}"),
             flags = format_args!("{flags:#x}"),
+            raw_protect = format_args!("{raw_protect:#x}"),
+            gpu_readonly = is_gpu_readonly(raw_protect),
             at = format_args!("{at:p}"),
             "XMemVirtualAlloc"
         );
     }
     at
+}
+
+/// Releases or decommits virtual memory, updating tracked region metadata and
+/// clearing GPU-read-only hints in `victory_gpu::title_hints`.
+pub extern "system" fn XMemVirtualFree(
+    address: *mut c_void,
+    size: usize,
+    free_type: u32,
+) -> BOOL {
+    if address.is_null() {
+        // SAFETY: forwarded to host for standard error handling.
+        return unsafe { VirtualFree(address, size, free_type) };
+    }
+    let placeholder_op = free_type & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) != 0;
+    let (clear_base, clear_len, committed_bytes) =
+        if !placeholder_op && (free_type & (MEM_RELEASE | MEM_DECOMMIT) != 0) {
+            measure_free_range(address as usize, size, free_type)
+        } else {
+            (address as usize, 0, 0)
+        };
+    // SAFETY: the title's own arguments.
+    let ok = unsafe { VirtualFree(address, size, free_type) };
+    if ok != 0 && clear_len > 0 {
+        if committed_bytes > 0 {
+            saturating_sub_atomic(&TITLE_VIRTUAL_COMMITTED, committed_bytes);
+        }
+        clear_virtual_region(clear_base, clear_len);
+        if free_type & MEM_RELEASE != 0 {
+            let mut p = physical();
+            let end = clear_base.saturating_add(clear_len);
+            let stale: Vec<usize> = p
+                .placeholders
+                .range(..end)
+                .filter(|&(&start, &len)| start.saturating_add(len) > clear_base)
+                .map(|(&start, _)| start)
+                .collect();
+            for start in stale {
+                p.placeholders.remove(&start);
+            }
+        }
+    }
+    ok
 }
 
 /// `MEMORY_BASIC_INFORMATION` (the console's first 0x30 bytes are the
@@ -247,7 +541,11 @@ pub extern "system" fn XMemVirtualQuery(
         }
         let info = &mut *out;
         info.flags = if info.host.State == MEM_COMMIT {
-            GRAPHICS
+            match virtual_region_flags(address as usize) {
+                Some(flags) if flags & GRAPHICS != 0 => flags,
+                Some(flags) => flags | GRAPHICS,
+                None => GRAPHICS,
+            }
         } else {
             0
         };
@@ -373,13 +671,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
-            let mut mbi = MEMORY_BASIC_INFORMATION::default();
-            if VirtualQuery(address, &mut mbi, size_of::<MEMORY_BASIC_INFORMATION>()) != 0
-                && mbi.State == MEM_COMMIT
-            {
-                saturating_sub_atomic(&TITLE_VIRTUAL_COMMITTED, mbi.RegionSize);
-            }
-            VirtualFree(address, 0, MEM_RELEASE);
+            XMemVirtualFree(address, 0, MEM_RELEASE);
             return;
         }
         let user = address.cast::<u8>();
@@ -1826,10 +2118,12 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
     1
 }
 
-/// Hands title memory (standard, in 2 MiB pages) to the system. The other
-/// transfers involve tools memory, which a retail console has none of.
+/// Transfers title memory (standard, in 2 MiB pages) between the title and the
+/// system (`0`: title to system, `1`: system to title). Other transfers involve
+/// tools memory, which a retail console has none of.
 pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
     const TITLE_TO_SYSTEM: u32 = 0;
+    const SYSTEM_TO_TITLE: u32 = 1;
     tracing::info!(kind, size, "XMemTransferMemory");
     if size == 0 {
         return 1;
@@ -1838,12 +2132,24 @@ pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
         return 0;
     };
     let standard = victory_gpu::console::current().title_memory().1;
-    let moved = kind == TITLE_TO_SYSTEM
-        && TRANSFERRED
+    let moved = match kind {
+        TITLE_TO_SYSTEM => TRANSFERRED
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |t| {
                 t.checked_add(size).filter(|&t| t <= standard)
             })
-            .is_ok();
+            .is_ok(),
+        SYSTEM_TO_TITLE => {
+            if size > standard {
+                false
+            } else {
+                let _ = TRANSFERRED.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |t| {
+                    Some(t.saturating_sub(size))
+                });
+                true
+            }
+        }
+        _ => false,
+    };
     moved.into()
 }
 
@@ -1862,6 +2168,7 @@ pub(crate) fn module() -> HleModule {
             hle_export!(XMemMapPhysicalPages),
             hle_export!(XMemMapPhysicalPagesScatter),
             hle_export!(XMemVirtualAlloc),
+            hle_export!(XMemVirtualFree),
             hle_export!(XMemVirtualQuery),
             hle_export!(XMemGetWorkingSetStatistics),
             hle_export!(XMemTransferMemory),
@@ -2488,5 +2795,248 @@ mod tests {
         assert!((0..2 * N).all(|k| query(at(k)).host.State == MEM_RESERVE));
         assert!(physical().views.range(a..a + 2 * N * PAGE).next().is_none());
         assert_eq!(XMemFreePhysicalPages(N, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn gpu_readonly_placeholder_subpool_carving_and_free() {
+        victory_gpu::title_hints::clear_gpu_readonly_ranges();
+
+        assert!(!is_gpu_readonly(PAGE_READWRITE));
+        assert!(!is_gpu_readonly(PAGE_GRAPHICS_NOACCESS));
+        assert!(is_gpu_readonly(PAGE_GRAPHICS_READONLY));
+        assert!(is_gpu_readonly(PAGE_READWRITE | PAGE_GRAPHICS_READONLY));
+        assert!(!is_gpu_readonly(PAGE_GRAPHICS_READWRITE));
+        assert!(!is_gpu_readonly(PAGE_GRAPHICS_EXECUTE));
+        assert!(is_gpu_readonly(PAGE_GRAPHICS_EXECUTE_READ));
+        assert!(!is_gpu_readonly(PAGE_GRAPHICS_EXECUTE_READWRITE));
+        assert!(!is_gpu_readonly(
+            PAGE_GRAPHICS_READONLY | PAGE_GRAPHICS_READWRITE
+        ));
+
+        // Simulate RAGE 9's multi-pool 32-bit GPU placeholder arena:
+        // reserve 4 x 64 KiB placeholder, split via MEM_PRESERVE_PLACEHOLDER,
+        // and replace sub-pools with RO / RW / EXEC_RO protections.
+        let arena = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            4 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            GRAPHICS | ADDRESS_32BIT,
+            PAGE_NOACCESS | PAGE_GRAPHICS_READONLY,
+        );
+        assert!(!arena.is_null());
+        let base = arena as u64;
+        assert!(victory_gpu::title_hints::gpu_readonly_contains(
+            base,
+            (4 * PAGE) as u64
+        ));
+
+        let pool0 = arena;
+        let pool1 = arena.wrapping_byte_add(PAGE);
+        let pool2 = arena.wrapping_byte_add(3 * PAGE);
+
+        // SAFETY: splitting our own placeholder reservation into 3 sub-placeholders.
+        unsafe {
+            assert_ne!(
+                VirtualFree(pool0, PAGE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER),
+                0
+            );
+            assert_ne!(
+                VirtualFree(pool1, 2 * PAGE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER),
+                0
+            );
+        }
+
+        // Pool 0: GPU read-only
+        assert_eq!(
+            XMemVirtualAlloc(
+                pool0,
+                PAGE,
+                MEM_RESERVE | MEM_REPLACE_PLACEHOLDER | PAGES_64K,
+                GRAPHICS | ADDRESS_32BIT,
+                PAGE_READWRITE | PAGE_GRAPHICS_READONLY,
+            ),
+            pool0
+        );
+        // Pool 1: GPU read-write (carved out of RO arena)
+        assert_eq!(
+            XMemVirtualAlloc(
+                pool1,
+                2 * PAGE,
+                MEM_RESERVE | MEM_REPLACE_PLACEHOLDER | PAGES_64K,
+                GRAPHICS | ADDRESS_32BIT,
+                PAGE_READWRITE | PAGE_GRAPHICS_READWRITE,
+            ),
+            pool1
+        );
+        // Pool 2: GPU execute-read (also read-only)
+        assert_eq!(
+            XMemVirtualAlloc(
+                pool2,
+                PAGE,
+                MEM_RESERVE | MEM_REPLACE_PLACEHOLDER | PAGES_64K,
+                GRAPHICS | ADDRESS_32BIT,
+                PAGE_READWRITE | PAGE_GRAPHICS_EXECUTE_READ,
+            ),
+            pool2
+        );
+
+        assert!(victory_gpu::title_hints::gpu_readonly_contains(
+            pool0 as u64,
+            PAGE as u64
+        ));
+        assert!(!victory_gpu::title_hints::gpu_readonly_contains(
+            pool1 as u64,
+            PAGE as u64
+        ));
+        assert!(!victory_gpu::title_hints::gpu_readonly_contains(
+            pool1 as u64,
+            (2 * PAGE) as u64
+        ));
+        assert!(!victory_gpu::title_hints::gpu_readonly_contains(
+            (pool0 as u64) + (PAGE as u64) - 16,
+            32
+        ));
+        assert!(victory_gpu::title_hints::gpu_readonly_contains(
+            pool2 as u64,
+            PAGE as u64
+        ));
+
+        // Releasing each sub-pool with size == 0 clears read-only hints.
+        assert_ne!(XMemVirtualFree(pool0, 0, MEM_RELEASE), 0);
+        assert!(!victory_gpu::title_hints::gpu_readonly_contains(
+            pool0 as u64,
+            PAGE as u64
+        ));
+        assert!(victory_gpu::title_hints::gpu_readonly_contains(
+            pool2 as u64,
+            PAGE as u64
+        ));
+        assert_ne!(XMemVirtualFree(pool1, 0, MEM_RELEASE), 0);
+        assert_ne!(XMemVirtualFree(pool2, 0, MEM_RELEASE), 0);
+        assert!(!victory_gpu::title_hints::gpu_readonly_contains(
+            pool2 as u64,
+            PAGE as u64
+        ));
+
+        // Non-placeholder RO allocation: partial MEM_DECOMMIT carves middle,
+        // full MEM_RELEASE clears remainder.
+        let committed = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            3 * PAGE,
+            MEM_RESERVE | MEM_COMMIT,
+            GRAPHICS,
+            PAGE_READWRITE | PAGE_GRAPHICS_READONLY,
+        );
+        assert!(!committed.is_null());
+        assert!(victory_gpu::title_hints::gpu_readonly_contains(
+            committed as u64,
+            (3 * PAGE) as u64
+        ));
+        let mid = committed.wrapping_byte_add(PAGE);
+        assert_ne!(XMemVirtualFree(mid, PAGE, MEM_DECOMMIT), 0);
+        assert!(victory_gpu::title_hints::gpu_readonly_contains(
+            committed as u64,
+            PAGE as u64
+        ));
+        assert!(!victory_gpu::title_hints::gpu_readonly_contains(
+            mid as u64,
+            PAGE as u64
+        ));
+        assert!(victory_gpu::title_hints::gpu_readonly_contains(
+            committed.wrapping_byte_add(2 * PAGE) as u64,
+            PAGE as u64
+        ));
+        assert_ne!(XMemVirtualFree(committed, 0, MEM_RELEASE), 0);
+        assert!(!victory_gpu::title_hints::gpu_readonly_contains(
+            committed as u64,
+            PAGE as u64
+        ));
+        assert!(!victory_gpu::title_hints::gpu_readonly_contains(
+            committed.wrapping_byte_add(2 * PAGE) as u64,
+            PAGE as u64
+        ));
+    }
+
+    #[test]
+    fn cpu_only_allocation_skips_write_watch_and_reports_tracked_flags() {
+        let cpu = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            PAGE,
+            MEM_RESERVE | MEM_COMMIT,
+            XMEM_CPU,
+            PAGE_READWRITE,
+        );
+        assert!(!cpu.is_null());
+        let info = query(cpu);
+        assert_eq!(info.host.State, MEM_COMMIT);
+        assert_eq!(info.flags, XMEM_CPU);
+
+        let (mut found, mut count, mut granularity) = ([0usize; 4], 4, 0);
+        // SAFETY: room for `count` addresses; fails because MEM_WRITE_WATCH was skipped.
+        let watched = unsafe {
+            windows_sys::Win32::System::Memory::GetWriteWatch(
+                0,
+                cpu,
+                PAGE,
+                found.as_mut_ptr().cast(),
+                &mut count,
+                &mut granularity,
+            )
+        };
+        assert_ne!(watched, 0, "CPU-only allocation should skip MEM_WRITE_WATCH");
+        assert_ne!(XMemVirtualFree(cpu, 0, MEM_RELEASE), 0);
+        assert_eq!(query(cpu).flags, 0);
+
+        // flags == 0 stays watched and reports GRAPHICS for backwards compatibility.
+        let default_alloc = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            PAGE,
+            MEM_RESERVE | MEM_COMMIT,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!default_alloc.is_null());
+        assert_eq!(query(default_alloc).flags, GRAPHICS);
+        let (mut found, mut count, mut granularity) = ([0usize; 4], 4, 0);
+        // SAFETY: room for `count` addresses.
+        let watched = unsafe {
+            windows_sys::Win32::System::Memory::GetWriteWatch(
+                0,
+                default_alloc,
+                PAGE,
+                found.as_mut_ptr().cast(),
+                &mut count,
+                &mut granularity,
+            )
+        };
+        assert_eq!(watched, 0, "flags == 0 must remain write-watched");
+        assert_ne!(XMemVirtualFree(default_alloc, 0, MEM_RELEASE), 0);
+    }
+
+    #[test]
+    fn transfer_memory_kind_one_succeeds_and_restores_budget() {
+        let mut before = WorkingSet::default();
+        assert_eq!(XMemGetWorkingSetStatistics(0x2000_0001, &mut before), 1);
+
+        assert_eq!(XMemTransferMemory(0, 64 * MIB), 1);
+        let mut shrunk = WorkingSet::default();
+        assert_eq!(XMemGetWorkingSetStatistics(0x2000_0001, &mut shrunk), 1);
+        assert_eq!(before.title_limit - shrunk.title_limit, 64 * MIB);
+
+        // `kind == 1` returns transferred memory to the title (2 MiB rounded).
+        assert_eq!(XMemTransferMemory(1, 64 * MIB - 1), 1);
+        let mut restored = WorkingSet::default();
+        assert_eq!(XMemGetWorkingSetStatistics(0x2000_0001, &mut restored), 1);
+        assert_eq!(restored.title_limit, before.title_limit);
+
+        // Standalone `kind == 1` still succeeds (saturating TRANSFERRED at 0)
+        // without exceeding total title memory, while tools transfers fail.
+        let (gpu_optimal, standard) = victory_gpu::console::current().title_memory();
+        assert_eq!(XMemTransferMemory(1, 32 * MIB), 1);
+        let mut capped = WorkingSet::default();
+        assert_eq!(XMemGetWorkingSetStatistics(0x2000_0001, &mut capped), 1);
+        assert!(capped.title_limit <= gpu_optimal + standard);
+        assert_eq!(XMemTransferMemory(1, standard + 2 * MIB), 0);
+        assert_eq!(XMemTransferMemory(2, MIB), 0, "no tools memory");
     }
 }

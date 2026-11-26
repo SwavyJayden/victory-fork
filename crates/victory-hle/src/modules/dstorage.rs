@@ -222,11 +222,18 @@ extern "system" fn create_queue(
     )
 }
 
-/// The title asks for 32 MiB and stops if this fails.
+/// The title asks for 32 MiB and stops if this fails. Honor
+/// `VICTORY_DSTORAGE_STAGING_MB` when set, otherwise keep at least the
+/// 64 MiB default staging cap so streaming does not stall artificially.
 extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
-    tracing::info!(size, "dstorage: staging buffer size");
+    let effective = effective_staging_size(u64::from(size), staging_override());
+    tracing::info!(
+        requested = size,
+        effective,
+        "dstorage: staging buffer size"
+    );
     if let Some(scheduler) = scheduler() {
-        scheduler.lock().staging = u64::from(size);
+        scheduler.lock().staging = effective;
     }
     S_OK
 }
@@ -334,11 +341,42 @@ struct Scheduler {
     finished: Condvar,
 }
 
+/// Number of DirectStorage priority classes: low (-1), normal (0), high (1),
+/// and real-time (2).
+const CLASSES: usize = 4;
 /// Priority weights per class (low, normal, high and real-time), as the
 /// console's: about 10x per level, counted against request sizes.
-const COST: [u64; 3] = [100, 10, 1];
-/// The console's default staging buffer.
-const STAGING: u64 = 32 << 20;
+const COST: [u64; CLASSES] = [1000, 100, 10, 1];
+/// Default staging buffer cap (64 MiB); overridable via
+/// `VICTORY_DSTORAGE_STAGING_MB`.
+const STAGING: u64 = 64 << 20;
+
+fn parse_staging_mb(raw: Option<&str>) -> Option<u64> {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&mb| mb > 0)
+        .and_then(|mb| mb.checked_mul(1 << 20))
+}
+
+fn staging_override() -> Option<u64> {
+    static OVERRIDE: OnceLock<Option<u64>> = OnceLock::new();
+    *OVERRIDE.get_or_init(|| parse_staging_mb(std::env::var("VICTORY_DSTORAGE_STAGING_MB").ok().as_deref()))
+}
+
+fn effective_staging_size(requested: u64, env_override: Option<u64>) -> u64 {
+    env_override.unwrap_or_else(|| requested.max(STAGING))
+}
+
+#[cfg(windows)]
+fn parse_worker_priority(raw: Option<&str>) -> (&'static str, i32) {
+    use windows_sys::Win32::System::Threading::{
+        THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_NORMAL,
+    };
+    match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("above_normal") => ("above_normal", THREAD_PRIORITY_ABOVE_NORMAL),
+        Some("below_normal") => ("below_normal", THREAD_PRIORITY_BELOW_NORMAL),
+        _ => ("normal", THREAD_PRIORITY_NORMAL),
+    }
+}
 
 struct Lanes {
     lanes: HashMap<u64, Lane>,
@@ -353,9 +391,9 @@ struct Lanes {
     /// Weighted round robin: each class's virtual time (bytes × cost), and
     /// the time of the last start; within a class, the lane clock of the
     /// last start.
-    clock: [u64; 3],
+    clock: [u64; CLASSES],
     now: u64,
-    lane_now: [u64; 3],
+    lane_now: [u64; CLASSES],
     /// Since the last debug summary: requests, bytes written, time spent
     /// running them.
     done: (u64, u64, std::time::Duration),
@@ -414,11 +452,11 @@ fn scheduler() -> Option<&'static Scheduler> {
                     next_id: 0,
                     next_seq: 0,
                     staged: 0,
-                    staging: STAGING,
+                    staging: staging_override().unwrap_or(STAGING),
                     starved: false,
-                    clock: [0; 3],
+                    clock: [0; CLASSES],
                     now: 0,
-                    lane_now: [0; 3],
+                    lane_now: [0; CLASSES],
                     done: Default::default(),
                     refused: 0,
                     bcpack: Default::default(),
@@ -437,25 +475,34 @@ fn scheduler() -> Option<&'static Scheduler> {
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|&n| n > 0)
             .unwrap_or(default_workers);
+        #[cfg(windows)]
+        let (priority_name, priority_val) =
+            parse_worker_priority(std::env::var("VICTORY_DSTORAGE_PRIORITY").ok().as_deref());
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
                     .name(format!("dstorage {i}"))
-                    .spawn(|| {
+                    .spawn(move || {
                         #[cfg(windows)]
                         // SAFETY: plain call setting priority of our own worker thread.
                         unsafe {
                             use windows_sys::Win32::System::Threading::{
-                                GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+                                GetCurrentThread, SetThreadPriority,
                             };
-                            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                            SetThreadPriority(GetCurrentThread(), priority_val);
                         }
                         work(scheduler);
                     })
                     .is_ok()
             })
             .count();
-        tracing::info!(workers = started, "dstorage: workers");
+        #[cfg(windows)]
+        tracing::info!(
+            workers = started,
+            priority = priority_name,
+            staging_mb = scheduler.lock().staging >> 20,
+            "dstorage: workers"
+        );
     });
     Some(scheduler)
 }
@@ -621,6 +668,11 @@ impl Lanes {
 
     fn finish(&mut self, job: &Job, result: Result<(), HRESULT>) {
         self.staged -= job.staging;
+        // Decrement backlog and record completion BEFORE `lane.flush()`
+        // publishes the Release status entry so polling callers immediately
+        // observe updated counters.
+        victory_gpu::title_hints::dstorage_sub_pending(1);
+        victory_gpu::title_hints::dstorage_note_completed(u64::from(job.request.destination_size));
         if let Some(lane) = self.lanes.get_mut(&job.lane) {
             lane.running.remove(&job.seq);
             if let Err(hr) = result {
@@ -680,7 +732,10 @@ impl Lanes {
             let seq = self.next_seq;
             self.next_seq += 1;
             match command {
-                Command::Read(request) => lane.reads.push_back((seq, request)),
+                Command::Read(request) => {
+                    lane.reads.push_back((seq, request));
+                    victory_gpu::title_hints::dstorage_add_pending(1);
+                }
                 Command::Status(status) => lane.statuses.push_back((seq, status)),
             }
         }
@@ -688,10 +743,19 @@ impl Lanes {
     }
 }
 
+impl Drop for Lane {
+    fn drop(&mut self) {
+        let remaining = self.reads.len() + self.running.len();
+        if remaining > 0 {
+            victory_gpu::title_hints::dstorage_sub_pending(remaining);
+        }
+    }
+}
+
 impl Lane {
     fn new(priority: i8, capacity: u16) -> Lane {
         Lane {
-            class: priority.clamp(-1, 1).wrapping_add(1) as usize,
+            class: priority.clamp(-1, 2).wrapping_add(1) as usize,
             capacity: usize::from(capacity),
             clock: 0,
             unsubmitted: Vec::new(),
@@ -734,12 +798,13 @@ impl Lane {
     }
 }
 
-/// Staging bytes a request holds while it runs: what it buffers between
-/// the file and the destination. Raw reads go straight to their
-/// destination, memory sources need none (as on the console).
+/// Staging bytes a request holds while it runs: compressed source bytes
+/// buffered between the file and decoder. Raw reads (including uncompressed
+/// `PAGE_DESTINATION` reads, which stream straight into `xmem::page_window`)
+/// and memory sources hold no staging buffer.
 fn staging_bytes(request: &Request) -> u64 {
-    let buffered = request.options & (ZLIB | BCPACK | PAGE_DESTINATION) != 0;
-    if buffered && request.options & MEMORY_SOURCE == 0 {
+    let compressed = request.options & (ZLIB | BCPACK) != 0;
+    if compressed && request.options & MEMORY_SOURCE == 0 {
         u64::from(request.source_size)
     } else {
         0
@@ -759,7 +824,9 @@ fn close_lane(id: u64) {
     lane.closed = true;
     lane.unsubmitted.clear();
     lane.held.clear();
+    let dropped = lane.reads.len();
     lane.reads.clear();
+    victory_gpu::title_hints::dstorage_sub_pending(dropped);
     lane.statuses.clear(); // releases their arrays
     while lanes.lanes.get(&id).is_some_and(|l| !l.running.is_empty()) {
         lanes = scheduler
@@ -1575,9 +1642,9 @@ mod tests {
             staged: 0,
             staging,
             starved: false,
-            clock: [0; 3],
+            clock: [0; CLASSES],
             now: 0,
-            lane_now: [0; 3],
+            lane_now: [0; CLASSES],
             done: Default::default(),
             refused: 0,
             bcpack: Default::default(),
@@ -1597,7 +1664,7 @@ mod tests {
         let mut l = lanes(STAGING);
         l.lanes.insert(0, Lane::new(0, 4096));
         l.lanes.insert(1, Lane::new(1, 4096));
-        l.lanes.insert(2, Lane::new(2, 4096)); // real-time: as high
+        l.lanes.insert(2, Lane::new(2, 4096)); // real-time: distinct class 3
         for _ in 0..400 {
             for id in 0..3 {
                 read(&mut l, id, 0, 4096);
@@ -1605,15 +1672,31 @@ mod tests {
         }
         (0..3).for_each(|id| l.submit(id));
         let mut started = [0u32; 3];
-        for _ in 0..330 {
+        for _ in 0..333 {
             let job = l.start().unwrap();
             started[job.lane as usize] += 1;
             l.finish(&job, Ok(()));
         }
-        // Normal gets about a tenth of what high and real-time get together.
-        assert_eq!(started[1] + started[2], 300, "{started:?}");
-        assert_eq!(started[0], 30, "{started:?}");
-        assert!(started[1].abs_diff(started[2]) <= 1, "{started:?}");
+        // Normal : High : RealTime share 1 : 10 : 100.
+        assert_eq!(started, [3, 30, 300], "{started:?}");
+
+        // Two queues in the same class share equally.
+        let mut same = lanes(STAGING);
+        same.lanes.insert(0, Lane::new(2, 4096));
+        same.lanes.insert(1, Lane::new(2, 4096));
+        for _ in 0..100 {
+            read(&mut same, 0, 0, 4096);
+            read(&mut same, 1, 0, 4096);
+        }
+        same.submit(0);
+        same.submit(1);
+        let mut pair = [0u32; 2];
+        for _ in 0..100 {
+            let job = same.start().unwrap();
+            pair[job.lane as usize] += 1;
+            same.finish(&job, Ok(()));
+        }
+        assert!(pair[0].abs_diff(pair[1]) <= 1, "{pair:?}");
     }
 
     #[test]
@@ -2022,5 +2105,120 @@ mod tests {
         assert_eq!(inflate(&bad_body, &mut out), Err(INVALID_DATA));
         assert_eq!(inflate(&packed, &mut out), Ok(plain.len()));
         assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn realtime_class_raw_page_staging_and_backlog_hints() {
+        // 4 priority classes preserve DSTORAGE_PRIORITY_REALTIME (priority == 2 -> class 3).
+        assert_eq!(Lane::new(-1, 64).class, 0);
+        assert_eq!(Lane::new(0, 64).class, 1);
+        assert_eq!(Lane::new(1, 64).class, 2);
+        assert_eq!(Lane::new(2, 64).class, 3);
+        assert_eq!(Lane::new(5, 64).class, 3);
+
+        // Raw PAGE_DESTINATION reads stream straight into xmem::page_window -> 0 staging bytes.
+        let mk = |options, size| {
+            let mut r = request(options, std::ptr::null_mut(), size, std::ptr::null(), 0, size);
+            r.source_size = size as u32;
+            r.destination_size = size as u32;
+            r
+        };
+        assert_eq!(staging_bytes(&mk(PAGE_DESTINATION, 1 << 20)), 0);
+        assert_eq!(staging_bytes(&mk(0, 1 << 20)), 0);
+        assert_eq!(
+            staging_bytes(&mk(ZLIB | MEMORY_SOURCE | PAGE_DESTINATION, 1 << 20)),
+            0
+        );
+        assert_eq!(
+            staging_bytes(&mk(ZLIB | PAGE_DESTINATION, 256 * 1024)),
+            256 * 1024
+        );
+        assert_eq!(staging_bytes(&mk(7 << 1, 128 * 1024)), 128 * 1024);
+
+        // Staging cap defaults to 64 MiB floor and respects VICTORY_DSTORAGE_STAGING_MB.
+        assert_eq!(effective_staging_size(32 << 20, None), 64 << 20);
+        assert_eq!(effective_staging_size(128 << 20, None), 128 << 20);
+        assert_eq!(
+            effective_staging_size(32 << 20, parse_staging_mb(Some("96"))),
+            96 << 20
+        );
+        assert_eq!(parse_staging_mb(Some("0")), None);
+
+        // Worker priority defaults to NORMAL and parses overrides.
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Threading::{
+                THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_NORMAL,
+            };
+            assert_eq!(parse_worker_priority(None), ("normal", THREAD_PRIORITY_NORMAL));
+            assert_eq!(
+                parse_worker_priority(Some("above_normal")),
+                ("above_normal", THREAD_PRIORITY_ABOVE_NORMAL)
+            );
+            assert_eq!(
+                parse_worker_priority(Some("below_normal")),
+                ("below_normal", THREAD_PRIORITY_BELOW_NORMAL)
+            );
+        }
+
+        // Backlog hints track submit -> finish -> 0 pending, plus completed ops & bytes.
+        let pending_before = victory_gpu::title_hints::dstorage_pending();
+        let (ops_before, bytes_before) = victory_gpu::title_hints::dstorage_completed();
+        {
+            let mut l = lanes(STAGING);
+            l.lanes.insert(0, Lane::new(2, 64));
+            read(&mut l, 0, PAGE_DESTINATION, 4096);
+            read(&mut l, 0, ZLIB, 8192);
+            l.submit(0);
+            assert_eq!(
+                victory_gpu::title_hints::dstorage_pending(),
+                pending_before + 2
+            );
+            let j1 = l.start().unwrap();
+            assert_eq!(j1.staging, 0);
+            let j2 = l.start().unwrap();
+            assert_eq!(j2.staging, 8192);
+            l.finish(&j1, Ok(()));
+            assert_eq!(
+                victory_gpu::title_hints::dstorage_pending(),
+                pending_before + 1
+            );
+            l.finish(&j2, Ok(()));
+            assert_eq!(victory_gpu::title_hints::dstorage_pending(), pending_before);
+        }
+        let (ops_after, bytes_after) = victory_gpu::title_hints::dstorage_completed();
+        assert_eq!(ops_after - ops_before, 2);
+        assert_eq!(bytes_after - bytes_before, 4096 + 8192);
+
+        // End-to-end realtime queue through the worker scheduler returns pending to 0.
+        let contents = pattern(8192);
+        let (_dir, file) = file_with(&contents);
+        let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
+            call(factory(), 0x50);
+        let desc = QueueDesc {
+            source_type: 0,
+            capacity: 0x80,
+            priority: 2,
+            name: c"realtime".as_ptr(),
+            unknown: 1,
+        };
+        let mut queue = std::ptr::null_mut();
+        assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
+        let array = status_array(1);
+        let mut out = vec![0u8; 4096];
+        let (ops_pre, bytes_pre) = victory_gpu::title_hints::dstorage_completed();
+        enqueue(
+            queue,
+            &request(0, out.as_mut_ptr().cast(), 4096, file, 1024, 4096),
+        );
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        assert_eq!(out, contents[1024..5120]);
+        assert_eq!(victory_gpu::title_hints::dstorage_pending(), 0);
+        let (ops_post, bytes_post) = victory_gpu::title_hints::dstorage_completed();
+        assert_eq!(ops_post - ops_pre, 1);
+        assert_eq!(bytes_post - bytes_pre, 4096);
+        void(queue, 0x40);
     }
 }
