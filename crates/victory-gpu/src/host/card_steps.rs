@@ -85,22 +85,20 @@ pub(super) fn stage() -> u32 {
 
 /// Whether a copy at its place in a list ([`place`]) is only in the way of
 /// what is done on the card in front of the lists if that stands behind it in
-/// them (`VICTORY_PLACED_ORDER=1`; off: wherever it stands), and a
-/// submission where it does is cut behind the copy's list ([`cut_for`]). Off:
-/// the case did not come up once in runs submit-1 to submit-3, so it has only
-/// its tests behind it.
+/// them (`VICTORY_PLACED_ORDER=0` disables; on by default), and a submission
+/// where it does is cut behind the copy's list ([`cut_for`]).
 ///
-/// The fills of constant buffers read the title's ring (7,500 a frame in the
-/// opening), and one copy of a few hundred bytes a frame writes into it at its
-/// place in a list. The whole submission was refused for it, and stood 40 to
-/// 60 ms until the flights had landed (run n19).
+/// The fills of constant buffers read the title's ring (4,800–7,500 a frame),
+/// and one copy of a few hundred bytes a frame writes into it at its place in
+/// a list. With this off, the whole submission was refused and stood 40 to
+/// 60 ms until the flights had landed (run n19 and Wave 19A session 112814).
 fn placed_order() -> bool {
     #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_PLACED_ORDER") {
         return on;
     }
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| crate::switch::on("VICTORY_PLACED_ORDER"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLACED_ORDER").is_none_or(|v| v != "0"))
 }
 
 /// Why [`plan`] refuses for [`place`].
@@ -108,10 +106,12 @@ const BEHIND_PLACED: &str = "a copy at its place in a list writes what it reads,
 
 /// The bytes of our buffer between reading and writing: what one submission
 /// may do this way (each place read once, however many fills take it).
-const BETWEEN: u64 = 4 << 20;
+/// Sized at 8 MiB so 8-part joined submissions (`3–4+ MiB` of constant fills)
+/// never refuse and force a synchronous flight drain.
+const BETWEEN: u64 = 8 << 20;
 
 /// The most steps of a submission done this way.
-const MOST: usize = 12288;
+const MOST: usize = 16384;
 
 /// How a fill's bytes get where its list reads them, if the card brings
 /// them.
@@ -680,7 +680,14 @@ impl Host {
                 DONE[3].fetch_add(1, Ordering::Relaxed);
                 #[cfg(feature = "diagnostics")]
                 refused(why);
-                let _ = why;
+                #[cfg(not(feature = "diagnostics"))]
+                {
+                    static LOGGED: Mutex<Option<std::collections::HashSet<&'static str>>> = Mutex::new(None);
+                    let mut guard = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
+                    if guard.get_or_insert_with(std::collections::HashSet::new).insert(why) {
+                        tracing::info!(why, "card_steps refused a submission and fell back to waiting for flights");
+                    }
+                }
                 None
             }
         }
