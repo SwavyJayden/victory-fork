@@ -45,7 +45,7 @@ fn in_flight_budget_for(tier: crate::residency::HostRamTier) -> u64 {
 }
 
 fn worker_count_for(logical_cpus: usize, tier: crate::residency::HostRamTier) -> usize {
-    if matches!(tier, crate::residency::HostRamTier::Tight) || logical_cpus < 8 {
+    if matches!(tier, crate::residency::HostRamTier::Tight) || logical_cpus <= 12 {
         2
     } else {
         4
@@ -524,7 +524,7 @@ mod tests {
         assert_eq!(in_flight_budget_for(HostRamTier::Plentiful), 256 << 20);
         assert_eq!(worker_count_for(12, HostRamTier::Tight), 2);
         assert_eq!(worker_count_for(6, HostRamTier::Moderate), 2);
-        assert_eq!(worker_count_for(12, HostRamTier::Moderate), 4);
+        assert_eq!(worker_count_for(12, HostRamTier::Moderate), 2);
         assert_eq!(worker_count_for(16, HostRamTier::Plentiful), 4);
     }
 }

@@ -525,19 +525,20 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
 
 /// Interval between forced full-pipeline settles solely to run [`sweep`] when
 /// submissions stay continuously in flight. Stays at 1,500 ms under host RAM or
-/// high VRAM (>= 85% budget) pressure; widens to 5,000 ms while memory has
-/// comfortable headroom to avoid periodic 100+ ms drain hitches.
+/// high VRAM (>= 92% budget) pressure; widens to 12,000 ms while memory has
+/// comfortable headroom so 16 GB cards running steadily at 82–86% VRAM do not
+/// suffer periodic drain hitches.
 fn sweep_settle_interval_ms(video_memory: Option<[u64; 4]>, host_pressured: bool) -> u64 {
     if host_pressured {
         return 1500;
     }
     if let Some([budget, used, ..]) = video_memory
         && budget > 0
-        && used.saturating_mul(100) >= budget.saturating_mul(85)
+        && used.saturating_mul(100) >= budget.saturating_mul(92)
     {
         return 1500;
     }
-    5000
+    12_000
 }
 
 /// Once a second, before a submission starts: lets go of what nothing
@@ -5380,15 +5381,17 @@ impl Host {
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // Behind what the title's queues were given before it.
         crate::queue::before_sync();
-        let _ = self.submit(runs, &[], false);
+        let _ = self.submit(runs, &[], false, true);
     }
 
     /// Runs a closed internal upload-only host list synchronously without
     /// draining title queues (`queue::before_sync`), so it is deadlock-safe
     /// when invoked from `VICTORY_THIN=1` worker threads. Settles in-flight
     /// GPU work and waits for the upload list's fence before returning.
+    /// Internal copy-only lists never read title descriptor heaps, so they
+    /// skip `sync_heaps`.
     pub(crate) fn execute_sync_internal(&self, list: &HostList) {
-        let _ = self.submit(&[list], &[], false);
+        let _ = self.submit(&[list], &[], false, false);
     }
 
     /// A queue's submission with [`late`]: the host lists `lists`, taken
@@ -5430,7 +5433,7 @@ impl Host {
     fn send_late(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>, parts: &[usize]) {
         let sent = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
-            self.submit(&runs, parts, true)
+            self.submit(&runs, parts, true, true)
         };
         let Some((mut submitted, sent)) = sent else {
             // (Not reached: a submission sent ahead always comes back.)
@@ -5490,7 +5493,9 @@ impl Host {
     /// it ran and was waited for after all.
     fn execute_own(&self, list: &HostList) -> u64 {
         late_threads();
-        let Some((submitted, sent)) = self.submit(&[list], &[], true) else {
+        // Present copy/composite lists never index title descriptor heaps;
+        // skipping `sync_heaps` prevents un-overlapped 3-16 ms pre-Present stalls.
+        let Some((submitted, sent)) = self.submit(&[list], &[], true, false) else {
             return 0;
         };
         let number = sent.number;
@@ -5739,7 +5744,13 @@ impl Host {
     /// `parts`: the lists of `runs` at which another part begins
     /// ([`joins`]): those go to the queue in calls of their own, one after the
     /// other, as they would have.
-    fn submit<'a>(&'a self, runs: &[&HostList], parts: &[usize], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
+    fn submit<'a>(
+        &'a self,
+        runs: &[&HostList],
+        parts: &[usize],
+        late: bool,
+        sync_heaps: bool,
+    ) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -5787,10 +5798,15 @@ impl Host {
         // command lists that index those slots are submitted.
         // Renderer port #7 (from renderer patch #4): the round asked for when
         // the title submitted it, if that is known (`crate::port_journal`).
-        let heaps_on = crate::port_journal::on();
-        let heaps_synced = match crate::port_journal::needed() {
-            0 => crate::descriptor::begin_sync_heaps(),
-            mark => crate::descriptor::begin_sync_heaps_after(mark),
+        // Internal copy/Present submissions never read title descriptor heaps.
+        let heaps_on = sync_heaps && crate::port_journal::on();
+        let heaps_synced = if sync_heaps {
+            Some(match crate::port_journal::needed() {
+                0 => crate::descriptor::begin_sync_heaps(),
+                mark => crate::descriptor::begin_sync_heaps_after(mark),
+            })
+        } else {
+            None
         };
         // That list runs first, and is one of the submission's from here on.
         let with: Vec<&HostList>;
@@ -5970,12 +5986,14 @@ impl Host {
         split.part(4);
         prep_mark(&mut p_split, 7);
         stage.next("submit: waiting for the heaps' records");
-        let heaps_began = std::time::Instant::now();
-        drop(heaps_synced);
-        crate::port_journal::heaps_waited(heaps_began.elapsed().as_nanos() as u64, heaps_on);
-        // The slots that waited for a texture's host copy, before the
-        // lists that may read them run.
-        crate::descriptor::make_waiting();
+        if let Some(heaps_synced) = heaps_synced {
+            let heaps_began = std::time::Instant::now();
+            drop(heaps_synced);
+            crate::port_journal::heaps_waited(heaps_began.elapsed().as_nanos() as u64, heaps_on);
+            // The slots that waited for a texture's host copy, before the
+            // lists that may read them run.
+            crate::descriptor::make_waiting();
+        }
         prep_mark(&mut p_split, 8);
         #[cfg(feature = "diagnostics")]
         split.part(15);
@@ -7721,7 +7739,7 @@ impl HostList {
                         if !batch.due.is_empty() {
                             batch.refresh_textures();
                         }
-                        batch.title_written();
+                        batch.title_written_range(p.dst, p.dst + p.len);
                     }
                     if let Some(bytes) = p.prepare(free) {
                         batch.placed.push((p.shadow.clone(), p.dst, bytes));
@@ -8519,6 +8537,24 @@ impl Batch {
     fn title_written(&mut self) {
         self.flush();
         self.ahead.clear();
+        self.textures.clear();
+    }
+
+    /// Before a placed copy writing `[from, to)` of title memory: only flushes
+    /// pending refreshes and invalidates `ahead` spans overlapping `[from, to)`
+    /// so unrelated shadows refreshed in `refresh_front` stay cached.
+    fn title_written_range(&mut self, from: usize, to: usize) {
+        let mut i = 0;
+        while i < self.refreshes.len() {
+            let (_, r_from, r_to) = self.refreshes[i];
+            if r_from < to && from < r_to {
+                let shadow = self.refreshes[i].0.clone();
+                self.flush_one(&shadow);
+            } else {
+                i += 1;
+            }
+        }
+        self.ahead.retain(|_, &mut (a_from, a_to)| !(a_from < to && from < a_to));
         self.textures.clear();
     }
 
@@ -9874,7 +9910,8 @@ impl Host {
                     flown
                 }
                 None => {
-                    self.execute(&[copy]);
+                    crate::queue::before_sync();
+                    let _ = self.submit(&[copy], &[], false, false);
                     0
                 }
             };
@@ -11398,11 +11435,11 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     #[test]
     fn sweep_settle_interval_scales_with_pressure() {
         let gib = 1024 * 1024 * 1024;
-        assert_eq!(super::sweep_settle_interval_ms(Some([16 * gib, 12 * gib, 0, 0]), false), 5000);
-        assert_eq!(super::sweep_settle_interval_ms(Some([100, 84, 0, 0]), false), 5000);
-        assert_eq!(super::sweep_settle_interval_ms(Some([100, 85, 0, 0]), false), 1500);
+        assert_eq!(super::sweep_settle_interval_ms(Some([16 * gib, 12 * gib, 0, 0]), false), 12_000);
+        assert_eq!(super::sweep_settle_interval_ms(Some([100, 91, 0, 0]), false), 12_000);
+        assert_eq!(super::sweep_settle_interval_ms(Some([100, 92, 0, 0]), false), 1500);
         assert_eq!(super::sweep_settle_interval_ms(Some([16 * gib, 8 * gib, 0, 0]), true), 1500);
-        assert_eq!(super::sweep_settle_interval_ms(None, false), 5000);
+        assert_eq!(super::sweep_settle_interval_ms(None, false), 12_000);
     }
 }
 

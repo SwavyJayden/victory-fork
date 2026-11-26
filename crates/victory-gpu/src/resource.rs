@@ -1210,6 +1210,9 @@ struct Hosted {
     /// The host copy (and twin) once made. Taken out again only by
     /// [`let_go_idle`] and when the title releases the resource.
     made: std::sync::Mutex<Option<Made>>,
+    /// Lock-free mirror of `made.is_some()` (updated under `made`'s lock) so
+    /// [`host_waits`] skips locking `made` on thousands of descriptor slots/frame.
+    has_made: std::sync::atomic::AtomicBool,
     /// The state and clear value the title created the texture with.
     state: u32,
     clear: Option<[u32; 5]>,
@@ -1363,6 +1366,7 @@ pub(crate) fn want_level(this: This, first: u32) {
     r.host.grown.store(true, Relaxed);
     HELD[2].fetch_add(1, Relaxed);
     if let Some(old) = made.take() {
+        r.host.has_made.store(false, std::sync::atomic::Ordering::Release);
         REPLACED.lock().unwrap_or_else(|e| e.into_inner()).push((crate::host::moment(), old));
     }
 }
@@ -1384,6 +1388,25 @@ static TEXTURES: std::sync::Mutex<std::collections::BTreeSet<usize>> =
 #[cfg(windows)]
 fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize>> {
     TEXTURES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A title texture pinned alive with a COM reference so an alias copy cannot
+/// race its release (PR #1336).
+#[cfg(windows)]
+pub(crate) struct Held(This);
+
+#[cfg(windows)]
+impl Held {
+    pub(crate) fn get(&self) -> This {
+        self.0
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Held {
+    fn drop(&mut self) {
+        crate::object::release_boxed::<Resource>(self.0);
+    }
 }
 
 /// The title textures the host renders to or writes (targets, depth,
@@ -1415,7 +1438,7 @@ static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
 /// `VICTORY_ALIAS_COPY=0`: none is found, as before; `=1`: only textures
 /// of one level and one layer, as at first.
 #[cfg(windows)]
-pub(crate) fn alias_of(this: This) -> Option<This> {
+pub(crate) fn alias_of(this: This) -> Option<Held> {
     use std::sync::atomic::Ordering::Relaxed;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if this.is_null()
@@ -1476,7 +1499,10 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
             );
         }
     }
-    same.then_some(other)
+    if !same || !crate::object::try_add_ref(other) {
+        return None;
+    }
+    Some(Held(other))
 }
 
 /// Whether host copies are made on first use. On by default;
@@ -1509,13 +1535,12 @@ pub(crate) fn title_fills(this: This) -> bool {
 /// (`crate::descriptor::make_waiting`).
 #[cfg(windows)]
 pub(crate) fn host_waits(this: This) -> bool {
+    use std::sync::atomic::Ordering::{Acquire, Relaxed};
     if this.is_null() || !lazy() {
         return false;
     }
     let r = resource(this);
-    r.desc.dimension != BUFFER
-        && !r.host.refused.load(std::sync::atomic::Ordering::Relaxed)
-        && r.host.made.lock().unwrap_or_else(|e| e.into_inner()).is_none()
+    r.desc.dimension != BUFFER && !r.host.refused.load(Relaxed) && !r.host.has_made.load(Acquire)
 }
 
 /// The host side of title texture `this`: made now if it is not there and
@@ -1629,6 +1654,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         }
         KINDS[6].fetch_add(1, Relaxed);
         *made = Some((std::sync::Arc::new(host), twin));
+        r.host.has_made.store(true, std::sync::atomic::Ordering::Release);
         // Slots the title wrote with views of it while it had no host copy
         // are made before the next submission runs.
         crate::descriptor::texture_made(this as usize);
@@ -2107,6 +2133,7 @@ pub(crate) fn let_go_idle() {
                 // state of the texture let go (it says "uploaded").
                 crate::texture::unstage(at as This);
                 r.host.wanted.store(u32::MAX, Relaxed);
+                r.host.has_made.store(false, std::sync::atomic::Ordering::Release);
                 made.take()
             } else {
                 None
@@ -2690,6 +2717,7 @@ fn hand_out_resource(
         #[cfg(windows)]
         host: Hosted {
             made: std::sync::Mutex::new(None),
+            has_made: std::sync::atomic::AtomicBool::new(false),
             state,
             // SAFETY: the title passes a whole clear value (the format,
             // then color or depth and stencil: 5 words) or null.

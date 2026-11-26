@@ -311,11 +311,12 @@ fn back_list(kind: u32) -> This {
     list
 }
 
-/// Default thin-list worker count scales to half the logical cores (2..=8) so
-/// 6C/12T CPUs (e.g. Ryzen 5 5600X) run 6 workers instead of oversubscribing
-/// with 8+, while 16–24T CPUs keep 8 workers.
+/// Default thin-list worker count scales to a third of logical cores (2..=8)
+/// so 6C/12T CPUs (e.g. Ryzen 5 5600X) run 4 workers instead of oversubscribing
+/// physical cores alongside title + submit + relay + land threads, while 24T+
+/// CPUs keep 8 workers.
 fn thin_threads_for(asked: Option<usize>, processors: usize) -> usize {
-    asked.unwrap_or_else(|| (processors / 2).clamp(2, 8)).clamp(1, 32)
+    asked.unwrap_or_else(|| (processors / 3).clamp(2, 8)).clamp(1, 32)
 }
 
 fn start() {
@@ -936,8 +937,8 @@ mod tests {
     #[test]
     fn thin_threads_scale_to_host_cores() {
         assert_eq!(thin_threads_for(None, 4), 2);
-        assert_eq!(thin_threads_for(None, 12), 6);
-        assert_eq!(thin_threads_for(None, 16), 8);
+        assert_eq!(thin_threads_for(None, 12), 4);
+        assert_eq!(thin_threads_for(None, 16), 5);
         assert_eq!(thin_threads_for(None, 24), 8);
         assert_eq!(thin_threads_for(Some(4), 12), 4);
         assert_eq!(thin_threads_for(Some(0), 12), 1);

@@ -417,21 +417,27 @@ pub(crate) fn sync_heaps() {
         let mirrored_count = heap.desc.count.min(host.count());
         // The records of some frames ago that no draw read through a table
         // since: a shader may pick them by index.
-        let before = host.copied_before(frame);
-        let of_tables = std::sync::atomic::AtomicU64::new(0);
-        crate::land::each_view(true, before.len().div_ceil(SYNC_AT_A_TIME), &|n| {
-            for &index in before.chunks(SYNC_AT_A_TIME).nth(n).unwrap_or_default() {
-                if host.copied_tabled(index, frame) {
-                    of_tables.fetch_add(1, Relaxed);
-                } else {
-                    host.mirror(index, start + u64::from(index) * step, false);
+        let before_began = std::time::Instant::now();
+        let (before, mut of_tables) = host.copied_before(frame);
+        if !before.is_empty() {
+            let extra_tables = std::sync::atomic::AtomicU64::new(0);
+            crate::land::each_view(true, before.len().div_ceil(SYNC_AT_A_TIME), &|n| {
+                for &index in before.chunks(SYNC_AT_A_TIME).nth(n).unwrap_or_default() {
+                    if host.copied_tabled(index, frame) {
+                        extra_tables.fetch_add(1, Relaxed);
+                    } else {
+                        host.mirror(index, start + u64::from(index) * step, false);
+                    }
                 }
-            }
-        });
-        let of_tables = of_tables.into_inner();
+            });
+            let extra = extra_tables.into_inner();
+            of_tables += extra;
+            let done = before.len() as u64 - extra;
+            mirrored += done;
+            kinds[4] += done;
+        }
         tabled += of_tables;
-        mirrored += before.len() as u64 - of_tables;
-        kinds[4] += before.len() as u64 - of_tables;
+        spent[2] += since(before_began);
         // Those of the changed pages, made together at the end.
         let mut make: Vec<(u32, [u32; 3])> = Vec::new();
         // Ranges of the heap to look at, and whether a range is one the
@@ -780,16 +786,16 @@ pub(crate) fn with_heap<T>(heap: usize, f: impl FnOnce(&Heap) -> T) -> Option<T>
     heaps.iter().any(|&(_, _, h)| h == heap).then(|| f(unsafe { &*(heap as *const Heap) }))
 }
 
-/// Gives back dynamic slots of the host heap behind the title heap at
+/// Gives back dynamic slots of the host heap `id` behind the title heap at
 /// `heap`, if that heap still exists.
 #[cfg(windows)]
-pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
+pub(crate) fn release_dynamic(heap: usize, id: u64, first: u32, n: u32) {
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     if heaps.iter().any(|&(_, _, h)| h == heap)
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
     {
-        host.release(first, n);
+        host.release(id, first, n);
     }
 }
 
@@ -808,23 +814,38 @@ pub(crate) fn with_view_heap<T>(f: impl FnOnce(&host::HostHeap) -> T) -> Option<
     Some(f(host))
 }
 
-/// Makes dynamic slot `index` of the host heap behind the title heap at
-/// `heap`, if that heap still exists, the constant buffer view of `size`
-/// bytes of `buffer` at `gpu`.
+/// Updates dynamic constant buffer view slots `(heap, index, gpu, size)` in
+/// batch, acquiring `SHADER_HEAPS.read()` once for a worker's entire slice
+/// instead of locking on each of up to 11,000 fills/frame.
 #[cfg(windows)]
-pub(crate) fn constant_slot(
-    heap: usize,
-    index: u32,
+pub(crate) fn constant_slots_batch(
+    slots: &[(usize, u32, u64, u32)],
     buffer: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
-    gpu: u64,
-    size: u32,
 ) {
+    if slots.is_empty() {
+        return;
+    }
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
-    if heaps.iter().any(|&(_, _, h)| h == heap)
-        // SAFETY: registered heaps are live (removed when dropped).
-        && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
-    {
-        host.constant_at(index, buffer, gpu, size);
+    let mut last: Option<(usize, &host::HostHeap)> = None;
+    for &(heap, index, gpu, size) in slots {
+        let host = match last {
+            Some((h, host)) if h == heap => Some(host),
+            _ => {
+                let found = heaps
+                    .iter()
+                    .any(|&(_, _, h)| h == heap)
+                    // SAFETY: registered heaps are live while `SHADER_HEAPS` read lock is held.
+                    .then(|| unsafe { &*(heap as *const Heap) }.host.get().and_then(Option::as_ref))
+                    .flatten();
+                if let Some(host) = found {
+                    last = Some((heap, host));
+                }
+                found
+            }
+        };
+        if let Some(host) = host {
+            host.constant_at(index, buffer, gpu, size);
+        }
     }
 }
 

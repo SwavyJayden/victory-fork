@@ -5377,9 +5377,29 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             (on_card, data, Some(Card::new(staging, len)))
         }
         None => {
+            // Drop `LOOSE.write()` before `shared_buffer()` so `CreateCommittedResource`
+            // + `MakeResident` + `mapped()` never serialize concurrent title/recording threads.
+            drop(map);
             let (buffer, data) = host()?.shared_buffer(len)?;
             crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
-            (buffer, data, None)
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            tracing::debug!(
+                start = format_args!("{start:#x}"),
+                len,
+                "loose memory copied to the host"
+            );
+            let mut shadow = Shadow::new(buffer, data, gpu, start, len);
+            shadow.window = true;
+            let shadow = Arc::new(shadow);
+            let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+            if let Some(existing) = map.get(&(start, len)) {
+                note(existing);
+                return Some(existing.clone());
+            }
+            note(&shadow);
+            map.insert((start, len), shadow.clone());
+            return Some(shadow);
         }
     };
     // SAFETY: a live buffer.
@@ -5437,28 +5457,40 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         return None;
     }
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
-    let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
-    let (tick, map) = &mut *guard;
-    *tick += 1;
-    let now = *tick;
-    if let Some((shadow, used)) = map.get_mut(&(address, len)) {
-        *used = now;
-        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
-        return Some(shadow.clone());
-    }
-    if map.len() >= MANY {
-        // Held by the map alone (no list), its buffer by the copy alone (no
-        // slot shows it), and not asked for lately.
-        map.retain(|_, (shadow, used)| {
-            Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
-        });
-    }
+    let now = {
+        let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+        let (tick, map) = &mut *guard;
+        *tick += 1;
+        let now = *tick;
+        if let Some((shadow, used)) = map.get_mut(&(address, len)) {
+            *used = now;
+            shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+            return Some(shadow.clone());
+        }
+        if map.len() >= MANY {
+            // Held by the map alone (no list), its buffer by the copy alone (no
+            // slot shows it), and not asked for lately.
+            map.retain(|_, (shadow, used)| {
+                Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
+            });
+        }
+        now
+    };
+    // Allocate outside `EXACT` so `CreateCommittedResource` + `MakeResident`
+    // + `mapped()` never stall concurrent callers looking up cached views.
     let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
-    map.insert((address, len), (shadow.clone(), now));
+    let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((existing, used)) = guard.1.get_mut(&(address, len)) {
+        *used = now.max(*used);
+        existing.used.store(crate::host::moment(), Ordering::Relaxed);
+        return Some(existing.clone());
+    }
+    guard.1.insert((address, len), (shadow.clone(), now));
+    drop(guard);
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     OWN_MADE.fetch_add(1, Ordering::Relaxed);
     Some(shadow)

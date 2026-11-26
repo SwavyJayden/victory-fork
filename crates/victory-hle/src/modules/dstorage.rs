@@ -634,7 +634,8 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let logical = std::thread::available_parallelism().map_or(8, |n| n.get());
+        let workers = (logical / 2).clamp(2, 6);
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()

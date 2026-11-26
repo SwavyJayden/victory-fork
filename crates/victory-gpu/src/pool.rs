@@ -38,20 +38,33 @@ const STAGING_KEPT: usize = 8;
 /// How many are kept now.
 static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 
+/// Hysteresis latch for [`spares_with_state`]: prevents the 85% VRAM sawtooth
+/// where dropping empty 64 MiB blocks immediately fell back below the threshold
+/// and caused 6 brand-new blocks to be allocated the next second.
+static TIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Sets how many empty blocks stay, by the card's memory (budget and use):
-/// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
-/// Asked once a second.
+/// [`SPARE_KEPT`] while below the hysteresis ceiling ([`crate::host::keep_freed`]),
+/// else [`SPARE`]. Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
     let pressure = crate::residency::pressured();
-    let limit = spares(memory, crate::host::keep_freed() && !pressure);
+    let (limit, tight) = spares_with_state(memory, crate::host::keep_freed() && !pressure, TIGHT.load(Ordering::Relaxed));
+    TIGHT.store(tight, Ordering::Relaxed);
     SPARES.store(limit, Ordering::Relaxed);
     let tick = now();
     // A full pool can become idle while another subsystem needs the VRAM.
     // A busy allocator observes the new limit on its next allocation or tick.
-    if let Ok(mut pool) = TEXTURES.try_lock() {
-        pool.reclaim(tick, limit, true);
+    // Evicted heaps are retired outside the lock so `victory-submit` never
+    // stalls synchronously on D3D12 heap teardown.
+    let evicted_textures = if let Ok(mut pool) = TEXTURES.try_lock() {
+        pool.reclaim(tick, limit, true)
+    } else {
+        Vec::new()
+    };
+    for heap in evicted_textures {
+        crate::host::retire(heap);
     }
-    if let Ok(mut pool) = STAGING.try_lock() {
+    let evicted_staging = if let Ok(mut pool) = STAGING.try_lock() {
         let staging_limit = if crate::residency::critical_commit() {
             0
         } else if pressure {
@@ -59,20 +72,43 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
         } else {
             limit
         };
-        pool.reclaim(tick, staging_limit, true);
+        pool.reclaim(tick, staging_limit, true)
+    } else {
+        Vec::new()
+    };
+    drop(evicted_staging);
+}
+
+fn spares_with_state(memory: Option<[u64; 4]>, keep: bool, was_tight: bool) -> (usize, bool) {
+    match memory {
+        Some([budget, used, ..]) if keep && budget > 0 => {
+            let free = budget.saturating_sub(used);
+            let big_budget = budget >= (4 << 30);
+            let tight = if was_tight {
+                // Leave tight mode only once comfortable headroom returns
+                // (< 88% used and >= 1.8 GiB free on >= 4 GiB cards), creating
+                // a ~600 MiB deadband larger than any single trim.
+                !(u128::from(used) * 100 < u128::from(budget) * 88 && (!big_budget || free >= (1800 << 20)))
+            } else {
+                // Enter tight mode only above 92% used or < 1.2 GiB free.
+                u128::from(used) * 100 >= u128::from(budget) * 92 || (big_budget && free < (1200 << 20))
+            };
+            if tight {
+                (SPARE, true)
+            } else {
+                // Cap idle empty 64 MiB blocks at 10% of the adapter's VRAM budget
+                // (~1.5 GiB on a 16 GB RTX 5070 Ti instead of 4 GiB) so active
+                // textures and GPU compute detiling never starve on 12–16 GB cards.
+                (((budget / 10) / BLOCK).clamp(SPARE as u64, SPARE_KEPT as u64) as usize, false)
+            }
+        }
+        _ => (SPARE, !keep),
     }
 }
 
+#[cfg(test)]
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
-    match memory {
-        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => {
-            // Cap idle empty 64 MiB blocks at 10% of the adapter's VRAM budget
-            // (~1.5 GiB on a 16 GB RTX 5070 Ti instead of 4 GiB) so active
-            // textures and GPU compute detiling never starve on 12–16 GB cards.
-            ((budget / 10) / BLOCK).clamp(SPARE as u64, SPARE_KEPT as u64) as usize
-        }
-        _ => SPARE,
-    }
+    spares_with_state(memory, keep, false).0
 }
 
 /// Milliseconds until a piece given back is used again. (It was three
@@ -104,7 +140,7 @@ pub(crate) fn on() -> bool {
 fn ahead() -> usize {
     static AHEAD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *AHEAD.get_or_init(|| {
-        let default = if crate::residency::moderate_or_limited_ram() { 8 } else { 12 };
+        let default = if crate::residency::moderate_or_limited_ram() { 4 } else { 8 };
         std::env::var("VICTORY_RIPE_BLOCKS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
     })
 }
@@ -220,8 +256,68 @@ impl<B: Clone> Pool<B> {
         self.take_ripe(len, align, now, Ripe::ALL, make)
     }
 
+    /// Attempts to cut a piece from an existing block without calling `make`.
+    /// Returns `(Some((piece, mem, again)), need_ahead)` on hit, or
+    /// `(None, can_grow)` when a brand-new block must be allocated outside the lock.
+    fn try_take_ripe_existing(
+        &mut self,
+        len: u64,
+        align: u64,
+        now: u64,
+        ripe: Ripe,
+    ) -> (Option<(Piece, B, bool)>, bool) {
+        if len == 0 || len > if ripe.ahead > 0 { BLOCK } else { BLOCK / 2 } {
+            return (None, false);
+        }
+        self.rested(now);
+        let mut found = None;
+        for (i, block) in self.blocks.iter_mut().enumerate() {
+            if let Some(block) = block
+                && ripe.is(block)
+                && let Some(start) = block.free.take(len, align)
+            {
+                found = Some((i, start));
+                break;
+            }
+        }
+        if found.is_none() && ripe.ahead > 0 {
+            let mut unripe: Vec<(u64, usize)> =
+                self.blocks.iter().enumerate().filter_map(|(i, b)| Some((b.as_ref()?.made, i))).collect();
+            unripe.sort_unstable();
+            found = unripe.into_iter().find_map(|(_, i)| Some((i, self.blocks[i].as_mut()?.free.take(len, align)?)));
+        }
+        let Some((i, start)) = found else {
+            return (None, now >= self.retry_growth_at);
+        };
+        let need_ahead = self.finish_ripe_bookkeeping(i, now, ripe);
+        let Some(block) = self.blocks[i].as_mut() else {
+            return (None, false);
+        };
+        let again = start < block.used_to;
+        block.used_to = block.used_to.max(start + len);
+        (Some((Piece { block: i, start, len }, block.memory.clone(), again)), need_ahead)
+    }
+
+    fn finish_ripe_bookkeeping(&self, i: usize, now: u64, ripe: Ripe) -> bool {
+        if ripe.ahead == 0 {
+            return false;
+        }
+        if let Some(block) = self.blocks[i].as_ref()
+            && !ripe.is(block)
+        {
+            let n = UNRIPE.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::info!("textures cut from blocks made while lists ran that still run: {n}");
+            }
+        }
+        let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count();
+        let keep_ahead = ripe.ahead.min(self.spare.max(SPARE));
+        empty < keep_ahead && now >= self.retry_growth_at
+    }
+
     /// The same from a block that is ripe, if one has room; `make` makes one
     /// ahead too, when few are empty.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn take_ripe(
         &mut self,
         len: u64,
@@ -319,10 +415,10 @@ impl<B: Clone> Pool<B> {
     /// Makes the pieces that rested long enough free, and lets go of empty
     /// blocks past [`SPARE`].
     fn rested(&mut self, now: u64) {
-        self.reclaim(now, SPARES.load(Ordering::Relaxed), false);
+        let _ = self.reclaim(now, SPARES.load(Ordering::Relaxed), false);
     }
 
-    fn reclaim(&mut self, now: u64, limit: usize, sweep: bool) {
+    fn reclaim(&mut self, now: u64, limit: usize, sweep: bool) -> Vec<B> {
         let mut any = false;
         while let Some(&(ready, piece)) = self.resting.front()
             && ready <= now
@@ -336,17 +432,21 @@ impl<B: Clone> Pool<B> {
         // (Without a piece given back too, once there is less room.)
         let most = limit.min(self.most);
         let previous = std::mem::replace(&mut self.spare, most);
+        let mut evicted = Vec::new();
         if sweep || any || most < previous {
             let mut spare = 0;
             for block in &mut self.blocks {
                 if block.as_ref().is_some_and(|b| b.free.whole(BLOCK)) {
                     spare += 1;
-                    if spare > most {
-                        *block = None;
+                    if spare > most
+                        && let Some(old) = block.take()
+                    {
+                        evicted.push(old.memory);
                     }
                 }
             }
         }
+        evicted
     }
 
     fn blocks(&self) -> usize {
@@ -550,8 +650,7 @@ pub(crate) unsafe fn texture(
     if info.SizeInBytes == u64::MAX {
         return None;
     }
-    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
-    let (piece, heap, again) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
+    let make_heap = || {
         let desc = D3D12_HEAP_DESC {
             SizeInBytes: BLOCK,
             Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
@@ -574,7 +673,59 @@ pub(crate) unsafe fn texture(
             return None;
         }
         heap
-    })?;
+    };
+    let tick = now();
+    let ripe = Ripe::now();
+    let align = info.Alignment.max(1);
+    let (found, need_more) = lock(&TEXTURES).try_take_ripe_existing(info.SizeInBytes, align, tick, ripe);
+    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+    let (piece, heap, again) = match found {
+        Some(res) => {
+            if need_more {
+                // Allocate the single pre-warmed ripe block OUTSIDE `TEXTURES`
+                // so `CreateHeap` + `MakeResident` + `mapped()` never stall other threads.
+                match make_heap() {
+                    Some(h) => {
+                        lock(&TEXTURES).add(h, ripe.started);
+                    }
+                    None => {
+                        lock(&TEXTURES).retry_growth_at = tick.saturating_add(500);
+                    }
+                }
+            }
+            res
+        }
+        None => {
+            if !need_more {
+                return None;
+            }
+            let Some(new_heap) = make_heap() else {
+                lock(&TEXTURES).retry_growth_at = tick.saturating_add(500);
+                return None;
+            };
+            let (res, need_ahead) = {
+                let mut pool = lock(&TEXTURES);
+                let i = pool.add(new_heap, ripe.started);
+                let start = pool.blocks[i].as_mut()?.free.take(info.SizeInBytes, align)?;
+                let need_ahead = pool.finish_ripe_bookkeeping(i, tick, ripe);
+                let block = pool.blocks[i].as_mut()?;
+                let again = start < block.used_to;
+                block.used_to = block.used_to.max(start + info.SizeInBytes);
+                ((Piece { block: i, start, len: info.SizeInBytes }, block.memory.clone(), again), need_ahead)
+            };
+            if need_ahead {
+                match make_heap() {
+                    Some(h) => {
+                        lock(&TEXTURES).add(h, ripe.started);
+                    }
+                    None => {
+                        lock(&TEXTURES).retry_growth_at = tick.saturating_add(500);
+                    }
+                }
+            }
+            res
+        }
+    };
     let mut made: Option<ID3D12Resource> = None;
     // SAFETY: the piece is no one else's; the heap lives while a piece of
     // it is taken.
@@ -672,10 +823,28 @@ mod tests {
     #[test]
     fn empty_blocks_stay_while_the_card_has_room() {
         let b = 100 * (1u64 << 30);
-        assert_eq!(spares(Some([b, b * 84 / 100, 0, 0]), true), SPARE_KEPT);
-        assert_eq!(spares(Some([b, b * 85 / 100, 0, 0]), true), SPARE);
+        assert_eq!(spares(Some([b, b * 91 / 100, 0, 0]), true), SPARE_KEPT);
+        assert_eq!(spares(Some([b, b * 92 / 100, 0, 0]), true), SPARE);
         assert_eq!(spares(Some([b, b * 10 / 100, 0, 0]), false), SPARE);
         assert_eq!(spares(None, true), SPARE);
+    }
+
+    #[test]
+    fn spares_hysteresis_prevents_85_percent_sawtooth() {
+        const GIB: u64 = 1 << 30;
+        let budget = 15 * GIB;
+        // 85%–91% stays calm when entering from non-tight state.
+        let (n, tight) = spares_with_state(Some([budget, budget * 86 / 100, 0, 0]), true, false);
+        assert!(!tight && n == 24);
+        // Crossing 92% (or < 1.2 GiB free) enters tight mode.
+        let (n, tight) = spares_with_state(Some([budget, budget * 93 / 100, 0, 0]), true, false);
+        assert!(tight && n == SPARE);
+        // Dropping to 90% stays tight inside the deadband (prevents thrash).
+        let (n, tight) = spares_with_state(Some([budget, budget * 90 / 100, 0, 0]), true, true);
+        assert!(tight && n == SPARE);
+        // Dropping below 88% with >= 1.8 GiB free exits tight mode cleanly.
+        let (n, tight) = spares_with_state(Some([budget, budget * 85 / 100, 0, 0]), true, true);
+        assert!(!tight && n == 24);
     }
 
     #[test]
@@ -823,12 +992,12 @@ mod tests {
     #[test]
     fn spares_scale_proportionally_with_vram_budget() {
         const GIB: u64 = 1 << 30;
-        // 16 GB card (~15 GiB budget) under 85% keeps 24 x 64 MiB = 1.5 GiB, not 4 GiB.
+        // 16 GB card (~15 GiB budget) under 92% keeps 24 x 64 MiB = 1.5 GiB, not 4 GiB.
         assert_eq!(spares(Some([15 * GIB, 8 * GIB, 0, 0]), true), 24);
         // 24 GB card (~23 GiB budget) keeps 36 x 64 MiB = 2.25 GiB.
         assert_eq!(spares(Some([23 * GIB, 10 * GIB, 0, 0]), true), 36);
-        // At/above 85% pressure or keep=false falls back to SPARE (2).
-        assert_eq!(spares(Some([15 * GIB, 13 * GIB, 0, 0]), true), SPARE);
+        // At/above 92% pressure (< 1.2 GiB free) or keep=false falls back to SPARE (2).
+        assert_eq!(spares(Some([15 * GIB, 14 * GIB, 0, 0]), true), SPARE);
         assert_eq!(spares(Some([15 * GIB, 4 * GIB, 0, 0]), false), SPARE);
         assert_eq!(spares(None, true), SPARE);
     }

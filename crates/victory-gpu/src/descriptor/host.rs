@@ -6,12 +6,24 @@
 //! reads it through a table and finds the slot changed.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
+
+/// Unique identity for each [`HostHeap`] so a released title heap whose
+/// address is reused never accepts dynamic slots freed from the older heap
+/// (PR #1324).
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Sentinel in [`HostHeap::null_kind`] meaning the slot holds a live (or
+/// uncached) descriptor rather than a known [`NullCache`] entry.
+const NULL_KIND_LIVE: u8 = u8::MAX;
+/// [`NullCache`] slot index for the default null texture view (`TEXTURE2D`).
+const NULL_KIND_VIEW: u8 = (NullCache::SRV_TEX_BASE + 2) as u8;
 
 /// A set of a heap's slots, a bit for each: no lock (a pass that went through
 /// a set of 70,000 under its lock kept everyone who writes slots waiting for
@@ -432,6 +444,15 @@ pub(crate) struct HostHeap {
     /// Lock-free presence bitmap mirroring `placed.by_slot` so buffer views,
     /// texture-object views, tabled slots, and null slots skip `self.placed.lock()`.
     in_placed: Slots,
+    /// Unique heap identity ([`NEXT_ID`]); guards [`HostHeap::release`] against
+    /// address reuse of a previously dropped title heap.
+    id: u64,
+    /// Per title slot `[0..count)` (view heaps only): the [`NullCache`] slot
+    /// index currently stored there, or [`NULL_KIND_LIVE`] when a real view
+    /// was written. Lets `mirror_record` / `make_null` / `unmake` skip
+    /// redundant `CopyDescriptorsSimple(1)` calls when a slot already holds
+    /// the exact same null descriptor.
+    null_kind: Box<[AtomicU8]>,
 }
 
 /// The spans of every view heap made ([`HostHeap::placed`]), for the
@@ -1872,6 +1893,10 @@ impl HostHeap {
                 spans
             },
             in_placed: Slots::new(count as usize),
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            null_kind: (0..if sampler { 0 } else { count })
+                .map(|_| AtomicU8::new(NULL_KIND_VIEW))
+                .collect(),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -1995,6 +2020,11 @@ impl HostHeap {
     /// when the host caps its size.
     pub(crate) fn count(&self) -> u32 {
         self.count
+    }
+
+    /// Unique identity of this host heap ([`HostHeap::release`]).
+    pub(crate) fn id(&self) -> u64 {
+        self.id
     }
 
     /// The GPU address of the table of element strides by title slot (view
@@ -2771,10 +2801,23 @@ impl HostHeap {
             return;
         }
         match view_at(key as u32, (key >> 32) as u32) {
-            Some(view) => null_for(&view, self.at(index)),
-            None => null_view(self.at(index)),
+            Some(view) => {
+                if let Some((kind, src)) = null_slot_for(&view) {
+                    self.copy_null(index, kind, src);
+                } else {
+                    null_for(&view, self.at(index));
+                    self.put(index);
+                }
+            }
+            None => {
+                if let Some((kind, src)) = null_view_slot() {
+                    self.copy_null(index, kind, src);
+                } else {
+                    null_view(self.at(index));
+                    self.put(index);
+                }
+            }
         }
-        self.put(index);
         self.clear_twin(index);
         self.write_stride(index, 0);
         self.keep(index, None);
@@ -2924,7 +2967,10 @@ impl HostHeap {
                 PLACED_TEXTURE_SLOTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 true
             }
-            Some(View::Shader(r, _)) if crate::resource::buffer_bytes(*r as crate::object::This).is_none() => {
+            Some(View::Shader(r, _))
+                if crate::resource::buffer_bytes(*r as crate::object::This).is_none()
+                    && crate::resource::title_fills(*r as crate::object::This) =>
+            {
                 OBJECT_TEXTURE_SLOTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 true
             }
@@ -3019,10 +3065,13 @@ impl HostHeap {
     }
 
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
-    /// returned).
+    /// returned) if `id` matches this heap ([`HostHeap::id`]).
     ///
     /// [`dynamic`]: HostHeap::dynamic
-    pub(crate) fn release(&self, first: u32, n: u32) {
+    pub(crate) fn release(&self, id: u64, first: u32, n: u32) {
+        if id != self.id {
+            return;
+        }
         let Some(at) = first.checked_sub(self.dynamic_base) else {
             return;
         };
@@ -3160,8 +3209,8 @@ impl HostHeap {
         if self.sampler {
             self.null_sampler(index);
         } else {
-            if let Some(src) = null_view_handle() {
-                self.copy_from(index, src);
+            if let Some((kind, src)) = null_view_slot() {
+                self.copy_null(index, kind, src);
             } else {
                 null_view(self.at(index));
                 self.put(index);
@@ -3435,9 +3484,33 @@ impl HostHeap {
         staged(self.sampler, 0).unwrap_or_else(|| self.cpu(index))
     }
 
+    /// Records what null descriptor (or [`NULL_KIND_LIVE`]) now occupies title
+    /// slot `index`. Dynamic slots (`index >= self.count`) are untracked.
+    #[inline]
+    fn set_null_kind(&self, index: u32, kind: u8) {
+        if let Some(slot) = self.null_kind.get(index as usize) {
+            slot.store(kind, Ordering::Relaxed);
+        }
+    }
+
+    /// Copies cached null descriptor `(kind, src)` into slot `index`, skipping
+    /// the D3D12 `CopyDescriptorsSimple(1)` call when title slot `index`
+    /// already holds that exact null descriptor.
+    #[inline]
+    fn copy_null(&self, index: u32, kind: u8, src: D3D12_CPU_DESCRIPTOR_HANDLE) {
+        if let Some(slot) = self.null_kind.get(index as usize)
+            && slot.load(Ordering::Relaxed) == kind
+        {
+            return;
+        }
+        self.copy_from(index, src);
+        self.set_null_kind(index, kind);
+    }
+
     /// The descriptor this thread made last ([`HostHeap::at`]) goes to slot
     /// `index`.
     fn put(&self, index: u32) {
+        self.set_null_kind(index, NULL_KIND_LIVE);
         self.copy_to(index, 0);
     }
 
@@ -3525,18 +3598,45 @@ impl HostHeap {
         self.waiting.lock().unwrap_or_else(|e| e.into_inner()).push_back((frame, slots));
     }
 
-    /// The slots that have waited long enough at `frame`
-    /// ([`HostHeap::copied_wait`]), each once.
-    pub(crate) fn copied_before(&self, frame: u64) -> Vec<u32> {
+    /// Up to `MAX_BEFORE_PER_ROUND` non-tabled slots that have waited long
+    /// enough at `frame` ([`HostHeap::copied_wait`]), each once, plus the
+    /// number of tabled slots filtered out before sorting.
+    ///
+    /// Filtering tabled slots before `sort_unstable` drops ~85% of entries in
+    /// linear time, and pacing expiry prevents a whole-frame cliff from landing
+    /// on the first `sync_heaps` round after `frame` ticks (the remaining
+    /// slots drain across the other ~8-10 rounds of the same frame).
+    pub(crate) fn copied_before(&self, frame: u64) -> (Vec<u32>, u64) {
+        const MAX_BEFORE_PER_ROUND: usize = 1024;
         let mut waiting = self.waiting.lock().unwrap_or_else(|e| e.into_inner());
         let mut out = Vec::new();
-        while waiting.front().is_some_and(|(written, _)| written + COPIED_GRACE <= frame) {
-            out.extend(waiting.pop_front().into_iter().flat_map(|(_, slots)| slots));
+        let mut tabled = 0u64;
+        while out.len() < MAX_BEFORE_PER_ROUND
+            && waiting.front().is_some_and(|(written, _)| written + COPIED_GRACE <= frame)
+        {
+            let Some((written, mut slots)) = waiting.pop_front() else {
+                break;
+            };
+            let mut i = 0;
+            while i < slots.len() && out.len() < MAX_BEFORE_PER_ROUND {
+                let slot = slots[i];
+                i += 1;
+                if self.copied_tabled(slot, frame) {
+                    tabled += 1;
+                } else {
+                    out.push(slot);
+                }
+            }
+            if i < slots.len() {
+                slots.drain(..i);
+                waiting.push_front((written, slots));
+                break;
+            }
         }
         drop(waiting);
         out.sort_unstable();
         out.dedup();
-        out
+        (out, tabled)
     }
 
     /// Makes host slot `index` from the record the title has at `handle`
@@ -3659,8 +3759,8 @@ impl HostHeap {
                 make_twinned(&view, self.at(index), self.twin(index))
             };
             if kept.is_none() && !self.sampler {
-                if let Some(src) = null_handle_for(&view) {
-                    self.copy_from(index, src);
+                if let Some((kind, src)) = null_slot_for(&view) {
+                    self.copy_null(index, kind, src);
                 } else {
                     null_for(&view, self.at(index));
                     self.put(index);
@@ -5265,9 +5365,15 @@ impl NullCache {
 }
 
 #[inline]
-fn null_view_handle() -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+fn null_view_slot() -> Option<(u8, D3D12_CPU_DESCRIPTOR_HANDLE)> {
     // Dimension 4 (`TEXTURE2D`) sits at `SRV_TEX_BASE + (4 - 2) = 3`.
-    Some(NullCache::get()?.slot(NullCache::SRV_TEX_BASE + 2))
+    Some((NULL_KIND_VIEW, NullCache::get()?.slot(NullCache::SRV_TEX_BASE + 2)))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[inline]
+fn null_view_handle() -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+    null_view_slot().map(|(_, h)| h)
 }
 
 #[inline]
@@ -5275,7 +5381,7 @@ fn null_buffer_handle() -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
     Some(NullCache::get()?.slot(NullCache::SRV_BUFFER))
 }
 
-fn null_handle_for(view: &View) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+fn null_slot_for(view: &View) -> Option<(u8, D3D12_CPU_DESCRIPTOR_HANDLE)> {
     let cache = NullCache::get()?;
     let is_buffer = |r: &usize| crate::resource::buffer_bytes(*r as crate::object::This).is_some();
     let tex_slot = |dim: u32| -> usize {
@@ -5319,7 +5425,12 @@ fn null_handle_for(view: &View) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
         View::Constant(..) => NullCache::CBV,
         _ => NullCache::SRV_TEX_BASE + 2,
     };
-    Some(cache.slot(slot))
+    Some((slot as u8, cache.slot(slot)))
+}
+
+#[inline]
+fn null_handle_for(view: &View) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+    null_slot_for(view).map(|(_, h)| h)
 }
 
 /// view. Writes to it are dropped, reads give zeros.
@@ -6308,7 +6419,7 @@ mod tests {
         assert_eq!((a, b), (base, base + heap.dynamic - 100));
         // 40 left at the end: 50 do not fit until something is given back.
         assert_eq!(heap.dynamic(50), None);
-        heap.release(a, 50);
+        heap.release(heap.id(), a, 50);
         assert_eq!(heap.dynamic(50), Some(base));
         assert_eq!(heap.dynamic(40), Some(base + heap.dynamic - 40));
         // Every dynamic slot must lie strictly below `view_heap_limit()` so
@@ -6317,6 +6428,53 @@ mod tests {
         if limit != 0 {
             assert!(heap.dynamic_base + heap.dynamic <= limit);
         }
+    }
+
+    #[test]
+    fn dynamic_slots_are_given_back_only_to_the_heap_that_took_them() {
+        let Some(first) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let Some(second) = HostHeap::new(false, 4) else {
+            return;
+        };
+        assert_ne!(first.id(), second.id());
+        let slot = second.dynamic(second.dynamic).unwrap();
+        assert_eq!(second.dynamic(1), None);
+        // Releasing with the first heap's id must not free the second heap's slots.
+        second.release(first.id(), slot, second.dynamic);
+        assert_eq!(second.dynamic(1), None);
+        // Releasing with the matching id frees them cleanly.
+        second.release(second.id(), slot, second.dynamic);
+        assert_eq!(second.dynamic(1), Some(second.dynamic_base));
+    }
+
+    #[test]
+    fn copied_before_filters_tabled_and_paces_expiry() {
+        let Some(heap) = HostHeap::new(false, 3000) else {
+            return;
+        };
+        // Mark even slots as tabled at frame 10; leave odd slots non-tabled.
+        let all: Vec<u32> = (0..2600).collect();
+        for &s in all.iter().filter(|&&s| s % 2 == 0) {
+            heap.tabled_in(s, false, 10);
+        }
+        heap.copied_wait(10, all);
+        // Too early before COPIED_GRACE elapses.
+        let (early, t0) = heap.copied_before(10 + COPIED_GRACE - 1);
+        assert!(early.is_empty() && t0 == 0);
+        // First round drains at most 1024 non-tabled slots while filtering tabled ones.
+        let (round1, tabled1) = heap.copied_before(10 + COPIED_GRACE);
+        assert_eq!(round1.len(), 1024);
+        assert!(round1.iter().all(|&s| s % 2 == 1));
+        assert!(tabled1 >= 1024);
+        // Second round drains the remaining 276 non-tabled slots.
+        let (round2, tabled2) = heap.copied_before(10 + COPIED_GRACE);
+        assert_eq!(round2.len(), 1300 - 1024);
+        assert_eq!(tabled1 + tabled2, 1300);
+        // Third round is empty.
+        let (round3, _) = heap.copied_before(10 + COPIED_GRACE);
+        assert!(round3.is_empty());
     }
 
     #[test]
@@ -6333,17 +6491,17 @@ mod tests {
         assert_eq!((first, left, right, rest), (base, base + 1, base + 3, base + 5));
 
         // Reallocating the left half puts the cursor back in the middle.
-        heap.release(left, 2);
+        heap.release(heap.id(), left, 2);
         assert_eq!(heap.dynamic(2), Some(left));
-        heap.release(left, 2);
-        heap.release(right, 2);
+        heap.release(heap.id(), left, 2);
+        heap.release(heap.id(), right, 2);
         assert_eq!(heap.dynamic(4), Some(left));
         assert_eq!(heap.dynamic(1), None);
 
         // A free slot at each physical end does not form a two-slot range.
-        heap.release(first, 1);
+        heap.release(heap.id(), first, 1);
         let last = first + heap.dynamic - 1;
-        heap.release(last, 1);
+        heap.release(heap.id(), last, 1);
         assert_eq!(heap.dynamic(2), None);
     }
 
