@@ -193,6 +193,39 @@ fn half_shift(width: u32) -> u32 {
     if width == 16 { 0 } else { 15 - width }
 }
 
+/// `s_setreg` hardware register of the pixel ordering unit (POPS packer).
+const HW_REG_POPS_PACKER: u16 = 25;
+/// Source operand code of `src_pops_exiting_wave_id`.
+const POPS_EXITING_WAVE_ID: u8 = 239;
+/// The SGPR after the user data that holds a POPS pixel program's entry word.
+const POPS_WAVE_SGPR: u8 = 18;
+
+/// Whether a pixel program runs part of itself in primitive order (POPS):
+/// it sets the ordering unit's packer register, or reads the exiting wave id.
+///
+/// The console's ordered section: s18 is the collision wave id (bits 9:0 the
+/// collision wave id, 25:16 this wave's id, 29:28 the packer mode, bit 31 set
+/// when an earlier wave may overlap). The program sets the packer register,
+/// spins until `src_pops_exiting_wave_id` passes the earlier wave's id, then
+/// does its read-modify-write on UAV images. The host's equivalent is a
+/// rasterizer-ordered view, so s18 is seeded with `1 << 16` (overlap = 0,
+/// wave_id = 1 != collision_id = 0, so both active skip and any inactive-lane
+/// wrap-around wait check exit immediately), the packer write is dropped, and
+/// every UAV the shader opens is marked rasterizer ordered.
+/// shortcut: all UAVs of the program, not only those the section touches.
+fn enters_pops(p: &Program) -> bool {
+    p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+        let Fields::Sop { src, imm, .. } = &i.fields else {
+            return false;
+        };
+        (matches!(i.name(), "s_setreg_imm32_b32" | "s_setreg_b32")
+            && imm.is_some_and(|m| m & 0x3F == HW_REG_POPS_PACKER))
+            || src
+                .iter()
+                .any(|o| matches!(o, Operand::Const(POPS_EXITING_WAVE_ID)))
+    })
+}
+
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
@@ -236,6 +269,8 @@ struct Lower<'a> {
     tail: Vec<Option<usize>>,
     /// The program writes UAVs: barriers fence them too.
     writes_uavs: bool,
+    /// A pixel program with a primitive-ordered section ([`enters_pops`]).
+    pops: bool,
     /// src0 of the current instruction as DPP fetched it.
     src0: Option<V>,
     /// Compute code that reads other lanes: thread ids follow the host
@@ -1269,6 +1304,8 @@ impl<'a> Lower<'a> {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
+        let pops = x.native.stage == HwStage::Ps && enters_pops(p);
+        s.rov = pops;
         let mut console_lanes = false;
         // LDS accesses get a group barrier each (a console wave split in two host waves)
         let mut split_lds = false;
@@ -1362,15 +1399,21 @@ impl<'a> Lower<'a> {
                                 }
                             }
                         }
-                        if lds_ok {
+                        if lds_ok || LOCAL_ANY.get() {
                             wave = 32;
-                            split_lds = s.lds_dwords > 0 && group > 32;
+                            split_lds = lds_ok && s.lds_dwords > 0 && group > 32;
                             if crosses {
                                 // lanes 32..63 are the other host wave: masks, lane reads and lane
                                 // numbers go through two exchange dwords past the program's LDS
                                 exchange = Some((s.lds_dwords, group <= 32, all));
                                 s.lds_dwords += 2 * group.div_ceil(64);
                             }
+                        }
+                    } else if LOCAL_ANY.get() {
+                        wave = 32;
+                        if crosses {
+                            exchange = Some((s.lds_dwords, group <= 32, vec![false; p.blocks.len()]));
+                            s.lds_dwords += 2 * group.div_ceil(64);
                         }
                     }
                 }
@@ -1557,6 +1600,7 @@ impl<'a> Lower<'a> {
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
             writes_uavs,
+            pops,
             src0: None,
             console_lanes,
             split_lds,
@@ -2417,6 +2461,17 @@ impl<'a> Lower<'a> {
                     // paths only seem to allow it before any save: the lane of a VGPR
                     // nobody wrote, and VGPRs nobody set read as zero.
                     None if n >= crate::ir::PARKED => Val::I32(self.s.m.i32(0)),
+                    // The ordered section's collision id (overlap bit 31 clear,
+                    // wave id 1 in bits 16..25, collision id 0 in bits 0..9)
+                    // and (`operand`) the exiting wave id (0): wave_id !=
+                    // collision_id so `wave_id + ~collision_id` is 0 rather than
+                    // 0xffff_ffff and inactive lanes falling through the wait
+                    // check exit immediately; ROVs order the UAV accesses.
+                    None if self.pops
+                        && (n == POPS_WAVE_SGPR || self.x.io.initialized_sgprs == Some(n + 1)) =>
+                    {
+                        Val::I32(self.s.m.i32(1 << 16))
+                    }
                     None => Val::Missing("a hardware SGPR input"),
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
@@ -3241,7 +3296,7 @@ impl<'a> Lower<'a> {
         });
         let whole = whole_wave && all_here;
         if !self.x.st.active.contains(&lo) && !whole {
-            if whole_wave {
+            if whole_wave || (self.s.pixel && !self.local) {
                 need(made.unwrap_or(0));
             }
             return Err(MASK_ELSEWHERE);
@@ -3302,6 +3357,8 @@ impl<'a> Lower<'a> {
                 let v = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
                 self.i32_of(v)
             }
+            // Read only by the wait that a clear overlap bit skips ([`enters_pops`]).
+            Operand::Const(POPS_EXITING_WAVE_ID) if self.pops => Ok(self.s.m.i32(0)),
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
                 .ok_or("a special operand (vccz, execz, scc, lds_direct)"),
@@ -3942,7 +3999,10 @@ impl<'a> Lower<'a> {
     fn wave_wide(&mut self, b: usize, when: Bool) -> Result<V, Why> {
         const WHY: Why = "a wave-wide branch where not every lane runs";
         let any = self.x.st.wave_any.get(b).copied().flatten().ok_or("a wave-wide branch on a scalar condition")?;
-        if self.exchange.is_none() && self.halves.is_none() && self.console_lanes && self.mask_data == MaskData::Console {
+        if self.exchange.is_none()
+            && self.halves.is_none()
+            && (self.console_lanes && self.mask_data == MaskData::Console || self.s.pixel)
+        {
             // The host's waves are the console's: the wave's own answer. The lanes that are
             // elsewhere have no bit set, as on the console, so "some lane" needs no one but
             // the lanes here, and "every lane's bit is clear" is true of the others anyway.
@@ -5164,6 +5224,14 @@ impl<'a> Lower<'a> {
         let lo = dst_code.and_then(|c| inst.write(Reg::S(c)));
         if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) {
             return Err(LANE_MASK);
+        }
+        if self.pops
+            && matches!(name, "s_setreg_imm32_b32" | "s_setreg_b32")
+            && imm.is_some_and(|i| i & 0x3F == HW_REG_POPS_PACKER)
+        {
+            // The packer takes the wave's place in the ordering; the host's
+            // rasterizer-ordered UAVs give that order ([`enters_pops`]).
+            return Ok(());
         }
         if matches!(
             name,

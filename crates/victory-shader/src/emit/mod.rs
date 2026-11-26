@@ -755,10 +755,10 @@ pub fn emit(
     // per-lane branches around it together ([`widen`]; the lowering has named the
     // skipped blocks). Split wave64-on-wave32 programs stay gated behind
     // `VICTORY_WAVE_WIDE=1` above because their widened branches carry group barriers.
-    let single_wave = !(native.wave64 && lower::host_max_wave() == 32);
+    let single_wave = native.stage == HwStage::Ps || !(native.wave64 && lower::host_max_wave() == 32);
     let original = match original {
         Err(ShaderError::Unsupported { what, .. })
-            if native.stage == HwStage::Cs
+            if matches!(native.stage, HwStage::Cs | HwStage::Ps)
                 && (what == lower::LANE_MASK || single_wave && lower::needs_every_lane(what))
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
@@ -828,6 +828,7 @@ fn widen(
     match native.io {
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
+        crate::native::StageIo::Ps { .. } => {}
         crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
         crate::native::StageIo::Cs(cs) => {
             if why {
@@ -853,7 +854,11 @@ fn widen(
         if !stuck {
             let cyc = in_cycles(p);
             if why {
-                eprintln!("WAVE64-WIDE {} branches taken wave-wide", wide.len());
+                eprintln!(
+                    "WAVE64-WIDE {} branches taken wave-wide => {:?}",
+                    wide.len(),
+                    r.as_ref().map(|(_, w)| *w)
+                );
                 let mut list: Vec<_> = wide.iter().copied().collect();
                 list.sort_unstable();
                 for &b in &list {
@@ -1324,6 +1329,133 @@ mod tests {
             &[el("SV_StencilRef", 20, 1)]
         ));
         assert!(!shader::early_depth(&StageIo::None, &[]));
+    }
+
+    /// A primitive-ordered pixel shader (POPS): reads the collision wave id
+    /// loaded into s18, writes `HW_REG_POPS_PACKER`, and reads
+    /// `src_pops_exiting_wave_id`. Lowered with s18 = `1 << 16` (overlap = 0,
+    /// wave_id = 1 != collision_id = 0) and ROVs on UAV handles.
+    #[test]
+    fn primitive_ordered_pixel_shaders_translate_without_ordering() {
+        let words = [
+            0x9381_FF12u32, // s_bfe_u32 s1, s18, 0x0002001c (packer, bits 28-29)
+            0x0002_001C,
+            0xB981_1019, // s_setreg_b32 hwreg(HW_REG_POPS_PACKER, 0, 3), s1
+            0x8102_01EF, // s_add_i32 s2, src_pops_exiting_wave_id, s1
+            0x7E04_0202, // v_mov_b32 v2, s2
+            0xF800_180F,
+            0x0202_0202, // exp mrt0, v2, v2, v2, v2 done vm
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: true,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 1 << 1,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let osg1 = container::signature(
+            &[SigElement {
+                name: "SV_Target".into(),
+                index: 0,
+                kind: 16,
+                comp: 9,
+                interp: 0,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 15,
+                half: false,
+                packed: false,
+            }],
+            false,
+        );
+        let isg1 = container::signature(&[], true);
+        let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        assert!(
+            p.inputs.iter().any(|&(r, _)| r == crate::ir::Reg::S(18)),
+            "the collision wave id is an input"
+        );
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let out = emit(&c, &native, &p, &st, &io, &res).expect("a POPS pixel shader translates");
+        #[cfg(windows)]
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
+    }
+
+    /// A Wave32 pixel shader with a wave-wide `s_cbranch_vccnz` before reading
+    /// an active-only lane mask as data (`s_bcnt1_i32_b32`): widening the
+    /// `vccnz` branch to `waveAnyTrue` keeps the mask active and validates.
+    #[test]
+    fn pixel_shader_widens_vcc_branch_for_mask_ballot() {
+        let words = [
+            0x7D84_0080u32, // 0: v_cmp_eq_u32 vcc_lo, 0, v0
+            0xBF87_0006,    // 4: s_cbranch_vccnz -> 32
+            0x7D84_0281,    // 8: v_cmp_eq_u32 vcc_lo, 1, v1
+            0x8702_7E6A,    // 12: s_and_b32 s2, vcc_lo, exec_lo
+            0xBE83_0F02,    // 16: s_bcnt1_i32_b32 s3, s2
+            0x7E04_0203,    // 20: v_mov_b32 v2, s3
+            0xF800_180F,    // 24: exp mrt0, v2, v2, v2, v2 done vm
+            0x0202_0202,
+            0xBF81_0000,    // 32: s_endpgm
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let osg1 = container::signature(
+            &[SigElement {
+                name: "SV_Target".into(),
+                index: 0,
+                kind: 16,
+                comp: 9,
+                interp: 0,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 15,
+                half: false,
+                packed: false,
+            }],
+            false,
+        );
+        let isg1 = container::signature(&[], true);
+        let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let out = emit(&c, &native, &p, &st, &io, &res)
+            .expect("single-wave PS widens s_cbranch_vccnz for active ballot");
+        #[cfg(windows)]
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
     }
 
     #[test]

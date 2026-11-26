@@ -99,6 +99,21 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                     eprintln!("corrupt record {}{}", path.display(), source.label());
                     continue;
                 };
+                static ONLY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+                let only = ONLY.get_or_init(|| {
+                    std::env::var("VICTORY_TRANSLATE_ONLY")
+                        .unwrap_or_default()
+                        .split(',')
+                        .map(|h| h.trim().to_lowercase())
+                        .filter(|h| !h.is_empty())
+                        .collect()
+                });
+                if !only.is_empty() {
+                    let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
+                    if !only.iter().any(|o| hash.starts_with(o.as_str())) {
+                        continue;
+                    }
+                }
                 let Ok(container) = Container::parse(&bytes) else {
                     continue;
                 };
