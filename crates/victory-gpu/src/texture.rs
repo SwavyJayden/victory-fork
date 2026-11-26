@@ -1455,11 +1455,13 @@ impl Staging {
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
-        let alone = self.once.load(std::sync::atomic::Ordering::Relaxed);
-        if alone && last.hash.is_some() {
-            return 0;
-        }
-        if !alone && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
+        // Only skip write-watch/guard queries on the first upload of a one-shot
+        // picked texture (`last.hash.is_none()`). Because Wave 6 retains lightweight
+        // `Staging` metadata in `STAGING` after releasing its `UploadBuf`, later
+        // refreshes (e.g. when higher mips finish streaming in) must still digest
+        // and detile rather than returning early.
+        let skip_watch = self.once.load(std::sync::atomic::Ordering::Relaxed) && last.hash.is_none();
+        if !skip_watch && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 ended(ends::UNWRITTEN);
                 return 0;
@@ -1487,7 +1489,7 @@ impl Staging {
         // texture's address, so the textures take turns.
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !alone
+        if !skip_watch
             && *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
