@@ -2661,6 +2661,16 @@ impl State {
         if sync.is_none() {
             BAKE_SERVED.store(0, Ordering::Relaxed);
         }
+        // Batch newly claimed `texture::ahead` jobs so copy-queue workers pop
+        // 32–64 textures per GPU submission instead of flushing 1–2 at a time.
+        let mut pending_ahead: Vec<std::sync::Arc<crate::texture::ahead::Job>> = Vec::with_capacity(32);
+        let mut pending_ahead_bytes = 0u64;
+        let flush_ahead = |pending: &mut Vec<std::sync::Arc<crate::texture::ahead::Job>>, bytes: &mut u64| {
+            if !pending.is_empty() {
+                crate::texture::ahead::send_batch(std::mem::take(pending));
+                *bytes = 0;
+            }
+        };
         let mut served = true;
         for (index, write) in due {
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
@@ -2925,7 +2935,11 @@ impl State {
                     host.texture_slot_show_ahead(job, index, handle);
                 }
                 if let Taken::New(job) = ahead {
-                    crate::texture::ahead::send(job);
+                    pending_ahead_bytes += job.bytes();
+                    pending_ahead.push(job.clone());
+                    if pending_ahead.len() >= 32 || pending_ahead_bytes >= (8 << 20) {
+                        flush_ahead(&mut pending_ahead, &mut pending_ahead_bytes);
+                    }
                 }
             }
             if ahead.is_none() && crate::residency::upload_refused() {
@@ -2937,6 +2951,9 @@ impl State {
             if let Some(view) = &view
                 && ahead.is_none()
             {
+                // Ensure any queued ahead jobs are visible to workers before
+                // `readable` can wait on `ahead::listed`.
+                flush_ahead(&mut pending_ahead, &mut pending_ahead_bytes);
                 // (What was found mapped of it a moment ago is not asked
                 // again, unless the host copy may need more.)
                 crate::texture::PICKING.set(Some(there.filter(|_| partly.is_none()).unwrap_or(u64::MAX)));
@@ -2990,6 +3007,7 @@ impl State {
                 let text: String = format!("{view:?}").chars().take(300).collect();
                 tracing::error!(why, slot = index, "the host device went while textures picked by index were made ready; last: {text}");
                 crate::host::log_removal_context();
+                flush_ahead(&mut pending_ahead, &mut pending_ahead_bytes);
                 return false;
             }
             let (bytes, whole) = crate::texture::staged(resource, there.is_none()).unwrap_or((0, true));
@@ -3041,6 +3059,7 @@ impl State {
                 None => host.texture_slot_done(index, write, again),
             }
         }
+        flush_ahead(&mut pending_ahead, &mut pending_ahead_bytes);
         if sync.is_none() && baking && served {
             BAKE_SERVED.store(host.texture_news().0 + 1, Ordering::Relaxed);
         }

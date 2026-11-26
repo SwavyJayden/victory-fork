@@ -197,12 +197,54 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
     Some(Back { buffer, footprints, rows, mips, layout: target.layout, ticket: target.ticket })
 }
 
+/// Returns indices into `ranges` keeping only the latest write for each
+/// distinct `(at, end)` title allocation, preserving their final order.
+fn dedup_latest_indices(ranges: &[(usize, usize)]) -> Vec<usize> {
+    if ranges.len() <= 1 {
+        return (0..ranges.len()).collect();
+    }
+    let mut keep = Vec::with_capacity(ranges.len());
+    let mut seen = std::collections::HashSet::with_capacity(ranges.len());
+    for i in (0..ranges.len()).rev() {
+        if seen.insert(ranges[i]) {
+            keep.push(i);
+        }
+    }
+    keep.reverse();
+    keep
+}
+
+/// Lands a batch of completed texture readbacks: keeps only the last write to
+/// each title allocation (earlier writes in the same landing batch are
+/// immediately overwritten) and tiles distinct allocations in parallel on the
+/// landing worker pool.
+pub(crate) fn land_batch(backs: &[&Back]) {
+    if backs.is_empty() {
+        return;
+    }
+    if backs.len() == 1 {
+        land(backs[0]);
+        return;
+    }
+    let ranges: Vec<(usize, usize)> = backs.iter().map(|b| b.range()).collect();
+    let chosen: Vec<&Back> = dedup_latest_indices(&ranges)
+        .into_iter()
+        .map(|i| backs[i])
+        .collect();
+    if chosen.len() <= 1 {
+        if let Some(&back) = chosen.first() {
+            land(back);
+        }
+        return;
+    }
+    crate::land::each(chosen.len(), &|i| land(chosen[i]));
+}
+
 /// Once the list has run, tile its texels back into the same title allocation.
 pub(crate) fn land(back: &Back) {
     static COPIED: AtomicU64 = AtomicU64::new(0);
     static STALE: AtomicU64 = AtomicU64::new(0);
     let _mapping = crate::watch::title_memory_reading();
-    let _ticket_guard = TICKETS.lock().unwrap_or_else(|e| e.into_inner());
     if !back.ticket.valid.load(Ordering::Acquire) {
         let skipped = STALE.fetch_add(1, Ordering::Relaxed) + 1;
         if skipped.is_power_of_two() {
@@ -241,6 +283,16 @@ pub(crate) fn land(back: &Back) {
     }
     // SAFETY: mapped above.
     unsafe { back.buffer.Unmap(0, None) };
+    // Re-check invalidation under `TICKETS` only around the final commit so
+    // parallel tiling never contends on the global ticket mutex.
+    let _ticket_guard = TICKETS.lock().unwrap_or_else(|e| e.into_inner());
+    if !back.ticket.valid.load(Ordering::Acquire) {
+        let skipped = STALE.fetch_add(1, Ordering::Relaxed) + 1;
+        if skipped.is_power_of_two() {
+            tracing::info!(skipped, "skipping texture readbacks whose title allocation changed");
+        }
+        return;
+    }
     crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
     let copied = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
     if copied == 1 || copied.is_multiple_of(128) {
@@ -252,6 +304,21 @@ pub(crate) fn land(back: &Back) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dedup_latest_indices_keeps_last_write_per_range() {
+        let ranges = [
+            (0x1000, 0x2000),
+            (0x3000, 0x4000),
+            (0x1000, 0x2000),
+            (0x5000, 0x6000),
+            (0x3000, 0x4000),
+            (0x1000, 0x2000),
+        ];
+        assert_eq!(dedup_latest_indices(&ranges), vec![3, 4, 5]);
+        assert_eq!(dedup_latest_indices(&[]), Vec::<usize>::new());
+        assert_eq!(dedup_latest_indices(&[(0x1000, 0x2000)]), vec![0]);
+    }
 
     #[test]
     fn only_readbacks_for_changed_allocations_are_invalidated() {

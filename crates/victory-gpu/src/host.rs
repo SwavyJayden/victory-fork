@@ -303,15 +303,27 @@ unsafe impl Send for Aside {}
 /// returns: a copy of a few bytes is sent to a queue of ours after the
 /// memory was made, which the system starts only when all mappings asked
 /// for so far are done, and waited for. (`MakeResident` came back before
-/// that: run n11 was lost as n08 was with it alone.) Best done off a hot
-/// path: a tenth of a millisecond to some.
+/// that: run n11 was lost as n08 was with it alone.)
+///
+/// Concurrent callers coalesce via group-commit tickets (`MAPPED_REQ` /
+/// `MAPPED_DONE`): any thread whose `MakeResident` finished before a copy
+/// submission starts is satisfied by that single GPU round-trip.
 pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
     static ASIDE: Mutex<Option<Aside>> = Mutex::new(None);
+    static MAPPED_REQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static MAPPED_DONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if !wait_resident() {
         return Ok(());
     }
+    let need = MAPPED_REQ.fetch_add(1, Ordering::AcqRel) + 1;
     let started = std::time::Instant::now();
     let mut aside = ASIDE.lock().unwrap_or_else(|e| e.into_inner());
+    if MAPPED_DONE.load(Ordering::Acquire) >= need {
+        return Ok(());
+    }
+    // Every caller whose `CreateCommittedResource` + `MakeResident` finished
+    // before this snapshot happens-before the `ExecuteCommandLists` below.
+    let batch_target = MAPPED_REQ.load(Ordering::Acquire);
     // SAFETY: plain object creation; the objects the list names are kept.
     unsafe {
         if aside.is_none() {
@@ -364,6 +376,7 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
             WaitForSingleObject(a.event, INFINITE);
         }
     }
+    MAPPED_DONE.store(batch_target, Ordering::Release);
     let us = started.elapsed().as_micros() as u64;
     MAPPED[0].fetch_add(1, Ordering::Relaxed);
     MAPPED[1].fetch_add(us, Ordering::Relaxed);
@@ -508,6 +521,23 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
         ((*methods)[1])(raw);
         ((*methods)[2])(raw)
     }
+}
+
+/// Interval between forced full-pipeline settles solely to run [`sweep`] when
+/// submissions stay continuously in flight. Stays at 1,500 ms under host RAM or
+/// high VRAM (>= 85% budget) pressure; widens to 5,000 ms while memory has
+/// comfortable headroom to avoid periodic 100+ ms drain hitches.
+fn sweep_settle_interval_ms(video_memory: Option<[u64; 4]>, host_pressured: bool) -> u64 {
+    if host_pressured {
+        return 1500;
+    }
+    if let Some([budget, used, ..]) = video_memory
+        && budget > 0
+        && used.saturating_mul(100) >= budget.saturating_mul(85)
+    {
+        return 1500;
+    }
+    5000
 }
 
 /// Once a second, before a submission starts: lets go of what nothing
@@ -4039,6 +4069,10 @@ fn read_backs(list: &HostList) {
     for back in &list.deferred().texture_backs {
         crate::texback::land(back);
     }
+    read_backs_buffers(list);
+}
+
+fn read_backs_buffers(list: &HostList) {
     for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
@@ -5108,12 +5142,29 @@ impl Host {
         let mut last = 0;
         let mut landed = Vec::new();
         let mut telling = std::time::Instant::now();
+        // Deduplicate & parallelize texture readbacks across all completed
+        // flights in this landing before signaling the title (matches
+        // `relay_card_back`, which already merged all flights' buffer writes).
+        let mut tex_backs = Vec::new();
+        for item in &items {
+            if let Late::Run(flight) = item {
+                for &i in &flight.order {
+                    let mut list_backs = std::mem::take(&mut flight.lists[i].host().deferred().texture_backs);
+                    tex_backs.append(&mut list_backs);
+                }
+            }
+        }
+        if !tex_backs.is_empty() {
+            let refs: Vec<&_> = tex_backs.iter().collect();
+            crate::texback::land_batch(&refs);
+            telling = crate::land::spent(crate::land::stat::READ_BACKS, telling);
+        }
         for item in items {
             telling = match item {
                 Late::Run(mut flight) => {
                     last = flight.number;
                     for &i in &flight.order {
-                        read_backs(flight.lists[i].host());
+                        read_backs_buffers(flight.lists[i].host());
                     }
                     if let Some(card) = flight.card {
                         self.card_done(card);
@@ -5589,12 +5640,25 @@ impl Host {
             // In the order given: what tells the title the card is done.
             let mut last = 0;
             let mut landed = Vec::new();
+            let mut tex_backs = Vec::new();
+            for item in &items {
+                if let Late::Run(flight) = item {
+                    for &i in &flight.order {
+                        let mut list_backs = std::mem::take(&mut flight.lists[i].host().deferred().texture_backs);
+                        tex_backs.append(&mut list_backs);
+                    }
+                }
+            }
+            if !tex_backs.is_empty() {
+                let refs: Vec<&_> = tex_backs.iter().collect();
+                crate::texback::land_batch(&refs);
+            }
             for item in items {
                 match item {
                     Late::Run(mut flight) => {
                         last = flight.number;
                         for &i in &flight.order {
-                            read_backs(flight.lists[i].host());
+                            read_backs_buffers(flight.lists[i].host());
                         }
                         if let Some(card) = flight.card {
                             self.card_done(card);
@@ -5739,7 +5803,11 @@ impl Host {
             }
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
-        } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
+        } else if late_free_present()
+            && now_ms()
+                > SWEPT.load(Ordering::Relaxed)
+                    + sweep_settle_interval_ms(self.video_memory(), crate::residency::pressured())
+        {
             // With the present sent ahead nothing else brings a moment
             // with nothing in the air: one is made for the sweep.
             self.settle(&mut submitted, WHY_SYNC);
@@ -10993,6 +11061,16 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(super::MAPPED[0].load(Ordering::Relaxed), mapped_before);
         assert_eq!(super::RESIDENT[0].load(Ordering::Relaxed), resident_before);
         drop((u, s, d));
+    }
+
+    #[test]
+    fn sweep_settle_interval_scales_with_pressure() {
+        let gib = 1024 * 1024 * 1024;
+        assert_eq!(super::sweep_settle_interval_ms(Some([16 * gib, 12 * gib, 0, 0]), false), 5000);
+        assert_eq!(super::sweep_settle_interval_ms(Some([100, 84, 0, 0]), false), 5000);
+        assert_eq!(super::sweep_settle_interval_ms(Some([100, 85, 0, 0]), false), 1500);
+        assert_eq!(super::sweep_settle_interval_ms(Some([16 * gib, 8 * gib, 0, 0]), true), 1500);
+        assert_eq!(super::sweep_settle_interval_ms(None, false), 5000);
     }
 }
 

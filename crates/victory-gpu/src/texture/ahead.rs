@@ -30,11 +30,27 @@ const PENDING: u8 = 1;
 const DONE: u8 = 2;
 pub(crate) const LISTED: u8 = 3;
 
-/// Bytes of title memory on their way at most: past it uploads go into the
-/// lists, as before.
-const MOST: u64 = 96 << 20;
+/// Bytes of title memory on their way at most on plentiful-RAM systems: past
+/// it uploads go into the lists, as before.
+const MOST: u64 = 256 << 20;
 /// Bytes and textures of one submission at most.
 const BATCH: (u64, usize) = (16 << 20, 64);
+
+fn in_flight_budget_for(tier: crate::residency::HostRamTier) -> u64 {
+    match tier {
+        crate::residency::HostRamTier::Tight => 32 << 20,
+        crate::residency::HostRamTier::Moderate => 160 << 20,
+        crate::residency::HostRamTier::Plentiful => MOST,
+    }
+}
+
+fn worker_count_for(logical_cpus: usize, tier: crate::residency::HostRamTier) -> usize {
+    if matches!(tier, crate::residency::HostRamTier::Tight) || logical_cpus < 8 {
+        2
+    } else {
+        4
+    }
+}
 
 /// Whether it is on (`VICTORY_UPLOAD_AHEAD`; off).
 pub(crate) fn on() -> bool {
@@ -56,6 +72,11 @@ pub(crate) struct Job {
 }
 
 impl Job {
+    /// Bytes staged by this upload job.
+    pub(crate) fn bytes(&self) -> u64 {
+        self.staging.read as u64
+    }
+
     /// Calls `f` when the copy has run: now if it has.
     pub(crate) fn then(&self, f: impl FnOnce() + Send + 'static) {
         let mut then = self.then.lock().unwrap_or_else(|e| e.into_inner());
@@ -104,11 +125,7 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
         let way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
         return way.iter().find(|(serial, _)| *serial == copy.serial).map(|(_, job)| Taken::Known(job.clone()));
     }
-    let most = match crate::residency::host_ram_tier() {
-        crate::residency::HostRamTier::Tight => 32 << 20,
-        crate::residency::HostRamTier::Moderate => 64 << 20,
-        crate::residency::HostRamTier::Plentiful => MOST,
-    };
+    let most = in_flight_budget_for(crate::residency::host_ram_tier());
     if !crate::residency::allow_staging_growth(false)
         || BYTES.load(Relaxed) >= most
         || copy.flags() & 0x7 != 0
@@ -148,9 +165,26 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
 }
 
 /// Sends a job of [`take`] on its way.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn send(job: &Arc<Job>) {
     QUEUE.0.lock().unwrap_or_else(|e| e.into_inner()).push_back(job.clone());
     QUEUE.1.notify_one();
+}
+
+/// Sends a batch of [`take`] jobs together under a single lock so copy-queue
+/// workers pop full batches (`BATCH`) instead of flushing 1–2 textures per
+/// GPU submission.
+pub(crate) fn send_batch(jobs: Vec<Arc<Job>>) {
+    if jobs.is_empty() {
+        return;
+    }
+    let count = jobs.len();
+    QUEUE.0.lock().unwrap_or_else(|e| e.into_inner()).extend(jobs);
+    if count == 1 {
+        QUEUE.1.notify_one();
+    } else {
+        QUEUE.1.notify_all();
+    }
 }
 
 /// Waits until every upload currently on its way here has finished copying
@@ -207,7 +241,9 @@ fn workers() -> Option<&'static ID3D12CommandQueue> {
                     })
                     .ok()?
             };
-            for n in 0..2 {
+            let logical = std::thread::available_parallelism().map_or(4, usize::from);
+            let count = worker_count_for(logical, crate::residency::host_ram_tier());
+            for n in 0..count {
                 let worker = Worker::new(&host.device, queue.clone()).ok()?;
                 std::thread::Builder::new().name(format!("uploads ahead {n}")).spawn(move || worker.work()).ok()?;
             }
@@ -478,5 +514,17 @@ mod tests {
         assert!(drain() >= 1);
         assert!(ran.load(std::sync::atomic::Ordering::Acquire), "job.then callback must run before drain() returns");
         assert_eq!(drain(), 0);
+    }
+
+    #[test]
+    fn in_flight_budget_and_worker_count_scale_with_host_tier() {
+        use crate::residency::HostRamTier;
+        assert_eq!(in_flight_budget_for(HostRamTier::Tight), 32 << 20);
+        assert_eq!(in_flight_budget_for(HostRamTier::Moderate), 160 << 20);
+        assert_eq!(in_flight_budget_for(HostRamTier::Plentiful), 256 << 20);
+        assert_eq!(worker_count_for(12, HostRamTier::Tight), 2);
+        assert_eq!(worker_count_for(6, HostRamTier::Moderate), 2);
+        assert_eq!(worker_count_for(12, HostRamTier::Moderate), 4);
+        assert_eq!(worker_count_for(16, HostRamTier::Plentiful), 4);
     }
 }
