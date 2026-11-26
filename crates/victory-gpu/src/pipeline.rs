@@ -61,21 +61,11 @@ pub(crate) struct Shader {
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
     container: Vec<u8>,
-    #[cfg(windows)]
-    translated: OnceLock<Option<Translated>>,
-    /// A mesh shader's link with its pixel shaders ([`Shader::mesh_link`]).
-    #[cfg(windows)]
-    mesh_link: OnceLock<Option<victory_shader::emit::Link>>,
-    /// The host code translated for each link ([`Shader::linked_dxil`]).
-    #[cfg(windows)]
-    linked: Mutex<HashMap<victory_shader::emit::Link, Option<Arc<Vec<u8>>>>>,
-    /// Whether its code walks the ray-tracing structures, once looked at
-    /// ([`Shader::walks`]).
-    #[cfg(windows)]
-    walks: OnceLock<bool>,
-    /// Its part in the stand-in for the indirect light ([`crate::ambient`]).
+    /// Its part in the stand-in for the indirect light.
     #[cfg(windows)]
     pub(crate) ambient: Option<crate::ambient::Role>,
+    #[cfg(windows)]
+    translated: OnceLock<Option<Translated>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -125,15 +115,9 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 hash: full.to_hex()[..16].to_owned(),
                 container: bytes.to_vec(),
                 #[cfg(windows)]
-                translated: OnceLock::new(),
-                #[cfg(windows)]
-                mesh_link: OnceLock::new(),
-                #[cfg(windows)]
-                linked: Mutex::new(HashMap::new()),
-                #[cfg(windows)]
-                walks: OnceLock::new(),
-                #[cfg(windows)]
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
+                #[cfg(windows)]
+                translated: OnceLock::new(),
             })
         })
         .clone()
@@ -143,16 +127,18 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
 #[cfg(windows)]
 pub(crate) struct Translated {
     pub(crate) host: victory_shader::emit::HostShader,
-    pub(crate) compute_threads: Option<[u32; 3]>,
+    /// A compute program's threads in a group.
+    pub(crate) threads: Option<[u32; 3]>,
     pub(crate) used: Vec<victory_shader::UsedResource>,
+    pub(crate) tables: crate::draw::TablePlan,
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
-    /// Per [`Translated::used`] entry: a store or atomic names that table
-    /// UAV descriptor. Empty when the code is not known.
-    pub(crate) used_written: Vec<bool>,
-    /// A buffer store whose descriptor could not be matched to `used`.
-    pub(crate) write_unknown: bool,
+    /// Whether it can store through raw addresses ([`stores_by_address`]).
+    pub(crate) stores_by_address: bool,
+    /// Whether it stores through a view it picks from the heap by an index,
+    /// once asked (`crate::picked`).
+    pub(crate) picks: std::sync::atomic::AtomicU8,
 }
 
 #[cfg(windows)]
@@ -197,56 +183,16 @@ impl Shader {
             })
             .as_ref()
     }
+}
 
-    /// For a mesh shader whose outputs pass the 32 KiB D3D12 allows (#283):
-    /// the link its pipelines translate it and their pixel shader with,
-    /// which packs its 16-bit outputs two per column. None for any other
-    /// shader; logged once.
-    pub(crate) fn mesh_link(&self) -> Option<&victory_shader::emit::Link> {
-        self.mesh_link
-            .get_or_init(|| {
-                if self.stage != "mesh" {
-                    return None;
-                }
-                let link = victory_shader::emit::mesh_link(&self.container);
-                if let Some(link) = &link {
-                    tracing::info!(
-                        hash = %self.hash,
-                        packed = link.packed.len(),
-                        "mesh shader outputs pass 32 KiB: its 16-bit outputs are packed with its pixel shaders' inputs"
-                    );
-                }
-                link
-            })
-            .as_ref()
-    }
-
-    /// The host code translated with `link`, made on first use. None if it
-    /// does not translate, or binds other than the plain translation (the
-    /// pipeline's root signature is made from that one).
-    pub(crate) fn linked_dxil(&self, link: &victory_shader::emit::Link) -> Option<Arc<Vec<u8>>> {
-        let mut linked = self.linked.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(dxil) = linked.get(link) {
-            return dxil.clone();
-        }
-        let plain = &self.translated()?.host;
-        let unbound = |h: &victory_shader::emit::HostShader| victory_shader::emit::HostShader {
-            dxil: Vec::new(),
-            ..h.clone()
-        };
-        let made = match crate::shader_cache::host_shader_linked(&self.container, link) {
-            Ok(host) if unbound(&host) == unbound(plain) => Some(Arc::new(host.dxil)),
-            Ok(_) => {
-                tracing::warn!(stage = self.stage, hash = %self.hash, "linked translation binds other than the shader's own; not used");
-                None
-            }
-            Err(e) => {
-                tracing::warn!(stage = self.stage, hash = %self.hash, error = %e, "shader does not translate linked; its own translation is used");
-                None
-            }
-        };
-        linked.insert(link.clone(), made.clone());
-        made
+#[cfg(windows)]
+impl Shader {
+    /// The console programs of the container; `None` if they are not known.
+    pub(crate) fn programs(&self) -> Option<Vec<victory_shader::NativeProgram>> {
+        use victory_shader::{Container, FourCC};
+        let c = Container::parse(&self.container).ok()?;
+        let part = c.part(FourCC::DXIL).or(c.part(FourCC::ACCC))?;
+        victory_shader::native_programs(part.data).ok()
     }
 }
 
@@ -256,39 +202,36 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     // The translation depends on it (a view index past a capped heap).
     crate::descriptor::host::probe_view_limit();
     let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let programs = match c.part(FourCC::DXIL) {
+    let programs = match c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)) {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
-    let compute_threads = programs.iter().find_map(|p| match &p.io {
-        victory_shader::native::StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => {
-            Some(cs.threads)
-        }
+    let threads = programs.iter().find_map(|p| match &p.io {
+        victory_shader::native::StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => Some(cs.threads),
         _ => None,
     });
-    let chosen = programs.iter().find(|p| {
-        matches!(
-            p.stage,
-            HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
-        )
-    });
-    let used = chosen.map(|p| p.used.to_vec()).unwrap_or_default();
-    let (used_written, mut write_unknown) = chosen
-        .map(|p| written_used(p, &used))
-        .unwrap_or((Vec::new(), !programs.is_empty()));
-    if programs.len() > 1 {
-        // Another stage's table store could name the same descriptor.
-        write_unknown = true;
-    }
+    let stores_by_address = programs.is_empty() || programs.iter().any(stores_by_address);
+    let used = programs
+        .into_iter()
+        .find(|p| {
+            matches!(
+                p.stage,
+                HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
+            )
+        })
+        .map(|p| p.used)
+        .unwrap_or_default();
+    let tables = crate::draw::TablePlan::new(&used, &host.root_indexed_views);
     Ok(Translated {
         host,
-        compute_threads,
+        threads,
         used,
+        tables,
         stores,
-        used_written,
-        write_unknown,
+        stores_by_address,
+        picks: Default::default(),
     })
 }
 
@@ -305,8 +248,11 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
 /// So a builder dispatch runs only while every builder pipeline the title
 /// has created has a host pipeline; the first builder dispatch makes them
 /// all on the spot instead of over the next frames (a stage "still being
-/// made" would be a dropped stage). One that cannot be made turns the
-/// builder off for the rest of the run.
+/// made" would be a dropped stage). While one cannot be made the builder
+/// is off; it is looked at again when the title creates another. A stage
+/// that could not be bound stops the stages after it for the rest of that
+/// frame and the next ([`builder_rests`]); it turned the builder off for the
+/// rest of the run at first.
 ///
 /// shortcut: and only with `VICTORY_BVH_BUILDER=1`, until a run has shown
 /// the whole builder and the host side of title memory by address
@@ -317,15 +263,18 @@ struct Builder {
     pipelines: Vec<Arc<make::Pending>>,
     /// Every one of `pipelines` has a host pipeline.
     whole: bool,
-    /// One could not be made.
-    off: bool,
+    /// One could not be made, of so many (0: none).
+    off: usize,
+    /// No stage runs before this frame.
+    rests: u64,
 }
 
 #[cfg(windows)]
 static BUILDER: Mutex<Builder> = Mutex::new(Builder {
     pipelines: Vec::new(),
     whole: false,
-    off: false,
+    off: 0,
+    rests: 0,
 });
 
 /// Whether `shaders` are a pipeline of the structure builder.
@@ -358,226 +307,21 @@ pub(crate) fn builder_quarantined(this: This) -> bool {
     is_builder(this) && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
 }
 
-#[cfg(windows)]
-pub(crate) use make::frame_drew;
-
-#[cfg(windows)]
-impl Shader {
-    /// Whether the program walks the ray-tracing structures: its code has
-    /// an `image_bvh_intersect_ray` or `image_bvh64_intersect_ray`. Looked
-    /// at once, when a dispatch first asks.
-    fn walks(&self) -> bool {
-        *self.walks.get_or_init(|| container_walks(&self.container))
-    }
-}
-
-/// Whether a console container's code tests rays against the nodes of a
-/// ray-tracing structure.
-#[cfg(windows)]
-fn container_walks(container: &[u8]) -> bool {
-    use victory_shader::{Container, FourCC};
-    let Ok(c) = Container::parse(container) else {
-        return false;
-    };
-    c.part(FourCC::DXIL)
-        .and_then(|part| victory_shader::native_programs(part.data).ok())
-        .is_some_and(|programs| programs.iter().any(|p| code_walks(&p.code)))
-}
-
-/// Whether native code has a ray-tracing node test.
-#[cfg(windows)]
-fn code_walks(code: &[u8]) -> bool {
-    victory_shader::gfx10::decode(code).is_ok_and(|code| code.iter().any(|i| i.name().is_some_and(|n| n.starts_with("image_bvh"))))
-}
-
-/// Dispatches held back by [`walk_held`] since the last frame line.
-#[cfg(windows)]
-pub(crate) static WALKS_HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Compute shaders known to walk unbuilt dynamic ray-tracing structures up to
-/// 65,535 iterations per wave and deterministically hang NVIDIA Wave32 cards
-/// (`DXGI_ERROR_DEVICE_HUNG` / `nvlddmkm` 153 -> `PF FLR`) when the structure
-/// builder has not run whole (upstream Marvisak#2311).
-#[cfg(windows)]
-const KNOWN_HANG_BVH_WALKS: &[&str] = &[
-    // CS_IrradianceCache_ShadowTrace_WithFar
-    "f607780aa8e502d0",
-];
-
-/// Policy for [`walk_held`] (`VICTORY_BVH_HOLD`).
-#[cfg(windows)]
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum BvhHold {
-    /// `0` / `off` / `none`: never hold BVH-walking dispatches.
-    Off,
-    /// Unset / `auto` (default): hold [`KNOWN_HANG_BVH_WALKS`] while the
-    /// structure builder has not run whole, and automatically escalate to
-    /// holding every BVH-walking compute shader after the first display-driver
-    /// error (`crate::drvwatch::tripped()`).
-    Auto,
-    /// `known`: hold only [`KNOWN_HANG_BVH_WALKS`] (no driver-watch escalation).
-    KnownOnly,
-    /// `1` / `all`: hold every BVH-walking compute dispatch while the builder
-    /// has not run whole.
-    All,
-    /// Comma-separated 16-hex shader hashes to hold (plus escalate to all on
-    /// driver-watch trip).
-    Custom(Vec<String>),
-}
-
-#[cfg(windows)]
-fn parse_bvh_hold(value: Option<&str>) -> BvhHold {
-    let Some(raw) = value.map(str::trim).filter(|s| !s.is_empty()) else {
-        return BvhHold::Auto;
-    };
-    if raw.eq_ignore_ascii_case("0")
-        || raw.eq_ignore_ascii_case("off")
-        || raw.eq_ignore_ascii_case("none")
-        || raw.eq_ignore_ascii_case("false")
-    {
-        return BvhHold::Off;
-    }
-    if raw.eq_ignore_ascii_case("1")
-        || raw.eq_ignore_ascii_case("all")
-        || raw.eq_ignore_ascii_case("true")
-    {
-        return BvhHold::All;
-    }
-    if raw.eq_ignore_ascii_case("auto") {
-        return BvhHold::Auto;
-    }
-    if raw.eq_ignore_ascii_case("known") {
-        return BvhHold::KnownOnly;
-    }
-    let hashes: Vec<String> = raw
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_ascii_lowercase)
-        .collect();
-    if hashes.is_empty() {
-        BvhHold::Auto
-    } else {
-        BvhHold::Custom(hashes)
-    }
-}
-
-#[cfg(windows)]
-fn bvh_hold_matches(mode: &BvhHold, hash: &str, driver_tripped: bool) -> bool {
-    match mode {
-        BvhHold::Off => false,
-        BvhHold::All => true,
-        BvhHold::KnownOnly => KNOWN_HANG_BVH_WALKS.iter().any(|&h| h.eq_ignore_ascii_case(hash)),
-        BvhHold::Auto => {
-            driver_tripped || KNOWN_HANG_BVH_WALKS.iter().any(|&h| h.eq_ignore_ascii_case(hash))
-        }
-        BvhHold::Custom(hashes) => {
-            driver_tripped || hashes.iter().any(|h| h.eq_ignore_ascii_case(hash))
-        }
-    }
-}
-
-#[cfg(windows)]
-fn should_hold_for_builder(mode: &BvhHold, builder_whole: bool, builder_off: bool, driver_tripped: bool) -> bool {
-    if matches!(mode, BvhHold::Off) {
-        return false;
-    }
-    let whole = builder_whole && !builder_off;
-    !(whole && !(driver_tripped && matches!(mode, BvhHold::Auto | BvhHold::Custom(_))))
-}
-
-/// Whether a dispatch with the title's pipeline `this` is held back
-/// because its program walks ray-tracing structures nothing has built
-/// (`VICTORY_BVH_HOLD`: default `auto`; `0`/`off` disables; `known` holds
-/// only known-hanging NVIDIA Wave32 shaders; `1`/`all` holds all 64).
-///
-/// The structure builder does not run (see [`Builder`]: only with
-/// `VICTORY_BVH_BUILDER=1`, and then only whole, which a host of 32-lane
-/// waves does not manage yet). The title's ray-traced passes run all the
-/// same: 64 programs of its shader pack test rays against structure nodes
-/// (ray-traced shadows, screen probes, reflections, the irradiance cache;
-/// one of them, `CS_IrradianceCache_ShadowTrace_WithFar` f607780aa8e502d0,
-/// from the first world frame on in every run). Each walks, in a loop the
-/// title bounds at 65,535 steps a wave, whatever bytes lie where the
-/// structure would be: what it returns is not a picture of the scene, and
-/// how long it runs depends on those bytes. Upstream's pull request 2311
-/// measured a card hung in `f607780aa8e502d0` on an NVIDIA card every
-/// run, and both card losses since the draw windows' own fault was fixed
-/// (runs 208 and 224) came within a second of first RT walk/resolve use.
-///
-/// In the default `auto` mode, `f607780aa8e502d0` is held back while the
-/// builder has not run whole (preserving static pre-built BVH indirect
-/// light), and if the display driver reports any error
-/// (`crate::drvwatch::tripped()`), all remaining BVH-walking shaders are
-/// automatically held for the rest of the run before a repeat hang can
-/// escalate to `FECS` / `PF FLR`.
-#[cfg(windows)]
-pub(crate) fn walk_held(this: This) -> bool {
-    static MODE: OnceLock<BvhHold> = OnceLock::new();
-    if this.is_null() {
-        return false;
-    }
-    let mode = MODE.get_or_init(|| parse_bvh_hold(std::env::var("VICTORY_BVH_HOLD").ok().as_deref()));
-    if matches!(mode, BvhHold::Off) {
-        return false;
-    }
-    let tripped = crate::drvwatch::tripped();
-    let p = pipeline(this);
-    // Check hash/policy match before decoding native bytecode so non-matching
-    // compute shaders pay only a cheap string compare until escalated.
-    let Some(matched) = p
-        .shaders
-        .iter()
-        .find(|s| s.stage == "compute" && bvh_hold_matches(mode, &s.hash, tripped) && s.walks())
-    else {
-        return false;
-    };
-    // (Asked only for programs that match and walk: the lock is the builder's.)
-    let (builder_whole, builder_off) = {
-        let b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
-        (b.whole, b.off)
-    };
-    if !should_hold_for_builder(mode, builder_whole, builder_off, tripped) {
-        return false;
-    }
-    let escalated = tripped && !KNOWN_HANG_BVH_WALKS.iter().any(|&h| h.eq_ignore_ascii_case(&matched.hash));
-    if WALKS_HELD.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            tracing::info!(
-                shaders = ?p.shaders,
-                ?mode,
-                driver_tripped = tripped,
-                "a dispatch of a program that walks ray-tracing structures is held back: the structure builder has not built them (VICTORY_BVH_HOLD); the first one"
-            );
-        });
-    } else if escalated {
-        static ESCALATED: std::sync::Once = std::sync::Once::new();
-        ESCALATED.call_once(|| {
-            tracing::warn!(
-                shaders = ?p.shaders,
-                ?mode,
-                "driver watch tripped: escalating BVH walk hold to all ray-tracing traversal shaders for the rest of the run"
-            );
-        });
-    }
-    true
-}
-
 /// Whether the title's pipeline `this` is one of the structure builder's.
 #[cfg(windows)]
 pub(crate) fn is_builder(this: This) -> bool {
     !this.is_null() && pipeline(this).builder
 }
 
-/// A stage of the builder was dropped after all: none runs from here on.
+/// A stage of the builder was dropped after all: none runs for the rest of
+/// this frame and the next (what it fed is not there).
 #[cfg(windows)]
-pub(crate) fn builder_off(why: &'static str) {
+pub(crate) fn builder_rests(why: &'static str) {
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
-    b.whole = false;
-    if !b.off {
-        b.off = true;
-        tracing::warn!(why, "the ray-tracing structure builder is turned off for the rest of the run: its stages run all or none");
+    b.rests = crate::frame::current() + 2;
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
+        tracing::warn!(why, "the ray-tracing structure builder rests for this frame and the next: its stages run all or none");
     }
 }
 
@@ -590,22 +334,24 @@ pub(crate) fn builder_runs() -> bool {
         return false;
     }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
-    if b.off {
+    if b.off == b.pipelines.len() || crate::frame::current() < b.rests {
         return false;
     }
     if b.whole {
         return true;
     }
-    let missing = b.pipelines.iter().filter(|p| !make::now(p)).count();
-    if missing > 0 {
-        b.off = true;
+    let missing: Vec<String> = b.pipelines.iter().filter(|p| !make::now(p)).map(|p| make::hashes(p)).collect();
+    if !missing.is_empty() {
+        b.off = b.pipelines.len();
         tracing::warn!(
-            missing,
+            missing = missing.len(),
             of = b.pipelines.len(),
+            which = ?missing,
             "the ray-tracing structure builder stays off: not all of its programs have a host pipeline, and its stages run all or none"
         );
         return false;
     }
+    b.off = 0;
     tracing::info!(
         pipelines = b.pipelines.len(),
         "the ray-tracing structure builder runs: all of its programs have host pipelines"
@@ -643,210 +389,21 @@ fn stores(program: &victory_shader::NativeProgram) -> bool {
     })
 }
 
-/// Which [`Translated::used`] table UAV buffer descriptors a store or atomic
-/// names. Traces each store/atomic instruction's descriptor through the SSA IR
-/// (`victory_shader::ir::build` + `victory_shader::resource::track`) back to
-/// its root parameter and table offset, matching `used` the same way lowering
-/// does (`user_data` and `table_offset_dwords`).
-///
-/// Any store whose target cannot be tied to a known table UAV entry or root
-/// descriptor (untracked IR, flat/global stores, indirect jumps, bindless
-/// `ResourceHeap` stores, raw memory addresses) leaves
-/// [`Translated::write_unknown`] set so the draw path conservatively falls back
-/// to `stores`.
+/// Whether a console program can store to memory through raw addresses
+/// (`crate::memory`): a flat or global store or atomic, or code that does
+/// not decode. The programs that only walk ray-tracing structures do not,
+/// whatever they store through views.
 #[cfg(windows)]
-fn written_used(
-    program: &victory_shader::NativeProgram,
-    used: &[victory_shader::UsedResource],
-) -> (Vec<bool>, bool) {
-    use victory_shader::gfx10::Encoding;
-    use victory_shader::resource::{Role, Source};
-    use victory_shader::{ResourceType, RootType};
-
-    let has_table_uav = used
-        .iter()
-        .any(|u| u.root == RootType::Table && u.kind == ResourceType::Uav);
-    if !has_table_uav || !stores(program) {
-        return (vec![false; used.len()], false);
-    }
-
-    let Ok(ir) = victory_shader::ir::build(&program.code, program.wave64, program.vgprs) else {
-        return (vec![true; used.len()], true);
+fn stores_by_address(program: &victory_shader::NativeProgram) -> bool {
+    use victory_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(&program.code) else {
+        return true;
     };
-    let tracked = victory_shader::resource::track(&ir, &program.layout, program.stage, None)
-        .or_else(|_| {
-            victory_shader::structure::structure(&ir).and_then(|st| {
-                victory_shader::resource::track(&ir, &program.layout, program.stage, Some(&st))
-            })
-        });
-    let Ok(res) = tracked else {
-        return (vec![true; used.len()], true);
-    };
-
-    let scalar: HashMap<victory_shader::resource::Site, victory_shader::resource::Address> =
-        res.scalar.iter().copied().collect();
-    let descriptors: HashMap<victory_shader::resource::Site, &Source> = res
-        .descriptors
-        .iter()
-        .filter(|d| d.role == Role::Resource)
-        .map(|d| (d.site, &d.source))
-        .collect();
-
-    let mut written = vec![false; used.len()];
-    let mut unknown = false;
-
-    for (b, block) in ir.blocks.iter().enumerate() {
-        for (i, inst) in block.insts.iter().enumerate() {
-            let name = inst.machine.name();
-            match inst.machine.encoding {
-                Encoding::Mubuf | Encoding::Mtbuf => {
-                    let is_store = name.is_none_or(|n| {
-                        (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
-                    });
-                    if !is_store {
-                        continue;
-                    }
-                }
-                Encoding::Smem => {
-                    let is_store = name.is_none_or(|n| {
-                        (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
-                    });
-                    if !is_store {
-                        continue;
-                    }
-                    // Scalar memory stores without a buffer descriptor (`s_store_*`)
-                    // are tracked in `res.scalar` rather than `res.descriptors`.
-                    if !name.is_some_and(|n| n.starts_with("s_buffer_")) {
-                        match scalar
-                            .get(&(b, i))
-                            .and_then(|a| program.layout.get(a.param))
-                        {
-                            Some(rp) if rp.root == RootType::Descriptor => continue,
-                            _ => {
-                                unknown = true;
-                                continue;
-                            }
-                        }
-                    }
-                }
-                Encoding::Flat | Encoding::Global => {
-                    if name.is_none_or(|n| {
-                        (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
-                    }) {
-                        unknown = true;
-                    }
-                    continue;
-                }
-                Encoding::Sop1 => {
-                    if name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")) {
-                        unknown = true;
-                    }
-                    continue;
-                }
-                _ => continue,
-            }
-
-            let Some(source) = descriptors.get(&(b, i)) else {
-                unknown = true;
-                continue;
-            };
-            let leaves = source.leaves();
-            if leaves.is_empty() {
-                unknown = true;
-                continue;
-            }
-            for leaf in leaves {
-                match leaf {
-                    Source::Loaded { load, first } | Source::Fetched { load, first } => {
-                        let Some(a) = scalar.get(load) else {
-                            unknown = true;
-                            continue;
-                        };
-                        let Some(rp) = program.layout.get(a.param) else {
-                            unknown = true;
-                            continue;
-                        };
-                        if rp.root == RootType::Descriptor {
-                            // Root descriptor writeback is handled via `stage.root_uavs`.
-                            continue;
-                        }
-                        if rp.root != RootType::Table {
-                            unknown = true;
-                            continue;
-                        }
-                        if a.dynamic.is_some() {
-                            // Dynamically indexed table store: mark every table UAV
-                            // in this root table slot (and fall back to unknown if
-                            // none are listed in `used`).
-                            let mut any = false;
-                            for (idx, resource) in used.iter().enumerate() {
-                                if resource.root == RootType::Table
-                                    && resource.kind == ResourceType::Uav
-                                    && resource.user_data == rp.user_data
-                                {
-                                    written[idx] = true;
-                                    any = true;
-                                }
-                            }
-                            if !any {
-                                unknown = true;
-                            }
-                            continue;
-                        }
-                        if !a.offset.is_multiple_of(4) {
-                            unknown = true;
-                            continue;
-                        }
-                        let dword = (a.offset / 4) + u32::from(*first);
-                        let matched_offset = used
-                            .iter()
-                            .filter(|u| {
-                                u.root == RootType::Table
-                                    && u.user_data == rp.user_data
-                                    && u.table_offset_dwords <= dword
-                            })
-                            .map(|u| u.table_offset_dwords)
-                            .max();
-                        let Some(offset) = matched_offset else {
-                            unknown = true;
-                            continue;
-                        };
-                        let mut hit = false;
-                        for (idx, resource) in used.iter().enumerate() {
-                            if resource.root == RootType::Table
-                                && resource.kind == ResourceType::Uav
-                                && resource.user_data == rp.user_data
-                                && resource.table_offset_dwords == offset
-                            {
-                                written[idx] = true;
-                                hit = true;
-                            }
-                        }
-                        if !hit {
-                            unknown = true;
-                        }
-                    }
-                    Source::Built { address, .. } => {
-                        match program.layout.get(address.param) {
-                            Some(rp) if rp.root == RootType::Descriptor => {
-                                // Store through a root UAV; does not name a table UAV.
-                            }
-                            _ => unknown = true,
-                        }
-                    }
-                    Source::Constant(_)
-                    | Source::Phi { .. }
-                    | Source::Select { .. }
-                    | Source::Lanes { .. }
-                    | Source::LanePhi { .. } => {
-                        unknown = true;
-                    }
-                }
-            }
-        }
-    }
-
-    (written, unknown)
+    code.iter().any(|i| {
+        matches!(i.encoding, Encoding::Flat | Encoding::Global)
+            && i.name()
+                .is_none_or(|n| (n.contains("store") || n.contains("atomic")) && !n.contains("scratch"))
+    })
 }
 
 #[repr(C)]
@@ -902,38 +459,10 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
-/// As [`host_pipeline`], for a draw into render target and depth views of
-/// the formats `bound`: if a bound view has another format than the title's
-/// pipeline declares for its slot (`host::formats_differ`), the host
-/// pipeline of the same shaders and state made for the bound formats
-/// (`make::for_formats`). A draw whose views are as declared pays one
-/// comparison of the nine words.
-#[cfg(windows)]
-pub(crate) fn host_pipeline_for<'a>(
-    this: This,
-    bound: &host::TargetFormats,
-) -> Option<&'a host::HostPipeline> {
-    if this.is_null() {
-        return None;
-    }
-    let p = &pipeline(this).host;
-    if p.formats != *bound && host::formats_differ(&p.formats, bound) {
-        return make::for_formats(p, bound);
-    }
-    make::ready(p)
-}
-
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
     make::waiting()
-}
-
-/// Live shader/pipeline warmup progress `(done, total, pre_world)` while any
-/// pipelines are queued; `None` once drained.
-#[cfg(windows)]
-pub(crate) fn loading_status() -> Option<(u64, u64, bool)> {
-    make::loading_status()
 }
 
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
@@ -1039,6 +568,8 @@ fn hand_out(
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
+    #[cfg(windows)]
+    known::note(host.key(), &shaders, host.graphics.as_deref());
     #[cfg(windows)]
     make::early(&host);
     #[cfg(windows)]
@@ -1186,21 +717,10 @@ pub(crate) extern "system" fn create_stream(
             );
             break;
         };
-        if at.checked_add(size).is_none_or(|end| end > desc.size) {
-            tracing::warn!(
-                kind,
-                at,
-                size,
-                total = desc.size,
-                "truncated pipeline subobject; the rest is ignored"
-            );
-            break;
-        }
         if let Some(stage) = stage {
-            // SAFETY: `at + size <= desc.size`, and a shader subobject is 24 bytes
-            // with `Bytecode` at +8.
-            let code = unsafe { desc.stream.add(at + 8).cast::<Bytecode>().read_unaligned() };
-            shaders.extend(copy(stage, &code));
+            // SAFETY: a shader subobject has its bytecode at +8.
+            let code = unsafe { &*desc.stream.add(at + 8).cast::<Bytecode>() };
+            shaders.extend(copy(stage, code));
         }
         #[cfg(windows)]
         // SAFETY: a whole subobject of this kind lies at `at`.
@@ -1238,15 +758,9 @@ static FUNCTIONS: Table<24> = {
 #[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
-mod library;
-
-/// Host pipelines created and loaded from the library since the start
-/// (`crate::framelog`).
+pub mod known;
 #[cfg(windows)]
-pub(crate) fn frame_log_counts() -> (u64, u64) {
-    use std::sync::atomic::Ordering::Relaxed;
-    (library::MADE.load(Relaxed), library::LOADED.load(Relaxed))
-}
+mod library;
 #[cfg(windows)]
 mod make;
 
@@ -1291,95 +805,6 @@ mod tests {
 
     use super::*;
     use crate::object::{S_OK, slot};
-
-    #[cfg(windows)]
-    #[test]
-    fn a_store_marks_only_the_table_descriptor_it_names() {
-        let make_program = |words: &[u32]| victory_shader::NativeProgram {
-            stage: victory_shader::HwStage::Cs,
-            wave64: false,
-            vgprs: 16,
-            layout: vec![victory_shader::RootParam {
-                root: victory_shader::RootType::Table,
-                table_offset_dwords: 0,
-                sgprs: 1,
-                base_register: 0,
-                user_data: 4,
-                slot: 1,
-            }],
-            used: vec![
-                victory_shader::UsedResource {
-                    kind: victory_shader::ResourceType::Uav,
-                    root: victory_shader::RootType::Table,
-                    table_offset_dwords: 0,
-                    lower_bound: 0,
-                    stride: 0,
-                    dwords: 4,
-                    user_data: 4,
-                    slot: 1,
-                },
-                victory_shader::UsedResource {
-                    kind: victory_shader::ResourceType::Uav,
-                    root: victory_shader::RootType::Table,
-                    table_offset_dwords: 8,
-                    // Deliberately equals the SGPR index (8) used by the load
-                    // of the first UAV to prove matching tracks table offsets
-                    // rather than confusing SGPR indices with HLSL registers.
-                    lower_bound: 8,
-                    stride: 0,
-                    dwords: 4,
-                    user_data: 4,
-                    slot: 1,
-                },
-            ],
-            io: victory_shader::native::StageIo::Cs(victory_shader::native::ComputeIo {
-                rsrc2: 5 << 1,
-                threads: [32, 1, 1],
-            }),
-            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
-        };
-
-        // Load UAV at table byte offset 0 (dword 0) into s[8:11], then store through s[8:11].
-        let store_first = make_program(&[
-            0xBE85_0380, // s_mov_b32 s5, 0
-            (0x3D << 26) | (0x02 << 18) | (8 << 6) | 2,
-            125 << 25, // s_load_dwordx4 s[8:11], s[4:5], 0
-            (0x38 << 26) | (0x1C << 18),
-            (0x80 << 24) | (2 << 16), // buffer_store_dword v0, off, s[8:11], 0
-            0xBF81_0000,              // s_endpgm
-        ]);
-        let (written, unknown) = super::written_used(&store_first, &store_first.used);
-        assert_eq!(written, [true, false]);
-        assert!(!unknown);
-
-        // Load UAV at table byte offset 32 (dword 8) into s[8:11], then store through s[8:11].
-        let store_second = make_program(&[
-            0xBE85_0380, // s_mov_b32 s5, 0
-            (0x3D << 26) | (0x02 << 18) | (8 << 6) | 2,
-            (125 << 25) | 32, // s_load_dwordx4 s[8:11], s[4:5], 0x20
-            (0x38 << 26) | (0x1C << 18),
-            (0x80 << 24) | (2 << 16), // buffer_store_dword v0, off, s[8:11], 0
-            0xBF81_0000,              // s_endpgm
-        ]);
-        let (written, unknown) = super::written_used(&store_second, &store_second.used);
-        assert_eq!(written, [false, true]);
-        assert!(!unknown);
-
-        // Read-only shader with no stores marks neither UAV.
-        let read_only = make_program(&[0xBF81_0000]);
-        let (written, unknown) = super::written_used(&read_only, &read_only.used);
-        assert_eq!(written, [false, false]);
-        assert!(!unknown);
-
-        // Unmatched/untracked store conservatively marks `unknown`.
-        let untracked = make_program(&[
-            (0x38 << 26) | (0x1C << 18),
-            (0x80 << 24) | (2 << 16), // buffer_store_dword with uninitialized s[8:11]
-            0xBF81_0000,
-        ]);
-        let (_, unknown) = super::written_used(&untracked, &untracked.used);
-        assert!(unknown);
-    }
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)
@@ -1483,121 +908,5 @@ mod tests {
                 (1, 28)
             );
         }
-    }
-
-    #[test]
-    fn truncated_and_unaligned_streams_do_not_read_out_of_bounds() {
-        // 1. Unaligned stream holding a complete 24-byte VS subobject (kind = 1).
-        let vs = [7u8; 6];
-        let mut backing = [0u8; 25];
-        let slice = &mut backing[1..25]; // intentionally misaligned by 1 byte
-        slice[0..4].copy_from_slice(&1u32.to_le_bytes());
-        slice[8..16].copy_from_slice(&(vs.as_ptr() as u64).to_le_bytes());
-        slice[16..24].copy_from_slice(&(vs.len() as u64).to_le_bytes());
-        let desc = StreamDesc {
-            size: slice.len(),
-            stream: slice.as_ptr(),
-        };
-        let mut p = std::ptr::null();
-        assert_eq!(
-            create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p),
-            S_OK
-        );
-        assert_eq!(shaders(p), [("vertex", vs.to_vec())]);
-        assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
-
-        // 2. Truncated 336-byte blend subobject (kind = 8) placed flush against a
-        // PAGE_NOACCESS guard page: must not fault reading past `desc.size`.
-        #[cfg(windows)]
-        {
-            use windows_sys::Win32::System::Memory::*;
-            // SAFETY: private two-page reservation with the second page inaccessible.
-            unsafe {
-                let base = VirtualAlloc(
-                    std::ptr::null(),
-                    0x2000,
-                    MEM_RESERVE | MEM_COMMIT,
-                    PAGE_READWRITE,
-                )
-                .cast::<u8>();
-                assert!(!base.is_null());
-                let mut old = 0;
-                assert_ne!(
-                    VirtualProtect(base.add(0x1000).cast(), 0x1000, PAGE_NOACCESS, &mut old),
-                    0
-                );
-                let tail = base.add(0x1000 - 12);
-                tail.cast::<u32>().write_unaligned(8); // D3D12_BLEND_DESC (336 bytes)
-                let trunc = StreamDesc {
-                    size: 12,
-                    stream: tail,
-                };
-                let mut q = std::ptr::null();
-                assert_eq!(
-                    create_stream(std::ptr::null(), &trunc, &PIPELINE_IIDS[0], &mut q),
-                    S_OK
-                );
-                assert!(shaders(q).is_empty());
-                assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
-                assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
-            }
-        }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn bvh_hold_policy_defaults_to_known_hang_and_escalates_on_driver_trip() {
-        assert_eq!(parse_bvh_hold(None), BvhHold::Auto);
-        assert_eq!(parse_bvh_hold(Some("")), BvhHold::Auto);
-        assert_eq!(parse_bvh_hold(Some(" auto ")), BvhHold::Auto);
-        assert_eq!(parse_bvh_hold(Some("0")), BvhHold::Off);
-        assert_eq!(parse_bvh_hold(Some("off")), BvhHold::Off);
-        assert_eq!(parse_bvh_hold(Some("1")), BvhHold::All);
-        assert_eq!(parse_bvh_hold(Some("all")), BvhHold::All);
-        assert_eq!(parse_bvh_hold(Some("known")), BvhHold::KnownOnly);
-        assert_eq!(
-            parse_bvh_hold(Some("F607780AA8E502D0, deadbeef00001111")),
-            BvhHold::Custom(vec![
-                "f607780aa8e502d0".to_owned(),
-                "deadbeef00001111".to_owned(),
-            ])
-        );
-
-        let hang = "f607780aa8e502d0";
-        let other = "0123456789abcdef";
-
-        // Default `Auto`: holds known NVIDIA Wave32 hang shader immediately,
-        // keeps other static-BVH lighting shaders running until a driver error,
-        // then escalates to hold all BVH walks.
-        assert!(bvh_hold_matches(&BvhHold::Auto, hang, false));
-        assert!(bvh_hold_matches(&BvhHold::Auto, "F607780AA8E502D0", false));
-        assert!(!bvh_hold_matches(&BvhHold::Auto, other, false));
-        assert!(bvh_hold_matches(&BvhHold::Auto, other, true));
-
-        // `KnownOnly`: never escalates to other shaders.
-        assert!(bvh_hold_matches(&BvhHold::KnownOnly, hang, false));
-        assert!(!bvh_hold_matches(&BvhHold::KnownOnly, other, true));
-
-        // `Off`: holds nothing even after driver trip.
-        assert!(!bvh_hold_matches(&BvhHold::Off, hang, true));
-        assert!(!bvh_hold_matches(&BvhHold::Off, other, true));
-
-        // `All`: holds every walking shader immediately.
-        assert!(bvh_hold_matches(&BvhHold::All, hang, false));
-        assert!(bvh_hold_matches(&BvhHold::All, other, false));
-
-        // `Custom`: holds listed hashes and escalates on driver trip.
-        let custom = parse_bvh_hold(Some("deadbeef00001111"));
-        assert!(bvh_hold_matches(&custom, "deadbeef00001111", false));
-        assert!(!bvh_hold_matches(&custom, other, false));
-        assert!(bvh_hold_matches(&custom, other, true));
-
-        // Builder interaction (`VICTORY_BVH_BUILDER=1` vs `builder_off` / driver trip).
-        assert!(should_hold_for_builder(&BvhHold::Auto, false, false, false));
-        assert!(!should_hold_for_builder(&BvhHold::Auto, true, false, false));
-        assert!(should_hold_for_builder(&BvhHold::Auto, true, true, false));
-        assert!(should_hold_for_builder(&BvhHold::Auto, true, false, true));
-        assert!(!should_hold_for_builder(&BvhHold::KnownOnly, true, false, true));
-        assert!(!should_hold_for_builder(&BvhHold::Off, false, true, true));
     }
 }

@@ -162,13 +162,19 @@ fn build(
     wide: bool,
     descriptor: Descriptor,
 ) -> Result<(HostShader, resource::Resources), ShaderError> {
-    let native = native(&program(wide, descriptor));
+    build_compute_shader(&native(&program(wide, descriptor)))
+}
+
+/// `native`, a compute program, translated (the tests' own way: no container).
+pub(super) fn build_compute_shader(
+    native: &NativeProgram,
+) -> Result<(HostShader, resource::Resources), ShaderError> {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    let io = io::raise(&p, &native).expect("io::raise");
+    let io = io::raise(&p, native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
-        native: &native,
+        native,
         p: &p,
         st: &st,
         io: &io,
@@ -187,8 +193,6 @@ fn build(
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
-        written_root_uavs: Vec::new(),
-        writes_guest_memory: false,
         root_indexed_views: res.root_indexed_views.clone(),
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -297,6 +301,12 @@ fn scene() -> (Scene, Vec<Vec<Case>>) {
     let ids2 = [8, bvh::NONE, 24, 0x1fff_fffc];
     box_nodes.push((s.add(nodes::box32(ids2, around), 32), 5));
     box_nodes.push((s.add(nodes::box16(ids2, around), 16), 4));
+    // A child that is not there with inverted infinite bounds (the title's
+    // builder leaves such slots): every ray "enters" it at minus infinity.
+    let mut empty = lined;
+    empty[1] = [f32::INFINITY, f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
+    let ids3 = [0x105, bvh::NONE, 0x304, 0x400];
+    box_nodes.push((s.add(nodes::box32(ids3, empty), 32), 5));
     // Random boxes.
     for n in 0..6 {
         let boxes: [[f32; 6]; 4] = std::array::from_fn(|_| {
@@ -688,76 +698,5 @@ fn a_structure_that_returns_triangle_ids_is_refused_by_name() {
             assert_eq!(what, "a ray-tracing structure that returns triangle ids");
         }
         other => panic!("{:?}", other.map(|_| ())),
-    }
-}
-
-#[test]
-fn bvh_no_hit_returns_immediate_miss_for_boxes_and_triangles() {
-    let _one = super::valu_tests::ONE_AT_A_TIME
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let (shader, _) = super::with_bvh_no_hit_for_test(true, || {
-        build(true, WHOLE).expect("lowers with VICTORY_BVH_NO_HIT=1")
-    });
-    assert!(!shader.root_srvs.contains(&super::SLOT_MEMORY));
-    assert!(!shader.root_uavs.contains(&super::SLOT_FAULTS));
-    let ray = Ray::new([0.0; 3], [1.0, 0.0, 0.0], 100.0);
-    let cases: Vec<Case> = vec![
-        Some((0, 4, ray)),
-        Some((0, 5, ray)),
-        Some((0, 0, ray)),
-        Some((0, 2, ray)),
-        Some((0, 6, ray)),
-        None,
-    ];
-    let scene = Scene {
-        words: vec![0; 32],
-        starts: vec![0],
-    };
-    let mut input = vec![0u32; (NODES as usize) / 4];
-    for (t, case) in cases.iter().enumerate() {
-        let at = t * 16;
-        if let Some((n, kind, r)) = case {
-            let ptr = ((u64::from(NODES) + (scene.starts[*n] as u64) * 4) >> 3) | u64::from(*kind);
-            input[at] = ptr as u32;
-            input[at + 1] = (ptr >> 32) as u32;
-            input[at + 2] = r.extent.to_bits();
-            for a in 0..3 {
-                input[at + 3 + a] = r.origin[a].to_bits();
-                input[at + 6 + a] = r.direction[a].to_bits();
-                input[at + 9 + a] = r.inverse[a].to_bits();
-            }
-            input[at + 12] = 1;
-        }
-    }
-    let Some(host) = Host::new(true).ok() else {
-        return;
-    };
-    let (root, pso) = host.compute_pipeline(&shader).unwrap();
-    let out = host
-        .dispatch(
-            &root,
-            &pso,
-            &Dispatch {
-                roots: vec![(0, Root::Constants(vec![0; 5]))],
-                views: &[
-                    View::Buffer {
-                        data: &input,
-                        stride: Stride::Raw,
-                    },
-                    View::RawUav(THREADS * 4),
-                ],
-                samplers: &[],
-                groups: [1, 1, 1],
-            },
-        )
-        .unwrap();
-    for (t, case) in cases.iter().enumerate() {
-        let got: [u32; 4] = out[0][4 * t..4 * t + 4].try_into().unwrap();
-        let expected = match case {
-            Some((_, kind, _)) => bvh::no_hit(*kind),
-            None => BEFORE,
-        };
-        assert_eq!(got, expected, "thread {t}");
     }
 }

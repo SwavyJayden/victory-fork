@@ -46,35 +46,21 @@ struct FilePaths {
 impl Config {
     /// Loads configuration from the environment and the config file.
     pub fn load() -> Result<Self> {
-        let explicit = std::env::var_os("VICTORY_CONFIG").map(PathBuf::from);
-        let path = if let Some(p) = &explicit {
-            Some(p.clone())
+        let explicit = explicit_config_path(|k| std::env::var_os(k));
+        let path = explicit
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("victory.toml"));
+        let file = if path.is_file() {
+            let text = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            Some((path, text))
+        } else if let Some(p) = explicit {
+            anyhow::bail!(
+                "VICTORY_CONFIG points at {}, which does not exist",
+                p.display()
+            );
         } else {
-            let cwd = PathBuf::from("victory.toml");
-            if cwd.is_file() {
-                Some(cwd)
-            } else {
-                std::env::current_exe()
-                    .ok()
-                    .and_then(|e| e.parent().map(|d| d.join("victory.toml")))
-                    .filter(|p| p.is_file())
-            }
-        };
-        let file = match path {
-            Some(path) if path.is_file() => {
-                let text = std::fs::read_to_string(&path)
-                    .with_context(|| format!("reading {}", path.display()))?;
-                Some((path, text))
-            }
-            _ => {
-                if let Some(p) = explicit {
-                    anyhow::bail!(
-                        "VICTORY_CONFIG points at {}, which does not exist",
-                        p.display()
-                    );
-                }
-                None
-            }
+            None
         };
         let (source, parsed) = match file {
             Some((path, text)) => {
@@ -131,6 +117,14 @@ impl Config {
     pub fn data_subdir(&self, sub: &str) -> Result<PathBuf> {
         subdir(&self.data_dir, sub)
     }
+}
+
+/// The config file explicitly named by the environment, if any. An empty
+/// `VICTORY_CONFIG` means unset, like the other path variables.
+fn explicit_config_path(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    env("VICTORY_CONFIG")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
 }
 
 fn subdir(root: &Path, sub: &str) -> Result<PathBuf> {
@@ -199,6 +193,17 @@ mod tests {
         assert_eq!(
             cfg.test_titles,
             vec![PathBuf::from("first"), PathBuf::from("second")]
+        );
+    }
+
+    #[test]
+    fn empty_config_env_is_ignored() {
+        let empty = |k: &str| (k == "VICTORY_CONFIG").then(OsString::new);
+        assert_eq!(explicit_config_path(empty), None);
+        let set = |k: &str| (k == "VICTORY_CONFIG").then(|| OsString::from("custom.toml"));
+        assert_eq!(
+            explicit_config_path(set),
+            Some(PathBuf::from("custom.toml"))
         );
     }
 

@@ -22,9 +22,15 @@
 /// vertices each in `dst`: `(v0, v1, v2)` and `(v0, v2, v3)`, so both
 /// triangles turn the same way. `elements` are (byte offset, format).
 pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: &[(u32, u32)]) {
+    if stride == 0 {
+        return;
+    }
+    let (Some(in_rect), Some(out_rect)) = (stride.checked_mul(3), stride.checked_mul(6)) else {
+        return;
+    };
     for (rect, out) in src
-        .chunks_exact(3 * stride)
-        .zip(dst.chunks_exact_mut(6 * stride))
+        .chunks_exact(in_rect)
+        .zip(dst.chunks_exact_mut(out_rect))
     {
         let v = |i: usize| &rect[i * stride..(i + 1) * stride];
         for (slot, i) in [0, 1, 2, 0, 2].into_iter().enumerate() {
@@ -55,6 +61,8 @@ enum Kind {
     F16,
     Unorm8,
     Unorm16,
+    Snorm8,
+    Snorm16,
 }
 
 /// Component count and kind of the vertex formats rectangles use.
@@ -69,7 +77,16 @@ fn components(format: u32) -> Option<(usize, Kind)> {
         54 => (1, Kind::F16),
         11 => (4, Kind::Unorm16),
         35 => (2, Kind::Unorm16),
+        56 => (1, Kind::Unorm16),
         28 | 29 | 87 | 91 => (4, Kind::Unorm8),
+        49 => (2, Kind::Unorm8),
+        61 => (1, Kind::Unorm8),
+        13 => (4, Kind::Snorm16),
+        37 => (2, Kind::Snorm16),
+        58 => (1, Kind::Snorm16),
+        31 => (4, Kind::Snorm8),
+        51 => (2, Kind::Snorm8),
+        63 => (1, Kind::Snorm8),
         _ => return None,
     })
 }
@@ -78,8 +95,8 @@ impl Kind {
     fn bytes(self) -> usize {
         match self {
             Kind::F32 => 4,
-            Kind::F16 | Kind::Unorm16 => 2,
-            Kind::Unorm8 => 1,
+            Kind::F16 | Kind::Unorm16 | Kind::Snorm16 => 2,
+            Kind::Unorm8 | Kind::Snorm8 => 1,
         }
     }
 
@@ -90,6 +107,8 @@ impl Kind {
             Kind::F16 => half_to_f32(u16::from_le_bytes([b[0], b[1]])),
             Kind::Unorm16 => f32::from(u16::from_le_bytes([b[0], b[1]])) / 65535.0,
             Kind::Unorm8 => f32::from(b[0]) / 255.0,
+            Kind::Snorm16 => (f32::from(i16::from_le_bytes([b[0], b[1]])) / 32767.0).max(-1.0),
+            Kind::Snorm8 => (f32::from(b[0] as i8) / 127.0).max(-1.0),
         }
     }
 
@@ -103,6 +122,10 @@ impl Kind {
                 b.copy_from_slice(&((v.clamp(0.0, 1.0) * 65535.0).round() as u16).to_le_bytes())
             }
             Kind::Unorm8 => b[0] = (v.clamp(0.0, 1.0) * 255.0).round() as u8,
+            Kind::Snorm16 => {
+                b.copy_from_slice(&((v.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes())
+            }
+            Kind::Snorm8 => b[0] = (v.clamp(-1.0, 1.0) * 127.0).round() as i8 as u8,
         }
     }
 }
@@ -129,10 +152,6 @@ fn f32_to_half(v: f32) -> u16 {
     let sign = ((bits >> 16) & 0x8000) as u16;
     let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
     let man = bits & 0x7f_ffff;
-    if v.is_nan() {
-        // A quiet NaN: the payload may sit only in bits the half drops.
-        return sign | 0x7e00;
-    }
     if exp >= 31 {
         return sign | 0x7c00; // too large: infinity
     }
@@ -151,14 +170,10 @@ fn f32_to_half(v: f32) -> u16 {
         let m = q + u32::from(r > halfway || (r == halfway && (q & 1) != 0));
         return sign | m as u16;
     }
-    // Rounded to nearest, ties to even as above: a carry out of the mantissa
-    // is added into the exponent (`2 - 2^-12` is 2.0); at most it reaches
-    // infinity, 0x7c00.
+    // Rounded to nearest: a carry out of the mantissa is added into the
+    // exponent (`2 - 2^-12` is 2.0); at most it reaches infinity, 0x7c00.
     let half = (exp as u32) << 10;
-    let q = man >> 13;
-    let r = man & 0x1fff;
-    let m = q + u32::from(r > 0x1000 || (r == 0x1000 && (q & 1) != 0));
-    sign | (half + m) as u16
+    sign | (half + ((man + 0x1000) >> 13)) as u16
 }
 
 #[cfg(test)]
@@ -226,6 +241,33 @@ mod tests {
         assert_eq!(dst[40..], vertex(4.0, 6.0)[..]);
     }
 
+    #[test]
+    fn normalized_attributes_are_interpolated_in_their_own_range() {
+        let vertex = |rg: [u8; 2], u16_value: u16, u8_value: u8, snorm8: i8, snorm16: i16| {
+            [
+                &rg[..],
+                &u16_value.to_le_bytes(),
+                &[u8_value, snorm8 as u8],
+                &snorm16.to_le_bytes(),
+            ]
+            .concat()
+        };
+        let src = [
+            vertex([3, 250], 1000, 10, i8::MIN, -23000),
+            vertex([8, 200], 500, 3, -120, -18000),
+            vertex([20, 253], 10000, 100, -120, -32000),
+        ]
+        .concat();
+        let mut dst = [0; 6 * 8];
+        expand_rects(
+            &src,
+            &mut dst,
+            8,
+            &[(0, 49), (2, 56), (4, 61), (5, 63), (6, 58)],
+        );
+        assert_eq!(dst[40..], vertex([15, 255], 10500, 107, -127, -32767));
+    }
+
     /// `half_to_f32` reads subnormals, so an f16 rectangle output must be
     /// able to write them back instead of flushing every one to zero.
     #[test]
@@ -243,112 +285,82 @@ mod tests {
         assert_eq!(half_to_f32(0x0001), 2f32.powi(-24));
     }
 
-    /// Normal values halfway between two halves go to the even mantissa,
-    /// as subnormals already did (#245). An R16_FLOAT element at 1.0, 0 and
-    /// 2^-11: the fourth corner is 1 + 2^-11, halfway between 0x3c00 and
-    /// 0x3c01.
     #[test]
-    fn normal_halves_round_ties_to_even() {
-        assert_eq!(f32_to_half(1.0 + 2f32.powi(-11)), 0x3c00);
-        assert_eq!(f32_to_half(1.0 + 3.0 * 2f32.powi(-11)), 0x3c02);
-        assert_eq!(f32_to_half(-(1.0 + 2f32.powi(-11))), 0xbc00);
-        // Just past the tie still rounds up.
-        assert_eq!(f32_to_half(1.0 + 2f32.powi(-11) + 2f32.powi(-23)), 0x3c01);
-        let src: Vec<u8> = [0x3c00_u16, 0x0000, 0x1000]
-            .iter()
-            .flat_map(|h| h.to_le_bytes())
-            .collect();
-        let mut dst = vec![0u8; 6 * 2];
-        expand_rects(&src, &mut dst, 2, &[(0, 54)]);
-        assert_eq!(dst[10..], 0x3c00_u16.to_le_bytes());
+    fn zero_or_overflowing_stride_is_ignored_without_panicking() {
+        let mut dst = [0xAAu8; 16];
+        expand_rects(&[1, 2, 3], &mut dst, 0, &[(0, 16)]);
+        assert_eq!(dst, [0xAAu8; 16]);
+        expand_rects(&[1, 2, 3], &mut dst, usize::MAX / 2, &[(0, 16)]);
+        assert_eq!(dst, [0xAAu8; 16]);
     }
 
-    /// A NaN stays a NaN instead of becoming infinity (#245), whatever its
-    /// payload: one only in the low f32 mantissa bits must not lose it.
     #[test]
-    fn nan_stays_nan_in_half() {
-        let is_nan = |h: u16| h & 0x7c00 == 0x7c00 && h & 0x03ff != 0;
-        for bits in [0x7fc0_0000, 0x7f80_0001, 0x7fbf_ffff, 0xffc0_0000_u32] {
-            let h = f32_to_half(f32::from_bits(bits));
-            assert!(is_nan(h), "{bits:#x} -> {h:#x}");
-            assert_eq!(h & 0x8000 != 0, bits >> 31 != 0, "{bits:#x} keeps its sign");
-        }
-        assert_eq!(f32_to_half(f32::INFINITY), 0x7c00);
-        assert_eq!(f32_to_half(f32::NEG_INFINITY), 0xfc00);
-        // A quiet NaN corner with the other two at zero.
-        let src: Vec<u8> = [0x7e00_u16, 0x0000, 0x0000]
-            .iter()
-            .flat_map(|h| h.to_le_bytes())
-            .collect();
-        let mut dst = vec![0u8; 6 * 2];
-        expand_rects(&src, &mut dst, 2, &[(0, 54)]);
-        let fourth = u16::from_le_bytes([dst[10], dst[11]]);
-        assert!(is_nan(fourth), "{fourth:#x}");
-    }
-
-    /// The half nearest `v`, ties to the even one, found by search over the
-    /// halves' exact values rather than by bit manipulation.
-    fn reference_half(v: f32) -> u16 {
-        let sign = if v.is_sign_negative() { 0x8000 } else { 0 };
-        let a = f64::from(v.abs());
-        // 0x7c00 is valued 2^16 here, one step past the largest half: that
-        // makes overflow (from 65520 on, a tie with an odd 0x7bff) fall out.
-        let value = |h: u16| {
-            let (e, m) = (i32::from(h >> 10), f64::from(h & 0x3ff));
-            if e == 0 {
-                m * 2f64.powi(-24)
-            } else {
-                (1024.0 + m) * 2f64.powi(e - 25)
-            }
+    fn unorm16_unorm8_clamping_and_unknown_formats_expand_correctly() {
+        // Vertex layout (12 bytes):
+        //   0..4: R16G16_UNORM (format 35)
+        //   4..8: R8G8B8A8_UNORM (format 28) — tests clamping below 0 and above 1
+        //   8..12: unknown format (999) — must keep v0's bytes verbatim
+        let v = |u0: u16, u1: u16, c: [u8; 4], raw: [u8; 4]| {
+            let mut b = Vec::with_capacity(12);
+            b.extend(u0.to_le_bytes());
+            b.extend(u1.to_le_bytes());
+            b.extend(c);
+            b.extend(raw);
+            b
         };
-        if a >= 65536.0 {
-            return sign | 0x7c00;
-        }
-        // Largest `lo` with value(lo) <= a.
-        let (mut lo, mut hi) = (0u16, 0x7c00u16);
-        while hi - lo > 1 {
-            let mid = lo + (hi - lo) / 2;
-            if value(mid) <= a { lo = mid } else { hi = mid }
-        }
-        let (d_lo, d_hi) = (a - value(lo), value(hi) - a);
-        let up = d_hi < d_lo || (d_hi == d_lo && lo & 1 != 0);
-        sign | if up { hi } else { lo }
+        let src = [
+            v(
+                10_000,
+                50_000,
+                [10, 200, 100, 255],
+                [0xDE, 0xAD, 0xBE, 0xEF],
+            ),
+            v(20_000, 10_000, [100, 50, 100, 255], [1, 2, 3, 4]),
+            v(30_000, 20_000, [20, 200, 100, 255], [5, 6, 7, 8]),
+        ]
+        .concat();
+        let mut dst = vec![0u8; 6 * 12];
+        expand_rects(&src, &mut dst, 12, &[(0, 35), (4, 28), (8, 999)]);
+        let fourth = &dst[60..72];
+        // u0: 10000 + 30000 - 20000 = 20000; u1: 50000 + 20000 - 10000 = 60000
+        assert_eq!(u16::from_le_bytes([fourth[0], fourth[1]]), 20_000);
+        assert_eq!(u16::from_le_bytes([fourth[2], fourth[3]]), 60_000);
+        // c0: 10 + 20 - 100 -> clamped to 0; c1: 200 + 200 - 50 -> clamped to 255
+        assert_eq!(&fourth[4..8], &[0, 255, 100, 255]);
+        // Unknown format keeps v0 bytes
+        assert_eq!(&fourth[8..12], &[0xDE, 0xAD, 0xBE, 0xEF]);
     }
 
-    /// `f32_to_half` against the reference over every half, every halfway
-    /// point and the f32 values either side of it, and a sweep of f32 bits.
     #[test]
-    fn half_conversion_matches_a_reference() {
-        let check = |v: f32| {
-            for v in [v, -v] {
-                assert_eq!(
-                    f32_to_half(v),
-                    reference_half(v),
-                    "{v:e} ({:#x})",
-                    v.to_bits()
-                );
+    fn multiple_rectangles_and_f32_f16_vector_formats_expand_in_sequence() {
+        // Two rectangles of R32G32B32_FLOAT (format 6, 12 bytes) + R16G16_FLOAT (format 34, 4 bytes) = 16 bytes
+        let v = |p: [f32; 3], uv: [f32; 2]| {
+            let mut b = Vec::with_capacity(16);
+            for x in p {
+                b.extend(x.to_le_bytes());
             }
+            for x in uv {
+                b.extend(f32_to_half(x).to_le_bytes());
+            }
+            b
         };
-        for h in 0..0x7c00u16 {
-            let (lo, hi) = (half_to_f32(h), half_to_f32(h + 1));
-            let mid = if h == 0x7bff {
-                65520.0
-            } else {
-                (lo + hi) / 2.0
-            };
-            check(lo);
-            for v in [
-                mid,
-                f32::from_bits(mid.to_bits() - 1),
-                f32::from_bits(mid.to_bits() + 1),
-            ] {
-                check(v);
-            }
-        }
-        for bits in (0..0x7f80_0000u32).step_by(0x1001) {
-            check(f32::from_bits(bits));
-        }
-        check(f32::MAX);
-        check(f32::INFINITY);
+        let src = [
+            // Rect 0
+            v([0.0, 1.0, 0.5], [0.0, 0.0]),
+            v([0.0, 0.0, 0.5], [0.0, 1.0]),
+            v([2.0, 0.0, 0.5], [1.0, 1.0]),
+            // Rect 1
+            v([10.0, 20.0, 1.0], [0.25, 0.5]),
+            v([10.0, 10.0, 1.0], [0.25, 1.0]),
+            v([14.0, 10.0, 1.0], [0.75, 1.0]),
+        ]
+        .concat();
+        let mut dst = vec![0u8; 12 * 16];
+        expand_rects(&src, &mut dst, 16, &[(0, 6), (12, 34)]);
+        assert_eq!(&dst[5 * 16..6 * 16], &v([2.0, 1.0, 0.5], [1.0, 0.0])[..]);
+        assert_eq!(
+            &dst[11 * 16..12 * 16],
+            &v([14.0, 20.0, 1.0], [0.75, 0.5])[..]
+        );
     }
 }

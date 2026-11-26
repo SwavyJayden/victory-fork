@@ -4,13 +4,15 @@
 //! the user's cache directory (outside the repository).
 
 mod census;
-mod desktop;
 mod inspect;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod replay;
 mod run;
 mod shader;
 mod translate;
+#[cfg(windows)]
+mod warm;
 
-use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -28,6 +30,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Summarise one PE image: headers, sections, imports, TLS, build id.
     Inspect {
@@ -83,9 +86,9 @@ enum Command {
         /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
-        /// Worker threads, at least 1 (default: every logical core).
+        /// Worker threads (default: every logical core).
         #[arg(long)]
-        jobs: Option<NonZeroUsize>,
+        jobs: Option<usize>,
         /// Warm the run's shader cache: a file of shader hashes (the 16
         /// hex digits a run's log names a shader by, anywhere in a line);
         /// the containers with those hashes are translated into the
@@ -93,6 +96,37 @@ enum Command {
         /// `VICTORY_VIEW_LIMIT` to what the run's log says of the host.
         #[arg(long)]
         warm: Option<PathBuf>,
+    },
+    /// Translate every shader found (as `translate` finds them) into the
+    /// shader cache, so that no run has to: a few minutes, once per change
+    /// of the translator.
+    Shaders {
+        paths: Vec<PathBuf>,
+        /// Worker threads (default: every logical core).
+        #[arg(long)]
+        jobs: Option<usize>,
+    },
+    /// Make the host pipelines of every pipeline the title ever created
+    /// (runs with `VICTORY_PIPELINE_BOOK=1` write them down), so that the
+    /// driver's cache on disk has them before a run needs one: once per change
+    /// of the translator or the driver. Goes on where it was stopped.
+    #[cfg(windows)]
+    Warm {
+        /// Processes at once (default: two thirds of the logical cores).
+        #[arg(long)]
+        jobs: Option<usize>,
+        /// At most this many pipelines.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Those made before too.
+        #[arg(long)]
+        again: bool,
+        /// Only the pipelines earlier runs drew with.
+        #[arg(long)]
+        used: bool,
+        /// (What the processes it starts are given.)
+        #[arg(long, hide = true)]
+        these: Option<String>,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -114,6 +148,10 @@ enum Command {
         #[arg(last = true)]
         title_args: Vec<String>,
     },
+    /// Run a captured frame's GPU work again (diagnostics builds; see
+    /// docs/replay.md).
+    #[cfg(all(windows, feature = "diagnostics"))]
+    Replay(replay::Replay),
     /// Show the resolved configuration and check it.
     Config,
 }
@@ -136,16 +174,6 @@ fn main() -> Result<()> {
     #[cfg(all(windows, feature = "diagnostics"))]
     if victory_hle::modules::audio::capture::child() {
         return Ok(());
-    }
-    #[cfg(windows)]
-    {
-        let raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
-        if raw_args.len() == 1 {
-            std::process::exit(desktop::run_interactive());
-        }
-        if raw_args.len() == 2 && desktop::should_treat_as_drop_target(&raw_args[1]) {
-            std::process::exit(desktop::run_path_target(std::path::Path::new(&raw_args[1])));
-        }
     }
     let cli = Cli::parse();
     match cli.command {
@@ -173,21 +201,35 @@ fn main() -> Result<()> {
             jobs,
             warm,
         } => {
-            apply_host_shader_overrides_from_env();
-            let jobs = jobs.map(NonZeroUsize::get);
+            // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
+            if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
+                victory_shader::emit::set_view_heap_limit(n);
+            }
+            // `VICTORY_HOST_WAVE=32`: translate as for a GPU whose waves are at most 32 lanes
+            if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
+                victory_shader::emit::set_host_max_wave(n);
+            }
             if let Some(file) = warm {
                 return translate::warm(paths, &file, jobs);
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }
+        Command::Shaders { paths, jobs } => translate::precompile(paths, jobs),
+        #[cfg(windows)]
+        Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
         Command::Run {
             exe,
             unimplemented,
             strict,
             execute,
             console,
-            title_args: _,
-        } => run::run(&exe, unimplemented, strict, execute, console),
+            title_args,
+        } => {
+            victory_hle::runtime::set_title_args(title_args);
+            run::run(&exe, unimplemented, strict, execute, console)
+        }
+        #[cfg(all(windows, feature = "diagnostics"))]
+        Command::Replay(options) => replay::run(options),
         Command::Config => show_config(),
     }
 }
@@ -236,72 +278,4 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         "no paths given and none configured (see victory.example.toml)"
     );
     Ok(all)
-}
-
-/// Applies offline `VICTORY_VIEW_LIMIT` and `VICTORY_HOST_WAVE` overrides so
-/// `victory translate` and `victory translate --warm` produce cache keys
-/// matching the runtime device's view-heap cap and wave width.
-fn apply_host_shader_overrides(view_limit: Option<&str>, host_wave: Option<&str>) {
-    if let Some(n) = view_limit.and_then(|v| v.trim().parse().ok()) {
-        victory_shader::emit::set_view_heap_limit(n);
-    }
-    if let Some(n) = host_wave.and_then(|v| v.trim().parse().ok()) {
-        victory_shader::emit::set_host_max_wave(n);
-    }
-}
-
-fn apply_host_shader_overrides_from_env() {
-    apply_host_shader_overrides(
-        std::env::var("VICTORY_VIEW_LIMIT").ok().as_deref(),
-        std::env::var("VICTORY_HOST_WAVE").ok().as_deref(),
-    );
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use victory_shader::emit::{
-        host_max_wave, set_host_max_wave, set_view_heap_limit, translation_fingerprint,
-        view_heap_limit,
-    };
-
-    fn jobs(args: &[&str]) -> Result<Option<usize>, clap::Error> {
-        let all = [&["victory", "translate", "shaders"][..], args].concat();
-        match Cli::try_parse_from(all)?.command {
-            Command::Translate { jobs, .. } => Ok(jobs.map(NonZeroUsize::get)),
-            _ => unreachable!(),
-        }
-    }
-
-    #[test]
-    fn translate_jobs_must_be_at_least_one() {
-        let zero = jobs(&["--jobs", "0"]).expect_err("--jobs 0 is refused");
-        assert_eq!(zero.kind(), clap::error::ErrorKind::ValueValidation);
-        assert_eq!(jobs(&["--jobs", "1"]).unwrap(), Some(1));
-        assert_eq!(jobs(&[]).unwrap(), None);
-    }
-
-    #[test]
-    fn offline_host_overrides_update_shader_cache_fingerprint() {
-        let prev_limit = view_heap_limit();
-        let prev_wave = host_max_wave();
-
-        set_view_heap_limit(0);
-        set_host_max_wave(0);
-        let default_fp = translation_fingerprint();
-
-        apply_host_shader_overrides(Some(" 999999 "), Some("32"));
-        assert_eq!(view_heap_limit(), 999_999);
-        assert_eq!(host_max_wave(), 32);
-        let tuned_fp = translation_fingerprint();
-        assert_ne!(default_fp, tuned_fp);
-
-        // Invalid values keep existing settings untouched.
-        apply_host_shader_overrides(Some("bad"), None);
-        assert_eq!(view_heap_limit(), 999_999);
-        assert_eq!(host_max_wave(), 32);
-
-        set_view_heap_limit(prev_limit);
-        set_host_max_wave(prev_wave);
-    }
 }

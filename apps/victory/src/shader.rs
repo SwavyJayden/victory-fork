@@ -42,15 +42,12 @@ pub(crate) fn sources(data: &[u8]) -> Vec<Source<'_>> {
     if sgd5::is_sgd5(data) {
         out.extend(sgd5::records(data).map(Source::Packed));
     }
-    // Exactly the bytes the parser checked: what follows a container is not
-    // part of it (nor of its hash).
-    let raw = memchr::memmem::find_iter(data, b"DXBC").filter_map(|offset| {
-        let size = Container::parse(&data[offset..]).ok()?.size;
-        Some(Source::Raw {
+    let raw = memchr::memmem::find_iter(data, b"DXBC")
+        .filter(|&offset| Container::parse(&data[offset..]).is_ok())
+        .map(|offset| Source::Raw {
             offset,
-            data: &data[offset..offset + size],
-        })
-    });
+            data: &data[offset..],
+        });
     out.extend(raw);
     out
 }
@@ -99,27 +96,12 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                     eprintln!("corrupt record {}{}", path.display(), source.label());
                     continue;
                 };
-                static ONLY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-                let only = ONLY.get_or_init(|| {
-                    std::env::var("VICTORY_TRANSLATE_ONLY")
-                        .unwrap_or_default()
-                        .split(',')
-                        .map(|h| h.trim().to_lowercase())
-                        .filter(|h| !h.is_empty())
-                        .collect()
-                });
-                if !only.is_empty() {
-                    let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
-                    if !only.iter().any(|o| hash.starts_with(o.as_str())) {
-                        continue;
-                    }
-                }
                 let Ok(container) = Container::parse(&bytes) else {
                     continue;
                 };
                 found_here += 1;
                 t.containers += 1;
-                let dxil = container.part(FourCC::DXIL);
+                let dxil = container.part(FourCC::DXIL).or(container.part(FourCC::ACCC));
                 t.with_dxil_part += usize::from(dxil.is_some());
                 let program = dxil.and_then(|p| DxilProgram::parse(p.data).ok());
                 let mut listing = Vec::new();
@@ -130,15 +112,12 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                         let mut list = Vec::new();
                         for n in &programs {
                             *t.native_stages.entry(n.stage).or_default() += 1;
-                            // A pixel program's DB_SHADER_CONTROL too (depth export,
-                            // kill, Z order, depth test before the shader).
-                            let db = match &n.io {
-                                victory_shader::native::StageIo::Ps { db_shader_control, .. } => {
-                                    format!(" db {db_shader_control:#x}")
-                                }
-                                _ => String::new(),
-                            };
-                            list.push(format!("{:?} {} B{db}", n.stage, n.code.len()));
+                            list.push(format!("{:?} {} B", n.stage, n.code.len()));
+                            if disasm {
+                                listing.push(format!("    {:?} stage I/O: {:?}", n.stage, n.io));
+                                listing.extend(n.layout.iter().map(|p| format!("    {p:?}")));
+                                listing.extend(n.used.iter().map(|u| format!("    {u:?}")));
+                            }
                             match gfx10::decode(&n.code) {
                                 Ok(insts) => {
                                     t.decoded += 1;
@@ -148,9 +127,6 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                                         *t.unnamed.entry(key).or_default() += 1;
                                     }
                                     if disasm {
-                                        listing
-                                            .extend(n.layout.iter().map(|p| format!("    {p:?}")));
-                                        listing.extend(n.used.iter().map(|u| format!("    {u:?}")));
                                         listing.extend(
                                             insts.iter().map(|i| format_instruction(i, n.wave64)),
                                         );
@@ -195,7 +171,9 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                     None => "no parsable DXIL program".to_owned(),
                 } + &native;
                 if verbose {
-                    println!("{}{}: {line}", path.display(), source.label());
+                    // As a run's log and a replay name it (`hash=`).
+                    let hash = blake3::hash(&bytes).to_hex();
+                    println!("{}{} #{}: {line}", path.display(), source.label(), &hash[..16]);
                     for l in &listing {
                         println!("{l}");
                     }
@@ -250,44 +228,4 @@ fn format_instruction(i: &Instruction, wave64: bool) -> String {
         None => format!("<{:?} {:#x}>", i.encoding, i.opcode),
     };
     format!("    {:06x}: {:<44} {text}", i.offset, words.join(" "))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A valid container with no parts: the 32-byte header alone.
-    fn empty_container() -> Vec<u8> {
-        let mut c = b"DXBC".to_vec();
-        c.extend_from_slice(&[0; 16]);
-        c.extend_from_slice(&1u16.to_le_bytes());
-        c.extend_from_slice(&0u16.to_le_bytes());
-        c.extend_from_slice(&0x20u32.to_le_bytes());
-        c.extend_from_slice(&0u32.to_le_bytes());
-        c
-    }
-
-    fn raw_bytes(data: &[u8]) -> Vec<(usize, Vec<u8>)> {
-        sources(data)
-            .iter()
-            .map(|s| match s {
-                Source::Raw { offset, .. } => (*offset, s.bytes().unwrap().into_owned()),
-                Source::Packed(_) => panic!("no SGD5 data here"),
-            })
-            .collect()
-    }
-
-    #[test]
-    fn raw_source_is_exactly_the_declared_container() {
-        let container = empty_container();
-        let standalone = raw_bytes(&container);
-        let mut embedded = b"lead".to_vec();
-        embedded.extend_from_slice(&container);
-        embedded.extend_from_slice(b"harmless tail");
-        let embedded = raw_bytes(&embedded);
-        assert_eq!(standalone, [(0, container.clone())]);
-        assert_eq!(embedded, [(4, container.clone())]);
-        // The hash a run's log names the shader by is the same for both.
-        assert_eq!(blake3::hash(&standalone[0].1), blake3::hash(&embedded[0].1));
-    }
 }

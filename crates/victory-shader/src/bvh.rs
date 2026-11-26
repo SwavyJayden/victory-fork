@@ -196,9 +196,10 @@ pub fn boxes(children: &[u32; 4], boxes: &[[f32; 6]; 4], ray: &Ray, sort: bool) 
         }
         let enter = near[0].max(near[1]).max(near[2]);
         let leave = far[0].min(far[1]).min(far[2]);
-        // A box whose minimum x is NaN is switched off, as is an absent
-        // child (NONE): an absent child must never get a finite sort key,
-        // or it can sort ahead of a real hit.
+        // A box whose minimum x is NaN is switched off. A child that is not
+        // there may have inverted infinite bounds, which every ray enters at
+        // minus infinity: it would be first of the sorted children and end
+        // the walk before them (DexNom/VIctory bc3cd4b0).
         if children[n] != NONE && !b[0].is_nan() && leave >= enter.max(0.0) && enter < ray.extent {
             ids[n] = children[n];
             distances[n] = enter;
@@ -217,15 +218,6 @@ pub fn boxes(children: &[u32; 4], boxes: &[[f32; 6]; 4], ray: &Ray, sort: bool) 
 
 /// What a triangle the ray misses returns.
 pub const MISS: [f32; 4] = [f32::INFINITY, 1.0, 0.0, 0.0];
-
-/// What an immediate no-hit returns for a node of `kind`: [`NONE`] for box
-/// nodes (kinds 4 and 5) and [`MISS`] for triangles or other nodes.
-pub fn no_hit(kind: u32) -> [u32; 4] {
-    match kind & 7 {
-        4 | 5 => [NONE; 4],
-        _ => MISS.map(f32::to_bits),
-    }
-}
 
 /// The triangle test: the hit distance's numerator, the denominator, and
 /// the numerators of the weights of vertices 1 and 2; [`MISS`] otherwise.
@@ -297,6 +289,17 @@ pub fn half_to_f32(h: u16) -> f32 {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// An empty slot's inverted infinite bounds do not come before the
+    /// children a ray enters (after DexNom/VIctory bc3cd4b0).
+    #[test]
+    fn an_empty_slot_is_never_entered() {
+        let inside = |x: f32| [x - 1.0, -1.0, -1.0, x + 1.0, 1.0, 1.0];
+        let (up, down) = (f32::INFINITY, f32::NEG_INFINITY);
+        let bounds = [inside(30.0), [up, up, up, down, down, down], inside(10.0), [up, up, up, down, down, down]];
+        let ray = Ray::new([0.0; 3], [1.0, 0.0, 0.0], 100.0);
+        assert_eq!(boxes(&[8, NONE, 16, NONE], &bounds, &ray, true), [16, 8, NONE, NONE]);
+    }
 
     /// The smallest 16-bit float not below `x` (`up`) or not above it.
     pub(crate) fn f32_to_half(x: f32, up: bool) -> u16 {
@@ -436,20 +439,6 @@ pub(crate) mod tests {
         // Backwards: nothing.
         let back = Ray::new([0.0; 3], [-1.0, 0.0, 0.0], 1000.0);
         assert_eq!(intersect(&node, 5, &back, true), [NONE; 4]);
-    }
-
-    #[test]
-    fn sorted_boxes_put_absent_children_after_real_hits() {
-        let bounds = [
-            [-1.0, -1.0, 1.0, 1.0, 1.0, 2.0],
-            [-1.0, -1.0, 3.0, 1.0, 1.0, 4.0],
-            [0.0; 6],
-            [0.0; 6],
-        ];
-        let ids = [NONE, 8, NONE, NONE];
-        let ray = Ray::new([0.0; 3], [0.0, 0.0, 1.0], 10.0);
-        assert_eq!(boxes(&ids, &bounds, &ray, true), [8, NONE, NONE, NONE]);
-        assert_eq!(boxes(&ids, &bounds, &ray, false), ids);
     }
 
     #[test]
@@ -716,15 +705,6 @@ pub(crate) mod tests {
                 assert!((h.1 - base.1).abs() < 1e-5 && (h.2 - base.2).abs() < 1e-5);
                 assert_eq!(h.3, base.3, "facing, axis {axis} flip {flip}");
             }
-        }
-    }
-
-    #[test]
-    fn no_hit_returns_none_for_boxes_and_miss_for_triangles() {
-        assert_eq!(no_hit(4), [NONE; 4]);
-        assert_eq!(no_hit(5), [NONE; 4]);
-        for k in [0, 1, 2, 3, 6, 7] {
-            assert_eq!(no_hit(k), MISS.map(f32::to_bits), "kind {k}");
         }
     }
 }

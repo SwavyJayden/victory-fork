@@ -83,20 +83,27 @@
 mod bitcode;
 mod container;
 #[cfg(all(test, windows))]
+mod cube_lod_tests;
+#[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
-mod lean;
 mod lower;
 mod own_bits;
+#[cfg(all(test, windows))]
+mod permlane_tests;
 mod rect;
 mod sampler;
 mod shader;
 mod threading;
 #[cfg(windows)]
 pub mod validator;
+#[cfg(all(test, windows))]
+mod probe_tests;
+#[cfg(all(test, windows))]
+mod size_tests;
 #[cfg(all(test, windows))]
 mod valu_tests;
 #[cfg(all(test, windows))]
@@ -111,12 +118,12 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::{host_max_wave, set_host_max_wave};
+pub use lower::{host_settings, set_host_max_wave, set_host_rdna};
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE,
-    USER_VIEW_ADDRESS, USER_VIEW_BIAS, set_view_heap_limit, view_heap_limit,
+    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
+    SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
@@ -140,6 +147,14 @@ pub fn loop_limit() -> u32 {
             lower::LOOP_LIMIT
         }
     })
+}
+
+/// Whether a pixel shader's helper lane reads its own value where the console reads the first
+/// lane's (`lower.rs` `first_lane`); on unless `VICTORY_HELPER_OWN=0`. Part of the translation:
+/// the shader cache keys on it.
+pub fn helper_own() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HELPER_OWN").is_none_or(|v| v != "0"))
 }
 
 /// Which of a translated program's group barriers wait for the whole
@@ -169,48 +184,21 @@ pub fn group_sync() -> u8 {
     })
 }
 
-/// `VICTORY_WAVE_LOCAL_FIRST=1` (default off): a console wave64 compute program on a host of
-/// 32-lane waves whose wave operations are the allocation idiom (`lower::wave_local`) is
-/// taken with each host wave as a wave of its own (exact, no group barrier) before the forms
-/// "without early-outs" and "without skips", whose two host waves exchange each wave-wide value
-/// through LDS at two group barriers. Without it those forms win whenever they translate, and
-/// the idiom's exact form is only tried after them.
-pub(crate) fn local_first() -> bool {
-    #[cfg(test)]
-    if let Some(on) = TEST_LOCAL_FIRST.get() {
-        return on;
-    }
+/// Whether buffer atomics of the ray-tracing structure builder stand between
+/// two fences (`VICTORY_BVH_FENCES=0`: they do not). Part of the
+/// translation: the shader cache keys on it.
+pub fn builder_fences() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_LOCAL_FIRST").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_FENCES").is_none_or(|v| v != "0"))
 }
 
-/// `VICTORY_LEAN_MATH` (default 0): cheaper DXIL for the console's math that DXIL lacks.
-/// `1`: only forms equal to the default ones for every input (`lower.rs`: `legacy_mul`,
-/// `max_min`, the cube-face instructions, and a scalar buffer load from a raw view read as one
-/// load of up to four dwords instead of one per dword). `2`: also DXIL's own FMax/FMin for the
-/// console's maximum and minimum of two variables, which is exact only on a host whose FMax and
-/// FMin order -0 below +0 (measured on the card: `valu_tests`,
-/// `host_max_and_min_order_signed_zeros`).
-pub(crate) fn lean_math() -> u8 {
-    #[cfg(test)]
-    if let Some(level) = TEST_LEAN_MATH.get() {
-        return level;
-    }
-    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *LEVEL.get_or_init(|| {
-        std::env::var("VICTORY_LEAN_MATH")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(0)
-    })
-}
-
-#[cfg(test)]
-thread_local! {
-    /// A test's choice for [`lean_math`], for its thread only.
-    pub(crate) static TEST_LEAN_MATH: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
-    /// A test's choice for [`local_first`], for its thread only.
-    pub(crate) static TEST_LOCAL_FIRST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+/// Whether the structure builder's accesses through its root views stay near
+/// them, and a size in a structure's header that cannot be one counts as none
+/// (`VICTORY_BVH_BOUNDS=0`: neither). Part of the translation: the shader
+/// cache keys on it.
+pub fn builder_bounds() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_BOUNDS").is_none_or(|v| v != "0"))
 }
 
 /// The clean-up passes that run over a translated program before it is
@@ -218,13 +206,15 @@ thread_local! {
 /// is exact, so the switch is for telling a translator fault from a
 /// clean-up fault, and for measuring what the clean-up is worth.
 /// `VICTORY_SHADER_OPT`:
-/// - unset: every pass.
+/// - unset: every pass but the last one below (63).
 /// - `0`: none (the module as the lowering made it).
 /// - a number (decimal or `0x` hex): those passes; 1 dead code, 2 constants
 ///   and identities, 4 one instruction for one value, 8 what a branch taken
 ///   says about its condition, 16 one read for one place within a block,
 ///   32 a first-lane read of two host waves without the round that asks
 ///   which half has a lane (where every lane has one).
+///   64 the dwords of one console load read by one call for every four
+///   (not on unless asked: `127` is every pass with it).
 ///
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
@@ -233,35 +223,55 @@ pub fn shader_opt() -> u32 {
     *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
 }
 
-/// `VICTORY_BVH_NO_HIT=1` (default OFF): every ray-tracing node test
-/// (`image_bvh_intersect_ray` / `image_bvh64_intersect_ray`) immediately
-/// returns a no-hit (`NONE` for box nodes, `bvh::MISS` for triangles/others)
-/// without reading BVH memory or traversing nodes, so non-RT runs skip
-/// expensive stub/empty BVH traversal.
+/// On a host whose shaders run on the console's own kind of hardware (AMD
+/// RDNA, [`set_host_rdna`]): which of the console's float instructions are
+/// written as the one host operation the driver makes the same instruction
+/// of, instead of spelled out in operations every host agrees on.
+/// `VICTORY_RDNA_FLOAT`: a set of [`rdna`]'s bits (decimal or `0x` hex); all
+/// of them when it is unset, `0` none. Nothing on other hosts.
 ///
-/// Part of the translation: the shader cache keys on it (`victory-gpu`'s
-/// does).
-pub fn bvh_no_hit() -> bool {
-    if let Some(on) = lower::intersect::TEST_BVH_NO_HIT.get() {
-        return on;
-    }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| parse_bvh_no_hit(std::env::var("VICTORY_BVH_NO_HIT").ok().as_deref()))
+/// Measured on an RX 7900 XTX (a frame of the yard, replayed turn by turn with
+/// and without): the title's dispatches and draws 18.4 -> 17.6 ms, 0.4 of it
+/// without [`rdna::LEGACY`]. Tried and worth nothing there: `v_mad_f32` as one
+/// multiply-add, a fast reciprocal, scalar buffer loads of four dwords at once,
+/// a wave size for every compute program (32, 64, the console's).
+///
+/// Part of the translation: the shader cache keys on it ([`host_settings`]).
+pub fn rdna_float() -> u32 {
+    static BITS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BITS.get_or_init(|| {
+        let value = std::env::var("VICTORY_RDNA_FLOAT").ok();
+        parse_set(value.as_deref(), rdna::ALL, rdna::ALL)
+    })
 }
 
-fn parse_bvh_no_hit(value: Option<&str>) -> bool {
-    matches!(
-        value.map(str::trim),
-        Some(v) if v == "1" || v.eq_ignore_ascii_case("true")
-    )
+/// The bits of [`rdna_float`].
+pub mod rdna {
+    /// `v_max_f32` and the like: the host's FMax and FMin, without the code
+    /// that orders -0 below +0.
+    pub const MAX_MIN: u32 = 1;
+    /// `v_mul_legacy_f32` and the like (0 times anything is 0): a plain product
+    /// where no factor can be an infinity or no number where the other is 0,
+    /// and one comparison where it can. A zero may have the other sign.
+    pub const LEGACY: u32 = 2;
+    /// `v_med3_f32` of a value between two ordered constants: a minimum of a
+    /// maximum.
+    pub const MED3: u32 = 4;
+    /// `v_fract_f32`: the host's Frc as it is.
+    pub const FRACT: u32 = 8;
+    pub const ALL: u32 = 15;
 }
 
-#[doc(hidden)]
-pub fn with_bvh_no_hit_for_test<R>(on: bool, f: impl FnOnce() -> R) -> R {
-    let prev = lower::intersect::TEST_BVH_NO_HIT.replace(Some(on));
-    let r = f();
-    lower::intersect::TEST_BVH_NO_HIT.set(prev);
-    r
+/// A switch's set of bits; `unset` when it is unset or unreadable. Pure, for
+/// testing.
+fn parse_set(value: Option<&str>, unset: u32, all: u32) -> u32 {
+    let parsed = value
+        .map(str::trim)
+        .and_then(|v| match v.strip_prefix("0x") {
+            Some(hex) => u32::from_str_radix(hex, 16).ok(),
+            None => v.parse().ok(),
+        });
+    parsed.map_or(unset, |n| n & all)
 }
 
 /// Everything a translation depends on besides the container: the
@@ -284,15 +294,12 @@ pub fn translation_fingerprint() -> Vec<u8> {
         out.push(0);
     }
     out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
+    out.extend_from_slice(&lower::host_rdna().to_le_bytes());
     out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());
+    out.extend_from_slice(&shader::raw_views().to_le_bytes());
     out.extend_from_slice(&loop_limit().to_le_bytes());
     out.push(group_sync());
     out.extend_from_slice(&shader_opt().to_le_bytes());
-    out.push(u8::from(bvh_no_hit()));
-    out.push(lean_math());
-    out.push(lean::wave_uniform());
-    out.push(u8::from(lean::class_ranges_on()));
-    out.push(u8::from(local_first()));
     out
 }
 
@@ -305,7 +312,7 @@ fn parse_shader_opt(value: Option<&str>) -> u32 {
             Some(hex) => u32::from_str_radix(hex, 16).ok(),
             None => v.parse().ok(),
         });
-    parsed.map_or(bitcode::opt::ALL, |n| n & bitcode::opt::ALL)
+    parsed.map_or(bitcode::opt::DEFAULT, |n| n & bitcode::opt::ALL)
 }
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
@@ -345,10 +352,6 @@ pub struct HostShader {
     /// Root UAVs (raw buffers) the shader reads or writes: `u<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_uavs: Vec<u8>,
-    /// Subset of root UAV slots through which this shader may write.
-    pub written_root_uavs: Vec<u8>,
-    /// A translated store or atomic can write through the guest page directory.
-    pub writes_guest_memory: bool,
     /// Heap descriptors that can be selected from root state at bind time.
     pub root_indexed_views: Vec<crate::resource::RootIndexedView>,
 }
@@ -380,117 +383,6 @@ pub struct UserData {
     pub dword: u32,
 }
 
-/// What a mesh shader and the pixel shader it feeds, translated together,
-/// agree on beyond the console's signatures (#283): the 16-bit per-vertex
-/// outputs, by semantic name and index, that both declare packed, two
-/// channels per 32-bit column (`container::SigElement::packed`). The
-/// console gives each 16-bit value a 32-bit scalar of its own, and a mesh
-/// shader of 128 vertices with more than 64 of them passes the 32 KiB
-/// D3D12 allows its outputs. Empty (the default): each stage as the
-/// console declares it.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
-pub struct Link {
-    pub packed: Vec<(String, u32)>,
-}
-
-impl Link {
-    /// Whether the link packs element `e`.
-    fn packs(&self, e: &container::SigElement) -> bool {
-        e.half
-            && e.kind == 0
-            && self
-                .packed
-                .iter()
-                .any(|(name, index)| *index == e.index && name.eq_ignore_ascii_case(&e.name))
-    }
-
-    /// The link as bytes, for a cache key.
-    pub fn key(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        for (name, index) in &self.packed {
-            out.extend(name.as_bytes());
-            out.push(0);
-            out.extend(index.to_le_bytes());
-        }
-        out
-    }
-}
-
-thread_local! {
-    /// The link the translation on this thread is made for
-    /// ([`translate_linked`]).
-    static LINK: std::cell::RefCell<Link> = std::cell::RefCell::default();
-}
-
-/// [`translate`], for a pipeline whose stages are translated together
-/// with `link` (from [`mesh_link`]): the mesh shader and the pixel shader
-/// both with it.
-pub fn translate_linked(container: &[u8], link: &Link) -> Result<HostShader, ShaderError> {
-    with_link(link, || translate(container))
-}
-
-/// `f`, translating for `link` ([`LINK`]).
-fn with_link<R>(link: &Link, f: impl FnOnce() -> R) -> R {
-    struct Restore(Option<Link>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            if let Some(old) = self.0.take() {
-                LINK.set(old);
-            }
-        }
-    }
-    let _restore = Restore(Some(LINK.replace(link.clone())));
-    f()
-}
-
-/// For a mesh shader whose outputs pass the 32 KiB D3D12 allows even with
-/// its maxima down at its lane count (`lower::mesh_prologue`), and fit with
-/// its 16-bit per-vertex outputs packed: the link that packs them, which
-/// it and its pixel shader are translated with ([`translate_linked`]).
-/// None for any other shader, or a container that does not parse.
-pub fn mesh_link(container: &[u8]) -> Option<Link> {
-    let c = Container::parse(container).ok()?;
-    let native = crate::native_programs(c.part(FourCC::DXIL)?.data)
-        .ok()?
-        .into_iter()
-        .find(|p| p.stage == HwStage::Ms)?;
-    let crate::native::StageIo::Ms(ms) = &native.io else {
-        return None;
-    };
-    let outputs = signature(c.part(FourCC::OSG1)?.data).ok()?;
-    let mut prims = match c.part(FourCC::PSG1) {
-        Some(part) => signature(part.data).ok()?,
-        None => Vec::new(),
-    };
-    prims.retain(|e| !matches!(e.kind, 10 | 30));
-    link_for(outputs, &prims, ms)
-}
-
-/// [`mesh_link`] for a mesh program's per-vertex and per-primitive
-/// signature elements.
-fn link_for(
-    mut outputs: Vec<container::SigElement>,
-    prims: &[container::SigElement],
-    ms: &crate::native::MeshIo,
-) -> Option<Link> {
-    use container::{MESH_OUTPUT_LIMIT, mesh_output_bytes};
-    let vertices = ms.max_vertices.min(ms.threads);
-    let primitives = ms.max_primitives.min(ms.threads);
-    if mesh_output_bytes(&outputs, prims, vertices, primitives) <= MESH_OUTPUT_LIMIT {
-        return None;
-    }
-    let mut link = Link::default();
-    for e in outputs.iter_mut().filter(|e| e.half && e.kind == 0) {
-        e.packed = true;
-        let key = (e.name.clone(), e.index);
-        if !link.packed.contains(&key) {
-            link.packed.push(key);
-        }
-    }
-    let fits = mesh_output_bytes(&outputs, prims, vertices, primitives) <= MESH_OUTPUT_LIMIT;
-    (fits && !link.packed.is_empty()).then_some(link)
-}
-
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 ///
@@ -513,6 +405,7 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
+        .or(c.part(FourCC::ACCC))
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
     let native = crate::native_programs(dxil.data)?
         .into_iter()
@@ -548,7 +441,6 @@ pub fn emit(
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
     let original = emit_program(c, native, p, st, io, res);
-    let init_needs = lower::take_needs();
     // A console wave64 compute program on a host of 32-lane waves that
     // still needs 64 lanes, or whose cross-lane code sits where not every
     // lane runs: once more with its early-outs left out
@@ -593,55 +485,46 @@ pub fn emit(
         };
         // The program in two other forms: without its early-outs, and
         // without any branch that only skips code no lane is left for.
-        let form = |p: Option<ir::Program>| {
-            if why && p.is_none() {
-                eprintln!("WAVE64-FORM nothing to leave out");
-            }
-            p.and_then(|p| {
-                let failed = |stage: &str, e: ShaderError| {
+        let form = |label: &str, p: Option<ir::Program>| {
+            let Some(p) = p else {
+                if why {
+                    eprintln!("WAVE64-FORM {label}: ir returned None");
+                }
+                return None;
+            };
+            let st = match structure::structure(&p) {
+                Ok(st) => st,
+                Err(e) => {
                     if why {
-                        eprintln!("WAVE64-FORM {stage}: {e}");
+                        eprintln!("WAVE64-FORM {label}: structure failed: {e}");
                     }
-                };
-                let st = structure::structure(&p)
-                    .map_err(|e| failed("structure", e))
-                    .ok()?;
-                let io = io::raise(&p, native)
-                    .map_err(|e| failed("io", e))
-                    .ok()?;
-                let res = resource::track(&p, &native.layout, native.stage, Some(&st))
-                    .map_err(|e| failed("resources", e))
-                    .ok()?;
-                Some((p, st, io, res))
-            })
+                    return None;
+                }
+            };
+            let io = match io::raise(&p, native) {
+                Ok(io) => io,
+                Err(e) => {
+                    if why {
+                        eprintln!("WAVE64-FORM {label}: io::raise failed: {e}");
+                    }
+                    return None;
+                }
+            };
+            let res = match resource::track(&p, &native.layout, native.stage, Some(&st)) {
+                Ok(res) => res,
+                Err(e) => {
+                    if why {
+                        eprintln!("WAVE64-FORM {label}: resource::track failed: {e}");
+                    }
+                    return None;
+                }
+            };
+            Some((p, st, io, res))
         };
         let forms = [
-            ("without early-outs", form(ir::without_early_outs(p))),
-            ("without skips", form(ir::without_skips(p, false))),
+            ("without early-outs", form("without early-outs", ir::without_early_outs(p))),
+            ("without skips", form("without skips", ir::without_skips(p, false))),
         ];
-        // `VICTORY_WAVE_LOCAL_FIRST=1`: the exact form with no group barrier (each host wave
-        // its own wave, where the wave operations are the allocation idiom) before the forms
-        // whose two host waves exchange through LDS at two group barriers per value.
-        if local_first() && local_on && !exact_only {
-            for (name, f) in &forms {
-                if let Some((p, st, io, res)) = f
-                    && idiom(p, st)
-                {
-                    let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
-                    report(&format!("local waves (idiom, first), {name}"), &local);
-                    if done(&local) {
-                        return local.map(|(shader, _)| shader);
-                    }
-                }
-            }
-            if idiom(p, st) {
-                let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
-                report("local waves (idiom, first)", &local);
-                if done(&local) {
-                    return local.map(|(shader, _)| shader);
-                }
-            }
-        }
         for (name, f) in &forms {
             if let Some((p, st, io, res)) = f {
                 let again = emit_program(c, native, p, st, io, res);
@@ -651,19 +534,29 @@ pub fn emit(
                 }
             }
         }
-        // For a console wave run as two host waves this form puts group barriers inside the
-        // branches it takes wave-wide, and runs 121-124 lost the card in a submission of two
-        // programs that had just moved to it (`ptfx_CS_lightAtlas_Sprite` and `_Trail`, whose
-        // wave-wide branches are loop exits). So by default only where no branch taken
-        // wave-wide lies in a loop ([`Wide::Acyclic`]): its barriers then stand in code each
-        // thread runs at most once per pass of the loops around it, as the barriers of the
-        // other forms do (uniform loops only). `VICTORY_WAVE_WIDE=1` takes any wave-wide form,
-        // `=0` none. The 32-lane programs' form below, which has no barrier, stays on.
-        let wide = match std::env::var("VICTORY_WAVE_WIDE").as_deref() {
-            Ok("1") => Some(Wide::Any),
-            Ok("0") => None,
-            _ => Some(Wide::Acyclic),
-        };
+        // Off unless asked for (`VICTORY_WAVE_WIDE=1`), for a console wave run as two host
+        // waves: this form puts group barriers inside branches and loops, and runs 121-124
+        // lost the card in a submission of two programs that had just moved to it
+        // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
+        // has no barrier, stays on.
+        let wide_option = std::env::var_os("VICTORY_WAVE_WIDE");
+        // Both archived kernels use one logical wave per group and have
+        // validated wave32 PSOs on RTX. Explicit policy wins.
+        let scene_kernel = matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64)
+            && matches!(
+                c.digest,
+                [0x58, 0x1d, 0xab, 0x2c, 0xd8, 0xbc, 0xf2, 0x2e, 0x5c, 0x96, 0x4b, 0x98, 0xe9, 0x03, 0x48, 0xd1]
+                    | [0x24, 0x31, 0xbb, 0xe7, 0xdc, 0x15, 0x4a, 0xd7, 0x59, 0xd2, 0x0b, 0xc9, 0x54, 0x82, 0x9c, 0x1c]
+            );
+        let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| v == "1");
+        // A single guest wave can iterate an active-lane loop until both host
+        // halves have finished. The precise latch and convergence conditions
+        // for the driver compute route are checked by widen().
+        let driver_loop = wide_option.is_none()
+            && c.part(FourCC::DXIL).is_none()
+            && c.part(FourCC::ACCC).is_some()
+            && matches!(&original, Err(ShaderError::Unsupported { what, .. })
+                if *what == lower::DIVERGENT_MASK_EXCHANGE);
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -674,7 +567,7 @@ pub fn emit(
                 // lane runs, where the two host waves can exchange.
                 // (`VICTORY_WAVE_DEEP_SKIPS=0` and `VICTORY_WAVE_WIDE=0` turn the two off.)
                 let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
-                let deep = if deep_on { form(ir::without_skips(p, true)) } else { None };
+                let deep = if deep_on { form("without skips, scalars followed", ir::without_skips(p, true)) } else { None };
                 if let Some((p, st, io, res)) = &deep {
                     let again = emit_program(c, native, p, st, io, res);
                     report("without skips, scalars followed", &again);
@@ -685,19 +578,16 @@ pub fn emit(
                 // Still stopped where not every lane runs: the per-lane branches around
                 // those places taken as the console takes them, by the whole wave at once
                 // ([`widen`]), at two group barriers per such branch.
-                if let Some(mode) = wide {
+                if wide_on || driver_loop {
                     let bases = [
-                        ("", deep.as_ref().map(|f| &f.0)),
-                        (", without skips", forms[1].1.as_ref().map(|f| &f.0)),
-                        (", without early-outs", forms[0].1.as_ref().map(|f| &f.0)),
-                        ("", Some(p)),
+                        deep.as_ref().map(|f| &f.0),
+                        forms[1].1.as_ref().map(|f| &f.0),
+                        forms[0].1.as_ref().map(|f| &f.0),
+                        Some(p),
                     ];
-                    // (each base where only the loop-free form is taken: another base may
-                    // need no branch in a loop taken wave-wide)
-                    let tries = if mode == Wide::Any { 1 } else { bases.len() };
-                    for (name, base) in bases.into_iter().filter_map(|(n, b)| Some((n, b?))).take(tries) {
-                        let again = widen(c, native, base, std::collections::HashSet::new(), why, mode);
-                        report(&format!("wave-wide branches{name}"), &again);
+                    if let Some(base) = bases.into_iter().flatten().next() {
+                        let again = widen(c, native, base, why, driver_loop);
+                        report("wave-wide branches", &again);
                         if done(&again) {
                             return again.map(|(shader, _)| shader);
                         }
@@ -749,47 +639,34 @@ pub fn emit(
             }
         }
     }
-    // Cross-lane code on a single host wave (no split-wave barriers) that needs
-    // every lane where it stands (SCC of a mask operation, a complement mask read
-    // as data, a lane read, a first-lane read): right once the wave takes the
-    // per-lane branches around it together ([`widen`]; the lowering has named the
-    // skipped blocks). Split wave64-on-wave32 programs stay gated behind
-    // `VICTORY_WAVE_WIDE=1` above because their widened branches carry group barriers.
-    let single_wave = native.stage == HwStage::Ps || !(native.wave64 && lower::host_max_wave() == 32);
+    // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
+    // trace programs): right once the wave takes that skip together ([`widen`]; the
+    // lowering has named the skipped blocks).
     let original = match original {
         Err(ShaderError::Unsupported { what, .. })
-            if matches!(native.stage, HwStage::Cs | HwStage::Ps)
-                && (what == lower::LANE_MASK || single_wave && lower::needs_every_lane(what))
+            if native.stage == HwStage::Cs
+                && what == lower::LANE_MASK
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
-            let seed: std::collections::HashSet<usize> = if init_needs.is_empty() {
-                std::collections::HashSet::new()
-            } else {
-                lower::branches_around(st, &init_needs)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .collect()
-            };
-            if !init_needs.is_empty() && seed.is_empty() {
-                original
-            } else {
-                let again = widen(
-                    c,
-                    native,
-                    p,
-                    seed,
-                    std::env::var_os("VICTORY_WAVE_WHY").is_some(),
-                    Wide::Any,
-                );
-                match again {
-                    Ok(_) => again,
-                    Err(_) => original,
-                }
+            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some(), false);
+            match again {
+                Ok(_) => again,
+                Err(_) => emit_program(c, native, p, st, io, res),
             }
         }
         other => other,
     };
-    let original = original.map(|(shader, _)| shader);
+    let supported = |(shader, wave): (HostShader, Option<u32>)| {
+        if wave == Some(64) && lower::host_max_wave() == 32 {
+            Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "no wave32 lowering for this wave64 program",
+            })
+        } else {
+            Ok(shader)
+        }
+    };
+    let original = original.and_then(supported);
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
     if !matches!(original, Err(ShaderError::Unsupported { .. })) {
@@ -803,7 +680,7 @@ pub fn emit(
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    emit_program(c, native, &p, &st, &io, &res).map(|(shader, _)| shader)
+    emit_program(c, native, &p, &st, &io, &res).and_then(supported)
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
@@ -817,9 +694,8 @@ fn widen(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,
-    mut wide: std::collections::HashSet<usize>,
     why: bool,
-    mode: Wide,
+    active_loop_only: bool,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
     const NOT: ShaderError = ShaderError::Unsupported {
         offset: 0,
@@ -828,7 +704,6 @@ fn widen(
     match native.io {
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
-        crate::native::StageIo::Ps { .. } => {}
         crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
         crate::native::StageIo::Cs(cs) => {
             if why {
@@ -838,8 +713,8 @@ fn widen(
         }
         _ => return Err(NOT),
     }
-    let mut last = Err(NOT);
-    for _ in 0..32 {
+    let mut wide = std::collections::HashSet::new();
+    loop {
         let st = structure::structure_wide(p, &wide)?;
         let io = io::raise(p, native)?;
         let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
@@ -852,31 +727,23 @@ fn widen(
                 if lower::needs_every_lane(what) || *what == lower::LANE_MASK && !needs.is_empty())
             || matches!(&r, Ok((_, Some(64)))) && !needs.is_empty();
         if !stuck {
-            let cyc = in_cycles(p);
             if why {
-                eprintln!(
-                    "WAVE64-WIDE {} branches taken wave-wide => {:?}",
-                    wide.len(),
-                    r.as_ref().map(|(_, w)| *w)
-                );
-                let mut list: Vec<_> = wide.iter().copied().collect();
-                list.sort_unstable();
-                for &b in &list {
-                    let off = p.blocks[b]
-                        .insts
-                        .last()
-                        .map_or(p.blocks[b].offset, |i| i.machine.offset);
-                    eprintln!(
-                        "WAVE64-WIDE   branch at {off:#x}{}",
-                        if cyc[b] { " (in a loop)" } else { "" }
-                    );
+                let order = ir::reverse_postorder(&p.blocks);
+                let mut rpo = vec![0usize; p.blocks.len()];
+                for (i, &b) in order.iter().enumerate() {
+                    rpo[b] = i;
                 }
-            }
-            if mode == Wide::Acyclic && r.is_ok() && wide.iter().any(|&b| cyc[b]) {
-                return Err(ShaderError::Unsupported {
-                    offset: 0,
-                    what: IN_LOOP,
-                });
+                let mut sorted: Vec<usize> = wide.iter().copied().collect();
+                sorted.sort_unstable();
+                let desc: Vec<String> = sorted
+                    .iter()
+                    .map(|&b| {
+                        let back = matches!(p.blocks[b].exit, ir::Exit::Branch { taken, not_taken } if rpo[taken] <= rpo[b] || rpo[not_taken] <= rpo[b]);
+                        let nm = p.blocks[b].insts.last().map_or("?", |i| i.name());
+                        format!("B{b}({nm}{})", if back { ",BACK" } else { "" })
+                    })
+                    .collect();
+                eprintln!("WAVE64-WIDE {} branches taken wave-wide: [{}]", wide.len(), desc.join(", "));
             }
             return r;
         }
@@ -891,43 +758,32 @@ fn widen(
             }
             return r;
         }
-        wide.extend(more);
-        last = r;
-    }
-    last
-}
-
-/// Which forms [`widen`] may give.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Wide {
-    /// Any.
-    Any,
-    /// Only those where no branch taken wave-wide lies in a loop.
-    Acyclic,
-}
-
-/// What [`widen`] gives in [`Wide::Acyclic`] for a form with a branch taken wave-wide in a loop.
-const IN_LOOP: &str = "a wave-wide branch in a loop (VICTORY_WAVE_WIDE=1 takes it)";
-
-/// Per block of `p`: whether it lies on a cycle of the control flow (a loop body or header).
-fn in_cycles(p: &ir::Program) -> Vec<bool> {
-    let n = p.blocks.len();
-    (0..n)
-        .map(|b| {
-            let mut seen = vec![false; n];
-            let mut stack = p.blocks[b].exit.successors();
-            while let Some(x) = stack.pop() {
-                if x == b {
-                    return true;
-                }
-                if x < n && !seen[x] {
-                    seen[x] = true;
-                    stack.extend(p.blocks[x].exit.successors());
-                }
+        if active_loop_only {
+            // Only a single backward branch on the SCC just set by
+            // s_andn2_wrexec_b64. This instruction restricts EXEC to the
+            // unfinished lanes. The guest repeats the loop if *either*
+            // half still has work, while individual vector writes retain
+            // their EXEC predicates.
+            let [latch] = more.as_slice() else {
+                return r;
+            };
+            let block = &p.blocks[*latch];
+            let [.., update, branch] = block.insts.as_slice() else {
+                return r;
+            };
+            if !wide.is_empty()
+                || update.name() != "s_andn2_wrexec_b64"
+                || branch.name() != "s_cbranch_scc1"
+                || !matches!(
+                    block.exit,
+                    ir::Exit::Branch { taken, not_taken } if taken <= *latch && not_taken > *latch
+                )
+            {
+                return r;
             }
-            false
-        })
-        .collect()
+        }
+        wide.extend(more);
+    }
 }
 
 /// The translated program, and the wave size it requires of the host.
@@ -964,6 +820,12 @@ fn emit_program(
             _ => 0,
         };
     }
+    // (DexNom/VIctory 5f4c3df4.)
+    if native.stage == HwStage::Vs
+        && let Some(psv) = c.part(FourCC::PSV0)
+    {
+        vertex_output_interpolation(psv.data, &mut outputs)?;
+    }
     // With a conservative depth output (SV_DepthLessEqual, GreaterEqual) DXIL
     // wants the position centroid (or per sample), as DXC declares it then.
     if pixel && outputs.iter().any(|e| matches!(e.kind, 18 | 19)) {
@@ -979,23 +841,6 @@ fn emit_program(
     for e in &mut prims {
         e.interp = 1;
     }
-    // The 16-bit per-vertex elements a linked pair packs: a mesh shader's
-    // outputs, its pixel shader's inputs ([`Link`]).
-    LINK.with_borrow(|link| {
-        let linked = match native.stage {
-            HwStage::Ms => &mut outputs,
-            HwStage::Ps => &mut inputs,
-            _ => return,
-        };
-        for e in linked {
-            e.packed = link.packs(e);
-            if e.packed && native.stage == HwStage::Ps {
-                // Read as the dwords they are, per vertex (`Lower::eval_packed`).
-                e.comp = 5;
-                e.interp = 1;
-            }
-        }
-    });
     // A mesh group's id arrives multiplied by max(threads, vertices,
     // primitives) (the code divides by that); the thread count is in PSV0
     // from runtime info version 2 on.
@@ -1013,7 +858,7 @@ fn emit_program(
         }
         _ => 0,
     };
-    let parts = lower::Parts {
+    let l = lower::lower(&lower::Parts {
         native,
         p,
         st,
@@ -1023,16 +868,7 @@ fn emit_program(
         outputs,
         prims,
         mesh_stride,
-    };
-    // The ray-structure builder's Box32/16 rehydration kernels encode one
-    // header per active thread of the group; their last group can be short.
-    // The caller's dispatch knows the actual thread count.
-    let box_rehydration = matches!(
-        u128::from_be_bytes(c.digest),
-        0xba30_5538_e28d_414c_af39_a51a_4bc2_f308
-            | 0xd635_3bf6_df15_ff8e_c4aa_aec1_0dbf_3974
-    ) && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads == [64, 1, 1]);
-    let l = lower::lower_with_thread_limit(&parts, box_rehydration)?;
+    })?;
     let wave_size = l.wave_size;
     let shader = HostShader {
         stage: native.stage,
@@ -1054,11 +890,70 @@ fn emit_program(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
-        written_root_uavs: l.written_root_uavs,
-        writes_guest_memory: l.writes_guest_memory,
         root_indexed_views: res.root_indexed_views.clone(),
     };
     Ok((shader, wave_size))
+}
+
+/// The title's vertex output interpolation lives in PSV0. A float packed
+/// beside an integer can be explicitly constant, as can a float on its own.
+/// OSG1 supplies the physical rows and columns used to match both tables.
+fn vertex_output_interpolation(
+    mut data: &[u8],
+    outputs: &mut [container::SigElement],
+) -> Result<(), ShaderError> {
+    const TRUNCATED: ShaderError =
+        ShaderError::Malformed("truncated vertex pipeline validation data");
+    fn take<'a>(data: &mut &'a [u8], len: usize) -> Result<&'a [u8], ShaderError> {
+        let (head, tail) = data.split_at_checked(len).ok_or(TRUNCATED)?;
+        *data = tail;
+        Ok(head)
+    }
+    fn size(data: &mut &[u8]) -> Result<usize, ShaderError> {
+        Ok(u32::from_le_bytes(take(data, 4)?.try_into().unwrap()) as usize)
+    }
+    let info_size = size(&mut data)?;
+    let info = take(&mut data, info_size)?;
+    // PSVRuntimeInfo0 has no signature. PSVRuntimeInfo1 and later share
+    // these stage and signature count fields.
+    if info.len() < 36 || info[24] != 1 || info[29] == 0 {
+        return Ok(());
+    }
+    let resources = size(&mut data)?;
+    if resources != 0 {
+        let stride = size(&mut data)?;
+        take(&mut data, resources.checked_mul(stride).ok_or(TRUNCATED)?)?;
+    }
+    let strings = size(&mut data)?;
+    take(&mut data, strings)?;
+    let indices = size(&mut data)?;
+    take(&mut data, indices.checked_mul(4).ok_or(TRUNCATED)?)?;
+    let stride = size(&mut data)?;
+    if stride < 16 {
+        return Err(TRUNCATED);
+    }
+    let count = usize::from(info[28]) + usize::from(info[29]);
+    let elements = take(&mut data, count.checked_mul(stride).ok_or(TRUNCATED)?)?;
+    for record in elements.chunks_exact(stride).skip(usize::from(info[28])) {
+        let packed = record[10];
+        if packed & 0x40 == 0 {
+            continue;
+        }
+        if record[13] > 7 {
+            return Err(ShaderError::Malformed("invalid vertex output interpolation"));
+        }
+        let first = u32::from(record[9]);
+        let rows = first..first + u32::from(record[8]);
+        for output in outputs.iter_mut().filter(|e| {
+            e.row.is_some_and(|r| rows.contains(&r))
+                && e.col == ((packed >> 4) & 3)
+                && e.cols == (packed & 15)
+                && e.kind == record[11]
+        }) {
+            output.interp = record[13];
+        }
+    }
+    Ok(())
 }
 
 /// The rows of an `ISG1`/`OSG1` part.
@@ -1148,7 +1043,6 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
             cols: mask.count_ones().max(1) as u8,
             usage: 0,
             half: (4..=6).contains(&raw),
-            packed: false,
         });
     }
     Ok(out)
@@ -1160,15 +1054,138 @@ mod tests {
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
 
+    /// The LLVM text `dxc -dumpbin` prints for a DXIL container, when dxc
+    /// is installed.
+    #[cfg(windows)]
+    fn dump_dxil(container: &[u8]) -> Option<String> {
+        let dxc = match std::env::var_os("VICTORY_PC_DXC") {
+            Some(p) => std::path::PathBuf::from(p),
+            None => super::validator::Validator::default_path()?.with_file_name("dxc.exe"),
+        };
+        if !dxc.exists() {
+            return None;
+        }
+        let file = std::env::temp_dir().join(format!("victory-interp-{}.dxil", std::process::id()));
+        std::fs::write(&file, container).ok()?;
+        let out = std::process::Command::new(dxc)
+            .arg("-dumpbin")
+            .arg(&file)
+            .output()
+            .ok()?;
+        let _ = std::fs::remove_file(&file);
+        assert!(
+            out.status.success(),
+            "dxc -dumpbin failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn interpolated_f16_writes_the_op_sel_half_with_modifiers() {
+        // p1_f32 v2, v0, attr0.x; then a p2_f16 completing it into v3, which holds a value
+        // (v2's own is no number here: a first half is evaluated with its second).
+        let p2 = |dst_high: bool, omod: u32, clamp: bool| {
+            let vgpr = |n: u32| 256 + n;
+            let mut w0 = 0x35u32 << 26 | 0x35au32 << 16 | 3;
+            if dst_high {
+                w0 |= 1 << 14; // op_sel[3]: the high destination half.
+            }
+            if clamp {
+                w0 |= 1 << 15;
+            }
+            let w1 = vgpr(1) << 9 | vgpr(2) << 18;
+            [w0, w1 | omod << 27]
+        };
+        let dump = |dst_high: bool, omod: u32, clamp: bool| {
+            let [w0, w1] = p2(dst_high, omod, clamp);
+            let words = [
+                0x7E06_0301u32, // v_mov_b32 v3, v1
+                0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+                w0,
+                w1, // v_interp_p2_f16 v3, attr0, v1, v2
+                0xF800_180F,
+                0x0303_0303, // exp mrt0, v3, v3, v3, v3 done vm
+                0xBF81_0000,
+            ];
+            let native = super::NativeProgram {
+                stage: super::HwStage::Ps,
+                wave64: false,
+                vgprs: 4,
+                layout: vec![],
+                used: vec![],
+                io: crate::native::StageIo::Ps {
+                    inputs: vec![crate::native::PsInput {
+                        usage: crate::native::Usage::Generic,
+                        row: 0,
+                        mask: 0b1111,
+                        attr: 0,
+                        flat: false,
+                        fp16: true,
+                        pack2: false,
+                        row2: 0,
+                    }],
+                    input_addr: 2,
+                    db_shader_control: 0,
+                    patches: vec![],
+                },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let el = |name: &str, kind, usage, half| SigElement {
+                name: name.into(),
+                index: 0,
+                kind,
+                comp: 9,
+                interp: 0,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage,
+                half,
+            };
+            let isg1 = super::container::signature(&[el("TEXCOORD", 0, 0, true)], true);
+            let osg1 = super::container::signature(&[el("SV_Target", 16, 15, false)], false);
+            let bytes =
+                crate::dxbc::build(&[(super::FourCC::ISG1, &isg1), (super::FourCC::OSG1, &osg1)]);
+            let c = super::Container::parse(&bytes).unwrap();
+            let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let st = crate::structure::structure(&p).unwrap();
+            let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = crate::io::raise(&p, &native).unwrap();
+            super::emit(&c, &native, &p, &st, &io, &res).unwrap().dxil
+        };
+        let (Some(low), Some(high)) = (
+            dump_dxil(&dump(false, 0, false)),
+            dump_dxil(&dump(true, 1, true)),
+        ) else {
+            eprintln!("no dxc.exe; DXIL check skipped");
+            return;
+        };
+        // The low-half write keeps the destination's high half.
+        assert!(low.contains("-65536"), "low write keeps the high half");
+        // The high-half write shifts the result up by 16.
+        assert!(high.contains("shl i32"), "op_sel[3] writes the high half");
+        // omod mul:2 and clamp (dx.op.unary.f32, opcode 7) are applied.
+        assert!(high.contains("2.000000e+00"), "omod multiplies by two");
+        assert!(
+            high.contains("dx.op.unary.f32(i32 7"),
+            "clamp saturates the result"
+        );
+        assert!(!low.contains("dx.op.unary.f32(i32 7"));
+    }
+
     #[test]
     fn the_clean_up_switch_parses_or_runs_every_pass() {
-        let all = super::bitcode::opt::ALL;
-        assert_eq!(parse_shader_opt(None), all);
+        let (all, usual) = (super::bitcode::opt::ALL, super::bitcode::opt::DEFAULT);
+        assert_eq!(usual, 63, "the passes of the builds before the wide loads");
+        assert_eq!(parse_shader_opt(None), usual);
         assert_eq!(parse_shader_opt(Some("0")), 0);
         assert_eq!(parse_shader_opt(Some(" 1 ")), 1);
         assert_eq!(parse_shader_opt(Some("0x1")), 1);
+        assert_eq!(parse_shader_opt(Some("127")), all);
         assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
-        assert_eq!(parse_shader_opt(Some("on")), all);
+        assert_eq!(parse_shader_opt(Some("on")), usual);
     }
 
     #[test]
@@ -1225,7 +1242,6 @@ mod tests {
             cols: 1,
             usage: 1,
             half: false,
-            packed: false,
         };
         let osg1 =
             container::signature(&[el("SV_Depth", 17, 9), el("SV_StencilRef", 20, 5)], false);
@@ -1249,120 +1265,91 @@ mod tests {
         assert_ne!(features & 0x200, 0, "SFI0 {features:#x}: no StencilRef");
     }
 
-    /// A pixel program the console tests depth for before it runs
-    /// (`DB_SHADER_CONTROL` 0x1050: DEPTH_BEFORE_SHADER, early Z, kill, as
-    /// the title's glass prepass has it) declares ForceEarlyDepthStencil:
-    /// the module differs from the same program without the bit only by that
-    /// flag, and the validator, where there is one, accepts it. With a depth
-    /// output the bit is not declared (the host cannot test before a shader
-    /// that writes the depth).
+    /// A pixel program with an ordered section, as the console compiler
+    /// makes one of rasterizer ordered views (the title's hair cards keep
+    /// their nearest layers that way): the wait for overlapped waves is
+    /// skipped, the views inside the section are the host's ordered ones,
+    /// the one after it is not.
     #[test]
-    fn a_pixel_program_tested_before_it_runs_declares_early_depth() {
-        // v_mov_b32 v0, 1.0; exp mrt0 v0, v0, v0, v0 done vm; s_endpgm
-        let color = [0x7E00_02F2u32, 0xF800_180F, 0x0000_0000, 0xBF81_0000];
-        // v_mov_b32 v0, 1.0; exp mrtz v0, off, off, off done vm; s_endpgm
-        let depth = [0x7E00_02F2u32, 0xF800_1881, 0x0000_0000, 0xBF81_0000];
-        let el = |name: &str, kind, cols| SigElement {
-            name: name.into(),
-            index: 0,
-            kind,
-            comp: 9,
-            interp: 0,
-            // A render target has a register; depth and stencil do not.
-            row: (kind == 16).then_some(0),
-            col: 0,
-            cols,
-            usage: (1 << cols) - 1,
-            half: false,
-            packed: false,
-        };
-        let emitted = |words: &[u32], out: SigElement, db: u32| {
+    fn an_ordered_section_uses_rasterizer_ordered_views() {
+        let section = [
+            0xBE82_0300u32, // s_mov_b32 s2, s0
+            0xBE83_0380,    // s_mov_b32 s3, 0
+            0xF40C_0201,    // s_load_dwordx8 s[8:15], s[2:3], 0
+            0xFA00_0000,
+            0x9390_FF01, // s_bfe_u32 s16, s1, 0x2001c
+            0x0002_001C,
+            0x9391_FF01, // s_bfe_u32 s17, s1, 0xa0000
+            0x000A_0000,
+            0x8F10_8110, // s_lshl_b32 s16, s16, 1
+            0x9392_FF01, // s_bfe_u32 s18, s1, 0xa0010
+            0x000A_0010,
+            0xBE91_0711, // s_not_b32 s17, s17
+            0x9013_9F01, // s_lshr_b32 s19, s1, 31
+            0x8810_8110, // s_or_b32 s16, s16, 1
+            0x8112_1112, // s_add_i32 s18, s18, s17
+            0xBF06_8013, // s_cmp_eq_u32 s19, 0
+            0xB990_1019, // s_setreg_b32 hwreg(HW_REG_POPS_PACKER, 0, 3), s16
+            0x8514_807E, // s_cselect_b32 s20, exec_lo, 0
+            0x8115_11EF, // s_add_i32 s21, src_pops_exiting_wave_id, s17
+            0xBF08_1215, // s_cmp_gt_u32 s21, s18
+            0x8516_807E, // s_cselect_b32 s22, exec_lo, 0
+            0x8814_1614, // s_or_b32 s20, s20, s22
+            0x876A_147E, // s_and_b32 vcc_lo, exec_lo, s20
+            0xBF87_0004, // s_cbranch_vccnz past the wait
+            0xBF8E_FFFF, // s_sleep 0xffff
+            0x8115_11EF, // s_add_i32 s21, src_pops_exiting_wave_id, s17
+            0xBF0A_1512, // s_cmp_lt_u32 s18, s21
+            0xBF84_FFFC, // s_cbranch_scc0 back to the sleep
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0xF000_3F88, // image_load v[2:5], v[0:1], s[8:15] dmask:0xf 2D glc dlc
+            0x0002_0200,
+            0x0604_04F2, // v_add_f32 v2, 1.0, v2
+            0xF020_3F08, // image_store v[2:5], v[0:1], s[8:15] dmask:0xf 2D glc
+            0x0002_0200,
+            0xBEFC_0380, // s_mov_b32 m0, 0
+            0xBF90_0007, // s_sendmsg sendmsg(MSG_ORDERED_PS_DONE)
+        ];
+        let end = [
+            0xF800_180Fu32, // exp mrt0 v2, v2, v2, v2 done vm
+            0x0202_0202,
+            0xBF81_0000, // s_endpgm
+        ];
+        // A store after the section, through an ordinary view.
+        let after = [0xF020_3F08u32, 0x0002_0200];
+        let lower = |words: Vec<u32>| {
             let native = NativeProgram {
                 stage: HwStage::Ps,
                 wave64: false,
-                vgprs: 1,
-                layout: vec![],
-                used: vec![],
+                vgprs: 8,
+                layout: vec![crate::native::RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                }],
+                used: vec![crate::native::UsedResource {
+                    kind: crate::native::ResourceType::Uav,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 4,
+                    dwords: 8,
+                    user_data: 0,
+                    slot: 0,
+                }],
                 io: StageIo::Ps {
                     inputs: vec![],
                     input_addr: 0,
-                    db_shader_control: db,
+                    db_shader_control: 0,
                     patches: vec![],
                 },
                 code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
             };
-            let osg1 = container::signature(&[out], false);
-            let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
-            let c = Container::parse(&bytes).unwrap();
-            let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
-            let st = structure::structure(&p).unwrap();
-            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
-            let io = io::raise(&p, &native).unwrap();
-            emit(&c, &native, &p, &st, &io, &res).unwrap().dxil
-        };
-        let late = emitted(&color, el("SV_Target", 16, 4), 0x50);
-        let early = emitted(&color, el("SV_Target", 16, 4), 0x1050);
-        assert_ne!(late, early, "the early-depth flag changed nothing");
-        #[cfg(windows)]
-        if let Ok(mut v) = super::validator::Validator::load(
-            super::validator::Validator::default_path().as_deref(),
-        ) {
-            v.validate(&mut early.clone()).unwrap();
-        }
-        let late = emitted(&depth, el("SV_Depth", 17, 1), 0x51);
-        let early = emitted(&depth, el("SV_Depth", 17, 1), 0x1051);
-        assert_eq!(late, early, "early depth declared for a depth export");
-        // The rule alone: the bit, and no export of depth, stencil or coverage.
-        let ps = |db| StageIo::Ps {
-            inputs: vec![],
-            input_addr: 0,
-            db_shader_control: db,
-            patches: vec![],
-        };
-        assert!(shader::early_depth(&ps(0x1450), &[]));
-        assert!(shader::early_depth(&ps(0x1010), &[]));
-        assert!(!shader::early_depth(&ps(0x0450), &[]));
-        assert!(!shader::early_depth(&ps(0x1012), &[]));
-        assert!(!shader::early_depth(&ps(0x1150), &[]));
-        assert!(!shader::early_depth(
-            &ps(0x1050),
-            &[el("SV_StencilRef", 20, 1)]
-        ));
-        assert!(!shader::early_depth(&StageIo::None, &[]));
-    }
-
-    /// A primitive-ordered pixel shader (POPS): reads the collision wave id
-    /// loaded into s18, writes `HW_REG_POPS_PACKER`, and reads
-    /// `src_pops_exiting_wave_id`. Lowered with s18 = `1 << 16` (overlap = 0,
-    /// wave_id = 1 != collision_id = 0) and ROVs on UAV handles.
-    #[test]
-    fn primitive_ordered_pixel_shaders_translate_without_ordering() {
-        let words = [
-            0x9381_FF12u32, // s_bfe_u32 s1, s18, 0x0002001c (packer, bits 28-29)
-            0x0002_001C,
-            0xB981_1019, // s_setreg_b32 hwreg(HW_REG_POPS_PACKER, 0, 3), s1
-            0x8102_01EF, // s_add_i32 s2, src_pops_exiting_wave_id, s1
-            0x7E04_0202, // v_mov_b32 v2, s2
-            0xF800_180F,
-            0x0202_0202, // exp mrt0, v2, v2, v2, v2 done vm
-            0xBF81_0000, // s_endpgm
-        ];
-        let native = NativeProgram {
-            stage: HwStage::Ps,
-            wave64: true,
-            vgprs: 4,
-            layout: vec![],
-            used: vec![],
-            io: StageIo::Ps {
-                inputs: vec![],
-                input_addr: 1 << 1,
-                db_shader_control: 0,
-                patches: vec![],
-            },
-            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
-        };
-        let osg1 = container::signature(
-            &[SigElement {
+            let target = SigElement {
                 name: "SV_Target".into(),
                 index: 0,
                 kind: 16,
@@ -1373,51 +1360,88 @@ mod tests {
                 cols: 4,
                 usage: 15,
                 half: false,
-                packed: false,
-            }],
-            false,
-        );
-        let isg1 = container::signature(&[], true);
-        let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
-        let c = Container::parse(&bytes).unwrap();
-        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
-        assert!(
-            p.inputs.iter().any(|&(r, _)| r == crate::ir::Reg::S(18)),
-            "the collision wave id is an input"
-        );
-        let st = structure::structure(&p).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
-        let io = io::raise(&p, &native).unwrap();
-        let out = emit(&c, &native, &p, &st, &io, &res).expect("a POPS pixel shader translates");
-        #[cfg(windows)]
-        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref())
-        {
-            v.validate(&mut out.dxil.clone()).unwrap();
-        }
+            };
+            let osg1 = container::signature(&[target], false);
+            let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+            let c = Container::parse(&bytes).unwrap();
+            let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+            let st = structure::structure(&p)?;
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+            let io = io::raise(&p, &native)?;
+            let out = emit(&c, &native, &p, &st, &io, &res)?;
+            #[cfg(windows)]
+            if let Ok(mut v) = super::validator::Validator::load(
+                super::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut out.dxil.clone()).unwrap();
+            }
+            let host = Container::parse(&out.dxil).unwrap();
+            let sfi0 = host.part(FourCC::SFI0).unwrap().data;
+            Ok::<u64, ShaderError>(u64::from_le_bytes(sfi0.try_into().unwrap()))
+        };
+        // D3D_SHADER_REQUIRES_ROVS
+        let features = lower([&section[..], &end].concat()).unwrap();
+        assert_ne!(features & 0x1000, 0, "SFI0 {features:#x}: no ROVs");
+        lower([&section[..], &after, &end].concat()).unwrap();
+        // The same accesses outside a section: ordinary views, no feature.
+        let plain = [&section[..4], &section[28..35], &end].concat();
+        let features = lower(plain).unwrap();
+        assert_eq!(features & 0x1000, 0, "SFI0 {features:#x}: ROVs");
+        // Without the section's start the wait stays unknown.
+        let mut unmarked = [&section[..], &end].concat();
+        unmarked.remove(16);
+        assert!(lower(unmarked).is_err());
     }
 
-    /// A Wave32 pixel shader with a wave-wide `s_cbranch_vccnz` before reading
-    /// an active-only lane mask as data (`s_bcnt1_i32_b32`): widening the
-    /// `vccnz` branch to `waveAnyTrue` keeps the mask active and validates.
     #[test]
-    fn pixel_shader_widens_vcc_branch_for_mask_ballot() {
+    fn immediate_sampler_slots_distinguish_comparison_uses() {
         let words = [
-            0x7D84_0080u32, // 0: v_cmp_eq_u32 vcc_lo, 0, v0
-            0xBF87_0006,    // 4: s_cbranch_vccnz -> 32
-            0x7D84_0281,    // 8: v_cmp_eq_u32 vcc_lo, 1, v1
-            0x8702_7E6A,    // 12: s_and_b32 s2, vcc_lo, exec_lo
-            0xBE83_0F02,    // 16: s_bcnt1_i32_b32 s3, s2
-            0x7E04_0203,    // 20: v_mov_b32 v2, s3
-            0xF800_180F,    // 24: exp mrt0, v2, v2, v2, v2 done vm
-            0x0202_0202,
-            0xBF81_0000,    // 32: s_endpgm
+            0xBE81_0380u32, // s_mov_b32 s1, 0
+            0xF40C_0000,
+            0xFA00_0000, // s_load_dwordx8 s[0:7], s[0:1], null
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0xBE8A_0380, // s_mov_b32 s10, 0
+            0xBE8B_0380, // s_mov_b32 s11, 0
+            0x7E00_02F0, // v_mov_b32 v0, 0.5 (comparison reference)
+            0x7E02_02F0, // v_mov_b32 v1, 0.5 (u)
+            0x7E04_02F0, // v_mov_b32 v2, 0.5 (v)
+            0xBF8C_0070, // s_waitcnt vmcnt(0) lgkmcnt(0)
+            0xF080_0108,
+            0x0040_0301, // image_sample v3, v[1:2], s[0:7], s[8:11]
+            0xF0A0_0108,
+            0x0040_0400, // image_sample_c v4, v[0:2], s[0:7], s[8:11]
+            0xF0BC_0108,
+            0x0040_0500, // image_sample_c_lz v5, v[0:2], s[0:7], s[8:11]
+            0xF080_0108,
+            0x0040_0601, // image_sample v6, v[1:2], s[0:7], s[8:11]
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xF800_180F,
+            0x0605_0403, // exp mrt0, v3, v4, v5, v6 done vm
+            0xBF81_0000,
         ];
         let native = NativeProgram {
             stage: HwStage::Ps,
             wave64: false,
-            vgprs: 4,
-            layout: vec![],
-            used: vec![],
+            vgprs: 7,
+            layout: vec![crate::native::RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![crate::native::UsedResource {
+                kind: crate::native::ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 8,
+                user_data: 0,
+                slot: 0,
+            }],
             io: StageIo::Ps {
                 inputs: vec![],
                 input_addr: 0,
@@ -1426,70 +1450,39 @@ mod tests {
             },
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
-        let osg1 = container::signature(
-            &[SigElement {
-                name: "SV_Target".into(),
-                index: 0,
-                kind: 16,
-                comp: 9,
-                interp: 0,
-                row: Some(0),
-                col: 0,
-                cols: 4,
-                usage: 15,
-                half: false,
-                packed: false,
-            }],
-            false,
-        );
-        let isg1 = container::signature(&[], true);
-        let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+        let output = SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        };
+        let osg1 = container::signature(&[output], false);
+        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
         let c = Container::parse(&bytes).unwrap();
         let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
-        let out = emit(&c, &native, &p, &st, &io, &res)
-            .expect("single-wave PS widens s_cbranch_vccnz for active ballot");
+        let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
+
+        let sampler = StaticSampler::from_words([0; 4]);
+        let comparison = StaticSampler {
+            filter: sampler.filter | 0x80,
+            ..sampler
+        };
+        assert_eq!(out.samplers, [[0; 4]; 2]);
+        assert_eq!(out.static_samplers, [sampler, comparison]);
         #[cfg(windows)]
-        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref())
-        {
+        if let Some(path) = super::validator::Validator::default_path() {
+            let mut v = super::validator::Validator::load(Some(&path)).unwrap();
             v.validate(&mut out.dxil.clone()).unwrap();
         }
-    }
-
-    #[test]
-    fn bvh_no_hit_switch_parses_and_updates_fingerprint() {
-        assert!(!parse_bvh_no_hit(None));
-        assert!(!parse_bvh_no_hit(Some("")));
-        assert!(!parse_bvh_no_hit(Some("0")));
-        assert!(!parse_bvh_no_hit(Some("false")));
-        assert!(parse_bvh_no_hit(Some("1")));
-        assert!(parse_bvh_no_hit(Some(" 1 ")));
-        assert!(parse_bvh_no_hit(Some("true")));
-        let off = with_bvh_no_hit_for_test(false, translation_fingerprint);
-        let on = with_bvh_no_hit_for_test(true, translation_fingerprint);
-        assert_ne!(off, on);
-
-        let base = translation_fingerprint();
-        let prev_lean = TEST_LEAN_MATH.replace(Some(1));
-        let lean1 = translation_fingerprint();
-        TEST_LEAN_MATH.set(Some(2));
-        let lean2 = translation_fingerprint();
-        TEST_LEAN_MATH.set(prev_lean);
-        assert_ne!(base, lean1);
-        assert_ne!(lean1, lean2);
-
-        let prev_uniform = lean::TEST_WAVE_UNIFORM.replace(Some(1));
-        let uni1 = translation_fingerprint();
-        lean::TEST_WAVE_UNIFORM.set(Some(2));
-        let uni2 = translation_fingerprint();
-        lean::TEST_WAVE_UNIFORM.set(Some(3));
-        let uni3 = translation_fingerprint();
-        lean::TEST_WAVE_UNIFORM.set(prev_uniform);
-        assert_ne!(base, uni1);
-        assert_ne!(uni1, uni2);
-        assert_ne!(uni2, uni3);
     }
 
     /// A wave64 compute program that writes only EXEC's high dword
@@ -1611,33 +1604,6 @@ mod tests {
         stores_v1(&[0x7E04_028B, 0xDACC_0000, 0x0100_0200]).unwrap();
     }
 
-    /// `ds_permute_b32` scatters through the console's zero-initialized
-    /// scratch: each lane gives its data register to the lane its address
-    /// names, within the calling lane's 32-lane half, and reads the slot of
-    /// its own name. It stopped as "an LDS operation".
-    #[test]
-    fn a_scatter_permute_writes_the_lane_its_address_names() {
-        // v_mov_b32 v2, 11; ds_permute_b32 v1, v0, v2
-        stores_v1(&[0x7E04_028B, 0xDAC8_0000, 0x0100_0200]).unwrap();
-    }
-
-    /// The scatter's barriers need every lane of the group: in a branch
-    /// this refuses (a wave-wide structuring of the block would open it).
-    #[test]
-    fn a_scatter_permute_in_a_branch_is_refused() {
-        let body = [
-            0x7E04_028B, // v_mov_b32 v2, 11
-            0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
-            0xBE82_376A, // s_andn1_saveexec_b64 s[2:3], vcc
-            0xBF88_0002, // s_cbranch_execz 2
-            0xDAC8_0000, // ds_permute_b32 v1, v0, v2
-            0x0100_0200,
-            0x88FE_027E, // s_or_b64 exec, exec, s[2:3]
-        ];
-        let e = stores_v1(&body).unwrap_err().to_string();
-        assert!(e.contains("a scatter permute in a branch"), "{e}");
-    }
-
     /// A carry-in reading a join of compares after a divergent branch. A
     /// lane that skipped the inner compare has VCC clear there (VOPC clears
     /// inactive lanes), not the first compare's bit, so the join is no
@@ -1672,7 +1638,6 @@ mod tests {
             cols: 4,
             usage: 15,
             half: false,
-            packed: false,
         });
         let b = s.entry;
         for (c, v) in [1.0f32, 0.5, 0.25, 1.0].into_iter().enumerate() {
@@ -1691,9 +1656,12 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn stub_pipeline_is_created() {
-        let Ok(host) = super::host::Host::new(false) else {
-            eprintln!("no SM 6.6 device; skipped");
-            return;
+        let host = match super::host::Host::new(false) {
+            Ok(host) => host,
+            Err(e) => {
+                eprintln!("no SM 6.6 device ({e}); skipped");
+                return;
+            }
         };
         let ps = super::HostShader {
             stage: crate::HwStage::Ps,
@@ -1704,8 +1672,6 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
-            written_root_uavs: Vec::new(),
-            writes_guest_memory: false,
             root_indexed_views: Vec::new(),
         };
         let file = |var: &str, stage| {
@@ -1718,8 +1684,6 @@ mod tests {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
-                written_root_uavs: Vec::new(),
-                writes_guest_memory: false,
                 root_indexed_views: Vec::new(),
             })
         };
@@ -1759,6 +1723,329 @@ mod tests {
         let ours = c[4..20].to_vec();
         v.validate(&mut c).unwrap();
         assert_eq!(c[4..20], ours[..], "our hash differs from the validator's");
+    }
+
+    /// A pixel program of `words` with no user data.
+    fn emit_native(words: &[u32], input_addr: u32) -> NativeProgram {
+        NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        }
+    }
+
+    /// A pixel program that takes its neighbour's position across its quad
+    /// (`ds_swizzle_b32`, as the console's compiler makes derivatives) and
+    /// exports the differences in x and y: 1 and -1 in every pixel of a
+    /// triangle, those at its edges too, whose neighbours are helpers.
+    #[test]
+    #[cfg(windows)]
+    fn quad_neighbours_at_a_triangles_edge_are_read() {
+        use super::host::{Draw, Host, Root};
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_SHADER_VISIBILITY_MESH, D3D12_SHADER_VISIBILITY_PIXEL,
+        };
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // v2, v3: position x, y (input address: POS_X and POS_Y after the
+        // two perspective barycentrics).
+        let swizzle = |dst: u32, src: u32, pattern: u32| {
+            [
+                0xD800_0000 | 0x35 << 18 | 0x8000 | pattern,
+                dst << 24 | src,
+            ]
+        };
+        let mut words = vec![0xBEFC_0380u32]; // s_mov_b32 m0, 0
+        words.extend(swizzle(4, 2, 0xB1)); // lanes 1 0 3 2
+        words.extend(swizzle(5, 3, 0x4E)); // lanes 2 3 0 1
+        words.extend(swizzle(6, 2, 0xA0)); // lanes 0 0 2 2
+        words.extend([
+            0x0808_0504,  // v_sub_f32 v4, v4, v2
+            0x080A_0705,  // v_sub_f32 v5, v5, v3
+            0x080C_0506,  // v_sub_f32 v6, v6, v2
+            0xF800_180F,
+            0x0302_0504, // exp mrt0 v4, v5, v2, v3 done vm
+            0xBF81_0000,
+        ]);
+        let _ = 6;
+        let mut native = emit_native(&words, 1 << 1 | 1 << 8 | 1 << 9);
+        native.vgprs = 8;
+        let out = SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        };
+        let position = SigElement {
+            name: "SV_Position".into(),
+            index: 0,
+            kind: 3,
+            comp: 9,
+            interp: 4,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 3,
+            half: false,
+        };
+        let isg1 = container::signature(&[position], true);
+        let osg1 = container::signature(&[out], false);
+        let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let ps = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        if let Some(path) = super::validator::Validator::default_path() {
+            let mut v = super::validator::Validator::load(Some(&path)).unwrap();
+            v.validate(&mut ps.dxil.clone()).unwrap();
+        }
+        let ms = triangle_mesh_to(TRIANGLE, 1.3).unwrap();
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                continue;
+            };
+            let Ok(root) = host.root_signature_for(&[
+                (&ms, D3D12_SHADER_VISIBILITY_MESH),
+                (&ps, D3D12_SHADER_VISIBILITY_PIXEL),
+            ]) else {
+                continue;
+            };
+            let Ok(pso) = host.mesh_pipeline_with(&root, &ms.dxil, &ps.dxil) else {
+                eprintln!("no mesh pipeline on {label}; skipped");
+                continue;
+            };
+            let texels = host
+                .draw(
+                    &root,
+                    &pso,
+                    &Draw {
+                        roots: vec![(0, Root::Constants(vec![0])), (1, Root::Constants(vec![0]))],
+                        textures: &[],
+                        samplers: &[],
+                        vertices: &[],
+                        stride: 0,
+                        size: (16, 16),
+                        mesh_groups: 1,
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: draw: {e}"));
+            let lit: Vec<(usize, &[f32; 4])> = texels.iter().enumerate().filter(|t| t.1[2] != 0.0).collect();
+            assert!((20..240).contains(&lit.len()), "{label}: {} texels lit", lit.len());
+            let bad: Vec<_> = lit
+                .iter()
+                .filter(|(n, t)| {
+                    let x = if n % 2 == 0 { 1.0 } else { -1.0 };
+                    let y = if n / 16 % 2 == 0 { 1.0 } else { -1.0 };
+                    (t[0], t[1]) != (x, y)
+                })
+                .collect();
+            assert!(bad.is_empty(), "{label}: {} of {} texels: {:?}", bad.len(), lit.len(), bad[0]);
+        }
+    }
+
+    /// Triangle (0, 1, 2), each corner's 9-bit index in its 10-bit field.
+    const TRIANGLE: u32 = 1 << 10 | 2 << 20;
+    /// The edge flags of the three corners (bits 9, 19 and 29).
+    const EDGE_FLAGS: u32 = 1 << 9 | 1 << 19 | 1 << 29;
+    /// The culling bit.
+    const CULL: u32 = 1 << 31;
+
+    /// A one-wave (32-lane) triangle mesh program whose lanes all export
+    /// primitive `prim` and, as vertex `lane`, the position
+    /// (lane & 1 ? 3 : -1, lane & 2 ? 3 : -1, 0.5, 1): triangle (0, 1, 2)
+    /// covers the whole target.
+    fn triangle_mesh(prim: u32) -> Result<HostShader, ShaderError> {
+        triangle_mesh_to(prim, 4.0)
+    }
+
+    /// The triangle with its far corners at `reach` - 1.
+    fn triangle_mesh_to(prim: u32, reach: f32) -> Result<HostShader, ShaderError> {
+        // (the second corner's y comes out as 2 x its lane bit: half of it)
+        let [x, y] = [reach.to_bits(), (reach / 2.0).to_bits()];
+        let words = [
+            0xD765_0001u32, // v_mbcnt_lo_u32_b32 v1, -1, 0
+            0x0001_00C1,
+            0x3604_0281, // v_and_b32 v2, 1, v1
+            0x3606_0282, // v_and_b32 v3, 2, v1
+            0x7E04_0D02, // v_cvt_f32_u32 v2, v2
+            0x7E06_0D03, // v_cvt_f32_u32 v3, v3
+            0x1008_04FF, // v_mul_f32 v4, reach, v2
+            x,
+            0x0608_08F3, // v_add_f32 v4, -1.0, v4
+            0x100A_06FF, // v_mul_f32 v5, reach / 2, v3
+            y,
+            0x060A_0AF3, // v_add_f32 v5, -1.0, v5
+            0x7E0C_02F0, // v_mov_b32 v6, 0.5
+            0x7E0E_02F2, // v_mov_b32 v7, 1.0
+            0x7E12_02FF, // v_mov_b32 v9, prim
+            prim,
+            0xF800_0941, // exp prim v9, off, off, off done
+            0x0000_0009,
+            0xF800_08CF, // exp pos0 v4, v5, v6, v7 done
+            0x0706_0504,
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: false,
+            vgprs: 10,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ms(crate::native::MeshIo {
+                outputs: vec![],
+                clip_cntl: 0,
+                threads: 32,
+                max_vertices: 32,
+                max_primitives: 32,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let position = SigElement {
+            name: "SV_Position".into(),
+            index: 0,
+            kind: 3,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+        };
+        let osg1 = container::signature(&[position], false);
+        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes)?;
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+        let st = structure::structure(&p)?;
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, &native)?;
+        emit(&c, &native, &p, &st, &io, &res)
+    }
+
+    /// A primitive export's corners are 9-bit indices: the edge flag above
+    /// each (bits 9, 19, 29) is no part of it. Masking ten bits made a
+    /// flagged corner index 512 or more, past any mesh program's vertices
+    /// (the draw test below shows the triangle). Flagged, unflagged and
+    /// culled exports translate, and dxil.dll, where there is one, takes
+    /// each module.
+    #[test]
+    fn primitive_export_indices_drop_the_edge_flags() {
+        #[cfg(windows)]
+        let mut validator = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        )
+        .ok();
+        for prim in [
+            TRIANGLE,
+            TRIANGLE | EDGE_FLAGS,
+            TRIANGLE | EDGE_FLAGS | CULL,
+        ] {
+            let ms = triangle_mesh(prim).unwrap_or_else(|e| panic!("{prim:#x}: {e}"));
+            #[cfg(windows)]
+            if let Some(v) = validator.as_mut() {
+                v.validate(&mut ms.dxil.clone())
+                    .unwrap_or_else(|e| panic!("{prim:#x}: {e}"));
+            }
+        }
+    }
+
+    /// A triangle mesh program on the host GPU and on WARP (where they have
+    /// mesh shaders): triangle (0, 1, 2) covers the target with its corners'
+    /// edge flags set as without them; with the culling bit, nothing is lit.
+    #[test]
+    #[cfg(windows)]
+    fn edge_flagged_triangles_draw_as_unflagged_ones() {
+        use super::host::{Draw, Host, Root};
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_FEATURE_D3D12_OPTIONS7, D3D12_FEATURE_DATA_D3D12_OPTIONS7,
+            D3D12_MESH_SHADER_TIER_NOT_SUPPORTED, D3D12_SHADER_VISIBILITY_MESH,
+        };
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let ps = constant_color();
+        let mut ran = 0;
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {label} device; skipped");
+                continue;
+            };
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+            // SAFETY: the query writes the structure of the given size.
+            let queried = unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS7,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+            };
+            if queried.is_err() || options.MeshShaderTier == D3D12_MESH_SHADER_TIER_NOT_SUPPORTED {
+                eprintln!("no mesh shaders on the {label} device; skipped");
+                continue;
+            }
+            for (prim, culled) in [
+                (TRIANGLE, false),
+                (TRIANGLE | EDGE_FLAGS, false),
+                (TRIANGLE | EDGE_FLAGS | CULL, true),
+            ] {
+                let ms = triangle_mesh(prim).unwrap();
+                let root = host
+                    .root_signature_for(&[(&ms, D3D12_SHADER_VISIBILITY_MESH)])
+                    .unwrap();
+                let pso = host
+                    .mesh_pipeline_with(&root, &ms.dxil, &ps)
+                    .unwrap_or_else(|e| panic!("{label}: mesh pipeline: {e}"));
+                let texels = host
+                    .draw(
+                        &root,
+                        &pso,
+                        &Draw {
+                            roots: vec![(0, Root::Constants(vec![0]))],
+                            textures: &[],
+                            samplers: &[],
+                            vertices: &[],
+                            stride: 0,
+                            size: (16, 16),
+                            mesh_groups: 1,
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{label}: draw: {e}"));
+                let lit = texels.iter().filter(|t| t[3] != 0.0).count();
+                if culled {
+                    assert_eq!(lit, 0, "{label}, {prim:#x}: a culled triangle lit texels");
+                    continue;
+                }
+                assert!(
+                    texels.iter().all(|t| *t == [1.0, 0.5, 0.25, 1.0]),
+                    "{label}, {prim:#x}: {lit} of 256 texels lit"
+                );
+            }
+            eprintln!("{label}: edge-flagged triangles drew");
+            ran += 1;
+        }
+        if ran == 0 {
+            eprintln!("no device with mesh shaders; skipped");
+        }
     }
 
     /// A pixel shader interpolating at sample positions (PERSP_SAMPLE
@@ -1809,7 +2096,6 @@ mod tests {
                 cols: 4,
                 usage,
                 half: false,
-                packed: false,
             };
             let isg1 = super::container::signature(&[el("TEXCOORD", 0, 0)], true);
             let osg1 = super::container::signature(&[el("SV_Target", 16, 15)], false);
@@ -1882,7 +2168,6 @@ mod tests {
             cols: 1,
             usage: 0,
             half: false,
-            packed: false,
         };
         let isg1 = super::container::signature(&[w_only], true);
         let bytes = crate::dxbc::build(&[(super::FourCC::ISG1, &isg1)]);
@@ -1893,6 +2178,156 @@ mod tests {
         let io = crate::io::raise(&p, &native).unwrap();
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
+    }
+
+    /// `s_buffer_load_dwordx4`, `x8` and `x16` from a raw SRV read the dwords
+    /// the console's range-checked load reads, a call a dword or
+    /// (`VICTORY_SHADER_OPT` with 64) a call for every four: also where a
+    /// call's four dwords lie across the view's end (the dwords out of it
+    /// are 0, the others are read). On the software adapter only: run the
+    /// test once plain and once with `VICTORY_SHADER_OPT=127`.
+    #[test]
+    #[cfg(windows)]
+    fn scalar_buffer_loads_read_the_same_dwords_one_call_or_four() {
+        // (first register, dwords) of the three loads, in order.
+        const LOADS: [(u32, u32); 3] = [(16, 8), (24, 4), (32, 16)];
+        let mut words: Vec<u32> = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0 (the SRV)
+            0xF408_0302,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20 (the UAV)
+            0xF42C_0404,
+            0x0000_0000, // s_buffer_load_dwordx8 s[16:23], s[8:11], s0
+            0xF428_0604,
+            0xFA00_0008, // s_buffer_load_dwordx4 s[24:27], s[8:11], 0x8
+            0xF430_0804,
+            0x0200_0004, // s_buffer_load_dwordx16 s[32:47], s[8:11], s1, 0x4
+        ];
+        let mut out_dword = 0u32;
+        for (first, n) in LOADS {
+            for k in 0..n {
+                // v_mov_b32 v1, s<first + k>
+                words.push(0x7E00_0000 | 1 << 17 | 0x001 << 9 | (first + k));
+                // buffer_store_dword v1, s[12:15], offset 4 * out_dword
+                words.push(0x38 << 26 | 0x1C << 18 | (4 * out_dword));
+                words.push(0x80 << 24 | (12 >> 2) << 16 | 1 << 8);
+                out_dword += 1;
+            }
+        }
+        words.push(0xBF81_0000); // s_endpgm
+        let table = |kind, at| crate::UsedResource {
+            kind,
+            root: crate::RootType::Table,
+            table_offset_dwords: at,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let native = super::NativeProgram {
+            stage: super::HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![
+                crate::RootParam {
+                    root: crate::RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                crate::RootParam {
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![table(crate::ResourceType::Srv, 0), table(crate::ResourceType::Uav, 8)],
+            io: crate::native::StageIo::Cs(crate::native::ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, None).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let l = super::lower::lower(&super::lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .unwrap();
+        // The calls that read the SRV: 28 a dword, 7 with four a call.
+        let wide = shader_opt() & super::bitcode::opt::WIDE != 0;
+        let mut dxil = l.dxil;
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut dxil).unwrap();
+        }
+        let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(host) = super::host::Host::new(true) else {
+            eprintln!("no software adapter; the dispatch is skipped");
+            return;
+        };
+        let cs = super::HostShader {
+            stage: super::HwStage::Cs,
+            dxil,
+            user_data: l.user_data,
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: l.root_cbvs,
+            root_srvs: l.root_srvs,
+            root_uavs: l.root_uavs,
+            root_indexed_views: Vec::new(),
+        };
+        let (root, pso) = host.compute_pipeline(&cs).unwrap();
+        // Twelve dwords: the loads below run across the view's end.
+        let data: Vec<u32> = (0..12u32).map(|i| 0x1111_1111u32.wrapping_mul(i + 1) ^ 0x8000_0000).collect();
+        let dword = |byte: u64| -> u32 {
+            if byte.is_multiple_of(4) && byte + 4 <= 4 * data.len() as u64 { data[(byte / 4) as usize] } else { 0 }
+        };
+        for (s0, s1) in [(0u32, 0u32), (16, 0), (24, 4), (40, 28), (48, 44), (8, 12)] {
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &super::host::Dispatch {
+                        roots: vec![(0, super::host::Root::Constants(vec![s0, s1, 0, 0, 0]))],
+                        views: &[
+                            super::host::View::Buffer {
+                                data: &data,
+                                stride: super::host::Stride::Raw,
+                            },
+                            super::host::View::RawUav(32),
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            let starts = [u64::from(s0), 8, u64::from(s1) + 4];
+            let mut want = Vec::new();
+            for (&(_, n), start) in LOADS.iter().zip(starts) {
+                want.extend((0..u64::from(n)).map(|k| dword(start + 4 * k)));
+            }
+            eprintln!("offsets {s0} and {s1}, four dwords a call: {wide}: {:x?}", &out[0][..28]);
+            assert_eq!(out[0][..28], want[..], "offsets {s0} and {s1}, four dwords a call: {wide}");
+        }
     }
 
     #[test]
@@ -2011,8 +2446,6 @@ mod tests {
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
-                written_root_uavs: l.written_root_uavs,
-                writes_guest_memory: l.writes_guest_memory,
                 root_indexed_views: Vec::new(),
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
@@ -2151,114 +2584,6 @@ mod atomic_tests {
 }
 
 #[cfg(test)]
-mod static_sampler_tests {
-    use super::*;
-    use crate::native::{ComputeIo, ResourceType, RootParam, StageIo, UsedResource};
-
-    /// Linear filtering, comparison less or equal, everything else zero.
-    const WORDS: [u32; 4] = [0x0000_3000, 0, 0x0050_0000, 0];
-
-    /// `image_sample_lz v6, v[1:2]` (`cmp`: `image_sample_c_lz v7, v[3:5]`)
-    /// of the 2D image in s[16:23] with the sampler in s[24:27], one channel.
-    fn sample(cmp: bool) -> [u32; 2] {
-        if cmp {
-            [0xF0BC_0108, 0x00C4_0703]
-        } else {
-            [0xF09C_0108, 0x00C4_0601]
-        }
-    }
-
-    /// A compute program that samples with [`WORDS`] once without and once
-    /// with comparison (`cmp_first`: the comparison first) and stores the
-    /// sum to a UAV.
-    fn translate(cmp_first: bool) -> HostShader {
-        let mut words = vec![
-            0xBE81_0380, // s_mov_b32 s1, 0 (table address high)
-            0xF408_0200,
-            0xFA00_0000, // s_load_dwordx4 s[8:11], s[0:1], 0 (the UAV)
-            0xF40C_0400,
-            0xFA00_0020, // s_load_dwordx8 s[16:23], s[0:1], 0x20 (the image)
-        ];
-        for (n, w) in (24u32..).zip(WORDS) {
-            // s_mov_b32 s<n>, literal
-            words.extend_from_slice(&[0xBE80_03FF | n << 16, w]);
-        }
-        for v in 1..6u32 {
-            words.push(0x7E00_02F0 | v << 17); // v_mov_b32 v<v>, 0.5
-        }
-        words.extend_from_slice(&sample(cmp_first));
-        words.extend_from_slice(&sample(!cmp_first));
-        words.extend_from_slice(&[
-            0x0602_0F06, // v_add_f32 v1, v6, v7
-            0x3406_0082, // v_lshlrev_b32 v3, 2, v0
-            0xE070_1000,
-            0x8002_0103, // buffer_store_dword v1, v3, s[8:11], 0 offen
-            0xBF81_0000,
-        ]);
-        let native = NativeProgram {
-            stage: HwStage::Cs,
-            wave64: false,
-            vgprs: 8,
-            layout: vec![RootParam {
-                root: RootType::Table,
-                table_offset_dwords: 0,
-                sgprs: 1,
-                base_register: 0,
-                user_data: 0,
-                slot: 0,
-            }],
-            used: [(ResourceType::Uav, 0, 4), (ResourceType::Srv, 8, 8)]
-                .map(|(kind, table_offset_dwords, dwords)| UsedResource {
-                    kind,
-                    root: RootType::Table,
-                    table_offset_dwords,
-                    lower_bound: 0,
-                    stride: 0,
-                    dwords,
-                    user_data: 0,
-                    slot: 0,
-                })
-                .into(),
-            io: StageIo::Cs(ComputeIo {
-                rsrc2: 2,
-                threads: [32, 1, 1],
-            }),
-            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
-        };
-        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
-        let io = io::raise(&p, &native).unwrap();
-        let st = structure::structure(&p).unwrap();
-        let bytes = crate::dxbc::build(&[]);
-        emit(&Container::parse(&bytes).unwrap(), &native, &p, &st, &io, &res).unwrap()
-    }
-
-    /// One sampler's words used for a sample and a comparison sample, in
-    /// either order: two static samplers, the comparison one marked so, the
-    /// first used in slot 0; the validator (when present) checks each
-    /// handle's sampler kind against its operation and the slot's metadata.
-    #[test]
-    fn one_samplers_words_with_and_without_comparison_get_two_slots() {
-        for cmp_first in [true, false] {
-            let shader = translate(cmp_first);
-            assert_eq!(shader.samplers, [WORDS, WORDS], "cmp_first {cmp_first}");
-            let plain = StaticSampler::from_words(WORDS);
-            let mut cmp = plain;
-            cmp.filter |= 0x80;
-            let want = if cmp_first { [cmp, plain] } else { [plain, cmp] };
-            assert_eq!(shader.static_samplers, want, "cmp_first {cmp_first}");
-            #[cfg(windows)]
-            if let Ok(mut v) =
-                validator::Validator::load(validator::Validator::default_path().as_deref())
-            {
-                v.validate(&mut shader.dxil.clone())
-                    .unwrap_or_else(|e| panic!("cmp_first {cmp_first}: {e}"));
-            }
-        }
-    }
-}
-
-#[cfg(test)]
 mod barycentric_tests {
     use super::container::SigElement;
     use super::*;
@@ -2290,13 +2615,16 @@ mod barycentric_tests {
             cols: 4,
             usage: 0,
             half: false,
-            packed: false,
         }
     }
 
     /// Translates a pixel program with the input VGPRs `input_addr`
     /// enables and one float4 TEXCOORD0 attribute (attr 0, row 0).
     fn pixel(words: &[u32], input_addr: u32) -> Result<HostShader, ShaderError> {
+        pixel_with_inputs(words, input_addr, &[element("TEXCOORD", 0, 0)])
+    }
+
+    fn pixel_with_inputs(words: &[u32], input_addr: u32, inputs: &[container::SigElement]) -> Result<HostShader, ShaderError> {
         let native = NativeProgram {
             stage: HwStage::Ps,
             wave64: false,
@@ -2322,7 +2650,7 @@ mod barycentric_tests {
         };
         let mut target = element("SV_Target", 16, 0);
         target.usage = 15;
-        let isg1 = container::signature(&[element("TEXCOORD", 0, 0)], true);
+        let isg1 = container::signature(inputs, true);
         let osg1 = container::signature(&[target], false);
         let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
         let c = Container::parse(&bytes).unwrap();
@@ -2331,6 +2659,51 @@ mod barycentric_tests {
         let io = io::raise(&p, &native)?;
         let st = structure::structure(&p)?;
         emit(&c, &native, &p, &st, &io, &res)
+    }
+
+    #[test]
+    fn an_unused_packed_input_matches_its_provoking_vertex_sibling() {
+        let [e0, e1] = exp_mrt0(3);
+        // v_interp_mov_f32 v3, p0, attr0.z followed by exp mrt0.
+        let words = [0xC80E_0202, e0, e1, 0xBF81_0000];
+        let xy = container::SigElement { cols: 2, ..element("TEXCOORD", 0, 0) };
+        let zw = container::SigElement { col: 2, cols: 2, ..element("NORMAL", 0, 0) };
+        let shader = pixel_with_inputs(&words, PERSP_CENTER, &[xy, zw]).unwrap();
+        let c = Container::parse(&shader.dxil).unwrap();
+        let psv = c.part(FourCC::PSV0).unwrap().data;
+        for columns in [0x42, 0x62] {
+            let record = [1, 0, columns, 0, 3, 1];
+            assert!(psv.windows(record.len()).any(|w| w == record));
+        }
+        let inputs = c.part(FourCC::ISG1).unwrap().data;
+        assert_eq!((inputs[8 + 25], inputs[8 + 32 + 25]), (0, 4));
+        validate(&shader);
+    }
+
+    /// A pixel program's first-lane loop (no table entry in it, so not a waterfall the tracker
+    /// knows) asks for helper lanes, which is valid DXIL (upstream #946's program).
+    #[test]
+    fn a_pixel_first_lane_loop_serves_helper_lanes() {
+        let shader = pixel(
+            &[
+                0xD765_0000, 0x0001_00C1, // v_mbcnt_lo_u32_b32 v0, -1, 0
+                0x7E02_0280, // v_mov_b32 v1, 0
+                0xBE97_037E, // s_mov_b32 s23, exec_lo
+                0x7E18_0500, // v_readfirstlane_b32 s12, v0
+                0x7D84_000C, // v_cmp_eq_u32 vcc, s12, v0
+                0xBE95_3C6A, // s_and_saveexec_b32 s21, vcc_lo
+                0xBF80_0000, // s_nop 0
+                0x7E02_02FF, 0x3F80_0000, // v_mov_b32 v1, 1.0
+                0x897E_157E, // s_xor_b32 exec_lo, exec_lo, s21
+                0xBF89_FFF8, // s_cbranch_execnz loop
+                0xBEFE_0317, // s_mov_b32 exec_lo, s23
+                0xF800_180F, 0x0101_0101, // exp mrt0 v1 v1 v1 v1 done vm
+                0xBF81_0000, // s_endpgm
+            ],
+            0,
+        )
+        .unwrap();
+        validate(&shader);
     }
 
     /// The translation's `SFI0` features and `ISG1` rows.
@@ -2411,6 +2784,153 @@ mod barycentric_tests {
         assert_eq!(features & 0x2_0000, 0);
         assert!(inputs.iter().all(|e| e.kind != 28), "{inputs:?}");
         validate(&shader);
+    }
+
+    #[test]
+    fn a_standalone_first_half_reads_the_vertices() {
+        let shader = first_half_pixel(false);
+        let (_, inputs) = parts(&shader);
+        assert_eq!(inputs.iter().filter(|e| e.kind == 28).count(), 1);
+        assert_eq!(texcoord_mode(&shader), 1);
+        validate(&shader);
+    }
+
+    #[test]
+    fn a_first_half_read_beside_its_pair_keeps_its_partial_value() {
+        let shader = first_half_pixel(true);
+        assert_eq!(texcoord_mode(&shader), 1);
+        validate(&shader);
+    }
+
+    fn first_half_pixel(paired: bool) -> HostShader {
+        let [e0, e1] = exp_mrt0(2);
+        let mut words = vec![0xC808_0000]; // v_interp_p1_f32 v2, v0, attr0.x
+        if paired {
+            words.extend([
+                0x7E06_0302, // v_mov_b32 v3, v2 (keep the partial value)
+                0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+                v_add_f32(2, 2, 3),
+            ]);
+        }
+        words.extend([e0, e1, 0xBF81_0000]);
+        pixel(&words, PERSP_CENTER).unwrap()
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn first_half_values_render_on_hardware_and_warp() {
+        use super::bitcode::{Attr, Term};
+        use super::host::{Draw, Host};
+        use super::shader::Shader;
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Pass POSITION and TEXCOORD through, with TEXCOORD in the same
+        // output row as the translated pixel shader's input signature.
+        let mut s = Shader::new(false);
+        s.inputs = vec![element("POSITION", 0, 0), element("TEXCOORD", 0, 1)];
+        for e in &mut s.inputs {
+            e.usage = 15;
+        }
+        s.outputs = vec![element("TEXCOORD", 0, 0), element("SV_Position", 3, 1)];
+        for (i, e) in s.outputs.iter_mut().enumerate() {
+            e.usage = 15;
+            e.interp = if i == 1 { 4 } else { 2 };
+        }
+        for row in 0..2 {
+            for col in 0..4 {
+                let args = [s.m.i32(row), s.m.i32(0), s.m.i8(col), s.m.undef(s.t.i32)];
+                let v = s.op(s.entry, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &args);
+                let args = [s.m.i32(1 - row), s.m.i32(0), s.m.i8(col), v];
+                s.op(
+                    s.entry,
+                    "storeOutput.f32",
+                    Attr::NoUnwind,
+                    s.t.void,
+                    5,
+                    &args,
+                );
+            }
+        }
+        s.m.terminate(s.entry, Term::Ret);
+        let vs = HostShader {
+            stage: HwStage::Vs,
+            dxil: s.finish(),
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            root_indexed_views: Vec::new(),
+        };
+        validate(&vs);
+        // One triangle covers an 8x8 target, with attribute values 2, 6, 10.
+        let vertices = [
+            -1.0, 1.0, 0.5, 1.0, 2.0, 0.0, 0.0, 0.0, -1.0, -3.0, 0.5, 1.0, 6.0, 0.0, 0.0, 0.0, 3.0,
+            1.0, 0.5, 1.0, 10.0, 0.0, 0.0, 0.0,
+        ];
+        let mut ran = 0;
+        for (backend, warp) in [("hardware", false), ("WARP", true)] {
+            let Ok(host) = Host::new(warp) else { continue };
+            let mut options =
+                windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+            // SAFETY: a correctly sized output for the feature query.
+            unsafe {
+                host.device
+                    .CheckFeatureSupport(
+                        windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_D3D12_OPTIONS3,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .unwrap();
+            }
+            if !options.BarycentricsSupported.as_bool() {
+                eprintln!("no barycentrics on {backend}; skipped");
+                continue;
+            }
+            for paired in [false, true] {
+                let ps = first_half_pixel(paired);
+                validate(&ps);
+                let (root, pso) = host.pipeline(&vs, &ps).expect("interpolation pipeline");
+                let out = host
+                    .draw(
+                        &root,
+                        &pso,
+                        &Draw {
+                            roots: Vec::new(),
+                            textures: &[],
+                            samplers: &[],
+                            vertices: &vertices,
+                            stride: 32,
+                            size: (8, 8),
+                            mesh_groups: 0,
+                        },
+                    )
+                    .expect("draw partial interpolation");
+                for (n, texel) in out.iter().enumerate() {
+                    let i = (n / 8) as f32 / 16.0 + 0.5 / 16.0;
+                    let j = (n % 8) as f32 / 16.0 + 0.5 / 16.0;
+                    let partial = 2.0 + i * 4.0;
+                    let want = if paired {
+                        partial + 2.0 + i * 4.0 + j * 8.0
+                    } else {
+                        partial
+                    };
+                    for &got in texel {
+                        assert!(
+                            (got - want).abs() < 1e-5,
+                            "{backend} paired={paired} pixel={n}: got {got}, want {want}"
+                        );
+                    }
+                }
+            }
+            ran += 1;
+            eprintln!("partial interpolation renders correctly on {backend}");
+        }
+        if ran == 0 {
+            eprintln!("no SM 6.6 host with barycentrics; GPU checks skipped");
+        }
     }
 
     /// Both: the attribute is interpolated and J is used as a value.
@@ -2528,383 +3048,5 @@ mod barycentric_tests {
         let [e0, e1] = exp_mrt0(4);
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
-    }
-
-    #[test]
-    fn pixel_quad_swizzles_validate_and_dpp8_cannot_cross_quads() {
-        let [e0, e1] = exp_mrt0(3);
-        let swizzle = |instruction: [u32; 2]| {
-            let words = [
-                0xc808_0000, 0xc809_0001, // interpolate attr0.x into v2
-                instruction[0], instruction[1], e0, e1, 0xbf81_0000,
-            ];
-            pixel(&words, PERSP_CENTER)
-        };
-        for permutation in [0x00, 0x55, 0xaa, 0xff, 0xb1, 0x4e, 0x1b, 0xe4, 0x27] {
-            // ds_swizzle_b32 v3,v2 and v_mov_b32 v3,v2 quad_perm.
-            validate(&swizzle([0xd8d4_8000 | permutation, 0x0300_0002]).unwrap());
-            validate(&swizzle([0x7e06_02fa, 0xff00_0002 | permutation << 8]).unwrap());
-        }
-        // DPP8: different permutations in the two quads of an octet.
-        let selections = [3u32, 0, 2, 1, 4, 6, 5, 7];
-        let sel = selections.into_iter().enumerate().fold(0, |s, (i, n)| s | n << (3 * i));
-        let mov_dpp8 = |sel: u32| [0x7e06_02e9, (sel << 8) | 2];
-        validate(&swizzle(mov_dpp8(sel)).unwrap());
-        assert!(swizzle(mov_dpp8(sel ^ 4)).is_err(), "lane 0 now reads lane 7");
-    }
-}
-
-/// Mesh shaders whose 16-bit outputs pass the 32 KiB D3D12 allows (#283),
-/// and the pixel shaders they feed, translated together ([`Link`]).
-#[cfg(test)]
-mod link_tests {
-    use super::container::{MESH_OUTPUT_LIMIT, SigElement, mesh_output_bytes};
-    use super::*;
-    use crate::native::{MeshIo, PsInput, StageIo, Usage, VsOutput};
-
-    const S_ENDPGM: u32 = 0xBF81_0000;
-    /// `SPI_PS_INPUT_ADDR` PERSP_CENTER.
-    const PERSP_CENTER: u32 = 1 << 1;
-    /// 16-bit rows of the mesh program: with its position, 68 scalars of
-    /// the 64 that fit 128 vertices.
-    const HALF_ROWS: u32 = 16;
-
-    fn element(name: &str, index: u32, kind: u8, row: u32, half: bool) -> SigElement {
-        SigElement {
-            name: name.into(),
-            index,
-            kind,
-            comp: 9,
-            interp: 0,
-            row: Some(row),
-            col: 0,
-            cols: 4,
-            usage: 0,
-            half,
-            packed: false,
-        }
-    }
-
-    /// A signature part as the console writes it: its 16-bit float rows
-    /// (`half`) of component type 6.
-    fn console_signature(elements: &[SigElement], input: bool) -> Vec<u8> {
-        let mut part = container::signature(elements, input);
-        for k in 0..elements.len() {
-            let at = 8 + 32 * k;
-            let register = u32::from_le_bytes(part[at + 20..at + 24].try_into().unwrap());
-            if elements.iter().any(|e| e.half && e.row == Some(register)) {
-                part[at + 16] = 6;
-            }
-        }
-        part
-    }
-
-    fn mesh_outputs() -> Vec<SigElement> {
-        let mut outputs = vec![element("SV_Position", 0, 3, 0, false)];
-        outputs.extend((0..HALF_ROWS).map(|n| element("TEXCOORD", n, 0, n + 1, true)));
-        outputs
-    }
-
-    fn mesh_io() -> MeshIo {
-        MeshIo {
-            // One entry per parameter: two 16-bit rows of four, two per
-            // dword (the second row the next one no entry names).
-            outputs: (0..HALF_ROWS / 2)
-                .map(|p| VsOutput {
-                    usage: Usage::Generic,
-                    row: (2 * p + 1) as u8,
-                    param: p as u8,
-                    fp16: true,
-                    pack2: true,
-                })
-                .collect(),
-            clip_cntl: 0,
-            threads: 128,
-            max_vertices: 128,
-            max_primitives: 128,
-            topology: 2,
-            lds_bytes: 0,
-        }
-    }
-
-    /// Translates, for `link`, a mesh program of 128 lanes that draws one
-    /// triangle over the whole target: lane n of a wave exports vertex n
-    /// at (-1, -1), (4, -1) or (-1, 4) (v0-v3), eight parameters of packed
-    /// 16-bit values (v10-v13: TEXCOORD0 is (1, 4, 1.5, 3) at vertex 1,
-    /// (1, 2, 1.5, 3) at the others) and, in its first lane, the
-    /// primitive (v9; the other lanes cull theirs).
-    fn mesh(link: &Link) -> Result<HostShader, ShaderError> {
-        let mut words = vec![
-            0xD765_0014,
-            0x0001_00C1, // v_mbcnt_lo_u32_b32 v20, -1, 0
-            0x7E3E_02F6, // v_mov_b32 v31, 4.0
-            0x7D84_2881, // v_cmp_eq_u32 vcc, 1, v20
-            0x0200_3EF3, // v_cndmask_b32 v0, -1.0, v31
-            0x7E2A_02FF,
-            0x4000_3C00, // v_mov_b32 v21, (y 2.0, x 1.0)
-            0x7E2C_02FF,
-            0x4400_3C00, // v_mov_b32 v22, (y 4.0, x 1.0)
-            0x0214_2D15, // v_cndmask_b32 v10, v21, v22
-            0x7D84_2882, // v_cmp_eq_u32 vcc, 2, v20
-            0x0202_3EF3, // v_cndmask_b32 v1, -1.0, v31
-            0x7E04_0280, // v_mov_b32 v2, 0
-            0x7E06_02F2, // v_mov_b32 v3, 1.0
-            0x7E16_02FF,
-            0x4200_3E00, // v_mov_b32 v11, (w 3.0, z 1.5)
-            0x7E18_0280, // v_mov_b32 v12, 0
-            0x7E1A_0280, // v_mov_b32 v13, 0
-            0x7D84_2880, // v_cmp_eq_u32 vcc, 0, v20
-            0x7E40_02FF,
-            0x0020_0400, // v_mov_b32 v32, indices 0, 1, 2
-            0x7E42_02FF,
-            0x8000_0000, // v_mov_b32 v33, culled
-            0x0212_4121, // v_cndmask_b32 v9, v33, v32
-            0xF800_00CF,
-            0x0302_0100, // exp pos0, v0, v1, v2, v3
-        ];
-        for p in 0..HALF_ROWS / 2 {
-            // exp param<p>, v10, v11, v12, v13 (v5 is the group input)
-            words.extend([0xF800_020F | p << 4, 0x0D0C_0B0A]);
-        }
-        words.extend([0xF800_0941, 0x0000_0009, S_ENDPGM]); // exp prim, v9 done
-        let native = NativeProgram {
-            stage: HwStage::Ms,
-            wave64: false,
-            vgprs: 40,
-            layout: vec![],
-            used: vec![],
-            io: StageIo::Ms(mesh_io()),
-            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
-        };
-        let osg1 = console_signature(&mesh_outputs(), false);
-        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
-        let c = Container::parse(&bytes).unwrap();
-        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
-        let res = resource::track(&p, &native.layout, native.stage, None)?;
-        let io = io::raise(&p, &native)?;
-        let st = structure::structure(&p)?;
-        with_link(link, || emit(&c, &native, &p, &st, &io, &res))
-    }
-
-    /// Translates, for `link`, a pixel program that interpolates the high
-    /// half of the first dword of a packed 16-bit attribute (TEXCOORD0.y,
-    /// of rows 1 and 2, where the mesh program writes them) and writes it
-    /// to its target.
-    fn pixel(link: &Link) -> Result<HostShader, ShaderError> {
-        let words = [
-            0xD742_0002,
-            0x0002_0100, // v_interp_p1ll_f16 v2, v0, attr0.x high
-            0xD75A_0003,
-            0x040A_0300, // v_interp_p2_f16 v3, v1, attr0.x high, v2
-            0x7E08_1703, // v_cvt_f32_f16 v4, v3
-            0xF800_180F,
-            0x0404_0404, // exp mrt0, v4, v4, v4, v4 done vm
-            S_ENDPGM,
-        ];
-        let native = NativeProgram {
-            stage: HwStage::Ps,
-            wave64: false,
-            vgprs: 8,
-            layout: vec![],
-            used: vec![],
-            io: StageIo::Ps {
-                inputs: vec![PsInput {
-                    usage: Usage::Generic,
-                    row: 1,
-                    mask: 0b1111,
-                    attr: 0,
-                    flat: false,
-                    fp16: true,
-                    pack2: true,
-                    row2: 2,
-                }],
-                input_addr: PERSP_CENTER,
-                db_shader_control: 0,
-                patches: vec![],
-            },
-            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
-        };
-        let mut target = element("SV_Target", 0, 16, 0, false);
-        target.usage = 15;
-        let inputs = [
-            element("TEXCOORD", 0, 0, 1, true),
-            element("TEXCOORD", 1, 0, 2, true),
-        ];
-        let isg1 = console_signature(&inputs, true);
-        let osg1 = container::signature(&[target], false);
-        let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
-        let c = Container::parse(&bytes).unwrap();
-        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
-        let res = resource::track(&p, &native.layout, native.stage, None)?;
-        let io = io::raise(&p, &native)?;
-        let st = structure::structure(&p)?;
-        with_link(link, || emit(&c, &native, &p, &st, &io, &res))
-    }
-
-    /// A translation's signature part, as the host declares it.
-    fn part(shader: &HostShader, fourcc: FourCC) -> Vec<SigElement> {
-        let c = Container::parse(&shader.dxil).unwrap();
-        signature(c.part(fourcc).unwrap().data).unwrap()
-    }
-
-    /// The validator's verdict, or None without `dxil.dll`.
-    fn validated(shader: &HostShader) -> Option<Result<(), String>> {
-        #[cfg(windows)]
-        if let Ok(mut v) =
-            validator::Validator::load(validator::Validator::default_path().as_deref())
-        {
-            return Some(v.validate(&mut shader.dxil.clone()));
-        }
-        let _ = shader;
-        None
-    }
-
-    fn the_link() -> Link {
-        link_for(mesh_outputs(), &[], &mesh_io()).expect("the outputs pass 32 KiB")
-    }
-
-    /// The fixture's mesh program needs 34,816 bytes at 128 vertices; with
-    /// its 16 rows of halves packed two per column, 18,432.
-    #[test]
-    fn a_mesh_program_past_the_limit_gets_its_halves_packed() {
-        let outputs = mesh_outputs();
-        assert_eq!(mesh_output_bytes(&outputs, &[], 128, 128), 34_816);
-        let link = the_link();
-        assert_eq!(link.packed.len(), HALF_ROWS as usize);
-        assert!(link.packed.iter().all(|(name, _)| name == "TEXCOORD"));
-        let mut packed = outputs.clone();
-        for e in packed.iter_mut().filter(|e| e.half) {
-            e.packed = true;
-        }
-        assert_eq!(mesh_output_bytes(&packed, &[], 128, 128), 18_432);
-        // Within the limit already: nothing to pack.
-        let few: Vec<_> = outputs.into_iter().take(1 + 8).collect();
-        assert_eq!(link_for(few, &[], &mesh_io()), None);
-    }
-
-    /// As the console declares it, the mesh program passes the limit and
-    /// the validator refuses it (#283); packed, every vertex is kept and
-    /// it validates.
-    #[test]
-    fn packed_mesh_outputs_fit_the_limit_and_validate() {
-        let plain = mesh(&Link::default()).unwrap();
-        let outputs = part(&plain, FourCC::OSG1);
-        assert!(mesh_output_bytes(&outputs, &[], 128, 128) > MESH_OUTPUT_LIMIT);
-        assert!(
-            outputs
-                .iter()
-                .filter(|e| e.name == "TEXCOORD")
-                .all(|e| e.comp == 9)
-        );
-        if let Some(verdict) = validated(&plain) {
-            let e = verdict.expect_err("past 32 KiB");
-            assert!(e.contains("output size"), "{e}");
-        }
-        let packed = mesh(&the_link()).unwrap();
-        let outputs = part(&packed, FourCC::OSG1);
-        assert!(mesh_output_bytes(&outputs, &[], 128, 128) <= MESH_OUTPUT_LIMIT);
-        for e in outputs.iter().filter(|e| e.name == "TEXCOORD") {
-            // Unsigned, two columns of two halves each.
-            assert_eq!((e.comp, e.col, e.cols), (5, 0, 2), "{e:?}");
-        }
-        if let Some(verdict) = validated(&packed) {
-            verdict.unwrap();
-        }
-    }
-
-    /// The pixel program of a linked pair reads the packed attribute as
-    /// the dwords the mesh program writes: constant, unsigned, its three
-    /// vertices weighed with `SV_Barycentrics`.
-    #[test]
-    fn a_packed_pixel_input_is_weighed_per_vertex() {
-        let plain = pixel(&Link::default()).unwrap();
-        let inputs = part(&plain, FourCC::ISG1);
-        let t0 = inputs
-            .iter()
-            .find(|e| e.name == "TEXCOORD" && e.index == 0)
-            .unwrap();
-        assert_eq!((t0.comp, t0.cols), (9, 4));
-        assert!(inputs.iter().all(|e| e.kind != 28), "{inputs:?}");
-        if let Some(verdict) = validated(&plain) {
-            verdict.unwrap();
-        }
-        let packed = pixel(&the_link()).unwrap();
-        let inputs = part(&packed, FourCC::ISG1);
-        let t0 = inputs
-            .iter()
-            .find(|e| e.name == "TEXCOORD" && e.index == 0)
-            .unwrap();
-        assert_eq!((t0.comp, t0.col, t0.cols), (5, 0, 2), "{inputs:?}");
-        assert_eq!(
-            inputs.iter().filter(|e| e.kind == 28).count(),
-            1,
-            "{inputs:?}"
-        );
-        let c = Container::parse(&packed.dxil).unwrap();
-        let sfi0 = u64::from_le_bytes(c.part(FourCC::SFI0).unwrap().data.try_into().unwrap());
-        assert_ne!(sfi0 & 0x2_0000, 0, "no Barycentrics feature");
-        if let Some(verdict) = validated(&packed) {
-            verdict.unwrap();
-        }
-    }
-
-    /// Drawn on the host GPU (`VICTORY_WARP=1`: on WARP): the host links
-    /// the pair translated together, and each pixel gets TEXCOORD0.y
-    /// weighed between its vertices' 2 and 4, as the pair translated apart
-    /// draws it where the host takes outputs past 32 KiB.
-    #[cfg(windows)]
-    #[test]
-    fn a_linked_pair_draws_what_the_pair_apart_draws() {
-        use super::host::{Draw, Host};
-        let Ok(host) = Host::new(std::env::var_os("VICTORY_WARP").is_some()) else {
-            eprintln!("no SM 6.6 device; skipped");
-            return;
-        };
-        let draw = |ms: &HostShader, ps: &HostShader| -> Result<Vec<[f32; 4]>, String> {
-            let (root, pso) = host.mesh_pipeline(ms, ps)?;
-            host.draw(
-                &root,
-                &pso,
-                &Draw {
-                    roots: vec![],
-                    textures: &[],
-                    samplers: &[],
-                    vertices: &[],
-                    stride: 0,
-                    size: (16, 16),
-                    mesh_groups: 1,
-                },
-            )
-        };
-        let link = the_link();
-        let together =
-            draw(&mesh(&link).unwrap(), &pixel(&link).unwrap()).expect("the linked pair draws");
-        let ys: Vec<f32> = together.iter().map(|t| t[0]).collect();
-        assert!(ys.iter().all(|&y| (2.0..=4.0).contains(&y)), "{ys:?}");
-        assert!(
-            ys.iter().any(|&y| y > 2.1),
-            "nothing weighed toward vertex 1: {ys:?}"
-        );
-        let plain = Link::default();
-        match draw(&mesh(&plain).unwrap(), &pixel(&plain).unwrap()) {
-            Ok(apart) => {
-                // Within one f16 step: the linked pixel program weighs the
-                // vertices itself (P0 + i P10 + j P20, as the console's
-                // f16 interpolation does), the host's interpolator for the
-                // pair apart; the f32 sums differ in their last bits, and
-                // the f16 the program rounds them to by one step at most
-                // (one texel in five, on an RTX card).
-                for (k, (a, b)) in together.iter().zip(&apart).enumerate() {
-                    let step = b[0].abs() / 1024.0;
-                    assert!(
-                        (a[0] - b[0]).abs() <= step,
-                        "texel {k}: {a:?} together, {b:?} apart"
-                    );
-                }
-            }
-            Err(e) => {
-                eprintln!("the pair translated apart is refused here ({e}): range checked only")
-            }
-        }
     }
 }

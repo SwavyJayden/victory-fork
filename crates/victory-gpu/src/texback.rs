@@ -4,7 +4,8 @@
 //! in the texture's host copy. The title's ocean is one: its wave passes write
 //! a 256x256 height map (R32_FLOAT) and a displacement map (R32G32_FLOAT), and
 //! its CPU code samples both, which is what boats float on; it read memory
-//! nothing had written, and boats sank.
+//! nothing had written (run rw1, `VICTORY_READ_WATCH=1`: about 30 places in
+//! the title read those two kinds), and boats sank.
 //!
 //! For textures of the kinds in `VICTORY_TEXTURE_BACK` (comma-separated
 //! `<width>x<height>f<format>`; unset or `1`: the four water formats found by
@@ -12,6 +13,11 @@
 //! into a read-back buffer of ours when it closes, and once the list has run
 //! the texels are tiled into the texture's title memory in the console's
 //! layout, as the console's GPU would have left them.
+//!
+//! shortcut: by kind, not by texture: textures of those kinds the title never
+//! reads are copied back too (about a megabyte per such list). The copy shows
+//! what the list's last write left; a title read in between sees the frame
+//! before, as it would before the console's GPU has run.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -38,10 +44,7 @@ fn kinds() -> &'static [(u64, u32, u32)] {
             })
             .collect();
         if !kinds.is_empty() {
-            tracing::info!(
-                ?kinds,
-                "textures of these kinds that shaders write are copied back into title memory (VICTORY_TEXTURE_BACK)"
-            );
+            tracing::info!(?kinds, "textures of these kinds that shaders write are copied back into title memory (VICTORY_TEXTURE_BACK)");
         }
         kinds
     })
@@ -67,12 +70,7 @@ static TICKETS: Mutex<Vec<Weak<Ticket>>> = Mutex::new(Vec::new());
 static TRACKING: AtomicBool = AtomicBool::new(false);
 
 fn track(owner: usize, at: usize, end: usize) -> Arc<Ticket> {
-    let ticket = Arc::new(Ticket {
-        owner,
-        at,
-        end,
-        valid: AtomicBool::new(true),
-    });
+    let ticket = Arc::new(Ticket { owner, at, end, valid: AtomicBool::new(true) });
     let mut tickets = TICKETS.lock().unwrap_or_else(|e| e.into_inner());
     tickets.retain(|weak| weak.strong_count() != 0);
     tickets.push(Arc::downgrade(&ticket));
@@ -84,18 +82,13 @@ fn invalidate(matches: impl Fn(&Ticket) -> bool) {
     if !TRACKING.load(Ordering::Relaxed) {
         return;
     }
-    TICKETS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .retain(|weak| {
-            let Some(ticket) = weak.upgrade() else {
-                return false;
-            };
-            if matches(&ticket) {
-                ticket.valid.store(false, Ordering::Release);
-            }
-            true
-        });
+    TICKETS.lock().unwrap_or_else(|e| e.into_inner()).retain(|weak| {
+        let Some(ticket) = weak.upgrade() else { return false };
+        if matches(&ticket) {
+            ticket.valid.store(false, Ordering::Release);
+        }
+        true
+    });
 }
 
 pub(crate) fn released(owner: usize) {
@@ -125,16 +118,10 @@ impl Target {
         let (layout, at, size) = crate::resource::title_texture(resource)?;
         let end = at.checked_add(size).filter(|&end| at != 0 && end > at)?;
         let ticket = track(resource as usize, at, end);
-        Some(Self {
-            copy,
-            layout,
-            ticket,
-        })
+        Some(Self { copy, layout, ticket })
     }
 
-    pub(crate) fn owner(&self) -> usize {
-        self.ticket.owner
-    }
+    pub(crate) fn owner(&self) -> usize { self.ticket.owner }
 }
 
 /// The readback resources and the allocation the pixels belong to.
@@ -196,29 +183,18 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
             // SAFETY: a borrowed pointer the location never releases.
             pResource: unsafe { std::mem::transmute_copy(&buffer) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                PlacedFootprint: *footprint,
-            },
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *footprint },
         };
         let from = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: as above.
             pResource: unsafe { std::mem::transmute_copy(texture) },
             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                SubresourceIndex: i as u32,
-            },
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: i as u32 },
         };
         // SAFETY: an open list; the texture is in the copy-source state.
         unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
-    Some(Back {
-        buffer,
-        footprints,
-        rows,
-        mips,
-        layout: target.layout,
-        ticket: target.ticket,
-    })
+    Some(Back { buffer, footprints, rows, mips, layout: target.layout, ticket: target.ticket })
 }
 
 /// Once the list has run, tile its texels back into the same title allocation.
@@ -230,10 +206,7 @@ pub(crate) fn land(back: &Back) {
     if !back.ticket.valid.load(Ordering::Acquire) {
         let skipped = STALE.fetch_add(1, Ordering::Relaxed) + 1;
         if skipped.is_power_of_two() {
-            tracing::info!(
-                skipped,
-                "skipping texture readbacks whose title allocation changed"
-            );
+            tracing::info!(skipped, "skipping texture readbacks whose title allocation changed");
         }
         return;
     }
@@ -257,17 +230,10 @@ pub(crate) fn land(back: &Back) {
         let pitch = f.RowPitch as usize;
         let len = pitch * rows as usize * f.Depth as usize;
         // SAFETY: the subresource's part of the mapped buffer.
-        let linear = unsafe {
-            std::slice::from_raw_parts(data.cast::<u8>().add(footprint.Offset as usize), len)
-        };
-        if let Err(e) = back
-            .layout
-            .tile(&mut tiled, mip, slice, linear, pitch, pitch * rows as usize)
-        {
+        let linear = unsafe { std::slice::from_raw_parts(data.cast::<u8>().add(footprint.Offset as usize), len) };
+        if let Err(e) = back.layout.tile(&mut tiled, mip, slice, linear, pitch, pitch * rows as usize) {
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| {
-                tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled")
-            });
+            ONCE.call_once(|| tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled"));
             // SAFETY: mapped above.
             unsafe { back.buffer.Unmap(0, None) };
             return;
@@ -281,6 +247,7 @@ pub(crate) fn land(back: &Back) {
         tracing::info!(copied, bytes = size, "texture readback landed");
     }
 }
+
 
 #[cfg(test)]
 mod tests {

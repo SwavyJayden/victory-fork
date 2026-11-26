@@ -90,6 +90,14 @@ fn query(kind: usize, iid: *const Iid, known: &[Iid], found: This, out: *mut Thi
     object::answer(kind, iid, object::is(iid, known).then_some(found), out)
 }
 
+fn enumeration_not_found(out: *mut This) -> HRESULT {
+    if !out.is_null() {
+        // SAFETY: the caller supplies a writable output slot when non-null.
+        unsafe { out.write(std::ptr::null()) };
+    }
+    NOT_FOUND
+}
+
 /// The DXGI device also answers for the D3D12 device.
 extern "system" fn device_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     if crate::device::is_device(iid) {
@@ -112,7 +120,7 @@ extern "system" fn adapter_parent(_: This, iid: *const Iid, out: *mut This) -> H
 }
 extern "system" fn adapter_outputs(_: This, index: u32, out: *mut This) -> HRESULT {
     if index != 0 {
-        return NOT_FOUND;
+        return enumeration_not_found(out);
     }
     object::answer(ADAPTER, &OUTPUT_IIDS[0], Some(&OUTPUT_OBJECT), out)
 }
@@ -165,7 +173,7 @@ extern "system" fn factory_query(this: This, iid: *const Iid, out: *mut This) ->
 }
 extern "system" fn factory_adapters(_: This, index: u32, out: *mut This) -> HRESULT {
     if index != 0 {
-        return NOT_FOUND;
+        return enumeration_not_found(out);
     }
     object::answer(FACTORY, &ADAPTER_IIDS[0], Some(&ADAPTER_OBJECT), out)
 }
@@ -219,159 +227,29 @@ struct Mode {
 }
 const _: () = assert!(size_of::<Mode>() == 32);
 
-/// Display mode configuration resolved from `VICTORY_DISPLAY_MODE` (and
-/// `VICTORY_FPS_CAP` for 120 Hz reporting) or the active console default.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct DisplayMode {
-    width: u32,
-    height: u32,
-    allow_120hz: bool,
-}
-
-/// Parses a resolution preset (`1080p`, `1440p`, `900p`, `720p`, `4k`/`2160p`/
-/// `native`) or `WxH` within supported bounds (`640..=7680` x `360..=4320`).
-fn parse_display_size(raw: &str) -> Option<(u32, u32)> {
-    let trimmed = raw.trim();
-    let preset = match trimmed.to_ascii_lowercase().as_str() {
-        "720p" => Some((1280, 720)),
-        "900p" => Some((1600, 900)),
-        "1080p" => Some((1920, 1080)),
-        "1440p" => Some((2560, 1440)),
-        "2160p" | "4k" | "native" => Some((3840, 2160)),
-        _ => None,
-    };
-    if let Some(size) = preset {
-        return Some(size);
-    }
-    let (w, h) = trimmed.split_once(['x', 'X'])?;
-    let w = w.trim().parse::<u32>().ok()?;
-    let h = h.trim().parse::<u32>().ok()?;
-    ((640..=7680).contains(&w) && (360..=4320).contains(&h)).then_some((w, h))
-}
-
-fn parse_refresh_hz(raw: &str) -> Option<u32> {
-    let trimmed = raw.trim();
-    let digits = trimmed
-        .strip_suffix("hz")
-        .or_else(|| trimmed.strip_suffix("HZ"))
-        .or_else(|| trimmed.strip_suffix("Hz"))
-        .unwrap_or(trimmed)
-        .trim();
-    let hz = digits.parse::<u32>().ok()?;
-    matches!(hz, 60 | 120).then_some(hz)
-}
-
-fn fps_cap_allows_120hz(cap: Option<&str>) -> bool {
-    let Some(raw) = cap.map(str::trim).filter(|s| !s.is_empty()) else {
-        return false;
-    };
-    if raw.eq_ignore_ascii_case("unlimited") || raw == "0" {
-        return true;
-    }
-    raw.parse::<u32>().is_ok_and(|fps| fps > 60)
-}
-
-/// Resolves the console display mode from `VICTORY_DISPLAY_MODE` (e.g.
-/// `1920x1080`, `2560x1440`, `1600x900`, `1280x720`, `1080p`, or `WxH`,
-/// optionally suffixed with `@60` / `@120`), falling back cleanly to
-/// 1920x1080 on Series S (`--console series-s`) and Native 4K (3840x2160) on
-/// Series X.
-fn resolve_display_mode(
-    mode_var: Option<&str>,
-    fps_cap_var: Option<&str>,
-    console: crate::console::Console,
-) -> DisplayMode {
-    let default_size = match console {
-        // A Series S on a 1080p set (its common case) lists 1080p; the
-        // title sizes its targets from the mode and the device type.
-        crate::console::Console::SeriesS => (1920, 1080),
-        crate::console::Console::SeriesX => (3840, 2160),
-    };
-    let parsed = mode_var
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .and_then(|v| match v.split_once('@') {
-            Some((size_part, hz_part)) => Some((parse_display_size(size_part)?, Some(parse_refresh_hz(hz_part)?))),
-            None => Some((parse_display_size(v)?, None)),
-        });
-    let ((width, height), explicit_hz) = match parsed {
-        Some(res) => res,
-        None => (default_size, None),
-    };
-    let allow_120hz = match explicit_hz {
-        Some(120) => true,
-        Some(_) => false,
-        None => fps_cap_allows_120hz(fps_cap_var),
-    };
-    DisplayMode {
-        width,
-        height,
-        allow_120hz,
-    }
-}
-
-/// The display mode the console reports: `VICTORY_DISPLAY_MODE` if set (as a
-/// console reports the television it is plugged into: a Series X on a 1080p
-/// set lists a 1080p mode), else 1920x1080 for a Series S
-/// (`--console series-s`) and 3840x2160 (Native 4K) for a Series X.
+/// The size of the display the console reports: `VICTORY_DISPLAY_MODE=WxH`
+/// if set (as a console reports the television it is plugged into: a
+/// Series X on a 1080p set lists a 1080p mode), else 3840x2160.
 /// shortcut: not yet the host display's own size by default; make it so
 /// once a title is seen to render for the mode it is given.
-fn display_mode() -> DisplayMode {
-    static MODE: std::sync::OnceLock<DisplayMode> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| {
-        let mode_var = std::env::var("VICTORY_DISPLAY_MODE").ok();
-        let fps_cap_var = std::env::var("VICTORY_FPS_CAP").ok();
-        let mode = resolve_display_mode(
-            mode_var.as_deref(),
-            fps_cap_var.as_deref(),
-            crate::console::current(),
-        );
-        tracing::info!(
-            width = mode.width,
-            height = mode.height,
-            refresh_120hz = mode.allow_120hz,
-            "display mode reported to the title"
-        );
-        mode
+fn display_size() -> (u32, u32) {
+    static SIZE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        let asked = std::env::var("VICTORY_DISPLAY_MODE").ok().and_then(|v| {
+            let (w, h) = v.trim().split_once(['x', 'X'])?;
+            Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
+        });
+        let size = match asked {
+            Some((w, h)) if (640..=7680).contains(&w) && (360..=4320).contains(&h) => (w, h),
+            _ => (3840, 2160),
+        };
+        tracing::info!(width = size.0, height = size.1, "display mode reported to the title");
+        size
     })
 }
 
-fn modes_into(mode: DisplayMode, count: *mut u32, out: *mut Mode) -> HRESULT {
-    // SAFETY: the title passes its count (null is tolerated).
-    let Some(count) = (unsafe { count.as_mut() }) else {
-        return E_INVALIDARG;
-    };
-    let rates: &[u32] = if mode.allow_120hz { &[60, 120] } else { &[60] };
-    let available = rates.len() as u32;
-    if out.is_null() {
-        *count = available;
-        return S_OK;
-    }
-    let requested = *count;
-    let to_write = requested.min(available);
-    for (i, &hz) in rates.iter().take(to_write as usize).enumerate() {
-        let entry = Mode {
-            width: mode.width,
-            height: mode.height,
-            refresh: [hz, 1],
-            format: 0,
-            scanlines: 1, // progressive
-            scaling: 0,
-            flags: 0,
-        };
-        // SAFETY: `out` is non-null and the caller provided room for `requested >= to_write` modes.
-        unsafe { out.add(i).write(entry) };
-    }
-    *count = to_write;
-    if requested < available {
-        MORE_DATA
-    } else {
-        S_OK
-    }
-}
-
-/// The console's mode list: 60 Hz (and 120 Hz when requested via
-/// `VICTORY_DISPLAY_MODE=...@120` or `VICTORY_FPS_CAP` > 60 / `0`).
+/// The console's mode list: one 4K mode at 60 Hz (the title looks
+/// for a 120 Hz one to allow 120 Hz frame intervals).
 /// shortcut: fixed mode, not the host display's; report the host's rates if
 /// a title paces by them.
 extern "system" fn modes(
@@ -381,7 +259,31 @@ extern "system" fn modes(
     count: *mut u32,
     out: *mut Mode,
 ) -> HRESULT {
-    modes_into(display_mode(), count, out)
+    // SAFETY: the title passes its count (null is tolerated).
+    let Some(count) = (unsafe { count.as_mut() }) else {
+        return E_INVALIDARG;
+    };
+    if out.is_null() {
+        *count = 1;
+        return S_OK;
+    }
+    if *count < 1 {
+        return MORE_DATA;
+    }
+    *count = 1;
+    let (width, height) = display_size();
+    let mode = Mode {
+        width,
+        height,
+        refresh: [60, 1],
+        format: 0,
+        scanlines: 1, // progressive
+        scaling: 0,
+        flags: 0,
+    };
+    // SAFETY: checked non-null; room for `count` >= 1 modes.
+    unsafe { out.write(mode) };
+    S_OK
 }
 
 /// IUnknown 3, object 4, output 15 (12 as on PC, then 3 console ones).
@@ -446,146 +348,16 @@ mod tests {
     }
 
     #[test]
-    fn display_mode_parses_presets_wxh_and_console_defaults() {
-        use crate::console::Console::{SeriesS, SeriesX};
-
-        assert_eq!(
-            resolve_display_mode(None, None, SeriesX),
-            DisplayMode {
-                width: 3840,
-                height: 2160,
-                allow_120hz: false,
-            }
-        );
-        assert_eq!(
-            resolve_display_mode(None, None, SeriesS),
-            DisplayMode {
-                width: 1920,
-                height: 1080,
-                allow_120hz: false,
-            }
-        );
-        for (input, expected) in [
-            ("1920x1080", (1920, 1080)),
-            ("2560x1440", (2560, 1440)),
-            ("1600x900", (1600, 900)),
-            ("1280x720", (1280, 720)),
-            ("3840X2160", (3840, 2160)),
-            (" 1080p ", (1920, 1080)),
-            ("1440P", (2560, 1440)),
-            ("900p", (1600, 900)),
-            ("720p", (1280, 720)),
-            ("4k", (3840, 2160)),
-            ("native", (3840, 2160)),
+    fn out_of_range_enumeration_clears_output() {
+        for (object, offset, method) in [
+            (&FACTORY_OBJECT, 0x38, "EnumAdapters"),
+            (&FACTORY_OBJECT, 0x60, "EnumAdapters1"),
+            (&ADAPTER_OBJECT, 0x38, "EnumOutputs"),
         ] {
-            let resolved = resolve_display_mode(Some(input), None, SeriesX);
-            assert_eq!((resolved.width, resolved.height), expected, "input={input}");
-            assert!(!resolved.allow_120hz);
+            let enumerate = slot::<Indexed>(object, offset);
+            let mut out = object as This;
+            assert_eq!(enumerate(object, 1, &mut out), NOT_FOUND, "{method}");
+            assert!(out.is_null(), "{method} left a stale output pointer");
         }
-
-        // Invalid or out-of-range values fall back cleanly to Native 4K on Series X.
-        for bad in ["", "invalid", "320x240", "8000x4000", "1920x1080@999", "1920x"] {
-            assert_eq!(
-                resolve_display_mode(Some(bad), None, SeriesX),
-                DisplayMode {
-                    width: 3840,
-                    height: 2160,
-                    allow_120hz: false,
-                },
-                "bad={bad}"
-            );
-        }
-
-        // Refresh rate overrides via @Hz or VICTORY_FPS_CAP.
-        assert!(resolve_display_mode(Some("1920x1080@120"), None, SeriesX).allow_120hz);
-        assert!(resolve_display_mode(Some("1080p@120Hz"), None, SeriesX).allow_120hz);
-        assert!(!resolve_display_mode(Some("1920x1080@60"), Some("0"), SeriesX).allow_120hz);
-        assert!(resolve_display_mode(None, Some("0"), SeriesX).allow_120hz);
-        assert!(resolve_display_mode(None, Some("unlimited"), SeriesX).allow_120hz);
-        assert!(resolve_display_mode(None, Some("120"), SeriesX).allow_120hz);
-        assert!(!resolve_display_mode(None, Some("60"), SeriesX).allow_120hz);
-    }
-
-    #[test]
-    fn modes_enumeration_reports_60hz_and_optional_120hz() {
-        assert_eq!(
-            modes_into(
-                DisplayMode {
-                    width: 1920,
-                    height: 1080,
-                    allow_120hz: false,
-                },
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            ),
-            E_INVALIDARG
-        );
-
-        let mode_60 = DisplayMode {
-            width: 1920,
-            height: 1080,
-            allow_120hz: false,
-        };
-        let mut count = 0u32;
-        assert_eq!(modes_into(mode_60, &mut count, std::ptr::null_mut()), S_OK);
-        assert_eq!(count, 1);
-
-        let mut single = [Mode {
-            width: 0,
-            height: 0,
-            refresh: [0, 0],
-            format: 0,
-            scanlines: 0,
-            scaling: 0,
-            flags: 0,
-        }];
-        count = 0;
-        assert_eq!(modes_into(mode_60, &mut count, single.as_mut_ptr()), MORE_DATA);
-        assert_eq!(count, 0);
-
-        count = 1;
-        assert_eq!(modes_into(mode_60, &mut count, single.as_mut_ptr()), S_OK);
-        assert_eq!(count, 1);
-        assert_eq!((single[0].width, single[0].height, single[0].refresh), (1920, 1080, [60, 1]));
-
-        let mode_120 = DisplayMode {
-            width: 2560,
-            height: 1440,
-            allow_120hz: true,
-        };
-        assert_eq!(modes_into(mode_120, &mut count, std::ptr::null_mut()), S_OK);
-        assert_eq!(count, 2);
-
-        // Requesting fewer slots than available writes what fits and returns MORE_DATA.
-        count = 1;
-        assert_eq!(modes_into(mode_120, &mut count, single.as_mut_ptr()), MORE_DATA);
-        assert_eq!(count, 1);
-        assert_eq!((single[0].width, single[0].height, single[0].refresh), (2560, 1440, [60, 1]));
-
-        let mut both = [
-            Mode {
-                width: 0,
-                height: 0,
-                refresh: [0, 0],
-                format: 0,
-                scanlines: 0,
-                scaling: 0,
-                flags: 0,
-            },
-            Mode {
-                width: 0,
-                height: 0,
-                refresh: [0, 0],
-                format: 0,
-                scanlines: 0,
-                scaling: 0,
-                flags: 0,
-            },
-        ];
-        count = 2;
-        assert_eq!(modes_into(mode_120, &mut count, both.as_mut_ptr()), S_OK);
-        assert_eq!(count, 2);
-        assert_eq!((both[0].width, both[0].height, both[0].refresh), (2560, 1440, [60, 1]));
-        assert_eq!((both[1].width, both[1].height, both[1].refresh), (2560, 1440, [120, 1]));
     }
 }

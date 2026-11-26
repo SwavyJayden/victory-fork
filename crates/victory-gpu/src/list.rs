@@ -18,6 +18,9 @@ use crate::object::{
 use crate::queue::Written;
 use crate::resource::PAGEABLE_IIDS;
 
+#[cfg(windows)]
+pub(crate) mod thin;
+
 const ALLOCATOR_IIDS: [Iid; 4] = [
     guid(
         0x6102dee4,
@@ -114,7 +117,7 @@ struct List {
     /// Ours, after the console layout: memory handed out by
     /// [`allocate_upload`], kept until the list is reset; the host list the
     /// calls record into (decision 0007), and the draw state the title set.
-    uploads: std::sync::Mutex<Vec<Vec<u8>>>,
+    uploads: std::sync::Mutex<Vec<Upload>>,
     #[cfg(windows)]
     host: Option<crate::host::HostList>,
     #[cfg(windows)]
@@ -127,6 +130,10 @@ struct List {
     /// at them before it runs `host`.
     #[cfg(windows)]
     gate: Vec<ValueWait>,
+    /// With `VICTORY_THIN=1`, of a list the title has: what it wrote down
+    /// ([`thin`]; then there is no `host`).
+    #[cfg(windows)]
+    thin: thin::Front,
 }
 
 /// One part of a title list cut at its waits: the waits the queue stands
@@ -151,8 +158,6 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
     #[cfg(feature = "diagnostics")]
     crate::copystat::recorded(started);
-    #[cfg(feature = "diagnostics")]
-    crate::profile::seen(crate::profile::Seen::Record);
 }
 
 /// The submission of `lists` has run: each gives its descriptor tables'
@@ -189,7 +194,7 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
 #[cfg(windows)]
 pub(crate) struct Detached {
     host: crate::host::HostList,
-    _uploads: Vec<Vec<u8>>,
+    _uploads: Vec<Upload>,
     _state: crate::draw::State,
 }
 
@@ -197,6 +202,12 @@ pub(crate) struct Detached {
 impl Detached {
     pub(crate) fn host(&self) -> &crate::host::HostList {
         &self.host
+    }
+
+    /// Releases this list's dynamic descriptor slots once its GPU submission
+    /// has completed, without waiting for the full `bury_lag` allocator delay.
+    pub(crate) fn release_tables(&mut self) {
+        self._state.tables_done();
     }
 }
 
@@ -220,15 +231,13 @@ unsafe impl Send for Idle {}
 #[cfg(windows)]
 static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::new(), 0));
 
-/// The most host lists kept idle, and the most upload memory they may keep
+/// The most host lists kept idle (128 were too few: flights land several at
+/// a time, so lists were thrown away and others made in the same frame, with
+/// their preludes and buffers, 12 % of the submitting thread in the opening,
+/// profile cpu-1), and the most upload memory they may keep
 /// between them (a list keeps scratch chunks over a reset only while lists
 /// do not share them, `VICTORY_SCRATCH_POOL=0`).
 #[cfg(windows)]
-// (512 since run 221: with submissions prepared by a thread of ours the
-// title has its lists back at once and resets them while the flights of
-// the frame before are still in the air, so more than 128 are out at a
-// time: 80 host lists were made and as many thrown away every frame,
-// 8 ms to make and more to free, on the thread that submits.)
 const IDLE_MOST: (usize, u64) = (512, 256 << 20);
 
 /// Whether host lists that have run are used again (on by default;
@@ -325,10 +334,6 @@ fn cut(this: This, wait: ValueWait) {
         list.gate.push(wait);
         return;
     };
-    list.state
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .end_batch(current);
     current.close();
     static CUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if CUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
@@ -568,11 +573,29 @@ fn new_list(
         return E_INVALIDARG;
     }
     tracing::debug!(kind, "command list");
+    #[cfg(windows)]
+    if thin::on() {
+        let mut list = boxed(kind, pipeline, true);
+        list.thin.begin(kind, pipeline);
+        return object::hand_out(LIST, list, iid, &LIST_IIDS, out);
+    }
+    object::hand_out(LIST, boxed(kind, pipeline, false), iid, &LIST_IIDS, out)
+}
+
+/// A list; with `thin` one whose calls are written down (it has no host list).
+fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
+    #[cfg(not(windows))]
+    let _ = thin;
     let list = Box::new(List {
-        object: if crate::device::newer() {
-            Object::new(&NEWER_LIST_FUNCTIONS)
-        } else {
-            Object::new(&LIST_FUNCTIONS)
+        object: match (crate::device::newer(), thin) {
+            (true, false) => Object::new(&NEWER_LIST_FUNCTIONS),
+            (false, false) => Object::new(&LIST_FUNCTIONS),
+            #[cfg(windows)]
+            (true, true) => Object::new(&NEWER_THIN_FUNCTIONS),
+            #[cfg(windows)]
+            (false, true) => Object::new(&THIN_FUNCTIONS),
+            #[cfg(not(windows))]
+            _ => Object::new(&LIST_FUNCTIONS),
         },
         kind,
         put: [0; 5],
@@ -583,7 +606,7 @@ fn new_list(
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(windows)]
-        host: crate::host::host().and_then(|h| match h.new_list() {
+        host: crate::host::host().filter(|_| !thin).and_then(|h| match h.new_list() {
             Ok(list) => Some(list),
             Err(e) => {
                 tracing::warn!(error = %e, "no host command list");
@@ -600,10 +623,12 @@ fn new_list(
         earlier: Vec::new(),
         #[cfg(windows)]
         gate: Vec::new(),
+        #[cfg(windows)]
+        thin: Default::default(),
     });
     #[cfg(not(windows))]
     let _ = pipeline;
-    object::hand_out(LIST, list, iid, &LIST_IIDS, out)
+    list
 }
 
 extern "system" fn allocator_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
@@ -629,9 +654,9 @@ extern "system" fn list_type(this: This) -> u32 {
     unsafe { (*this.cast::<List>()).kind }
 }
 extern "system" fn close(this: This) -> HRESULT {
+    let _called = crate::timeline::span("the title's Close");
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
-        with_state(this, |list, s| s.end_batch(list));
         host.close();
     }
     S_OK
@@ -640,6 +665,7 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     if allocator.is_null() {
         return E_INVALIDARG;
     }
+    let _called = crate::timeline::span("the title's list Reset");
     // A wait recorded and never submitted goes with the recording.
     VALUE_WAITS
         .lock()
@@ -664,8 +690,9 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         host.reset();
         state.reset(pipeline);
     });
+    crate::pipeline::bound(pipeline);
     #[cfg(not(windows))]
-    let _ = (this, pipeline);
+    let _ = this;
     S_OK
 }
 
@@ -748,24 +775,15 @@ const UAV_BARRIER: Barrier = Barrier {
     last: 0,
 };
 
-/// Notifies [`crate::draw::State::title_barrier`] when the title orders its
-/// work via a barrier, barrier group, or pipeline sync.
-#[cfg(windows)]
-fn title_ordered(this: This, waits: bool) {
-    let rules = crate::indirect::run_rules();
-    if rules.title_barriers || (rules.order && waits) {
-        with_state(this, |list, s| s.title_barrier(list, waits));
-    }
-}
-
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
-    #[cfg(windows)]
-    title_ordered(this, false);
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && !barriers.is_null()
     {
+        if count > 0 {
+            with_state(this, |_, state| state.synced());
+        }
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
         let mut host: Vec<Barrier> = barriers
@@ -829,6 +847,20 @@ fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
     Some(unsafe { data.add(offset as usize) })
 }
 
+/// A copy of title memory that `list` records: on the card at its place in
+/// the list ([`crate::host::HostList::place_copy`]), or at submission.
+#[cfg(windows)]
+fn buffer_copy(this: This, list: &crate::host::HostList, to: *mut u8, from: *const u8, len: usize) {
+    if len == 0 {
+        return;
+    }
+    if list.place_copy(to as usize, from as usize, len) {
+        with_state(this, |_, state| state.copied());
+    } else {
+        list.defer_copy(to, from, len);
+    }
+}
+
 /// Buffer to buffer: both are host memory, copied at submission.
 extern "system" fn copy_buffer_region(
     this: This,
@@ -843,7 +875,7 @@ extern "system" fn copy_buffer_region(
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
-        list.defer_copy(to, from, len as usize);
+        buffer_copy(this, list, to, from, len as usize);
     }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_offset, src, src_offset, len);
@@ -893,12 +925,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             // is noted of the textures stays as it was. After
             // triippywhale 6e502b3b.
             let same = windows::core::Interface::as_raw(to) == windows::core::Interface::as_raw(from);
-            // A source aliased over a GPU-written texture gets those texels;
-            // otherwise a source the title fills itself is uploaded first
-            // (upstream PR #671): a copy read whatever the host texture held.
-            let aliased = crate::resource::alias_of(src)
-                .is_some_and(|gpu_src| crate::texture::alias(list, src, gpu_src));
-            if !aliased && crate::texture::title_written(from) {
+            // A source the title fills itself is uploaded first (upstream
+            // PR #671): a copy read whatever the host texture held.
+            if crate::texture::title_written(from) {
                 crate::texture::upload(list, src, from);
             }
             // Depth textures shaders also write: what they wrote, first.
@@ -924,31 +953,13 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             ensure_state(list, src, COPY_SOURCE);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
-            // SAFETY: live textures.
-            let (dst_desc, src_desc) = unsafe { (to.GetDesc(), from.GetDesc()) };
-            let bridged = needs_cross_format_bridge(&dst_desc, &src_desc);
-            if crate::resource::ped_tex_diag()
-                && (crate::resource::is_bc_format(dst_desc.Format.0 as u32)
-                    || crate::resource::is_bc_format(src_desc.Format.0 as u32))
-            {
-                log_ped_copy_resource(
-                    &dst_desc,
-                    crate::resource::host_tiled(dst).is_some(),
-                    &src_desc,
-                    bridged,
-                );
-            }
-            if bridged {
-                bridge_copy_resource(list, to, &dst_desc, from, &src_desc);
-            } else {
-                // SAFETY: an open list and live textures of compatible format family.
-                unsafe { list.list.CopyResource(to, from) };
-            }
+            // SAFETY: an open list and live textures.
+            unsafe { list.list.CopyResource(to, from) };
         } else if let (Some((to, a)), Some((from, b))) = (
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
         ) {
-            list.defer_copy(to, from, a.min(b) as usize);
+            buffer_copy(this, list, to, from, a.min(b) as usize);
         }
     }
     #[cfg(not(windows))]
@@ -967,655 +978,6 @@ pub(crate) struct CopyLocation {
     resource: This,
     kind: u32,
     footprint: crate::resource::PlacedFootprint,
-}
-
-/// What unwritten texels of a title-filled texture hold on the first GPU
-/// `CopyTextureRegion` into it (`VICTORY_COPY_OVER_TITLE`).
-#[cfg(any(windows, test))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CopyOverTitle {
-    /// Leave pool block bytes untouched (`VICTORY_COPY_OVER_TITLE=0`).
-    Off,
-    /// Upload current title memory first (`VICTORY_COPY_OVER_TITLE=title`).
-    Title,
-    /// Zero every subresource first (default: prevents stale pool bytes from
-    /// bleeding into unwritten regions of partially baked atlases).
-    Zeros,
-}
-
-#[cfg(any(windows, test))]
-fn copy_over_title_from(raw: Option<&str>) -> CopyOverTitle {
-    match raw.map(str::trim) {
-        Some("0") => CopyOverTitle::Off,
-        Some("title") => CopyOverTitle::Title,
-        _ => CopyOverTitle::Zeros,
-    }
-}
-
-#[cfg(windows)]
-fn copy_over_title() -> CopyOverTitle {
-    static MODE: std::sync::OnceLock<CopyOverTitle> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| {
-        copy_over_title_from(std::env::var("VICTORY_COPY_OVER_TITLE").ok().as_deref())
-    })
-}
-
-/// Records copies of zeros into every subresource of `texture` (or, if
-/// `level_mask` is `Some(mask)`, only mip levels whose bit is set in `mask`),
-/// which must already be in `COPY_DEST`. Returns `true` if at least one copy
-/// was recorded.
-#[cfg(windows)]
-fn zero_texture_levels(
-    list: &crate::host::HostList,
-    host: &crate::host::Host,
-    texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
-    level_mask: Option<u32>,
-) -> bool {
-    use windows::Win32::Graphics::Direct3D12::*;
-    // SAFETY: a live resource.
-    let d = unsafe { texture.GetDesc() };
-    if d.SampleDesc.Count > 1 {
-        return false;
-    }
-    let mips = u32::from(d.MipLevels);
-    let layers = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
-        1
-    } else {
-        u32::from(d.DepthOrArraySize)
-    };
-    let count = mips * layers;
-    if count == 0 {
-        return false;
-    }
-    if let Some(mask) = level_mask {
-        let mut wrote = false;
-        for level in (0..mips.min(32)).filter(|&l| mask & (1u32 << l) != 0) {
-            for layer in 0..layers {
-                let sub = layer * mips + level;
-                let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
-                let mut bytes = 0u64;
-                // SAFETY: outputs for one subresource.
-                unsafe {
-                    host.device.GetCopyableFootprints(
-                        &d,
-                        sub,
-                        1,
-                        0,
-                        Some(&mut footprint),
-                        None,
-                        None,
-                        Some(&mut bytes),
-                    );
-                }
-                if bytes == 0 || bytes == u64::MAX {
-                    continue;
-                }
-                let Some((buffer, data)) = list.upload(host, bytes) else {
-                    continue;
-                };
-                // SAFETY: a mapped buffer of `bytes` bytes, just made.
-                unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
-                let to = D3D12_TEXTURE_COPY_LOCATION {
-                    // SAFETY: a borrowed pointer the location never releases.
-                    pResource: unsafe { std::mem::transmute_copy(texture) },
-                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                        SubresourceIndex: sub,
-                    },
-                };
-                let from = D3D12_TEXTURE_COPY_LOCATION {
-                    // SAFETY: as above; the list holds the buffer until it is reset.
-                    pResource: unsafe { std::mem::transmute_copy(&buffer) },
-                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                        PlacedFootprint: footprint,
-                    },
-                };
-                // SAFETY: an open list; both locations name live resources.
-                unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
-                wrote = true;
-            }
-        }
-        return wrote;
-    }
-    let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
-    let mut bytes = 0u64;
-    // SAFETY: outputs for `count` subresources.
-    unsafe {
-        host.device.GetCopyableFootprints(
-            &d,
-            0,
-            count,
-            0,
-            Some(footprints.as_mut_ptr()),
-            None,
-            None,
-            Some(&mut bytes),
-        );
-    }
-    if bytes == 0 || bytes == u64::MAX {
-        return false;
-    }
-    let Some((buffer, data)) = list.upload(host, bytes) else {
-        return false;
-    };
-    // SAFETY: a mapped buffer of `bytes` bytes, just made.
-    unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
-    for (i, footprint) in footprints.iter().enumerate() {
-        let to = D3D12_TEXTURE_COPY_LOCATION {
-            // SAFETY: a borrowed pointer the location never releases.
-            pResource: unsafe { std::mem::transmute_copy(texture) },
-            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                SubresourceIndex: i as u32,
-            },
-        };
-        let from = D3D12_TEXTURE_COPY_LOCATION {
-            // SAFETY: as above; the list holds the buffer until it is reset.
-            pResource: unsafe { std::mem::transmute_copy(&buffer) },
-            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                PlacedFootprint: *footprint,
-            },
-        };
-        // SAFETY: an open list; both locations name live resources.
-        unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
-    }
-    true
-}
-
-/// Records copies of zeros into every subresource of `texture`, which must
-/// already be in `COPY_DEST`.
-#[cfg(windows)]
-fn zero_texture_subresources(
-    list: &crate::host::HostList,
-    host: &crate::host::Host,
-    texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
-) {
-    zero_texture_levels(list, host, texture, None);
-}
-
-/// Whether two host textures belong to different DXGI typeless format families
-/// but share the same bytes-per-element (or block) so a cross-format GPU copy
-/// must go through an intermediate device-local buffer (e.g., `(W/4 x H/4)`
-/// `R32G32B32A32_UINT` -> `(W x H)` `BC3`/`BC5`/`BC7`, `R32G32_UINT` ->
-/// `BC1`/`BC4`, `BC3` -> `BC7`, or `R32_UINT` -> `R9G9B9E5`).
-#[cfg(windows)]
-fn needs_cross_format_bridge(
-    dst: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC,
-    src: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC,
-) -> bool {
-    let (dst_fmt, src_fmt) = (dst.Format.0 as u32, src.Format.0 as u32);
-    if crate::resource::family(dst_fmt) == crate::resource::family(src_fmt) {
-        return false;
-    }
-    if dst.SampleDesc.Count > 1
-        || src.SampleDesc.Count > 1
-        || crate::resource::is_depth_stencil_format(dst_fmt)
-        || crate::resource::is_depth_stencil_format(src_fmt)
-    {
-        return false;
-    }
-    match (
-        crate::resource::element(dst_fmt),
-        crate::resource::element(src_fmt),
-    ) {
-        (Some((db, dk)), Some((sb, sk))) => db == sb && matches!(dk, 1 | 4) && matches!(sk, 1 | 4),
-        _ => false,
-    }
-}
-
-/// Computes source and destination buffer footprints for a cross-format
-/// texture-to-texture region copy through a transient GPU buffer.
-/// Returns `(buf_bytes, src_buf_fp, dst_buf_fp, clamped_src_box)` where
-/// `clamped_src_box` is the source `D3D12_BOX` to read (or `None` when copying
-/// the entire source subresource).
-#[cfg(any(windows, test))]
-#[allow(clippy::too_many_arguments)]
-fn cross_format_footprints(
-    dst_fmt: u32,
-    dst_mip_w: u32,
-    dst_mip_h: u32,
-    dst_mip_d: u32,
-    dst_xyz: [u32; 3],
-    src_fmt: u32,
-    src_mip_w: u32,
-    src_mip_h: u32,
-    src_mip_d: u32,
-    src_box: Option<[u32; 6]>,
-) -> Option<(u64, crate::resource::PlacedFootprint, crate::resource::PlacedFootprint, Option<[u32; 6]>)> {
-    let (dst_bpe, dst_blk) = crate::resource::element(dst_fmt)?;
-    let (src_bpe, src_blk) = crate::resource::element(src_fmt)?;
-    if dst_bpe != src_bpe || !matches!(dst_blk, 1 | 4) || !matches!(src_blk, 1 | 4) {
-        return None;
-    }
-    let (dst_blk_u32, src_blk_u32) = (dst_blk as u32, src_blk as u32);
-    let (copy_w, copy_h, copy_d, use_box) = match src_box {
-        Some(b) => {
-            if b[3] <= b[0] || b[4] <= b[1] || b[5] <= b[2] {
-                return None;
-            }
-            (b[3] - b[0], b[4] - b[1], b[5] - b[2], Some(b))
-        }
-        None => {
-            // Clamp if an oversized scratch UAV is copied without a source box
-            // into a smaller mip subresource.
-            let dst_avail_blocks_w = dst_mip_w
-                .div_ceil(dst_blk_u32)
-                .saturating_sub(dst_xyz[0] / dst_blk_u32);
-            let dst_avail_blocks_h = dst_mip_h
-                .div_ceil(dst_blk_u32)
-                .saturating_sub(dst_xyz[1] / dst_blk_u32);
-            let dst_avail_d = dst_mip_d.saturating_sub(dst_xyz[2]);
-            let src_blocks_w = src_mip_w.div_ceil(src_blk_u32);
-            let src_blocks_h = src_mip_h.div_ceil(src_blk_u32);
-            if dst_avail_blocks_w == 0 || dst_avail_blocks_h == 0 || dst_avail_d == 0 {
-                return None;
-            }
-            if src_blocks_w > dst_avail_blocks_w
-                || src_blocks_h > dst_avail_blocks_h
-                || src_mip_d > dst_avail_d
-            {
-                let cw = (dst_avail_blocks_w * src_blk_u32).min(src_mip_w);
-                let ch = (dst_avail_blocks_h * src_blk_u32).min(src_mip_h);
-                let cd = dst_avail_d.min(src_mip_d);
-                (cw, ch, cd, Some([0, 0, 0, cw, ch, cd]))
-            } else {
-                (src_mip_w, src_mip_h, src_mip_d, None)
-            }
-        }
-    };
-    let blocks_w = u64::from(copy_w.div_ceil(src_blk_u32));
-    let blocks_h = u64::from(copy_h.div_ceil(src_blk_u32));
-    let depth = u64::from(copy_d);
-    let row_bytes = blocks_w.checked_mul(src_bpe)?;
-    let row_pitch = row_bytes.max(1).next_multiple_of(256);
-    let lines = blocks_h.checked_mul(depth)?;
-    let buf_bytes = row_pitch
-        .checked_mul(lines.saturating_sub(1))?
-        .checked_add(row_bytes)?;
-    let row_pitch_u32 = u32::try_from(row_pitch).ok()?;
-    let src_fp = crate::resource::PlacedFootprint {
-        offset: 0,
-        format: src_fmt,
-        width: u32::try_from(blocks_w.checked_mul(src_blk)?).ok()?,
-        height: u32::try_from(blocks_h.checked_mul(src_blk)?).ok()?,
-        depth: copy_d,
-        row_pitch: row_pitch_u32,
-    };
-    let dst_fp = crate::resource::PlacedFootprint {
-        offset: 0,
-        format: dst_fmt,
-        width: u32::try_from(blocks_w.checked_mul(dst_blk)?).ok()?,
-        height: u32::try_from(blocks_h.checked_mul(dst_blk)?).ok()?,
-        depth: copy_d,
-        row_pitch: row_pitch_u32,
-    };
-    Some((buf_bytes, src_fp, dst_fp, use_box))
-}
-
-#[cfg(windows)]
-fn subresource_dims(
-    desc: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC,
-    sub: u32,
-) -> (u32, u32, u32) {
-    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DIMENSION_TEXTURE3D;
-    let mips = u32::from(desc.MipLevels).max(1);
-    let mip = sub % mips;
-    let w = (desc.Width >> mip).max(1) as u32;
-    let h = (desc.Height >> mip).max(1);
-    let d = if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
-        (u32::from(desc.DepthOrArraySize) >> mip).max(1)
-    } else {
-        1
-    };
-    (w, h, d)
-}
-
-/// Bridges a cross-format texture-to-texture `CopyTextureRegion` through a
-/// transient device-local buffer (both textures must already be in
-/// `COPY_DEST` / `COPY_SOURCE`). Returns `true` if recorded.
-#[cfg(windows)]
-#[allow(clippy::too_many_arguments)]
-fn bridge_copy_texture_region(
-    list: &crate::host::HostList,
-    to: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
-    dst_desc: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC,
-    dst_sub: u32,
-    x: u32,
-    y: u32,
-    z: u32,
-    from: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
-    src_desc: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC,
-    src_sub: u32,
-    src_box: Option<[u32; 6]>,
-) -> bool {
-    use windows::Win32::Graphics::Direct3D12::*;
-    let Some(host) = crate::host::host() else {
-        return false;
-    };
-    let (dw, dh, dd) = subresource_dims(dst_desc, dst_sub);
-    let (sw, sh, sd) = subresource_dims(src_desc, src_sub);
-    let Some((buf_bytes, src_fp, dst_fp, use_box)) = cross_format_footprints(
-        dst_desc.Format.0 as u32,
-        dw,
-        dh,
-        dd,
-        [x, y, z],
-        src_desc.Format.0 as u32,
-        sw,
-        sh,
-        sd,
-        src_box,
-    ) else {
-        return false;
-    };
-    let Some(buffer) = host.uav_buffer(buf_bytes.next_multiple_of(256)) else {
-        return false;
-    };
-    let common = D3D12_RESOURCE_STATE_COMMON;
-    let copy_dst = D3D12_RESOURCE_STATE_COPY_DEST;
-    let copy_src = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    let to_sub_loc = |tex: &ID3D12Resource, sub: u32| D3D12_TEXTURE_COPY_LOCATION {
-        // SAFETY: borrowed pointer never released by the location.
-        pResource: unsafe { std::mem::transmute_copy(tex) },
-        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-            SubresourceIndex: sub,
-        },
-    };
-    let to_buf_loc = |fp: crate::resource::PlacedFootprint| D3D12_TEXTURE_COPY_LOCATION {
-        // SAFETY: borrowed pointer kept alive by `list.keep(&buffer)`.
-        pResource: unsafe { std::mem::transmute_copy(&buffer) },
-        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-            // SAFETY: `PlacedFootprint` matches `D3D12_PLACED_SUBRESOURCE_FOOTPRINT` layout (asserted in `resource.rs`).
-            PlacedFootprint: unsafe { std::mem::transmute::<crate::resource::PlacedFootprint, D3D12_PLACED_SUBRESOURCE_FOOTPRINT>(fp) },
-        },
-    };
-    let d3d_box = use_box.map(|b| D3D12_BOX {
-        left: b[0],
-        top: b[1],
-        front: b[2],
-        right: b[3],
-        bottom: b[4],
-        back: b[5],
-    });
-    // SAFETY: an open list and live resources; buffer is sized for the footprints.
-    unsafe {
-        list.list
-            .ResourceBarrier(&[crate::host::transition(&buffer, common, copy_dst)]);
-        list.list.CopyTextureRegion(
-            &to_buf_loc(src_fp),
-            0,
-            0,
-            0,
-            &to_sub_loc(from, src_sub),
-            d3d_box.as_ref().map(std::ptr::from_ref),
-        );
-        list.list
-            .ResourceBarrier(&[crate::host::transition(&buffer, copy_dst, copy_src)]);
-        list.list.CopyTextureRegion(
-            &to_sub_loc(to, dst_sub),
-            x,
-            y,
-            z,
-            &to_buf_loc(dst_fp),
-            None,
-        );
-        list.list
-            .ResourceBarrier(&[crate::host::transition(&buffer, copy_src, common)]);
-    }
-    list.keep(&buffer);
-    true
-}
-
-/// Bridges a cross-format `CopyResource` between two textures (including
-/// `(W/4 x H/4)` uncompressed UAV -> `(W x H)` BC) per subresource through a
-/// single transient device-local buffer.
-#[cfg(windows)]
-fn bridge_copy_resource(
-    list: &crate::host::HostList,
-    to: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
-    dst_desc: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC,
-    from: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
-    src_desc: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC,
-) {
-    use windows::Win32::Graphics::Direct3D12::*;
-    let layers = |d: &D3D12_RESOURCE_DESC| {
-        if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
-            1
-        } else {
-            u32::from(d.DepthOrArraySize)
-        }
-    };
-    let (dst_mips, src_mips) = (u32::from(dst_desc.MipLevels), u32::from(src_desc.MipLevels));
-    let mips = dst_mips.min(src_mips);
-    let slice_count = layers(dst_desc).min(layers(src_desc));
-    for slice in 0..slice_count {
-        for mip in 0..mips {
-            let dst_sub = slice * dst_mips + mip;
-            let src_sub = slice * src_mips + mip;
-            bridge_copy_texture_region(
-                list, to, dst_desc, dst_sub, 0, 0, 0, from, src_desc, src_sub, None,
-            );
-        }
-    }
-}
-
-/// Translates a buffer-to-texture `PlacedFootprint` to satisfy PC D3D12 rules
-/// (256-byte row pitch, BC 4x4 block-aligned dimensions, and format
-/// compatibility with `dst_fmt`, including `(W/4 x H/4)` uncompressed block
-/// buffers copied into `(W x H)` BC textures).
-/// Returns `(host_footprint, adjusted_box, needs_repitch, [host_bytes, row_bytes, lines, src_pitch])`.
-#[cfg(any(windows, test))]
-fn prepare_upload_footprint(
-    src: crate::resource::PlacedFootprint,
-    dst_fmt: u32,
-    src_box: Option<[u32; 6]>,
-) -> Option<(
-    crate::resource::PlacedFootprint,
-    Option<[u32; 6]>,
-    bool,
-    [u64; 4],
-)> {
-    let (src_bpe, src_blk) = crate::resource::element(src.format)?;
-    let (mut host_fp, [_, row, lines, src_pitch]) = src.host_rows()?;
-    let needs_repitch = src.row_pitch == 0
-        || !u64::from(src.row_pitch).is_multiple_of(256)
-        || u64::from(src.row_pitch) < row;
-    let host_pitch = if needs_repitch {
-        u64::from(host_fp.row_pitch)
-    } else {
-        u64::from(src.row_pitch)
-    };
-    host_fp.row_pitch = u32::try_from(host_pitch).ok()?;
-    let host_bytes = host_pitch
-        .checked_mul(lines.saturating_sub(1))?
-        .checked_add(row)?;
-    let mut adj_box = src_box;
-    // Align/translate footprint format to match the destination texture family
-    // when both share the same element/block byte width.
-    if crate::resource::family(src.format) != crate::resource::family(dst_fmt)
-        && !crate::resource::is_depth_stencil_format(dst_fmt)
-        && let Some((dst_bpe, dst_blk)) = crate::resource::element(dst_fmt)
-        && dst_bpe == src_bpe
-    {
-        match (src_blk, dst_blk) {
-            (1, 4) => {
-                host_fp.format = dst_fmt;
-                host_fp.width = host_fp.width.checked_mul(4)?;
-                host_fp.height = host_fp.height.checked_mul(4)?;
-                if let Some(b) = adj_box.as_mut() {
-                    b[0] = b[0].checked_mul(4)?;
-                    b[1] = b[1].checked_mul(4)?;
-                    b[3] = b[3].checked_mul(4)?;
-                    b[4] = b[4].checked_mul(4)?;
-                }
-            }
-            (4, 1) => {
-                host_fp.format = dst_fmt;
-                host_fp.width = host_fp.width.div_ceil(4);
-                host_fp.height = host_fp.height.div_ceil(4);
-                if let Some(b) = adj_box.as_mut() {
-                    b[0] /= 4;
-                    b[1] /= 4;
-                    b[3] = b[3].div_ceil(4);
-                    b[4] = b[4].div_ceil(4);
-                }
-            }
-            (1, 1) | (4, 4) => {
-                host_fp.format = dst_fmt;
-            }
-            _ => {}
-        }
-    }
-    Some((host_fp, adj_box, needs_repitch, [host_bytes, row, lines, src_pitch]))
-}
-
-#[cfg(windows)]
-#[allow(clippy::too_many_arguments)]
-fn log_ped_copy_texture_region(
-    dst_desc: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC,
-    dst_sub: u32,
-    dst_tiled: bool,
-    dst_staged: bool,
-    dst_host_wrote: bool,
-    src_kind: u32,
-    src_sub: u32,
-    src_mips: u16,
-    src_w: u32,
-    src_h: u32,
-    src_fmt: u32,
-    src_pitch: u32,
-    x: u32,
-    y: u32,
-    src_box: Option<[u32; 6]>,
-    bridged: bool,
-    bridge_ok: bool,
-) {
-    static SEEN: std::sync::Mutex<std::collections::BTreeSet<[u64; 15]>> =
-        std::sync::Mutex::new(std::collections::BTreeSet::new());
-    let b = src_box.unwrap_or([u32::MAX; 6]);
-    let key = [
-        dst_desc.Width,
-        u64::from(dst_desc.Height),
-        u64::from(dst_desc.Format.0 as u32),
-        (u64::from(dst_desc.MipLevels) << 16) | u64::from(dst_desc.DepthOrArraySize),
-        u64::from(dst_sub),
-        u64::from(dst_tiled)
-            | (u64::from(dst_staged) << 1)
-            | (u64::from(dst_host_wrote) << 2)
-            | (u64::from(bridged) << 3)
-            | (u64::from(bridge_ok) << 4),
-        u64::from(src_kind),
-        (u64::from(src_sub) << 16) | u64::from(src_mips),
-        u64::from(src_w),
-        u64::from(src_h),
-        u64::from(src_fmt),
-        u64::from(src_pitch),
-        (u64::from(x) << 32) | u64::from(y),
-        (u64::from(b[0]) << 32) | u64::from(b[1]),
-        (u64::from(b[3]) << 32) | u64::from(b[4]),
-    ];
-    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    let cap = crate::resource::ped_tex_diag_cap();
-    if seen.len() < cap && seen.insert(key) {
-        if bridged && !bridge_ok {
-            tracing::warn!(
-                frame = crate::frame::current(),
-                dst_w = dst_desc.Width,
-                dst_h = dst_desc.Height,
-                dst_fmt = dst_desc.Format.0,
-                dst_mips = dst_desc.MipLevels,
-                dst_layers = dst_desc.DepthOrArraySize,
-                dst_sub,
-                dst_tiled,
-                dst_staged,
-                dst_host_wrote,
-                src_kind,
-                src_sub,
-                src_mips,
-                src_w,
-                src_h,
-                src_fmt,
-                src_pitch,
-                x,
-                y,
-                src_box = ?src_box,
-                bridged,
-                bridge_ok,
-                "VICTORY_PED_TEX_DIAG CopyTextureRegion BC bridge failed"
-            );
-        } else {
-            tracing::info!(
-                frame = crate::frame::current(),
-                dst_w = dst_desc.Width,
-                dst_h = dst_desc.Height,
-                dst_fmt = dst_desc.Format.0,
-                dst_mips = dst_desc.MipLevels,
-                dst_layers = dst_desc.DepthOrArraySize,
-                dst_sub,
-                dst_tiled,
-                dst_staged,
-                dst_host_wrote,
-                src_kind,
-                src_sub,
-                src_mips,
-                src_w,
-                src_h,
-                src_fmt,
-                src_pitch,
-                x,
-                y,
-                src_box = ?src_box,
-                bridged,
-                bridge_ok,
-                "VICTORY_PED_TEX_DIAG CopyTextureRegion BC"
-            );
-        }
-    }
-}
-
-#[cfg(windows)]
-fn log_ped_copy_resource(
-    dst_desc: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC,
-    dst_tiled: bool,
-    src_desc: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC,
-    bridged: bool,
-) {
-    static SEEN: std::sync::Mutex<std::collections::BTreeSet<[u64; 9]>> =
-        std::sync::Mutex::new(std::collections::BTreeSet::new());
-    let key = [
-        dst_desc.Width,
-        u64::from(dst_desc.Height),
-        u64::from(dst_desc.Format.0 as u32),
-        (u64::from(dst_desc.MipLevels) << 16) | u64::from(dst_desc.DepthOrArraySize),
-        src_desc.Width,
-        u64::from(src_desc.Height),
-        u64::from(src_desc.Format.0 as u32),
-        (u64::from(src_desc.MipLevels) << 16) | u64::from(src_desc.DepthOrArraySize),
-        u64::from(dst_tiled) | (u64::from(bridged) << 1),
-    ];
-    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if seen.len() < crate::resource::ped_tex_diag_cap() && seen.insert(key) {
-        tracing::info!(
-            frame = crate::frame::current(),
-            dst_w = dst_desc.Width,
-            dst_h = dst_desc.Height,
-            dst_fmt = dst_desc.Format.0,
-            dst_mips = dst_desc.MipLevels,
-            dst_layers = dst_desc.DepthOrArraySize,
-            dst_tiled,
-            src_w = src_desc.Width,
-            src_h = src_desc.Height,
-            src_fmt = src_desc.Format.0,
-            src_mips = src_desc.MipLevels,
-            src_layers = src_desc.DepthOrArraySize,
-            bridged,
-            "VICTORY_PED_TEX_DIAG CopyResource BC"
-        );
-    }
 }
 
 /// Texture to texture on the GPU; buffer to texture through an upload
@@ -1680,67 +1042,39 @@ extern "system" fn copy_texture_region(
         if unlike(dst.resource, src.resource) {
             return;
         }
-        // SAFETY: a live texture and optional title box.
-        let dst_desc = unsafe { to.GetDesc() };
-        let dst_fmt = dst_desc.Format.0 as u32;
-        let raw_box = (!source_box.is_null()).then(|| unsafe { *source_box });
-        let mut adjusted_box = raw_box;
         let mut from = src;
         // Both sides are the same subresource of one host texture (set below).
         let mut same = false;
-        let mut src_texture: Option<&windows::Win32::Graphics::Direct3D12::ID3D12Resource> = None;
-        let mut src_tex_desc: Option<windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC> =
-            None;
-        let mut bridged = false;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
         let mut read = None;
         if src.kind == FOOTPRINT {
-            let (Some(host), Some(src_bytes)) = (crate::host::host(), src.footprint.bytes()) else {
+            let (Some(host), Some(bytes)) = (crate::host::host(), src.footprint.bytes()) else {
                 return;
             };
-            let Some((host_fp, adj_box, needs_repitch, [host_bytes, row, lines, src_pitch])) =
-                prepare_upload_footprint(src.footprint, dst_fmt, raw_box)
-            else {
+            let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
                 return;
             };
-            let Some(data) = buffer_range(src.resource, src.footprint.offset, src_bytes) else {
-                return;
-            };
-            let Some((buffer, staging)) = list.upload(host, host_bytes) else {
-                return;
-            };
-            if needs_repitch {
-                // Non-256B console RowPitch: zero padding once and copy every
-                // row into its 256-byte-aligned destination row at submission.
-                // SAFETY: `staging` is a freshly mapped upload buffer of `host_bytes` bytes.
-                unsafe { std::ptr::write_bytes(staging, 0, host_bytes as usize) };
-                let host_pitch = u64::from(host_fp.row_pitch);
-                for r in 0..lines {
-                    // SAFETY: both offsets stay within `host_bytes` and `src_bytes` (validated above).
-                    let dst_row = unsafe { staging.add((r * host_pitch) as usize) };
-                    let src_row = unsafe { data.add((r * src_pitch) as usize) };
-                    list.defer_fill(dst_row, src_row, row as usize);
+            let buffer = match list.place_source(data as usize, bytes as usize) {
+                // What shaders wrote to it, at this place of the list.
+                Some(buffer) => buffer,
+                None => {
+                    let Some((buffer, staging)) = list.upload(host, bytes) else {
+                        return;
+                    };
+                    // The list owns this mapped D3D12 upload buffer. Wine can
+                    // report its address as MEM_FREE, so use the host-upload
+                    // path.
+                    list.defer_fill_buffer(&buffer, staging, data, bytes as usize);
+                    buffer
                 }
-                bridged = true;
-            } else {
-                // The list owns this mapped D3D12 upload buffer. Wine can report
-                // its address as MEM_FREE, so use the host-upload path.
-                list.defer_fill(staging, data, src_bytes.min(host_bytes) as usize);
-                if host_fp.format != src.footprint.format
-                    || host_fp.width != src.footprint.width
-                    || host_fp.height != src.footprint.height
-                {
-                    bridged = true;
-                }
-            }
+            };
             from.resource = buffer.as_raw().cast_const().cast();
-            from.footprint = host_fp;
-            adjusted_box = adj_box;
+            from.footprint.offset = 0;
             #[cfg(feature = "diagnostics")]
             {
                 // SAFETY: a live buffer.
-                read = Some((unsafe { buffer.GetGPUVirtualAddress() }, host_bytes));
+                read = Some((unsafe { buffer.GetGPUVirtualAddress() }, bytes));
             }
             _upload = buffer;
         } else {
@@ -1756,71 +1090,47 @@ extern "system" fn copy_texture_region(
                 && dst.kind != FOOTPRINT
                 && src.footprint.offset as u32 == dst.footprint.offset as u32;
             list.twin_use(src.resource, false, false);
-            let aliased = crate::resource::alias_of(src.resource)
-                .is_some_and(|gpu_src| crate::texture::alias(list, src.resource, gpu_src));
-            if !aliased && crate::texture::title_written(texture) {
+            if crate::texture::title_written(texture) {
                 crate::texture::upload(list, src.resource, texture);
             }
             if !same {
                 ensure_state(list, src.resource, COPY_SOURCE);
             }
-            // SAFETY: a live texture.
-            let sdesc = unsafe { texture.GetDesc() };
-            bridged = !same && needs_cross_format_bridge(&dst_desc, &sdesc);
-            src_texture = Some(texture);
-            src_tex_desc = Some(sdesc);
             from.resource = texture.as_raw().cast_const().cast();
         }
-        let dst_sub = dst.footprint.offset as u32;
-        let dst_tiled = crate::resource::host_tiled(dst.resource);
-        let dst_staged = crate::texture::is_staged(dst.resource);
-        let dst_host_wrote = crate::texture::host_wrote(dst.resource as usize);
         // A depth texture shaders also write: what they wrote, first (the
         // source above too).
         list.twin_use(dst.resource, false, true);
         // The first copy into a texture of the title's: what it does not
         // write is zeros, as in a texture that was an allocation of its own
-        // (`VICTORY_COPY_OVER_TITLE=title`: what title memory holds; `=0`:
-        // whatever the pool block held). A host copy cut from a pool block
-        // otherwise holds stale bytes from earlier textures, and no upload
-        // runs once a copy wrote it — partially baked atlases (e.g., 2048x2048
-        // BC3 character decoration bakes written in 256x256 regions) would
-        // composite stale bytes over unwritten areas.
-        let over = copy_over_title();
-        if over != CopyOverTitle::Off && crate::texture::title_written(to) && !dst_host_wrote {
-            // A texture a list uploaded or a draw sampled already holds the
-            // title's bytes; on-demand tiled textures have freshly mapped
-            // levels zeroed by `card_writes` below, while any already-mapped
-            // tiles (e.g. from an earlier unstaged upload of stale pool memory)
-            // are zeroed here before the title's copy writes over them.
-            let mut touched = false;
-            if over == CopyOverTitle::Zeros && !dst_staged {
+        // (`VICTORY_COPY_OVER_TITLE=title`: what title memory holds, which
+        // may be another texture's: specks on the waitress's forehead were
+        // left in run n04). (The host
+        // copy is cut from a block and held whatever lay there, and no
+        // upload is made once a copy wrote it: the atlas the title copies
+        // its baked decorations into, a 2048x2048 BC3 texture of which a
+        // bake writes 256x256 at most, was drawn over a character's face
+        // with other textures' bytes wherever nothing was baked, runs n01 and
+        // textures-1.)
+        static OVER: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        let over = *OVER.get_or_init(|| match std::env::var("VICTORY_COPY_OVER_TITLE").as_deref() {
+            Ok("0") => 0,
+            Ok("title") => 1,
+            _ => 2,
+        });
+        if over != 0 && crate::texture::title_written(to) && !crate::texture::host_wrote(dst.resource as usize) {
+            // One a list uploaded, or a draw sampled, holds the title's.
+            if over == 2 && !list.used(dst.resource as usize) && !crate::texture::is_staged(dst.resource) {
                 if let Some(host) = crate::host::host() {
-                    if let Some(ref on_demand) = dst_tiled {
-                        if let Some(tiled) = on_demand.tiled() {
-                            let all = tiled.every_level();
-                            let already = all & !tiled.without(all);
-                            if already != 0 && list.first_use(dst.resource as usize) {
-                                ensure_state(list, dst.resource, COPY_DEST);
-                                touched = zero_texture_levels(list, host, to, Some(already));
-                            }
-                        }
-                    } else if list.first_use(dst.resource as usize) {
-                        ensure_state(list, dst.resource, COPY_DEST);
-                        zero_texture_subresources(list, host, to);
-                        touched = true;
-                    } else {
-                        crate::texture::upload(list, dst.resource, to);
-                        touched = true;
-                    }
+                    ensure_state(list, dst.resource, COPY_DEST);
+                    let _ = list.first_use(dst.resource as usize);
+                    crate::texture::zeros(list, host, to);
                 }
             } else {
                 crate::texture::upload(list, dst.resource, to);
-                touched = true;
             }
-            // Done before the title's copy writes over it (forces a
-            // COPY_DEST -> COPY_SOURCE -> COPY_DEST barrier pair).
-            if touched {
+            // (Done before the title's copy writes over it.)
+            if list.used(dst.resource as usize) {
                 ensure_state(list, dst.resource, COPY_SOURCE);
             }
         }
@@ -1828,105 +1138,31 @@ extern "system" fn copy_texture_region(
         // of this list (`crate::tiles`): the title's bake copies each level
         // of its result into a block-compressed texture of that kind, and
         // a copy into a level without memory is dropped.
-        crate::texture::card_writes(list, dst.resource, to, Some(dst_sub));
+        crate::texture::card_writes(list, dst.resource, to, Some(dst.footprint.offset as u32));
         crate::texture::host_written(dst.resource);
         if same {
             SELF_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return;
         }
         ensure_state(list, dst.resource, COPY_DEST);
-        let mut bridged_ran = false;
-        if bridged
-            && src.kind != FOOTPRINT
-            && let (Some(src_tex), Some(sdesc)) = (src_texture, src_tex_desc)
-            && bridge_copy_texture_region(
-                list,
-                to,
-                &dst_desc,
-                dst_sub,
-                x,
-                y,
-                z,
-                src_tex,
-                &sdesc,
-                src.footprint.offset as u32,
-                raw_box,
-            )
-        {
-            bridged_ran = true;
-        }
-        if crate::resource::ped_tex_diag() {
-            let (src_w, src_h, src_fmt, src_pitch, src_sub, src_mips) = if src.kind == FOOTPRINT {
-                (
-                    src.footprint.width,
-                    src.footprint.height,
-                    src.footprint.format,
-                    src.footprint.row_pitch,
-                    0u32,
-                    0u16,
-                )
-            } else if let Some(sd) = src_tex_desc {
-                (
-                    sd.Width as u32,
-                    sd.Height,
-                    sd.Format.0 as u32,
-                    0u32,
-                    src.footprint.offset as u32,
-                    sd.MipLevels,
-                )
-            } else {
-                (0, 0, 0, 0, 0, 0)
-            };
-            if crate::resource::is_bc_format(dst_fmt) || crate::resource::is_bc_format(src_fmt) {
-                let bridge_ok = !bridged || src.kind == FOOTPRINT || bridged_ran;
-                log_ped_copy_texture_region(
-                    &dst_desc,
-                    dst_sub,
-                    dst_tiled.is_some(),
-                    dst_staged,
-                    dst_host_wrote,
-                    src.kind,
-                    src_sub,
-                    src_mips,
-                    src_w,
-                    src_h,
-                    src_fmt,
-                    src_pitch,
-                    x,
-                    y,
-                    raw_box,
-                    bridged,
-                    bridge_ok,
-                );
-            }
-        }
-        if bridged_ran {
-            return;
-        }
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
-        let d3d_box = adjusted_box.map(|b| D3D12_BOX {
-            left: b[0],
-            top: b[1],
-            front: b[2],
-            right: b[3],
-            bottom: b[4],
-            back: b[5],
-        });
-        let host_box = d3d_box.as_ref().map(std::ptr::from_ref);
+        let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
         #[cfg(feature = "diagnostics")]
         {
             let text = || {
+                // SAFETY: a live texture; the box is the title's or null.
+                let (d, b) = unsafe { (to.GetDesc(), host_box.map(|b| *b)) };
                 format!(
-                    "copy to {:?} {}x{} f{} sub/kind {} at {x},{y},{z} from {:?} kind {} footprint {:?} box {d3d_box:?}",
+                    "copy to {:?} {}x{} f{} sub/kind {} at {x},{y},{z} from {:?} kind {} footprint {:?} box {b:?}",
                     dst.resource,
-                    dst_desc.Width,
-                    dst_desc.Height,
-                    dst_desc.Format.0,
+                    d.Width,
+                    d.Height,
+                    d.Format.0,
                     dst.kind,
                     src.resource,
                     src.kind,
-                    (src.kind == FOOTPRINT).then_some(from.footprint)
+                    (src.kind == FOOTPRINT).then_some(src.footprint)
                 )
             };
             match read {
@@ -1937,7 +1173,7 @@ extern "system" fn copy_texture_region(
         const _: () =
             assert!(size_of::<CopyLocation>() == size_of::<D3D12_TEXTURE_COPY_LOCATION>());
         // SAFETY: an open list; both locations in the host's layout, naming
-        // live resources; the box is constructed in D3D12_BOX layout.
+        // live resources; the box is the title's (same layout).
         unsafe {
             list.list.CopyTextureRegion(
                 (&raw const to_location).cast(),
@@ -2210,6 +1446,10 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
         && src != 0
     {
         let len = len as usize;
+        if list.place_copy(dst as usize, src as usize, len) {
+            with_state(this, |_, state| state.copied());
+            return;
+        }
         list.defer(move || {
             if crate::texture::committed(src as *const u8, len)
                 && crate::texture::committed(dst as *const u8, len)
@@ -2228,13 +1468,13 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
     0
 }
 
-/// `DispatchX(x, y, z, flags)`: keep console flags so thread-count dispatches
-/// (`flags & 0x20`, used by the ray-tracing builder) convert to group counts
-/// and populate `USER_DISPATCH_THREADS_X`.
+/// `DispatchX(x, y, z, flags)`: a dispatch with console flags, of which the
+/// host follows one: the counts are threads, not groups (`draw.rs`
+/// `THREAD_DIMENSIONS`; the ray-tracing structure builder dispatches this way).
 extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     count_dispatch();
     #[cfg(windows)]
-    state::dispatch_with_flags(this, x, y, z, Some(flags));
+    with_state(this, |list, s| s.dispatch(list, x, y, z, flags));
     #[cfg(not(windows))]
     let _ = (this, x, y, z, flags);
 }
@@ -2310,20 +1550,66 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 }
 
 /// Pipeline syncs: waits for earlier work and cache flushes, at the top or
-/// bottom of the pipe `(flags, control, address, size)`. Host lists order
-/// their own work and every submission is waited for, so there is nothing
-/// to do.
-extern "system" fn sync(this: This, _flags: u32, _control: u32, _address: u64, _size: u64) {
+/// bottom of the pipe `(flags, control, address, size)`. The host orders
+/// nothing between dispatches by itself: what shaders wrote is waited for
+/// here as at the title's barriers (the ray-tracing structure builder has
+/// no other wait between its stages).
+/// (Arguments may be what earlier shaders wrote from here on:
+/// `State::synced`.)
+extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size: u64) {
     #[cfg(windows)]
-    title_ordered(this, false);
-    #[cfg(not(windows))]
-    let _ = this;
+    {
+        with_state(this, |_, state| state.synced());
+        if let Some(list) = host_list(this) {
+            use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+            #[cfg(feature = "diagnostics")]
+            {
+                // The shapes of the title's calls, each once.
+                static SEEN: std::sync::Mutex<Vec<(u32, u32, bool)>> = std::sync::Mutex::new(Vec::new());
+                let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+                let shape = (flags, control, address == 0);
+                if seen.len() < 64 && !seen.contains(&shape) {
+                    seen.push(shape);
+                    tracing::info!(
+                        flags = format_args!("{flags:#x}"),
+                        control = format_args!("{control:#x}"),
+                        address = format_args!("{address:#x}"),
+                        size = format_args!("{size:#x}"),
+                        "a pipeline sync"
+                    );
+                }
+                crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
+            }
+            // SAFETY: the same layout; no resource named.
+            let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+            // SAFETY: an open list.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
+        }
+    }
+    let _ = (this, flags, control, address, size);
 }
 
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only
 /// tune the console's command memory.
 extern "system" fn reset_x(this: This, allocator: This, pipeline: This, _flags: u32) -> HRESULT {
     reset(this, allocator, pipeline)
+}
+
+#[cfg(windows)]
+use crate::upload::Upload;
+
+/// The memory of [`allocate_upload`] where no host GPU reads it by address.
+#[cfg(not(windows))]
+struct Upload(Vec<u8>);
+
+#[cfg(not(windows))]
+impl Upload {
+    fn new(len: usize) -> Option<Upload> {
+        Some(Upload(vec![0; len]))
+    }
+    fn start(&mut self) -> *mut u8 {
+        self.0.as_mut_ptr()
+    }
 }
 
 /// Newer lists' 0x4a0 `(size, alignment) -> pointer`: memory the list
@@ -2339,13 +1625,14 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
     if this.is_null() || !align.is_power_of_two() {
         return std::ptr::null_mut();
     }
-    let mut block = vec![0u8; len];
-    let start = block.as_mut_ptr();
+    let Some(mut block) = Upload::new(len) else {
+        return std::ptr::null_mut();
+    };
+    let start = block.start();
     // SAFETY: the offset is below `align`, so `size` bytes fit after it.
     let at = unsafe { start.add(start.align_offset(align)) };
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
-    // Moving the vector keeps its heap block where it is.
     uploads.lock().unwrap_or_else(|e| e.into_inner()).push(block);
     at
 }
@@ -2501,10 +1788,7 @@ mod state {
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
-        dispatch_with_flags(this, x, y, z, None);
-    }
-    pub(super) fn dispatch_with_flags(this: This, x: u32, y: u32, z: u32, flags: Option<u32>) {
-        with_state(this, |list, s| s.dispatch(list, x, y, z, flags));
+        with_state(this, |list, s| s.dispatch(list, x, y, z, 0));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.
@@ -2855,10 +2139,6 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
 extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
-    #[cfg(windows)]
-    if count > 0 {
-        title_ordered(this, true);
-    }
     // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if count > 0 {
@@ -2872,6 +2152,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         && let Some(list) = host_list(this)
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+        with_state(this, |_, state| state.synced());
         // SAFETY: the same layout; no resource named.
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
@@ -2940,11 +2221,7 @@ fn value_written(this: This, address: u64, value: u64) {
         let Some(fresh) = fresh_list() else {
             return;
         };
-        list.state
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .end_batch(current);
-    current.close();
+        current.close();
         if let Some(done) = list.host.replace(fresh) {
             // The part so far keeps its waits; nothing stands before the
             // next one but this part itself.
@@ -3095,6 +2372,11 @@ const fn list_table(newer: bool) -> [*const (); 160] {
 /// titles add.
 static LIST_FUNCTIONS: Table<160> = Table(list_table(false));
 static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
+/// Of lists whose calls are written down.
+#[cfg(windows)]
+static THIN_FUNCTIONS: Table<160> = Table(thin::table(false));
+#[cfg(windows)]
+static NEWER_THIN_FUNCTIONS: Table<160> = Table(thin::table(true));
 
 #[cfg(test)]
 mod tests {
@@ -3164,515 +2446,6 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         for object in [buffer, list, allocator] {
             assert_eq!(release(object), 0);
-        }
-    }
-
-    #[test]
-    fn copy_over_title_defaults_to_zeros_and_parses_overrides() {
-        assert_eq!(copy_over_title_from(None), CopyOverTitle::Zeros);
-        assert_eq!(copy_over_title_from(Some("")), CopyOverTitle::Zeros);
-        assert_eq!(copy_over_title_from(Some("1")), CopyOverTitle::Zeros);
-        assert_eq!(copy_over_title_from(Some("zeros")), CopyOverTitle::Zeros);
-        assert_eq!(copy_over_title_from(Some("title")), CopyOverTitle::Title);
-        assert_eq!(copy_over_title_from(Some(" title ")), CopyOverTitle::Title);
-        assert_eq!(copy_over_title_from(Some("0")), CopyOverTitle::Off);
-        assert_eq!(copy_over_title_from(Some(" 0 ")), CopyOverTitle::Off);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn zero_texture_subresources_clears_texture_cleanly() {
-        use windows::Win32::Graphics::Direct3D12::*;
-        use windows::Win32::Graphics::Dxgi::Common::{
-            DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
-        };
-        let Some(host) = crate::host::host() else {
-            return;
-        };
-        let heap = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_DEFAULT,
-            ..Default::default()
-        };
-        let desc = D3D12_RESOURCE_DESC {
-            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-            Width: 16,
-            Height: 16,
-            DepthOrArraySize: 1,
-            MipLevels: 3,
-            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            ..Default::default()
-        };
-        let mut tex: Option<ID3D12Resource> = None;
-        // SAFETY: plain default-heap 2D texture creation.
-        unsafe {
-            host.device
-                .CreateCommittedResource(
-                    &heap,
-                    D3D12_HEAP_FLAG_NONE,
-                    &desc,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    None,
-                    &mut tex,
-                )
-                .expect("create 2D texture");
-        }
-        let tex = tex.expect("texture created");
-        let list = host.new_list().expect("host list");
-        zero_texture_subresources(&list, host, &tex);
-        list.close();
-        host.execute(&[&list]);
-        if let Some(err) = host.log_messages() {
-            panic!("D3D12 debug layer error in zero_texture_subresources: {err}");
-        }
-    }
-
-    #[test]
-    fn prepare_upload_footprint_repitches_aligns_bc_and_bridges_uav_format() {
-        // Unaligned 64-byte RowPitch on 16x16 BC7 (4 block rows of 64 bytes):
-        // must re-pitch to 256 bytes and total 3*256 + 64 = 832 bytes.
-        let unaligned = crate::resource::PlacedFootprint {
-            offset: 128,
-            format: 98, // BC7_UNORM
-            width: 16,
-            height: 16,
-            depth: 1,
-            row_pitch: 64,
-        };
-        let (fp, adj_box, repitch, [host_bytes, row, lines, src_pitch]) =
-            prepare_upload_footprint(unaligned, 98, None).expect("repitch footprint");
-        assert!(repitch);
-        assert_eq!(adj_box, None);
-        assert_eq!((fp.offset, fp.format, fp.width, fp.height, fp.row_pitch), (0, 98, 16, 16, 256));
-        assert_eq!((host_bytes, row, lines, src_pitch), (3 * 256 + 64, 64, 4, 64));
-
-        // 2x2 BC7 tail mip with 256B pitch: width/height must pad up to 4x4 without re-pitch.
-        let tail = crate::resource::PlacedFootprint {
-            offset: 0,
-            format: 98,
-            width: 2,
-            height: 2,
-            depth: 1,
-            row_pitch: 256,
-        };
-        let (fp, _, repitch, [host_bytes, row, lines, _]) =
-            prepare_upload_footprint(tail, 98, None).expect("tail footprint");
-        assert!(!repitch);
-        assert_eq!((fp.width, fp.height, fp.row_pitch), (4, 4, 256));
-        assert_eq!((host_bytes, row, lines), (16, 16, 1));
-
-        // (W/4 x H/4) R32G32B32A32_UINT buffer copied into (W x H) BC7_UNORM:
-        // format becomes 98, footprint & source box scale by 4.
-        let uav_buf = crate::resource::PlacedFootprint {
-            offset: 0,
-            format: 3, // R32G32B32A32_UINT
-            width: 16,
-            height: 16,
-            depth: 1,
-            row_pitch: 256,
-        };
-        let (fp, adj_box, repitch, [host_bytes, row, lines, _]) =
-            prepare_upload_footprint(uav_buf, 98, Some([2, 3, 0, 10, 11, 1]))
-                .expect("uav->bc footprint");
-        assert!(!repitch);
-        assert_eq!((fp.format, fp.width, fp.height, fp.row_pitch), (98, 64, 64, 256));
-        assert_eq!(adj_box, Some([8, 12, 0, 40, 44, 1]));
-        assert_eq!((host_bytes, row, lines), (15 * 256 + 256, 256, 16));
-    }
-
-    #[test]
-    fn cross_format_footprints_computes_uav_to_bc_and_bc_to_bc_layouts() {
-        // 16x16 R32G32B32A32_UINT sub-box [4,4..12,12] -> 64x64 BC7 at (16,16).
-        let (bytes, sfp, dfp, use_box) = cross_format_footprints(
-            98,
-            64,
-            64,
-            1,
-            [16, 16, 0],
-            3,
-            16,
-            16,
-            1,
-            Some([4, 4, 0, 12, 12, 1]),
-        )
-        .expect("uav->bc partial");
-        assert_eq!(use_box, Some([4, 4, 0, 12, 12, 1]));
-        assert_eq!((sfp.format, sfp.width, sfp.height, sfp.row_pitch), (3, 8, 8, 256));
-        assert_eq!((dfp.format, dfp.width, dfp.height, dfp.row_pitch), (98, 32, 32, 256));
-        assert_eq!(bytes, 7 * 256 + 128);
-
-        // 1x1 R32G32B32A32_UINT -> 2x2 BC7 mip tail.
-        let (bytes, sfp, dfp, use_box) =
-            cross_format_footprints(98, 2, 2, 1, [0, 0, 0], 3, 1, 1, 1, None)
-                .expect("uav->bc 2x2 tail");
-        assert_eq!(use_box, None);
-        assert_eq!((sfp.width, sfp.height, dfp.width, dfp.height, sfp.row_pitch), (1, 1, 4, 4, 256));
-        assert_eq!(bytes, 16);
-
-        // Oversized 32x32 scratch UAV without box into 32x32 BC7 (8x8 blocks): clamped to 8x8.
-        let (_, sfp, dfp, use_box) =
-            cross_format_footprints(98, 32, 32, 1, [0, 0, 0], 3, 32, 32, 1, None)
-                .expect("clamped scratch uav");
-        assert_eq!(use_box, Some([0, 0, 0, 8, 8, 1]));
-        assert_eq!((sfp.width, sfp.height, dfp.width, dfp.height), (8, 8, 32, 32));
-
-        // 64x64 BC3 (77) -> 64x64 BC7 (98).
-        let (bytes, sfp, dfp, use_box) =
-            cross_format_footprints(98, 64, 64, 1, [0, 0, 0], 77, 64, 64, 1, None)
-                .expect("bc3->bc7");
-        assert_eq!(use_box, None);
-        assert_eq!((sfp.format, dfp.format, sfp.width, dfp.width, sfp.row_pitch), (77, 98, 64, 64, 256));
-        assert_eq!(bytes, 15 * 256 + 256);
-    }
-
-    /// End-to-end GPU test (D3D12 debug layer clean):
-    /// 1) Buffer -> BC7 CopyTextureRegion with non-256B console RowPitch (64B)
-    /// 2) R32G32B32A32_UINT (16x16) UAV -> BC7 (64x64) partial CopyTextureRegion
-    ///    (with unwritten outer region cleanly zeroed)
-    /// 3) R32G32B32A32_UINT (16x16) UAV -> BC7 (64x64) whole CopyResource
-    #[cfg(windows)]
-    #[test]
-    fn gpu_bc7_repitch_and_uav_to_bc_copies_pass_debug_layer() {
-        use windows::Win32::Graphics::Direct3D12::*;
-        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
-        let Some(host) = crate::host::host() else {
-            return;
-        };
-        let null = std::ptr::null();
-        let res_iid = crate::object::guid(
-            0x6964_42be,
-            0xa72e,
-            0x4059,
-            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
-        );
-        let queue_iid = crate::object::guid(
-            0x0ec8_70a6,
-            0x5d7e,
-            0x4c22,
-            [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
-        );
-        let alloc_iid = crate::object::guid(
-            0x6102_dee4,
-            0xaf59,
-            0x4b09,
-            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
-        );
-        let list_iid = crate::object::guid(
-            0x5b16_0d0f,
-            0xac1b,
-            0x4185,
-            [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
-        );
-        let (mut queue, mut allocator, mut list) = (null, null, null);
-        let qdesc = [0u32; 4];
-        assert_eq!(crate::queue::create(null, qdesc.as_ptr().cast(), &queue_iid, &mut queue), S_OK);
-        assert_eq!(create_allocator(null, 0, &alloc_iid, &mut allocator), S_OK);
-        assert_eq!(create_list(null, 0, 0, allocator, null, &list_iid, &mut list), S_OK);
-
-        let readback_tex = |tex: &ID3D12Resource| -> (Vec<u8>, u32, u32, u64) {
-            // SAFETY: live D3D12 texture.
-            let d = unsafe { tex.GetDesc() };
-            let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
-            let mut rows = 0u32;
-            let mut row_size = 0u64;
-            let mut total = 0u64;
-            // SAFETY: plain query.
-            unsafe {
-                host.device.GetCopyableFootprints(
-                    &d,
-                    0,
-                    1,
-                    0,
-                    Some(&mut fp),
-                    Some(&mut rows),
-                    Some(&mut row_size),
-                    Some(&mut total),
-                );
-            }
-            let heap = D3D12_HEAP_PROPERTIES {
-                Type: D3D12_HEAP_TYPE_READBACK,
-                ..Default::default()
-            };
-            let bdesc = D3D12_RESOURCE_DESC {
-                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                Width: total.max(256),
-                Height: 1,
-                DepthOrArraySize: 1,
-                MipLevels: 1,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                ..Default::default()
-            };
-            let mut rb: Option<ID3D12Resource> = None;
-            // SAFETY: plain readback buffer creation.
-            unsafe {
-                host.device
-                    .CreateCommittedResource(
-                        &heap,
-                        D3D12_HEAP_FLAG_NONE,
-                        &bdesc,
-                        D3D12_RESOURCE_STATE_COPY_DEST,
-                        None,
-                        &mut rb,
-                    )
-                    .unwrap();
-            }
-            let rb = rb.unwrap();
-            let blist = host.new_list().unwrap();
-            let dst_loc = D3D12_TEXTURE_COPY_LOCATION {
-                // SAFETY: borrowed pointer.
-                pResource: unsafe { std::mem::transmute_copy(&rb) },
-                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp },
-            };
-            let src_loc = D3D12_TEXTURE_COPY_LOCATION {
-                // SAFETY: borrowed pointer.
-                pResource: unsafe { std::mem::transmute_copy(tex) },
-                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
-            };
-            // SAFETY: open list; caller transitioned `tex` to COPY_SOURCE.
-            unsafe { blist.list.CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, None) };
-            blist.close();
-            host.execute(&[&blist]);
-            let mut ptr = std::ptr::null_mut();
-            // SAFETY: completed readback buffer.
-            let out = unsafe {
-                rb.Map(0, None, Some(&mut ptr)).unwrap();
-                let slice = std::slice::from_raw_parts(ptr.cast::<u8>(), total as usize).to_vec();
-                rb.Unmap(0, None);
-                slice
-            };
-            (out, fp.Footprint.RowPitch, rows, row_size)
-        };
-
-        // --- Sub-test 1: Buffer -> 16x16 BC7 with non-256B RowPitch = 64 ---
-        let bc16_words: [u32; 14] = [3, 0, 0, 0, 16, 0, 16, (1 << 16) | 1, 98, 1, 0, 0, 0, 0];
-        // SAFETY: 14 words = 56-byte ResourceDesc.
-        let bc16_desc: crate::resource::ResourceDesc = unsafe { std::mem::transmute(bc16_words) };
-        let mut bc16_backing = vec![0u8; 64 << 10];
-        let mut bc16: This = null;
-        assert_eq!(
-            crate::resource::create_at_address(
-                null,
-                bc16_backing.as_mut_ptr() as u64,
-                &bc16_desc,
-                0,
-                null.cast(),
-                &res_iid,
-                &mut bc16
-            ),
-            S_OK
-        );
-        let src_buf = crate::resource::test_buffer(512);
-        let (buf_ptr, _) = crate::resource::buffer_bytes(src_buf).unwrap();
-        let pattern: Vec<u8> = (0..256u32).map(|i| ((i * 37 + 11) & 0xff) as u8).collect();
-        // SAFETY: 256 bytes inside 512-byte test buffer.
-        unsafe { std::ptr::copy_nonoverlapping(pattern.as_ptr(), buf_ptr, 256) };
-        let dst_loc = CopyLocation {
-            resource: bc16,
-            kind: 0,
-            footprint: crate::resource::PlacedFootprint {
-                offset: 0,
-                format: 0,
-                width: 0,
-                height: 0,
-                depth: 0,
-                row_pitch: 0,
-            },
-        };
-        let src_loc = CopyLocation {
-            resource: src_buf,
-            kind: 1,
-            footprint: crate::resource::PlacedFootprint {
-                offset: 0,
-                format: 98,
-                width: 16,
-                height: 16,
-                depth: 1,
-                row_pitch: 64, // intentionally non-256B aligned!
-            },
-        };
-        type CopyRegion =
-            extern "system" fn(This, *const CopyLocation, u32, u32, u32, *const CopyLocation, *const [u32; 6]);
-        slot::<CopyRegion>(list, 0x80)(list, &dst_loc, 0, 0, 0, &src_loc, null.cast());
-        ensure_state(host_list(list).unwrap(), bc16, COPY_SOURCE);
-        assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
-        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
-        assert_eq!(reset(list, allocator, null), S_OK);
-        if let Some(err) = host.log_messages() {
-            panic!("D3D12 debug layer error (unaligned BC7 repitch): {err}");
-        }
-        let (read, pitch, rows, row_size) = readback_tex(crate::resource::host_resource(bc16).unwrap());
-        assert_eq!((rows, row_size), (4, 64));
-        for r in 0..4usize {
-            assert_eq!(
-                &read[r * pitch as usize..r * pitch as usize + 64],
-                &pattern[r * 64..(r + 1) * 64],
-                "unaligned BC7 row {r}"
-            );
-        }
-
-        // --- Sub-test 2 & 3: 16x16 R32G32B32A32_UINT UAV -> 64x64 BC7 ---
-        let uav_words: [u32; 14] = [3, 0, 0, 0, 16, 0, 16, (1 << 16) | 1, 3, 1, 0, 0, 4, 0];
-        let bc64_words: [u32; 14] = [3, 0, 0, 0, 64, 0, 64, (1 << 16) | 1, 98, 1, 0, 0, 0, 0];
-        // SAFETY: 14 words = 56-byte ResourceDesc.
-        let uav_desc: crate::resource::ResourceDesc = unsafe { std::mem::transmute(uav_words) };
-        let bc64_desc: crate::resource::ResourceDesc = unsafe { std::mem::transmute(bc64_words) };
-        let mut uav_backing = vec![0u8; 64 << 10];
-        let mut bc64_a_backing = vec![0u8; 64 << 10];
-        let mut bc64_b_backing = vec![0u8; 64 << 10];
-        let (mut uav, mut bc64_partial, mut bc64_whole) = (null, null, null);
-        assert_eq!(
-            crate::resource::create_at_address(
-                null,
-                uav_backing.as_mut_ptr() as u64,
-                &uav_desc,
-                0,
-                null.cast(),
-                &res_iid,
-                &mut uav
-            ),
-            S_OK
-        );
-        assert_eq!(
-            crate::resource::create_at_address(
-                null,
-                bc64_a_backing.as_mut_ptr() as u64,
-                &bc64_desc,
-                0,
-                null.cast(),
-                &res_iid,
-                &mut bc64_partial
-            ),
-            S_OK
-        );
-        assert_eq!(
-            crate::resource::create_at_address(
-                null,
-                bc64_b_backing.as_mut_ptr() as u64,
-                &bc64_desc,
-                0,
-                null.cast(),
-                &res_iid,
-                &mut bc64_whole
-            ),
-            S_OK
-        );
-        // Seed the 16x16 R32G32B32A32_UINT UAV with unique 16-byte payloads per texel.
-        let uav_buf = crate::resource::test_buffer(4096);
-        let (uav_ptr, _) = crate::resource::buffer_bytes(uav_buf).unwrap();
-        let mut expected_blocks = vec![0u8; 16 * 16 * 16];
-        for y in 0..16usize {
-            for x in 0..16usize {
-                let block = [
-                    (x as u8).wrapping_add(1),
-                    (y as u8).wrapping_add(1),
-                    ((x * 13 + y * 7) & 0xff) as u8,
-                    0xa5,
-                    0x11,
-                    0x22,
-                    0x33,
-                    0x44,
-                    0x55,
-                    0x66,
-                    0x77,
-                    0x88,
-                    0x99,
-                    0xaa,
-                    0xbb,
-                    0xcc,
-                ];
-                expected_blocks[(y * 16 + x) * 16..(y * 16 + x + 1) * 16].copy_from_slice(&block);
-            }
-        }
-        // SAFETY: 4096 bytes inside 4096-byte test buffer (row_pitch = 256 = 16*16).
-        unsafe { std::ptr::copy_nonoverlapping(expected_blocks.as_ptr(), uav_ptr, 4096) };
-        let seed_dst = CopyLocation {
-            resource: uav,
-            kind: 0,
-            footprint: crate::resource::PlacedFootprint {
-                offset: 0,
-                format: 0,
-                width: 0,
-                height: 0,
-                depth: 0,
-                row_pitch: 0,
-            },
-        };
-        let seed_src = CopyLocation {
-            resource: uav_buf,
-            kind: 1,
-            footprint: crate::resource::PlacedFootprint {
-                offset: 0,
-                format: 3,
-                width: 16,
-                height: 16,
-                depth: 1,
-                row_pitch: 256,
-            },
-        };
-        slot::<CopyRegion>(list, 0x80)(list, &seed_dst, 0, 0, 0, &seed_src, null.cast());
-
-        // Partial copy: 8x8 blocks [4,4..12,12] from UAV -> BC7 at (16, 16) (4x4 blocks).
-        let partial_dst = CopyLocation {
-            resource: bc64_partial,
-            kind: 0,
-            footprint: seed_dst.footprint,
-        };
-        let uav_src = CopyLocation {
-            resource: uav,
-            kind: 0,
-            footprint: seed_dst.footprint,
-        };
-        let sbox = [4u32, 4, 0, 12, 12, 1];
-        slot::<CopyRegion>(list, 0x80)(list, &partial_dst, 16, 16, 0, &uav_src, &sbox);
-
-        // Whole copy: CopyResource UAV (16x16) -> BC7 (64x64).
-        slot::<extern "system" fn(This, This, This)>(list, 0x88)(list, bc64_whole, uav);
-
-        ensure_state(host_list(list).unwrap(), bc64_partial, COPY_SOURCE);
-        ensure_state(host_list(list).unwrap(), bc64_whole, COPY_SOURCE);
-        assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
-        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
-        assert_eq!(reset(list, allocator, null), S_OK);
-        if let Some(err) = host.log_messages() {
-            panic!("D3D12 debug layer error (UAV->BC7 bridge): {err}");
-        }
-
-        let (partial_rb, p_pitch, p_rows, p_row_size) =
-            readback_tex(crate::resource::host_resource(bc64_partial).unwrap());
-        assert_eq!((p_rows, p_row_size), (16, 256));
-        for by in 0..16usize {
-            for bx in 0..16usize {
-                let off = by * p_pitch as usize + bx * 16;
-                let got = &partial_rb[off..off + 16];
-                if (4..12).contains(&by) && (4..12).contains(&bx) {
-                    let want = &expected_blocks[(by * 16 + bx) * 16..(by * 16 + bx + 1) * 16];
-                    assert_eq!(got, want, "partial UAV->BC7 block ({bx},{by})");
-                } else {
-                    assert_eq!(got, &[0u8; 16], "unwritten BC7 block ({bx},{by}) must be zero");
-                }
-            }
-        }
-
-        let (whole_rb, w_pitch, w_rows, w_row_size) =
-            readback_tex(crate::resource::host_resource(bc64_whole).unwrap());
-        assert_eq!((w_rows, w_row_size), (16, 256));
-        for by in 0..16usize {
-            assert_eq!(
-                &whole_rb[by * w_pitch as usize..by * w_pitch as usize + 256],
-                &expected_blocks[by * 256..(by + 1) * 256],
-                "whole CopyResource UAV->BC7 block row {by}"
-            );
-        }
-
-        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
-        for obj in [bc16, src_buf, uav, bc64_partial, bc64_whole, uav_buf, list, allocator, queue] {
-            let _ = release(obj);
         }
     }
 }

@@ -20,21 +20,6 @@ memchr.workspace = true
 clap.workspace = true
 walkdir.workspace = true
 
-[target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = [
-    "Win32_Foundation",
-    "Win32_System_ApplicationInstallationAndServicing",
-    "Win32_System_Com",
-    "Win32_System_Console",
-    "Win32_System_LibraryLoader",
-    "Win32_UI_Controls",
-    "Win32_UI_Controls_Dialogs",
-    "Win32_UI_WindowsAndMessaging",
-] }
-
-[dev-dependencies]
-tempfile.workspace = true
-
 [features]
 # Debug-level logs and the debugging switches (frame capture, stack dumps,
 # the host debug layer, scripted keys). Off in a plain release build.

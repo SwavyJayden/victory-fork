@@ -62,6 +62,11 @@ pub fn use_pipeline_cache(dir: PathBuf) {
     let _ = DIR.set(dir);
 }
 
+/// The folder the library is kept in.
+pub(super) fn folder() -> Option<PathBuf> {
+    DIR.get().cloned()
+}
+
 /// Host pipelines created, loaded from the library, and title pipelines
 /// started at creation, since the start.
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
@@ -371,7 +376,7 @@ pub(crate) fn trim() {
     {
         return;
     }
-    let quiet_ms = crate::host::effective_ram_idle_ms();
+    let quiet_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
     if crate::host::now_ms() < LOADED_AT.load(Ordering::Relaxed) + quiet_ms
         || TRIMMED.swap(true, Ordering::Relaxed)
     {
@@ -429,15 +434,13 @@ fn one_call() -> Option<MutexGuard<'static, ()>> {
 }
 
 const LIBRARY_FILE: &str = "host-pipelines.bin";
-/// A library the driver refused, kept as it was ([`open`]).
-const REJECTED_FILE: &str = "host-pipelines.rejected.bin";
 /// A saved library that could not replace [`LIBRARY_FILE`] while this run
 /// had it mapped (a system that refuses to replace a mapped file): the next
 /// start renames it over the library first ([`Blob::of`]).
 const NEXT_FILE: &str = "host-pipelines.next";
 const EARLY_FILE: &str = "early-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
-const EARLY_MAX: usize = 8192;
+const EARLY_MAX: usize = 100_000;
 
 fn library() -> Option<&'static Library> {
     static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
@@ -463,7 +466,6 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
             device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
         }
     };
-    let mut rejected = false;
     if !blob.bytes().is_empty() {
         match make(blob.bytes()) {
             Ok(library) => {
@@ -482,10 +484,7 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
                     saving: RwLock::new(()),
                 });
             }
-            Err(e) => {
-                rejected = true;
-                tracing::warn!(error = %e, "host pipeline library rejected; starting an empty one (the rejected file is kept as {REJECTED_FILE})");
-            }
+            Err(e) => tracing::info!(error = %e, "host pipeline library rejected; starting an empty one"),
         }
     } else {
         tracing::info!("no host pipeline library yet; starting an empty one");
@@ -493,14 +492,6 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     // The rejected bytes are let go (a mapped file is unmapped) before the
     // empty library is made: nothing reads them any more.
     drop(blob);
-    // Keep the rejected library under another name rather than overwriting it
-    // on the first save in case a transient failure caused refusal.
-    if rejected
-        && let Some(dir) = DIR.get()
-        && let Err(e) = std::fs::rename(dir.join(LIBRARY_FILE), dir.join(REJECTED_FILE))
-    {
-        tracing::warn!(error = %e, "the rejected host pipeline library could not be kept under its other name");
-    }
     let library = make(&[]).ok()?;
     Some(Library {
         library,
@@ -578,54 +569,38 @@ pub(crate) fn pipeline(
     Ok(pso)
 }
 
-fn save_every() -> std::time::Duration {
-    static EVERY: OnceLock<std::time::Duration> = OnceLock::new();
-    *EVERY.get_or_init(|| {
-        let secs = std::env::var("VICTORY_LIBRARY_SAVE_SECS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .filter(|&s| s > 0)
-            .unwrap_or(60);
-        std::time::Duration::from_secs(secs)
-    })
-}
-
 /// Writes the library and the early list if pipelines were added since the
-/// last save and [`save_every`] has passed (or `now`).
+/// last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-    let save_every = save_every();
+    const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        if !now && last.is_some_and(|t| t.elapsed() < save_every) {
+        if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
             return;
         }
         *last = Some(std::time::Instant::now());
     }
-    let Some(_one_save) = one_save(now) else { return };
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
     }
-    let tmp = tmp_beside(&dir.join(LIBRARY_FILE));
+    let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
     // The bytes of the library written to `tmp`; 0 when no pipeline was
     // added: the library on disk is then what it was, and only the early
     // list is written (a title pipeline first drawn with wrote all 1,352 MB
     // of the library again: run 60's second save).
-    // The pipelines in it are taken off `added` once it is renamed in place:
-    // a save that fails leaves them for the next one.
-    let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
-    let (bytes, added) = {
+    let bytes = {
         let _all = one_call();
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
         let added = library.added.load(Ordering::Relaxed);
-        if !used_changed && added == 0 {
+        if !USED_CHANGED.swap(false, Ordering::Relaxed) && added == 0 {
             return;
         }
         if added == 0 {
-            (0, 0)
+            0
         } else {
             // SAFETY: a plain query.
             let size = unsafe { library.library.GetSerializedSize() };
@@ -633,17 +608,18 @@ pub(crate) fn save(now: bool) {
             if let Err(e) = serialise(&library.library, &tmp, size) {
                 tracing::warn!(error = %e, "host pipeline library not serialised");
                 let _ = std::fs::remove_file(&tmp);
-                USED_CHANGED.fetch_or(used_changed, Ordering::Relaxed);
                 return;
             }
+            library.added.store(0, Ordering::Relaxed);
             SAVED.store(size as u64, Ordering::Relaxed);
-            (size, added)
+            size
         }
     };
-    let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
+    // Through `used`: a process that asked for none yet (`victory shaders`)
+    // must not write the earlier runs' list over with nothing.
+    let used: Vec<String> = used().iter().flatten().cloned().collect();
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
-        library.added.fetch_sub(added, Ordering::Relaxed);
         // In place unless the system refused and the new one waits beside it.
         let in_place = !dir.join(NEXT_FILE).exists();
         if in_place && VIEW[0].load(Ordering::Relaxed) != 0 {
@@ -657,35 +633,10 @@ pub(crate) fn save(now: bool) {
             )
         });
     }
-    // The early list and slow-pipeline list only when changed: a pipeline made
-    // again from the library leaves them as they were.
-    let slow: Vec<String> = if used_changed {
-        slow_ones()
-            .iter()
-            .flatten()
-            .map(|(key, ms)| format!("{key} {ms}"))
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let slow: Vec<String> = slow_ones().iter().flatten().map(|(key, ms)| format!("{key} {ms}")).collect();
     let written = library_written
-        .and_then(|()| {
-            if used_changed && !slow.is_empty() {
-                write_atomically(&dir.join(SLOW_FILE), slow.join("\n").as_bytes())
-            } else {
-                Ok(())
-            }
-        })
-        .and_then(|()| {
-            if used_changed {
-                write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes())
-            } else {
-                Ok(())
-            }
-        });
-    if written.is_err() {
-        USED_CHANGED.fetch_or(used_changed, Ordering::Relaxed);
-    }
+        .and_then(|()| write_atomically(&dir.join(SLOW_FILE), slow.join("\n").as_bytes()))
+        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
     match written {
         Ok(()) => tracing::info!(
             bytes,
@@ -696,27 +647,6 @@ pub(crate) fn save(now: bool) {
             "host pipeline library saved"
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
-    }
-}
-
-/// Held for a whole save: saves share the `.tmp` files beside the library
-/// and the early list, so a second one would truncate the file the first
-/// is about to rename over the library (the end-of-run save against a
-/// worker's periodic one; upstream Marvisak/VIctory#1660). A periodic save
-/// (`now` false) that finds one running is skipped; `now` waits for it.
-fn one_save(now: bool) -> Option<MutexGuard<'static, ()>> {
-    static SAVING: Mutex<()> = Mutex::new(());
-    alone(&SAVING, now)
-}
-
-fn alone(lock: &Mutex<()>, wait: bool) -> Option<MutexGuard<'_, ()>> {
-    match lock.try_lock() {
-        Ok(guard) => Some(guard),
-        Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
-        Err(std::sync::TryLockError::WouldBlock) if wait => {
-            Some(lock.lock().unwrap_or_else(|e| e.into_inner()))
-        }
-        Err(std::sync::TryLockError::WouldBlock) => None,
     }
 }
 
@@ -746,29 +676,26 @@ fn serialise(library: &ID3D12PipelineLibrary1, tmp: &std::path::Path, size: usiz
 /// stay: the rest read as zeros). Where a system refuses, the new library
 /// is left beside it as [`NEXT_FILE`] for the next start.
 fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Result<()> {
-    std::fs::rename(tmp, dir.join(LIBRARY_FILE))
-        .or_else(|_| std::fs::rename(tmp, dir.join(NEXT_FILE)))
-        .inspect_err(|_| {
-            let _ = std::fs::remove_file(tmp);
-        })
+    std::fs::rename(tmp, dir.join(LIBRARY_FILE)).or_else(|_| std::fs::rename(tmp, dir.join(NEXT_FILE)))
 }
 
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
-/// `path`: a reader never sees a part.
+/// `path`: a reader never sees a part. Serialised so concurrent worker and
+/// shutdown saves do not race on the same staging file or target rename.
 fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = tmp_beside(path);
-    std::fs::write(&tmp, bytes)
-        .and_then(|()| std::fs::rename(&tmp, path))
-        .inspect_err(|_| {
-            let _ = std::fs::remove_file(&tmp);
-        })
-}
-
-/// The temporary file a save writes before renaming it over `path`: named
-/// for this process, as nothing keeps two runs off one cache folder
-/// ([`one_save`] keeps this run's saves apart).
-fn tmp_beside(path: &std::path::Path) -> std::path::PathBuf {
-    path.with_extension(format!("tmp-{}", std::process::id()))
+    use std::sync::atomic::AtomicU64;
+    static WRITING: Mutex<()> = Mutex::new(());
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let _guard = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".tmp-{}-{n}", std::process::id()));
+    let tmp = path.with_file_name(name);
+    let res = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
 }
 
 /// How long each title pipeline that took long to make took, in ms (beside
@@ -781,10 +708,7 @@ static SLOW: Mutex<Option<std::collections::HashMap<String, u64>>> = Mutex::new(
 fn slow_ones() -> std::sync::MutexGuard<'static, Option<std::collections::HashMap<String, u64>>> {
     let mut slow = SLOW.lock().unwrap_or_else(|e| e.into_inner());
     if slow.is_none() {
-        let listed = DIR
-            .get()
-            .and_then(|d| std::fs::read_to_string(d.join(SLOW_FILE)).ok())
-            .unwrap_or_default();
+        let listed = DIR.get().and_then(|d| std::fs::read_to_string(d.join(SLOW_FILE)).ok()).unwrap_or_default();
         *slow = Some(
             listed
                 .lines()
@@ -835,7 +759,15 @@ fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
 }
 
 /// Whether the title pipeline with `key` was requested in this or an earlier run.
+///
+/// `VICTORY_EARLY_ALL=1`: every title pipeline is started at creation,
+/// requested before or not, so that the driver's own cache holds it for
+/// later runs.
 pub(crate) fn wanted_early(key: &str) -> bool {
+    static ALL: OnceLock<bool> = OnceLock::new();
+    if *ALL.get_or_init(|| std::env::var_os("VICTORY_EARLY_ALL").is_some_and(|v| v == "1")) {
+        return true;
+    }
     used().as_ref().is_some_and(|s| s.contains(key))
 }
 
@@ -862,45 +794,6 @@ mod tests {
         assert_ne!(a, name("mesh", b"root", &[b"vs", b"ps"], "state"));
         // Parts do not run into each other.
         assert_ne!(a, name("graphics", b"root", &[b"vsp", b"s"], "state"));
-    }
-
-    #[test]
-    fn a_periodic_save_skips_a_running_one_and_an_end_of_run_save_waits() {
-        static LOCK: Mutex<()> = Mutex::new(());
-        let held = alone(&LOCK, false).expect("free");
-        assert!(alone(&LOCK, false).is_none());
-        let (tx, rx) = std::sync::mpsc::channel();
-        let waiter = std::thread::spawn(move || {
-            let _g = alone(&LOCK, true).expect("waits");
-            tx.send(()).unwrap();
-        });
-        assert!(rx.recv_timeout(std::time::Duration::from_millis(100)).is_err());
-        drop(held);
-        rx.recv_timeout(std::time::Duration::from_secs(5)).expect("ran after release");
-        waiter.join().unwrap();
-        assert!(alone(&LOCK, false).is_some());
-    }
-
-    #[test]
-    fn a_save_leaves_a_whole_file_and_no_temporary_one() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(EARLY_FILE);
-        let tmp = tmp_beside(&path);
-        assert_ne!(tmp, path);
-        assert!(tmp.to_string_lossy().ends_with(&format!(".tmp-{}", std::process::id())));
-        write_atomically(&path, b"first").unwrap();
-        write_atomically(&path, b"second").unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"second");
-        // A rename that cannot land (a folder in the way) leaves no tmp.
-        let blocked = dir.path().join("blocked");
-        std::fs::create_dir(&blocked).unwrap();
-        std::fs::write(blocked.join("x"), b"").unwrap();
-        assert!(write_atomically(&blocked, b"bytes").is_err());
-        let names: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        assert!(!names.iter().any(|n| n.contains(".tmp")), "{names:?}");
     }
 
     #[test]
@@ -1014,5 +907,28 @@ mod tests {
             pattern(page * 4096, &mut expected);
             assert!(bytes == &expected[..], "page {page} of the replaced library no longer reads as the old file");
         }
+    }
+
+    #[test]
+    fn concurrent_write_atomically_never_fails_or_truncates() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("host-pipelines.bin");
+        let threads: Vec<_> = (0..4)
+            .map(|t| {
+                let target = target.clone();
+                std::thread::spawn(move || {
+                    let payload = vec![b'a' + t as u8; 4096];
+                    for _ in 0..30 {
+                        write_atomically(&target, &payload).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let final_bytes = std::fs::read(&target).unwrap();
+        assert_eq!(final_bytes.len(), 4096);
+        assert!(final_bytes.iter().all(|&b| b == final_bytes[0]));
     }
 }

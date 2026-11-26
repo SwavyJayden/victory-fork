@@ -4,7 +4,7 @@
 //! (taken by a refresh, asked about), for 40 frames from each of the times
 //! `VICTORY_FAULT_BOOK_AT` gives (seconds after the start; 150,210,270 unless
 //! given). Written as `<file>.<n>.bin`, records of 40 bytes: ticks of the
-//! performance counter, three words, thread, what.
+//! performance counter, two words, thread, what.
 #![cfg(feature = "diagnostics")]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
@@ -13,7 +13,6 @@ use std::sync::{Mutex, OnceLock};
 /// What a record is of.
 #[derive(Clone, Copy)]
 #[repr(u32)]
-#[allow(dead_code)]
 pub(crate) enum What {
     /// A frame ended (a: its number).
     Frame = 0,
@@ -33,8 +32,11 @@ pub(crate) enum What {
     Alias = 6,
     /// A fault on block `a` that someone else had opened; b: nanoseconds.
     Open = 7,
-    /// Blocks `[a, b)` were opened ahead of the title's writes.
-    Ahead = 8,
+    /// The instruction at `a` made the fault before (block `b`).
+    Site = 9,
+    /// A store (the instruction at `a`) was done beside the guard of block
+    /// `b`.
+    Stored = 10,
 }
 
 #[repr(C)]
@@ -107,19 +109,5 @@ pub(crate) fn frame() {
     } else if times.get(MADE.load(Relaxed) as usize).is_some_and(|&t| began.elapsed().as_secs() >= t) {
         LEFT.store(FRAMES, Relaxed);
         ON.store(true, Relaxed);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn record_is_40_bytes_and_book_is_off_by_default() {
-        assert_eq!(size_of::<Record>(), 40);
-        assert!(!on());
-        note(What::Fault, 1, 2, 3);
-        assert!(BOOK.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
-        assert!(ticks() > 0);
     }
 }

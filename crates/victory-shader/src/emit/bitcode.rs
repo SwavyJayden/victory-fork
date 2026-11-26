@@ -326,66 +326,6 @@ impl Module {
         }
     }
 
-    /// The bits of an f32 known when the module is built: a float constant,
-    /// an i32 constant read as a float, or the negation (`-0 - x`) or
-    /// absolute value (FAbs) of one; `None` for anything else.
-    pub fn float_bits(&self, v: V) -> Option<u32> {
-        match v {
-            V::Const(i) => match self.consts[i as usize] {
-                (_, Const::Float(b)) => Some(b),
-                (t, Const::Int(x)) if self.types[t.0 as usize] == TypeDef::Int(32) => {
-                    Some(x as u32)
-                }
-                _ => None,
-            },
-            V::Inst(i) => match &self.insts[i as usize].op {
-                Op::Cast(Cast::Bitcast, x) => self.float_bits(*x),
-                Op::Bin(Bin::Sub, z, x)
-                    if self.is_float_inst(i) && self.float_bits(*z) == Some(0x8000_0000) =>
-                {
-                    self.float_bits(*x).map(|b| b ^ 0x8000_0000)
-                }
-                _ => self
-                    .fabs_of(v)
-                    .and_then(|x| self.float_bits(x))
-                    .map(|b| b & 0x7FFF_FFFF),
-            },
-            _ => None,
-        }
-    }
-
-    fn is_float_inst(&self, i: u32) -> bool {
-        self.types[self.insts[i as usize].ty.0 as usize] == TypeDef::Float
-    }
-
-    /// `x` where `v` is `|x|` (DXIL FAbs).
-    fn fabs_of(&self, v: V) -> Option<V> {
-        let V::Inst(i) = v else { return None };
-        let Op::Call(f, args) = &self.insts[i as usize].op else {
-            return None;
-        };
-        (self.funcs[*f as usize].name == "dx.op.unary.f32"
-            && args.len() == 2
-            && self.int_value(args[0]) == Some(6))
-        .then_some(args[1])
-    }
-
-    /// The value `v` is zero exactly when: `v` without negations (`-0 - x`)
-    /// and absolute values (FAbs) around it.
-    pub fn zero_root(&self, v: V) -> V {
-        if let V::Inst(i) = v
-            && let Op::Bin(Bin::Sub, z, x) = &self.insts[i as usize].op
-            && self.is_float_inst(i)
-            && self.float_bits(*z) == Some(0x8000_0000)
-        {
-            return self.zero_root(*x);
-        }
-        match self.fabs_of(v) {
-            Some(x) => self.zero_root(x),
-            None => v,
-        }
-    }
-
     /// Gives constant `old` the content of `new` (both stay valid).
     pub fn replace_const(&mut self, old: V, new: V) {
         if let (V::Const(o), V::Const(n)) = (old, new) {
@@ -787,7 +727,7 @@ impl Module {
             let blk = &self.blocks[b];
             if let (Some(Term::Br(h)), true, [p]) = (
                 blk.term,
-                blk.phis.is_empty() && blk.body.is_empty(),
+                blk.phis.iter().all(|&i| !live[i as usize]) && blk.body.is_empty(),
                 &preds[b][..],
             ) && pos[h] < pos[b]
                 && !succs(*p).contains(&h)
@@ -1254,6 +1194,45 @@ mod tests {
         assert!(live[ids(read)] && live[ids(sum)]);
         assert!(!live[ids(unread)] && !live[ids(cyc_a)] && !live[ids(cyc_b)]);
         assert_eq!(live, live_by_passes(&m));
+    }
+
+    #[test]
+    fn empty_latch_with_dead_phis_is_folded() {
+        // Two identical loops except one has an unread phi in its empty latch;
+        // both must fold the latch and emit identical bitcode.
+        let build = |with_dead_phi: bool| {
+            let mut m = Module::default();
+            let i32t = m.int(32);
+            let void = m.void();
+            let fty = m.func_ty(void, vec![i32t]);
+            let f = m.function("sink", fty, Some(Attr::NoUnwind), false);
+            let main_ty = m.func_ty(void, vec![]);
+            m.function("main", main_ty, None, true);
+            let (entry, head, body, latch, exit) = (
+                m.new_block(),
+                m.new_block(),
+                m.new_block(),
+                m.new_block(),
+                m.new_block(),
+            );
+            let (z, one, ten) = (m.i32(0), m.i32(1), m.i32(10));
+            m.terminate(entry, Term::Br(head));
+            let i = m.phi(head, i32t);
+            m.terminate(head, Term::Br(body));
+            let next = m.bin(body, Bin::Add, i, one);
+            let cond = m.cmp(body, pred::IULT, next, ten);
+            m.terminate(body, Term::CondBr(cond, latch, exit));
+            if with_dead_phi {
+                let dead = m.phi(latch, i32t);
+                m.set_phi(dead, vec![(next, body)]);
+            }
+            m.terminate(latch, Term::Br(head));
+            m.set_phi(i, vec![(z, entry), (next, latch)]);
+            let _ = m.call(exit, f, vec![next]);
+            m.terminate(exit, Term::Ret);
+            m.write()
+        };
+        assert_eq!(build(false), build(true));
     }
 
     #[test]

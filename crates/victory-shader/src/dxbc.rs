@@ -17,6 +17,8 @@ pub struct FourCC(pub [u8; 4]);
 
 impl FourCC {
     pub const DXIL: FourCC = FourCC(*b"DXIL");
+    /// Native code another compiler made, in place of `DXIL` (VIctory upstream 0b35b7f).
+    pub const ACCC: FourCC = FourCC(*b"ACCC");
     pub const STAT: FourCC = FourCC(*b"STAT");
     pub const RTS0: FourCC = FourCC(*b"RTS0");
     pub const PSV0: FourCC = FourCC(*b"PSV0");
@@ -58,9 +60,6 @@ pub struct Part<'a> {
 pub struct Container<'a> {
     pub digest: [u8; 16],
     pub version: (u16, u16),
-    /// The header's total size, checked against the data: the container is
-    /// exactly this many bytes, whatever follows it.
-    pub size: usize,
     pub parts: Vec<Part<'a>>,
 }
 
@@ -105,7 +104,6 @@ impl<'a> Container<'a> {
         Ok(Container {
             digest,
             version,
-            size: total,
             parts,
         })
     }
