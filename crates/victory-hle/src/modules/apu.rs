@@ -137,6 +137,9 @@ struct State {
     results: VecDeque<ApuResult>,
     commands: u32,
     dequeued: u32,
+    /// Persistent PCM decode scratch buffer (`MAX_FRAMES * channels`, up to 46 KB),
+    /// reused across all `PROCESS` commands to avoid per-packet heap alloc/zero/free.
+    pcm_scratch: Vec<f32>,
 }
 
 fn lock(c: &Connection) -> std::sync::MutexGuard<'_, State> {
@@ -210,6 +213,7 @@ pub extern "system" fn XApuConnect(
             results: VecDeque::new(),
             commands: 0,
             dequeued: 0,
+            pcm_scratch: Vec::new(),
         }),
     });
     // SAFETY: checked non-null.
@@ -269,7 +273,12 @@ pub extern "system" fn XApuEnqueueCommand(
         input_length: 0,
         input: std::ptr::null(),
     };
-    let decoder = &mut state.streams[stream];
+    let State {
+        streams,
+        pcm_scratch,
+        ..
+    } = &mut *state;
+    let decoder = &mut streams[stream];
     match id.kind {
         ACTIVATE => {
             // SAFETY: an activate command is this struct.
@@ -300,7 +309,7 @@ pub extern "system" fn XApuEnqueueCommand(
             // SAFETY: a process command is this struct.
             let command = unsafe { command.cast::<Process>().read_unaligned() };
             match decoder {
-                Some(d) => process(d, connection.options, &command, &mut result),
+                Some(d) => process(d, connection.options, &command, pcm_scratch, &mut result),
                 None => result.error = INVALID_STREAM,
             }
         }
@@ -322,7 +331,13 @@ pub extern "system" fn XApuEnqueueCommand(
 
 /// Decodes one packet into the command's output buffer, keeping the frames
 /// from `first_frame` on, at most `frame_count` of them.
-fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &mut ApuResult) {
+fn process(
+    decoder: &mut OpusDecoder,
+    options: u32,
+    command: &Process,
+    pcm_scratch: &mut Vec<f32>,
+    result: &mut ApuResult,
+) {
     let channels = decoder.channels();
     let (input, input_length) = (command.input, command.input_length);
     let (output, output_length) = (command.output, command.output_length);
@@ -335,8 +350,12 @@ fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &
     }
     // SAFETY: the title's packet in its connection memory.
     let packet = unsafe { std::slice::from_raw_parts(input, input_length as usize) };
-    let mut pcm = vec![0f32; MAX_FRAMES * channels];
-    let decoded = match decoder.decode(packet, MAX_FRAMES, &mut pcm) {
+    let needed = MAX_FRAMES * channels;
+    if pcm_scratch.len() < needed {
+        pcm_scratch.resize(needed, 0.0);
+    }
+    let pcm = &mut pcm_scratch[..needed];
+    let decoded = match decoder.decode(packet, MAX_FRAMES, pcm) {
         Ok(n) => n,
         Err(_) => {
             result.error = BAD_PACKET;
@@ -674,5 +693,101 @@ mod tests {
             );
             assert_eq!(XApuDisconnect(handle), S_OK);
         }
+    }
+
+    #[test]
+    fn reuses_pcm_scratch_across_repeated_mono_and_stereo_packets() {
+        let stereo_tone: Vec<f32> = (0..960 * 2)
+            .map(|i| ((i / 2) as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin() * 0.4)
+            .collect();
+        let mono_tone: Vec<f32> = (0..960)
+            .map(|i| (i as f32 * 660.0 * std::f32::consts::TAU / 48_000.0).sin() * 0.4)
+            .collect();
+        let mut enc_stereo = OpusEncoder::new(48_000, 2, Application::Audio).unwrap();
+        let mut enc_mono = OpusEncoder::new(48_000, 1, Application::Audio).unwrap();
+        let (mut pkt_s, mut pkt_m) = ([0u8; 1500], [0u8; 1500]);
+        let ns = enc_stereo.encode(&stereo_tone, 960, &mut pkt_s).unwrap();
+        let nm = enc_mono.encode(&mono_tone, 960, &mut pkt_m).unwrap();
+
+        let input = ConnectInput {
+            process: DECODE_OPUS,
+            streams: 4,
+            commands_per_stream: 4,
+            memory: 0x4_0000,
+            frames_per_output: 0,
+            options: 0,
+        };
+        let mut output = ConnectOutput {
+            memory: std::ptr::null_mut(),
+            result_event: std::ptr::null_mut(),
+        };
+        let mut handle = std::ptr::null_mut();
+        assert_eq!(XApuConnect(&input, &mut output, &mut handle), S_OK);
+        let base = output.memory.cast::<u8>();
+
+        for (stream, channels) in [(0u32, 2u32), (1u32, 1u32)] {
+            let act = Activate {
+                id: id(ACTIVATE, stream),
+                channels,
+                init_length: 0,
+                init: std::ptr::null(),
+                start_pitch: 1.0,
+                processing_length: 0,
+                processing: std::ptr::null_mut(),
+            };
+            assert_eq!(
+                XApuEnqueueCommand(handle, (&raw const act).cast(), std::ptr::null_mut()),
+                S_OK
+            );
+            let mut res = std::mem::MaybeUninit::<ApuResult>::zeroed();
+            assert_eq!(XApuDequeueResult(handle, res.as_mut_ptr()), S_OK);
+        }
+
+        // SAFETY: inside the connection memory.
+        unsafe {
+            std::ptr::copy_nonoverlapping(pkt_s.as_ptr(), base, ns);
+            std::ptr::copy_nonoverlapping(pkt_m.as_ptr(), base.wrapping_add(0x2000), nm);
+        }
+
+        let mut scratch_ptr = 0usize;
+        for round in 0..8 {
+            let (stream, in_ptr, in_len, out_len) = if round % 2 == 0 {
+                (0u32, base, ns as u32, 960 * 8)
+            } else {
+                (1u32, base.wrapping_add(0x2000), nm as u32, 960 * 4)
+            };
+            let cmd = Process {
+                id: id(PROCESS, stream),
+                pitch_ramp: 0.0,
+                target_pitch: 1.0,
+                first_frame: 0,
+                frame_count: 960,
+                input_length: in_len,
+                input: in_ptr,
+                output_length: out_len,
+                output: base.wrapping_add(0x10000),
+            };
+            assert_eq!(
+                XApuEnqueueCommand(handle, (&raw const cmd).cast(), std::ptr::null_mut()),
+                S_OK
+            );
+            let mut res = std::mem::MaybeUninit::<ApuResult>::zeroed();
+            assert_eq!(XApuDequeueResult(handle, res.as_mut_ptr()), S_OK);
+            // SAFETY: written by `XApuDequeueResult`.
+            let decoded = unsafe { res.assume_init() };
+            let (err, frames) = (decoded.error, decoded.frames);
+            assert_eq!((err, frames), (S_OK, 960));
+
+            // SAFETY: valid connection handle.
+            let state = lock(unsafe { &*handle });
+            let ptr = state.pcm_scratch.as_ptr() as usize;
+            if round == 0 {
+                scratch_ptr = ptr;
+                assert_eq!(state.pcm_scratch.len(), MAX_FRAMES * 2);
+            } else {
+                assert_eq!(ptr, scratch_ptr, "scratch buffer must be reused without reallocating");
+            }
+        }
+        assert_eq!(XApuDisconnect(handle), S_OK);
     }
 }

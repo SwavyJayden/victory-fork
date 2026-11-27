@@ -394,13 +394,97 @@ pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 4] =
 pub(crate) static PLANES: [std::sync::atomic::AtomicU64; 3] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
-/// The colour twin of title texture `this`, if it has one.
+/// The colour twin of title texture `this` if one has already been allocated
+/// (does not allocate eagerly on DSV/SRV/copy uses). Records when a depth+UAV
+/// texture is touched before its first UAV so a lazily created twin syncs from
+/// the depth texture on first shader use.
 #[cfg(windows)]
 pub(crate) fn twin(this: This) -> Option<std::sync::Arc<Twin>> {
+    use std::sync::atomic::Ordering::{Acquire, Release};
     if this.is_null() {
         return None;
     }
-    hosted(this, true).and_then(|made| made.1)
+    let r = resource(this);
+    if !r.host.has_twin.load(Acquire) {
+        if r.desc.dimension != BUFFER && r.desc.flags & 6 == 6 {
+            r.host.depth_used_before_twin.store(true, Release);
+        }
+        return None;
+    }
+    hosted(this, false).and_then(|made| made.1)
+}
+
+/// Lazily allocates the colour twin for depth+UAV texture `this` on first
+/// actual UAV creation, avoiding eager VRAM allocation for depth textures that
+/// never receive a UAV.
+#[cfg(windows)]
+fn ensure_twin(this: This) -> Option<std::sync::Arc<Twin>> {
+    use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER || r.desc.flags & 6 != 6 {
+        return None;
+    }
+    if !r.host.has_twin.load(Acquire) && r.host.twin_attempted.load(Acquire) {
+        return None;
+    }
+    // Ensure the host depth texture itself exists first.
+    let _ = hosted(this, true)?;
+    let (depth_texture, desc, depth_was_used) = {
+        let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        let (host, twin_slot) = made.as_ref()?;
+        if let Some(twin) = twin_slot {
+            return Some(twin.clone());
+        }
+        if r.host.twin_attempted.load(Relaxed) {
+            return None;
+        }
+        (
+            host.texture.clone(),
+            r.desc,
+            r.host.depth_used_before_twin.load(Acquire),
+        )
+    };
+    // Allocate the D3D12 colour twin outside `r.host.made`'s lock.
+    let created = twin_texture(&desc, &depth_texture, depth_was_used);
+    let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((_, twin_slot)) = made.as_mut() else {
+        drop(made);
+        if let Some(twin) = created {
+            crate::host::retire(twin);
+        }
+        return None;
+    };
+    if let Some(existing) = twin_slot {
+        let out = existing.clone();
+        drop(made);
+        if let Some(twin) = created {
+            crate::host::retire(twin);
+        }
+        return Some(out);
+    }
+    r.host.twin_attempted.store(true, Release);
+    if let Some(twin) = created {
+        *twin_slot = Some(twin.clone());
+        r.host.has_twin.store(true, Release);
+        tracing::info!(
+            resource = ?this,
+            desc = ?r.desc,
+            twin = true,
+            "depth texture with unordered access (twin allocated lazily)"
+        );
+        Some(twin)
+    } else {
+        tracing::info!(
+            resource = ?this,
+            desc = ?r.desc,
+            twin = false,
+            "depth texture with unordered access"
+        );
+        None
+    }
 }
 
 /// The twin's texture, for the unordered access views of `this`.
@@ -408,13 +492,11 @@ pub(crate) fn twin(this: This) -> Option<std::sync::Arc<Twin>> {
 pub(crate) fn twin_resource<'a>(
     this: This,
 ) -> Option<&'a windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
-    if this.is_null() {
-        return None;
-    }
-    let (_, twin) = hosted(this, true)?;
-    // SAFETY: as in `host_resource`: the twin lives as long as the host
-    // copy, which a depth texture keeps until the title releases it.
-    twin.map(|t| unsafe { &*std::ptr::from_ref(&t.colour.texture) })
+    let twin = ensure_twin(this)?;
+    // SAFETY: as in `host_resource`: once lazily stored in `r.host.made`,
+    // the twin lives as long as the host copy, which a depth texture keeps
+    // until the title releases it.
+    Some(unsafe { &*std::ptr::from_ref(&twin.colour.texture) })
 }
 
 /// The texture of the twin of the depth plane of `this`, a depth texture
@@ -423,11 +505,7 @@ pub(crate) fn twin_resource<'a>(
 pub(crate) fn twin_plane_resource<'a>(
     this: This,
 ) -> Option<&'a windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
-    if this.is_null() {
-        return None;
-    }
-    let (_, twin) = hosted(this, true)?;
-    let twin = twin?;
+    let twin = ensure_twin(this)?;
     // SAFETY: as in `twin_resource`.
     twin.plane
         .as_ref()
@@ -449,6 +527,7 @@ pub(crate) fn twin_plane_resource<'a>(
 fn twin_texture(
     desc: &ResourceDesc,
     depth: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    depth_was_used: bool,
 ) -> Option<std::sync::Arc<Twin>> {
     use std::sync::atomic::Ordering::Relaxed;
     use windows::Win32::Graphics::Direct3D12::*;
@@ -586,7 +665,9 @@ fn twin_texture(
     TWINS[0].fetch_add(1, Relaxed);
     Some(std::sync::Arc::new(Twin {
         colour: std::sync::Arc::new(HostTexture::new(texture, UNORDERED_ACCESS)),
-        behind: std::sync::atomic::AtomicU32::new(0),
+        // If the depth texture was already touched before its first UAV was
+        // created, mark bit 1 so the first shader UAV use copies depth -> twin.
+        behind: std::sync::atomic::AtomicU32::new(if depth_was_used { 2 } else { 0 }),
         through,
         plane,
     }))
@@ -1216,6 +1297,15 @@ struct Hosted {
     /// Lock-free mirror of `made.is_some()` (updated under `made`'s lock) so
     /// [`host_waits`] skips locking `made` on thousands of descriptor slots/frame.
     has_made: std::sync::atomic::AtomicBool,
+    /// Lock-free mirror of `made.as_ref().is_some_and(|(_, t)| t.is_some())` so
+    /// [`twin`] avoids locking `made` on every non-twinned texture draw/copy.
+    has_twin: std::sync::atomic::AtomicBool,
+    /// Set once [`ensure_twin`] has attempted lazy colour-twin allocation so
+    /// unsupported/refused depth textures do not retry on every UAV call.
+    twin_attempted: std::sync::atomic::AtomicBool,
+    /// Set when [`twin`] observes a depth+UAV texture used before its colour
+    /// twin has been allocated, so lazy creation marks the twin behind depth.
+    depth_used_before_twin: std::sync::atomic::AtomicBool,
     /// Lock-free mirror of `made.as_ref().map(|(h, _)| h.base)` (`u32::MAX`
     /// when no host copy exists), letting [`want_level`] skip locking `made`
     /// once the host copy already holds mip 0.
@@ -1664,18 +1754,9 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             r.host.refused.store(true, Relaxed);
             return None;
         };
-        let twin = twin_texture(&r.desc, &texture);
-        // One line per depth texture with unordered access: its address is
-        // the one target dumps and the captured frame's list of commands
-        // name.
-        if r.desc.flags & 6 == 6 {
-            tracing::info!(
-                resource = ?this,
-                desc = ?r.desc,
-                twin = twin.is_some(),
-                "depth texture with unordered access"
-            );
-        }
+        // Depth-UAV colour twins are allocated lazily on first actual UAV
+        // creation ([`ensure_twin`]), reclaiming VRAM for depth textures that
+        // set `ALLOW_UNORDERED_ACCESS` but never receive a UAV.
         let state = crate::host::legal_state(&texture, crate::host::texture_state(r.host.state));
         let mut host = match tiled {
             Some(tiled) => HostTexture::new_tiled(texture, state, tiled),
@@ -1699,7 +1780,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             KINDS[5].fetch_add(host.bytes, Relaxed);
         }
         KINDS[6].fetch_add(1, Relaxed);
-        *made = Some((std::sync::Arc::new(host), twin));
+        *made = Some((std::sync::Arc::new(host), None));
         r.host.made_base.store(base, std::sync::atomic::Ordering::Release);
         r.host.has_made.store(true, std::sync::atomic::Ordering::Release);
         // Slots the title wrote with views of it while it had no host copy
@@ -2800,6 +2881,9 @@ fn hand_out_resource(
         host: Hosted {
             made: std::sync::Mutex::new(None),
             has_made: std::sync::atomic::AtomicBool::new(false),
+            has_twin: std::sync::atomic::AtomicBool::new(false),
+            twin_attempted: std::sync::atomic::AtomicBool::new(false),
+            depth_used_before_twin: std::sync::atomic::AtomicBool::new(false),
             made_base: std::sync::atomic::AtomicU32::new(u32::MAX),
             state,
             // SAFETY: the title passes a whole clear value (the format,
@@ -4967,5 +5051,96 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(grown.base, 0);
         assert_eq!(resource(tex).host.made_base.load(Relaxed), 0);
         assert!(filled_made().contains(&key));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn depth_uav_twin_is_allocated_lazily_on_first_uav_and_syncs_prior_depth_use() {
+        use std::sync::atomic::Ordering::Relaxed;
+        if crate::host::host().is_none() {
+            return;
+        }
+        let null = std::ptr::null();
+        const DEPTH_WRITE: u32 = 0x10;
+        let desc = ResourceDesc {
+            flags: 6,
+            ..texture(16, 16, 55, 1)
+        };
+        let mut depth_after_use = null;
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &desc,
+                DEPTH_WRITE,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut depth_after_use
+            ),
+            S_OK
+        );
+        let twins_before = TWINS[0].load(Relaxed);
+        // Making the host depth texture for DSV/SRV use must NOT eagerly allocate a twin.
+        assert!(host_resource(depth_after_use).is_some());
+        assert_eq!(TWINS[0].load(Relaxed), twins_before);
+        // Simulating a prior DSV/SRV use records `depth_used_before_twin` without allocating.
+        assert!(twin(depth_after_use).is_none());
+        assert_eq!(TWINS[0].load(Relaxed), twins_before);
+        // First actual UAV creation lazily allocates the twin and marks bit 1 (behind depth).
+        let Some(lazy_twin_res) = twin_resource(depth_after_use) else {
+            return; // VICTORY_DEPTH_TWINS=0
+        };
+        assert_eq!(TWINS[0].load(Relaxed), twins_before + 1);
+        let lazy_twin = twin(depth_after_use).expect("twin present after first UAV");
+        assert_eq!(lazy_twin.behind.load(Relaxed), 2);
+        // Subsequent calls return the same stored resource without allocating again.
+        let second = twin_resource(depth_after_use).expect("cached lazy twin");
+        assert_eq!(std::ptr::from_ref(lazy_twin_res), std::ptr::from_ref(second));
+        assert_eq!(TWINS[0].load(Relaxed), twins_before + 1);
+
+        // Fresh depth+UAV texture with no prior depth use starts with `behind == 0`.
+        let mut depth_fresh = null;
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &desc,
+                DEPTH_WRITE,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut depth_fresh
+            ),
+            S_OK
+        );
+        assert!(host_resource(depth_fresh).is_some());
+        assert!(twin_resource(depth_fresh).is_some());
+        assert_eq!(twin(depth_fresh).unwrap().behind.load(Relaxed), 0);
+
+        // Unsupported MSAA depth+UAV records refusal once and never retries.
+        let msaa_desc = ResourceDesc {
+            sample_count: 4,
+            ..desc
+        };
+        let mut depth_msaa = null;
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &msaa_desc,
+                DEPTH_WRITE,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut depth_msaa
+            ),
+            S_OK
+        );
+        let refused_before = TWINS[1].load(Relaxed);
+        assert!(twin_resource(depth_msaa).is_none());
+        assert_eq!(TWINS[1].load(Relaxed), refused_before + 1);
+        assert!(twin_resource(depth_msaa).is_none());
+        assert_eq!(TWINS[1].load(Relaxed), refused_before + 1);
     }
 }

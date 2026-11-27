@@ -10,11 +10,12 @@
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::{BTreeMap, BinaryHeap, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
 
 use super::xgameruntime::{Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing};
 
@@ -147,26 +148,56 @@ impl Port {
     }
 }
 
-/// The thread pool behind thread-pool ports: idle workers are reused, and a
-/// new one starts whenever more tasks wait than workers idle, so a callback
-/// that blocks on another never starves it. Workers stay for reuse.
-struct Pool {
-    /// Queued tasks and the number of idle workers.
-    state: Mutex<(VecDeque<Task>, usize)>,
-    ready: Condvar,
+/// Maximum concurrent threads spawned by [`POOL`].
+const MAX_POOL_WORKERS: usize = 16;
+/// Idle timeout after which an unused [`POOL`] worker exits cleanly.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+struct PoolState {
+    tasks: VecDeque<Task>,
+    idle: usize,
+    workers: usize,
 }
 
-static POOL: Pool = Pool {
-    state: Mutex::new((VecDeque::new(), 0)),
-    ready: Condvar::new(),
-};
+/// The thread pool behind thread-pool ports: idle workers are reused, a new
+/// one starts whenever more tasks wait than workers idle (up to `max_workers`)
+/// so callbacks that wait on each other never deadlock, and idle workers exit
+/// cleanly after `idle_timeout`.
+struct Pool {
+    state: Mutex<PoolState>,
+    ready: Condvar,
+    max_workers: usize,
+    idle_timeout: Duration,
+}
+
+static POOL: Pool = Pool::new(MAX_POOL_WORKERS, POOL_IDLE_TIMEOUT);
 
 impl Pool {
+    const fn new(max_workers: usize, idle_timeout: Duration) -> Self {
+        Self {
+            state: Mutex::new(PoolState {
+                tasks: VecDeque::new(),
+                idle: 0,
+                workers: 0,
+            }),
+            ready: Condvar::new(),
+            max_workers,
+            idle_timeout,
+        }
+    }
+
     fn submit(&'static self, task: Task) {
         let mut state = lock(&self.state);
-        state.0.push_back(task);
-        if state.0.len() > state.1 {
-            std::thread::spawn(move || self.work());
+        state.tasks.push_back(task);
+        if state.tasks.len() > state.idle && state.workers < self.max_workers {
+            state.workers += 1;
+            if std::thread::Builder::new()
+                .name("victory xasync worker".into())
+                .spawn(move || self.work())
+                .is_err()
+            {
+                state.workers -= 1;
+            }
         } else {
             self.ready.notify_one();
         }
@@ -175,18 +206,130 @@ impl Pool {
     fn work(&self) {
         let mut state = lock(&self.state);
         loop {
-            while state.0.is_empty() {
-                state.1 += 1;
-                state = self.ready.wait(state).unwrap_or_else(|e| e.into_inner());
-                state.1 -= 1;
-            }
-            let task = state.0.pop_front();
-            drop(state);
-            if let Some(task) = task {
+            if let Some(task) = state.tasks.pop_front() {
+                drop(state);
                 task.run(false);
+                state = lock(&self.state);
+                continue;
             }
-            state = lock(&self.state);
+            state.idle += 1;
+            let (guard, timeout) = self
+                .ready
+                .wait_timeout(state, self.idle_timeout)
+                .unwrap_or_else(|e| e.into_inner());
+            state = guard;
+            state.idle -= 1;
+            if state.tasks.is_empty() && timeout.timed_out() {
+                state.workers -= 1;
+                return;
+            }
         }
+    }
+}
+
+/// One delayed callback scheduled on the single shared timer thread.
+struct DelayedEntry {
+    deadline: Instant,
+    id: u64,
+    port: u32,
+    queue: Arc<Queue>,
+}
+
+impl PartialEq for DelayedEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.deadline == other.deadline && self.id == other.id
+    }
+}
+
+impl Eq for DelayedEntry {}
+
+impl PartialOrd for DelayedEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for DelayedEntry {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        // Min-heap order: earliest deadline (and smallest id) sits at the top.
+        (other.deadline, other.id).cmp(&(self.deadline, self.id))
+    }
+}
+
+struct SharedTimer {
+    heap: Mutex<BinaryHeap<DelayedEntry>>,
+    wake: Condvar,
+}
+
+static TIMER: OnceLock<SharedTimer> = OnceLock::new();
+
+fn shared_timer() -> &'static SharedTimer {
+    TIMER.get_or_init(|| {
+        let timer = SharedTimer {
+            heap: Mutex::new(BinaryHeap::new()),
+            wake: Condvar::new(),
+        };
+        let _ = std::thread::Builder::new()
+            .name("victory xasync timer".into())
+            .spawn(timer_loop);
+        timer
+    })
+}
+
+fn timer_loop() {
+    let timer = shared_timer();
+    let mut heap = lock(&timer.heap);
+    loop {
+        let Some(earliest) = heap.peek() else {
+            heap = timer.wake.wait(heap).unwrap_or_else(|e| e.into_inner());
+            continue;
+        };
+        let now = Instant::now();
+        if earliest.deadline > now {
+            let wait = earliest.deadline - now;
+            let (guard, _) = timer
+                .wake
+                .wait_timeout(heap, wait)
+                .unwrap_or_else(|e| e.into_inner());
+            heap = guard;
+            continue;
+        }
+        let mut due = Vec::new();
+        while let Some(top) = heap.peek() {
+            if top.deadline <= now {
+                if let Some(entry) = heap.pop() {
+                    due.push(entry);
+                }
+            } else {
+                break;
+            }
+        }
+        drop(heap);
+        for entry in due {
+            // Gone if the queue was terminated meanwhile, which canceled it.
+            let task = lock(&entry.queue.delayed).remove(&entry.id);
+            if let Some(task) = task {
+                entry.queue.deliver(entry.port, task);
+            }
+        }
+        heap = lock(&timer.heap);
+    }
+}
+
+fn schedule_delayed(entry: DelayedEntry) {
+    let timer = shared_timer();
+    let mut heap = lock(&timer.heap);
+    let earlier = heap.peek().is_none_or(|top| entry.deadline < top.deadline);
+    heap.push(entry);
+    if earlier {
+        timer.wake.notify_one();
+    }
+}
+
+fn cancel_delayed_for_queue(queue: &Arc<Queue>) {
+    if let Some(timer) = TIMER.get() {
+        let mut heap = lock(&timer.heap);
+        heap.retain(|entry| !Arc::ptr_eq(&entry.queue, queue));
     }
 }
 
@@ -233,14 +376,14 @@ impl Queue {
             }
             delayed.insert(id, task);
         }
-        let queue = self.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(delay_ms.into()));
-            // Gone if the queue was terminated meanwhile, which canceled it.
-            let task = lock(&queue.delayed).remove(&id);
-            if let Some(task) = task {
-                queue.deliver(port, task);
-            }
+        let deadline = Instant::now()
+            .checked_add(Duration::from_millis(delay_ms.into()))
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400 * 365));
+        schedule_delayed(DelayedEntry {
+            deadline,
+            id,
+            port,
+            queue: self.clone(),
         });
         S_OK
     }
@@ -411,6 +554,7 @@ pub fn XTaskQueueTerminate(
         }
     }
     let delayed = std::mem::take(&mut *lock(&queue.delayed));
+    cancel_delayed_for_queue(&queue);
     for task in delayed.into_values() {
         task.run(true);
     }
@@ -1736,5 +1880,90 @@ mod tests {
         );
         assert_eq!((used, out), (8, [0x55; 8]));
         XTaskQueueCloseHandle(q);
+    }
+
+    #[test]
+    fn shared_timer_fires_delayed_callbacks_in_deadline_order() {
+        static ORDER: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+        extern "system" fn record(context: *mut c_void, canceled: bool) {
+            if !canceled {
+                lock(&ORDER).push(context as u32);
+            }
+        }
+        lock(&ORDER).clear();
+        let mut q = std::ptr::null();
+        // Immediate completion port so order is recorded deterministically on the timer thread.
+        assert_eq!(XTaskQueueCreate(3, 3, &mut q), S_OK);
+        // Submit intentionally out of deadline order (60ms, 15ms, 35ms).
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(
+                q,
+                WORK,
+                60,
+                std::ptr::without_provenance_mut(3),
+                Some(record),
+            ),
+            S_OK
+        );
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(
+                q,
+                WORK,
+                15,
+                std::ptr::without_provenance_mut(1),
+                Some(record),
+            ),
+            S_OK
+        );
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(
+                q,
+                WORK,
+                35,
+                std::ptr::without_provenance_mut(2),
+                Some(record),
+            ),
+            S_OK
+        );
+        let start = Instant::now();
+        while lock(&ORDER).len() < 3 && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(*lock(&ORDER), [1, 2, 3]);
+        XTaskQueueCloseHandle(q);
+    }
+
+    #[test]
+    fn pool_caps_workers_and_expires_idle_threads() {
+        static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+        static PEAK: AtomicUsize = AtomicUsize::new(0);
+        static DONE: AtomicUsize = AtomicUsize::new(0);
+        extern "system" fn work(_: *mut c_void, _: bool) {
+            let cur = ACTIVE.fetch_add(1, Ordering::SeqCst) + 1;
+            PEAK.fetch_max(cur, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(25));
+            ACTIVE.fetch_sub(1, Ordering::SeqCst);
+            DONE.fetch_add(1, Ordering::SeqCst);
+        }
+        let pool: &'static Pool = Box::leak(Box::new(Pool::new(3, Duration::from_millis(40))));
+        for _ in 0..9 {
+            pool.submit(Task::new(std::ptr::null_mut(), work));
+        }
+        let start = Instant::now();
+        while DONE.load(Ordering::SeqCst) < 9 && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(DONE.load(Ordering::SeqCst), 9);
+        assert!(
+            PEAK.load(Ordering::SeqCst) <= 3,
+            "pool exceeded worker cap: peak={}",
+            PEAK.load(Ordering::SeqCst)
+        );
+        // Wait for idle timeout so workers exit cleanly back to 0.
+        let wait = Instant::now();
+        while lock(&pool.state).workers > 0 && wait.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(lock(&pool.state).workers, 0, "idle pool workers must expire");
     }
 }

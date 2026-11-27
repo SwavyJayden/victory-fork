@@ -1228,10 +1228,26 @@ extern "system" fn desc(this: This, out: *mut QueueDesc) {
     }
 }
 
+/// Xbox `ID3D12CommandQueue::SuspendX(flags)` (`0xb8` newer / `0xa8` older):
+/// PC D3D12 has no console queue suspension; succeed as a quiet no-op.
+extern "system" fn suspend_x(_: This, flags: u32) -> HRESULT {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| tracing::debug!(flags, "command queue SuspendX ignored (S_OK no-op)"));
+    S_OK
+}
+
+/// Xbox `ID3D12CommandQueue::ResumeX()` (`0xc0` newer / `0xb0` older):
+/// matching no-op for [`suspend_x`].
+extern "system" fn resume_x(_: This) -> HRESULT {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| tracing::debug!("command queue ResumeX ignored (S_OK no-op)"));
+    S_OK
+}
+
 /// The queue methods by their slot in older titles' queues (the 2020-era
 /// layout): IUnknown 3, object 4, device child 1, queue 26 (12 as on PC,
 /// then console ones).
-const METHODS: [(usize, *const ()); 15] = [
+const METHODS: [(usize, *const ()); 17] = [
     (0, query as *const ()),
     (2, release as *const ()),
     (7, object::parent_device as *const ()), // 0x38
@@ -1242,6 +1258,8 @@ const METHODS: [(usize, *const ()); 15] = [
     (14, signal as *const ()),               // 0x70
     (15, wait as *const ()),                 // 0x78
     (16, timestamp_frequency as *const ()),  // 0x80
+    (21, suspend_x as *const ()),            // 0xa8 (0xb8 newer) SuspendX
+    (22, resume_x as *const ()),             // 0xb0 (0xc0 newer) ResumeX
     (26, desc as *const ()),                 // 0xd0
     (29, copy_page_mappings as *const ()),   // 0xe8 page mapping batch
     (30, present as *const ()),              // 0xf0
@@ -1342,8 +1360,35 @@ mod tests {
         let (old, new) = (queue_table(false), queue_table(true));
         assert_eq!(old[10], new[10]); // submission stays at 0x50
         assert_eq!(old[14], new[16]); // signal 0x70 → 0x80
+        assert_eq!(old[21], suspend_x as *const ()); // 0xa8
+        assert_eq!(old[22], resume_x as *const ()); // 0xb0
+        assert_eq!(new[23], suspend_x as *const ()); // 0xb8
+        assert_eq!(new[24], resume_x as *const ()); // 0xc0
         assert_eq!(old[30], new[32]); // present 0xf0 → 0x100
         assert_eq!(new[35], execute_x as *const ()); // 0x118
+    }
+
+    #[test]
+    fn suspend_and_resume_return_ok_on_queue_vtables() {
+        let null = std::ptr::null();
+        let desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let mut q = null;
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+        let (suspend_off, resume_off) = if signal_slot(q) == 0x80 {
+            (0xb8, 0xc0)
+        } else {
+            (0xa8, 0xb0)
+        };
+        let suspend = slot::<extern "system" fn(This, u32) -> HRESULT>(q, suspend_off);
+        let resume = slot::<extern "system" fn(This) -> HRESULT>(q, resume_off);
+        assert_eq!(suspend(q, 0), S_OK);
+        assert_eq!(resume(q), S_OK);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
     }
 
     #[test]

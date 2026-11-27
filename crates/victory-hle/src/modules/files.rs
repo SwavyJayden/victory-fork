@@ -281,7 +281,7 @@ static HAS_DATA_RPF_STREAM: AtomicBool = AtomicBool::new(false);
 static DATA_RPF_STREAMS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 fn is_data_rpf_wide_ptr(path: *const u16) -> bool {
-    if path.is_null() {
+    if super::prompts::patching_disabled() || path.is_null() {
         return false;
     }
     // SAFETY: caller passes a NUL-terminated UTF-16 path.
@@ -293,7 +293,7 @@ fn is_data_rpf_wide_ptr(path: *const u16) -> bool {
 }
 
 fn is_data_rpf_narrow_ptr(path: *const c_char) -> bool {
-    if path.is_null() {
+    if super::prompts::patching_disabled() || path.is_null() {
         return false;
     }
     // SAFETY: caller passes a NUL-terminated narrow path.
@@ -302,7 +302,11 @@ fn is_data_rpf_narrow_ptr(path: *const c_char) -> bool {
 }
 
 fn track_data_rpf_handle(handle: Handle, is_data_rpf: bool) {
-    if !is_data_rpf || handle.is_null() || handle as isize == -1 {
+    if !is_data_rpf
+        || super::prompts::patching_disabled()
+        || handle.is_null()
+        || handle as isize == -1
+    {
         return;
     }
     let key = handle as usize;
@@ -313,8 +317,25 @@ fn track_data_rpf_handle(handle: Handle, is_data_rpf: bool) {
     }
 }
 
-fn is_data_rpf_handle(handle: Handle) -> bool {
+fn untrack_data_rpf_handle(handle: Handle) {
     if !HAS_DATA_RPF_HANDLE.load(Ordering::Acquire) || handle.is_null() || handle as isize == -1 {
+        return;
+    }
+    let key = handle as usize;
+    let mut list = DATA_RPF_HANDLES.lock().unwrap_or_else(|e| e.into_inner());
+    let before = list.len();
+    list.retain(|&h| h != key);
+    if list.len() != before && list.is_empty() {
+        HAS_DATA_RPF_HANDLE.store(false, Ordering::Release);
+    }
+}
+
+fn is_data_rpf_handle(handle: Handle) -> bool {
+    if super::prompts::patching_disabled()
+        || !HAS_DATA_RPF_HANDLE.load(Ordering::Acquire)
+        || handle.is_null()
+        || handle as isize == -1
+    {
         return false;
     }
     DATA_RPF_HANDLES
@@ -324,7 +345,7 @@ fn is_data_rpf_handle(handle: Handle) -> bool {
 }
 
 fn track_data_rpf_stream(stream: File, is_data_rpf: bool) {
-    if !is_data_rpf || stream.is_null() {
+    if !is_data_rpf || super::prompts::patching_disabled() || stream.is_null() {
         return;
     }
     let key = stream as usize;
@@ -335,14 +356,73 @@ fn track_data_rpf_stream(stream: File, is_data_rpf: bool) {
     }
 }
 
-fn is_data_rpf_stream(stream: File) -> bool {
+fn untrack_data_rpf_stream(stream: File) {
     if !HAS_DATA_RPF_STREAM.load(Ordering::Acquire) || stream.is_null() {
+        return;
+    }
+    let key = stream as usize;
+    let mut list = DATA_RPF_STREAMS.lock().unwrap_or_else(|e| e.into_inner());
+    let before = list.len();
+    list.retain(|&s| s != key);
+    if list.len() != before && list.is_empty() {
+        HAS_DATA_RPF_STREAM.store(false, Ordering::Release);
+    }
+}
+
+fn is_data_rpf_stream(stream: File) -> bool {
+    if super::prompts::patching_disabled()
+        || !HAS_DATA_RPF_STREAM.load(Ordering::Acquire)
+        || stream.is_null()
+    {
         return false;
     }
     DATA_RPF_STREAMS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .contains(&(stream as usize))
+}
+
+/// Opens a file with virtual-drive rewriting without adding it to
+/// [`DATA_RPF_HANDLES`] (used by DirectStorage, which manages its own
+/// `is_data_rpf` flag and closes the `std::fs::File` handle directly).
+pub(crate) fn open_host_file_w(
+    path: *const u16,
+    access: u32,
+    share: u32,
+    security: *const c_void,
+    disposition: u32,
+    flags: u32,
+    template: Handle,
+) -> Handle {
+    let p = wide(path);
+    host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
+        p.ptr(),
+        access,
+        share,
+        security,
+        disposition,
+        flags,
+        template,
+    )
+}
+
+/// Evicts any tracked `data.rpf` Win32 handle before closing it so recycled
+/// handle values never inherit stale tracking state. Fast-pathed to a single
+/// atomic load when no `data.rpf` Win32 handle is open.
+pub extern "system" fn CloseHandle(handle: Handle) -> i32 {
+    if HAS_DATA_RPF_HANDLE.load(Ordering::Acquire) {
+        untrack_data_rpf_handle(handle);
+    }
+    host!("kernel32.dll", "CloseHandle": extern "system" fn(Handle) -> i32)(handle)
+}
+
+/// Evicts any tracked `data.rpf` CRT `FILE*` stream before closing it so
+/// recycled `FILE*` addresses never inherit stale tracking state.
+pub extern "C" fn fclose(stream: File) -> i32 {
+    if HAS_DATA_RPF_STREAM.load(Ordering::Acquire) {
+        untrack_data_rpf_stream(stream);
+    }
+    host!("ucrtbase.dll", "fclose": extern "C" fn(File) -> i32)(stream)
 }
 
 // kernel32 and its file API sets.
@@ -913,6 +993,7 @@ pub(crate) fn module() -> HleModule {
             "kernel32.dll",
             "kernelbase.dll",
             "api-ms-win-core-file-*",
+            "api-ms-win-core-handle-*",
             "api-ms-win-core-processenvironment-*",
             "ucrtbase.dll",
             "api-ms-win-crt-stdio-*",
@@ -922,7 +1003,9 @@ pub(crate) fn module() -> HleModule {
         ],
         exports: vec![
             hle_export!(ReadFile),
+            hle_export!(CloseHandle),
             hle_export!(fread),
+            hle_export!(fclose),
             hle_export!(CreateFileW),
             hle_export!(CreateFileA),
             hle_export!(CreateFile2),
@@ -1216,5 +1299,50 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, ["present.txt"]);
+    }
+
+    #[test]
+    fn close_handle_and_fclose_evict_tracked_data_rpf_entries() {
+        assert!(
+            crate::registry::lookup("api-ms-win-core-handle-l1-1-0.dll", "CloseHandle").is_some()
+        );
+        assert!(crate::registry::lookup("ucrtbase.dll", "fclose").is_some());
+
+        let dir = tempfile::tempdir().unwrap();
+        let rpf_path = dir.path().join("data.rpf");
+        std::fs::write(&rpf_path, b"RPF8test").unwrap();
+
+        // Win32 handle tracking + CloseHandle eviction.
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const FILE_SHARE_READ: u32 = 1;
+        const OPEN_EXISTING: u32 = 3;
+        let h = CreateFileW(
+            w(&rpf_path.to_string_lossy()).as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        );
+        assert_ne!(h as isize, -1);
+        assert!(is_data_rpf_handle(h));
+        assert!(HAS_DATA_RPF_HANDLE.load(Ordering::Acquire));
+        assert_ne!(CloseHandle(h), 0);
+        assert!(!is_data_rpf_handle(h));
+        if DATA_RPF_HANDLES.lock().unwrap().is_empty() {
+            assert!(!HAS_DATA_RPF_HANDLE.load(Ordering::Acquire));
+        }
+
+        // CRT FILE* stream tracking + fclose eviction.
+        let stream = _wfopen(w(&rpf_path.to_string_lossy()).as_ptr(), w("rb").as_ptr());
+        assert!(!stream.is_null());
+        assert!(is_data_rpf_stream(stream));
+        assert!(HAS_DATA_RPF_STREAM.load(Ordering::Acquire));
+        assert_eq!(fclose(stream), 0);
+        assert!(!is_data_rpf_stream(stream));
+        if DATA_RPF_STREAMS.lock().unwrap().is_empty() {
+            assert!(!HAS_DATA_RPF_STREAM.load(Ordering::Acquire));
+        }
     }
 }

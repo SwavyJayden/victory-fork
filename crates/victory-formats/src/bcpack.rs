@@ -252,10 +252,47 @@ impl Tables {
     }
 }
 
+/// Reusable per-worker working buffers for [`decode_with_scratch`], avoiding
+/// per-texture heap allocations for the rANS record buffer and 256-block history.
+#[derive(Default)]
+pub struct Scratch {
+    records: Vec<u8>,
+    plain_history: Vec<Plain>,
+    bc6_history: Vec<(Bc6Ep, Bc6Ix)>,
+    bc7_history: Vec<(Bc7Ep, Bc7Ix)>,
+}
+
+impl Scratch {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Drops the rANS record buffer if it grew above `max_bytes`, keeping
+    /// steady-state thread-local memory bounded after unusually large textures.
+    pub fn trim(&mut self, max_bytes: usize) {
+        if self.records.capacity() > max_bytes {
+            self.records = Vec::new();
+        }
+    }
+}
+
 /// Unpacks `src` (BC number `bc`, 1 and 3-7) into `dst`, whose length gives
 /// the block count. The stream carries no size: bytes after the last one the
 /// lanes need are ignored, a stream that runs out is an error.
 pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(), Error> {
+    let mut scratch = Scratch::default();
+    decode_with_scratch(bc, src, dst, tables, &mut scratch)
+}
+
+/// Like [`decode`], reusing `scratch`'s record and 256-block history buffers
+/// across calls on the same worker thread.
+pub fn decode_with_scratch(
+    bc: u8,
+    src: &[u8],
+    dst: &mut [u8],
+    tables: &Tables,
+    scratch: &mut Scratch,
+) -> Result<(), Error> {
     let block = match bc {
         1 | 4 => 8,
         3 | 5 | 6 | 7 => 16,
@@ -274,19 +311,55 @@ pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(),
         _ => (&[3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4], 2),
     };
     let stride = widths.len() * per;
-    let mut records = vec![0u8; blocks * stride];
+    let needed = blocks * stride;
+    if scratch.records.len() < needed {
+        scratch.records.resize(needed, 0);
+    }
+    let records_buf = &mut scratch.records[..needed];
     let mut next = src.iter().copied();
-    lanes(tables, widths, per, blocks, |_| next.next(), &mut records)?;
-    let records = records.chunks_exact(stride);
+    lanes(tables, widths, per, blocks, |_| next.next(), records_buf)?;
+    let records = records_buf.chunks_exact(stride);
     let out = dst.chunks_exact_mut(block);
     let t = tables;
     match bc {
-        1 => plain(records, out, &t.bc1, &BC1, |s| bc1_residual(t, s), bc1_pack),
-        3 => plain(records, out, &t.bc3, &BC3, |s| bc3_residual(t, s), bc3_pack),
-        4 => plain(records, out, &t.bc4, &BC4, |s| bc4_residual(t, s), bc4_pack),
-        5 => plain(records, out, &t.bc5, &BC5, |s| bc5_residual(t, s), bc5_pack),
-        6 => bc6(records, out, &t.bc6),
-        _ => bc7(records, out, t),
+        1 => plain(
+            records,
+            out,
+            &t.bc1,
+            &BC1,
+            &mut scratch.plain_history,
+            |s| bc1_residual(t, s),
+            bc1_pack,
+        ),
+        3 => plain(
+            records,
+            out,
+            &t.bc3,
+            &BC3,
+            &mut scratch.plain_history,
+            |s| bc3_residual(t, s),
+            bc3_pack,
+        ),
+        4 => plain(
+            records,
+            out,
+            &t.bc4,
+            &BC4,
+            &mut scratch.plain_history,
+            |s| bc4_residual(t, s),
+            bc4_pack,
+        ),
+        5 => plain(
+            records,
+            out,
+            &t.bc5,
+            &BC5,
+            &mut scratch.plain_history,
+            |s| bc5_residual(t, s),
+            bc5_pack,
+        ),
+        6 => bc6(records, out, &t.bc6, &mut scratch.bc6_history),
+        _ => bc7(records, out, t, &mut scratch.bc7_history),
     }
 }
 
@@ -531,15 +604,18 @@ fn plain<'a>(
     out: impl Iterator<Item = &'a mut [u8]>,
     dictionary: &[Plain],
     w: &Widths,
+    history: &mut Vec<Plain>,
     residual: impl Fn(&[u8]) -> Plain,
     pack: fn(&Plain, &mut [u8]),
 ) -> Result<(), Error> {
-    let mut history = vec![Plain::default(); HISTORY];
+    if history.len() < HISTORY {
+        history.resize(HISTORY, Plain::default());
+    }
     let zero = Plain::default();
     for (i, (s, block)) in records.zip(out).enumerate() {
         let (ep_ref, ix_ref) = references(s, w.paired);
-        let ep_ref = &pick(i, ep_ref, &history, dictionary, &zero).ep;
-        let ix_ref = &pick(i, ix_ref, &history, dictionary, &zero).ix;
+        let ep_ref = &pick(i, ep_ref, history, dictionary, &zero).ep;
+        let ix_ref = &pick(i, ix_ref, history, dictionary, &zero).ix;
         let mut v = residual(s);
         for ((v, r), bits) in v.ep.iter_mut().zip(ep_ref).zip(w.ep) {
             *v = v.wrapping_add(*r) & ((1u16 << bits) - 1) as u8;
@@ -761,8 +837,11 @@ fn bc7<'a>(
     records: impl Iterator<Item = &'a [u8]>,
     out: impl Iterator<Item = &'a mut [u8]>,
     t: &Tables,
+    history: &mut Vec<(Bc7Ep, Bc7Ix)>,
 ) -> Result<(), Error> {
-    let mut history = vec![(Bc7Ep::default(), Bc7Ix::default()); HISTORY];
+    if history.len() < HISTORY {
+        history.resize(HISTORY, (Bc7Ep::default(), Bc7Ix::default()));
+    }
     let zero = (Bc7Ep::default(), Bc7Ix::default());
     for (i, (s, block)) in records.zip(out).enumerate() {
         let (ep_ref, ix_ref) = references(s, true);
@@ -799,7 +878,7 @@ fn bc7<'a>(
                 0,
             ],
         ];
-        let r = &pick(i, ep_ref, &history, &t.bc7, &zero).0;
+        let r = &pick(i, ep_ref, history, &t.bc7, &zero).0;
         let mut ep = Bc7Ep {
             ctrl,
             ..Default::default()
@@ -822,7 +901,7 @@ fn bc7<'a>(
             }
         }
         let bits = BC7_INDEX[mode];
-        let rx = &pick(i, ix_ref, &history, &t.bc7, &zero).1;
+        let rx = &pick(i, ix_ref, history, &t.bc7, &zero).1;
         let mut ix = Bc7Ix {
             bits,
             ..Default::default()
@@ -1061,8 +1140,11 @@ fn bc6<'a>(
     records: impl Iterator<Item = &'a [u8]>,
     out: impl Iterator<Item = &'a mut [u8]>,
     dictionary: &[(Bc6Ep, Bc6Ix)],
+    history: &mut Vec<(Bc6Ep, Bc6Ix)>,
 ) -> Result<(), Error> {
-    let mut history = vec![(Bc6Ep::default(), Bc6Ix::default()); HISTORY];
+    if history.len() < HISTORY {
+        history.resize(HISTORY, (Bc6Ep::default(), Bc6Ix::default()));
+    }
     let zero = (
         Bc6Ep::default(),
         Bc6Ix {
@@ -1094,7 +1176,7 @@ fn bc6<'a>(
         } else {
             (e0, e1)
         };
-        let r = &pick(i, ep_ref, &history, dictionary, &zero).0;
+        let r = &pick(i, ep_ref, history, dictionary, &zero).0;
         let mut ep = Bc6Ep::default();
         // Endpoint 0 at the base precision, the others per channel; the
         // reference is cut by the mask after the sum.
@@ -1118,7 +1200,7 @@ fn bc6<'a>(
             }
             ep.e[3] = ep.e[1];
         }
-        let rx = &pick(i, ix_ref, &history, dictionary, &zero).1;
+        let rx = &pick(i, ix_ref, history, dictionary, &zero).1;
         let bits = bc6_index_bits(mode);
         let mut ix = Bc6Ix {
             mode,
@@ -1604,5 +1686,30 @@ mod tests {
             let ok = (ix.bits[1] != 0 || ix.ix[1] == [0; 16]) && anchor.contains(&ix.ix[0][0]);
             assert!(ok, "entry {k}: {:?}", ix.ix);
         }
+    }
+
+    #[test]
+    fn decode_with_scratch_matches_stateless_decode_across_repeated_calls() {
+        let t = Tables::parse(&tables()).unwrap();
+        let cases: [(u8, &[u8], usize, usize, usize); 3] = [
+            (1, &[7, 7, 4, 5, 4, 4, 5, 4, 7, 7, 7, 7], 1, 8, 64),
+            (4, &BC4_LANES, 1, 8, 300),
+            (7, &[3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4], 2, 16, 48),
+        ];
+        let mut scratch = Scratch::new();
+        for round in 0..2 {
+            for &(bc, widths, per, block, blocks) in &cases {
+                let records = random_records(widths, per, blocks, bc == 7);
+                let src = stream(&t, widths, per, &records);
+                let mut expected = vec![0u8; blocks * block];
+                let mut got = vec![0u8; blocks * block];
+                decode(bc, &src, &mut expected, &t).unwrap();
+                decode_with_scratch(bc, &src, &mut got, &t, &mut scratch).unwrap();
+                assert_eq!(got, expected, "round {round} bc{bc}");
+            }
+        }
+        assert!(scratch.records.capacity() > 0);
+        scratch.trim(16);
+        assert_eq!(scratch.records.capacity(), 0);
     }
 }

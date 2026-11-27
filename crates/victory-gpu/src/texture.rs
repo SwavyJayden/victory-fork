@@ -103,10 +103,10 @@ pub(crate) struct Staging {
     waiting: std::sync::atomic::AtomicU64,
     /// Recorded for a one-shot decoration bake (`BAKING`): submission-time
     /// refresh must capture an exact snapshot (bypassing write-watch/guard
-    /// skips and the 30-frame partial-read throttle, and never leaving stale
-    /// bytes behind when `no_wait()` reads lock-free; only falling back to
-    /// `title_memory_reading` if this texture's own pages stay transiently
-    /// missing).
+    /// skips and the [`PARTIAL_RETRY_MS`] partial-read throttle, and never
+    /// leaving stale bytes behind when `no_wait()` reads lock-free; only
+    /// falling back to `title_memory_reading` if this texture's own pages stay
+    /// transiently missing).
     exact: std::sync::atomic::AtomicBool,
 }
 
@@ -116,12 +116,22 @@ pub(crate) struct Staging {
 struct Last {
     hash: Option<Digest>,
     asked: u64,
-    /// The frame a partly mapped texture was last read in.
+    /// Monotonic time (`crate::host::now_ms`) a partly mapped texture was last
+    /// read at.
     partial: Option<u64>,
     /// Until this frame a guarded texture is hashed at every check: its
     /// first checks, and after the hash found a change the guard had not
     /// seen ([`hot_textures`]). 0: not checked under the guard yet.
     hot_until: u64,
+}
+
+/// Minimum interval (ms) between re-reads of a partly mapped streamed texture.
+/// Time-based (rather than 30 frames) so newly arrived mips stream in within
+/// ~150 ms even at 12–20 FPS instead of lagging 1.5–2.5 seconds.
+const PARTIAL_RETRY_MS: u64 = 150;
+
+fn partial_throttled(last_ms: Option<u64>, now_ms: u64) -> bool {
+    last_ms.is_some_and(|at| now_ms.saturating_sub(at) < PARTIAL_RETRY_MS)
 }
 
 /// Frames a guarded texture is hashed at every check from its first check,
@@ -1639,14 +1649,15 @@ impl Staging {
             // there, the usual state while it streams in. Read through the
             // copy, which stands unmapped pages (zeros), and upload what
             // is there; nothing at all mapped changes nothing.
-            // shortcut: read again at most every 30 frames (reading around
-            // unmapped pages is slow, and nothing tells us when pages
-            // arrive): a mip that streams in shows up to 30 frames late.
-            let frame = crate::frame::current();
-            if !exact && last.partial.is_some_and(|at| frame < at + 30) {
+            // shortcut: read again at most every `PARTIAL_RETRY_MS` (150 ms)
+            // because reading around unmapped pages is slow and nothing tells
+            // us when pages arrive; time-based so mip streaming stays snappy
+            // at 12–20 FPS instead of waiting 30 frames (1.5–2.5 s).
+            let now = crate::host::now_ms();
+            if !exact && partial_throttled(last.partial, now) {
                 return 0;
             }
-            last.partial = Some(frame);
+            last.partial = Some(now);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
@@ -1785,7 +1796,7 @@ impl Staging {
         if full {
             UNLOCKED[0].fetch_add(1, Relaxed);
         } else {
-            last.partial = Some(crate::frame::current());
+            last.partial = Some(crate::host::now_ms());
             UNLOCKED[2].fetch_add(1, Relaxed);
         }
         if changed {
@@ -1862,7 +1873,7 @@ impl Staging {
             }
             got
         });
-        last.partial = Some(crate::frame::current());
+        last.partial = Some(crate::host::now_ms());
         UNLOCKED[2].fetch_add(1, Relaxed);
         if got < there.max(self.expected.load(Relaxed)) {
             UNLOCKED[3].fetch_add(1, Relaxed);
@@ -3046,5 +3057,16 @@ mod prelude_upload_tests {
 
             assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
         }
+    }
+
+    #[test]
+    fn partial_mip_throttle_uses_150ms_time_window() {
+        assert!(!super::partial_throttled(None, 0));
+        assert!(super::partial_throttled(Some(0), 0));
+        assert!(super::partial_throttled(Some(1000), 1149));
+        assert!(!super::partial_throttled(Some(1000), 1150));
+        assert!(!super::partial_throttled(Some(1000), 1500));
+        // Clock skew / saturating subtraction stays safely throttled instead of wrapping.
+        assert!(super::partial_throttled(Some(1000), 999));
     }
 }

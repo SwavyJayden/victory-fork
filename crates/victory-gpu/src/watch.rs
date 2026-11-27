@@ -1919,6 +1919,65 @@ thread_local! {
 /// ([`Claims`]).
 static BUSY: Bits = Bits::new();
 
+/// Number of striped wait buckets for contended [`BUSY`] block claims.
+/// Eliminates `yield_now()` spin-wait loops on 6-core CPUs when multiple threads
+/// collide on a block undergoing `VirtualProtect` + TLB shootdown.
+const CLAIM_STRIPES: usize = 64;
+
+struct ClaimStripe {
+    waiters: std::sync::atomic::AtomicU32,
+    lock: std::sync::Mutex<()>,
+    cv: std::sync::Condvar,
+}
+
+impl ClaimStripe {
+    const fn new() -> Self {
+        Self {
+            waiters: std::sync::atomic::AtomicU32::new(0),
+            lock: std::sync::Mutex::new(()),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+}
+
+static CLAIM_WAIT_STRIPES: [ClaimStripe; CLAIM_STRIPES] = [const { ClaimStripe::new() }; CLAIM_STRIPES];
+
+#[inline]
+fn claim_stripe(block: usize) -> &'static ClaimStripe {
+    &CLAIM_WAIT_STRIPES[(block ^ (block >> 6)) & (CLAIM_STRIPES - 1)]
+}
+
+/// Acquires [`BUSY`] claim on `block` with a lock-free fast path and a zero-spin
+/// kernel blocking `Condvar` slow path (returns number of blocking waits taken).
+fn acquire_claim_block(block: usize) -> u64 {
+    if BUSY.try_set(block) {
+        return 0;
+    }
+    let stripe = claim_stripe(block);
+    let mut guard = stripe.lock.lock().unwrap_or_else(|e| e.into_inner());
+    stripe.waiters.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let mut waits = 0u64;
+    while !BUSY.try_set(block) {
+        waits += 1;
+        guard = stripe.cv.wait(guard).unwrap_or_else(|e| e.into_inner());
+    }
+    stripe.waiters.fetch_sub(1, std::sync::atomic::Ordering::Release);
+    drop(guard);
+    waits
+}
+
+/// Releases [`BUSY`] claim on `block`, waking blocked waiters on that stripe only
+/// when `waiters != 0` (single `SeqCst` load on uncontended fast path).
+#[inline]
+fn release_claim_block(block: usize) {
+    BUSY.clear(block);
+    let stripe = claim_stripe(block);
+    if stripe.waiters.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+        let _guard = stripe.lock.lock().unwrap_or_else(|e| e.into_inner());
+        stripe.cv.notify_all();
+    }
+}
+
 /// Claims of blocks ([`BUSY`]), let go when dropped.
 struct Claims(Vec<usize>);
 
@@ -1927,22 +1986,12 @@ impl Claims {
     /// the other: who waits holds only claims of lower blocks.
     fn wait_for(blocks: &[usize]) -> Claims {
         debug_assert!(blocks.windows(2).all(|w| w[0] < w[1]));
-        let mut spun = 0u64;
+        let mut waited = 0u64;
         for &block in blocks {
-            let mut tries = 0u32;
-            while !BUSY.try_set(block) {
-                tries += 1;
-                spun += 1;
-                if tries < 64 {
-                    std::hint::spin_loop();
-                } else {
-                    // Another thread's `VirtualProtect` of the block.
-                    std::thread::yield_now();
-                }
-            }
+            waited += acquire_claim_block(block);
         }
-        if spun != 0 {
-            port6_count(P6_CLAIM_SPINS, spun);
+        if waited != 0 {
+            port6_count(P6_CLAIM_SPINS, waited);
         }
         Claims(blocks.to_vec())
     }
@@ -1970,7 +2019,7 @@ impl Claims {
 impl Drop for Claims {
     fn drop(&mut self) {
         for &block in &self.0 {
-            BUSY.clear(block);
+            release_claim_block(block);
         }
     }
 }
@@ -1981,20 +2030,9 @@ struct ClaimOne(usize);
 
 impl ClaimOne {
     fn wait_for(block: usize) -> ClaimOne {
-        let mut spun = 0u64;
-        let mut tries = 0u32;
-        while !BUSY.try_set(block) {
-            tries += 1;
-            spun += 1;
-            if tries < 64 {
-                std::hint::spin_loop();
-            } else {
-                // Another thread's `VirtualProtect` of the block.
-                std::thread::yield_now();
-            }
-        }
-        if spun != 0 {
-            port6_count(P6_CLAIM_SPINS, spun);
+        let waited = acquire_claim_block(block);
+        if waited != 0 {
+            port6_count(P6_CLAIM_SPINS, waited);
         }
         ClaimOne(block)
     }
@@ -2002,7 +2040,7 @@ impl ClaimOne {
 
 impl Drop for ClaimOne {
     fn drop(&mut self) {
-        BUSY.clear(self.0);
+        release_claim_block(self.0);
     }
 }
 
@@ -3845,6 +3883,9 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
     let ranges = crate::inplace::views_of_section(section, offset, len);
     for &(at, n) in &ranges {
         forget_private(at / BLOCK, at.saturating_add(n).div_ceil(BLOCK));
+    }
+    if crate::gpu_only::enabled() && crate::gpu_only::active_pieces() > 0 && !ranges.is_empty() {
+        crate::shadow::gpu_only_notify_views_mapped(&ranges);
     }
     // (A block is noted in `PROTECTED` ahead of the look at its page's views
     // that did not find this one yet.)
@@ -6502,5 +6543,49 @@ mod rearm_tests {
         assert_eq!(NOT_REARMED.load(Relaxed), before + 2);
         // SAFETY: our allocation.
         unsafe { VirtualFree(page as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Contended `Claims::wait_for` and `ClaimOne::wait_for` must serialize
+    /// exclusive block ownership cleanly via blocking `Condvar` waits with zero
+    /// lost wakeups and zero concurrent double-ownership across threads.
+    #[test]
+    fn blocking_claims_serialize_contended_blocks_without_lost_wakeups() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const BASE: usize = 0x10_0000; // high synthetic block index outside test allocations
+        const BLOCKS: usize = 4;
+        let active: [AtomicUsize; BLOCKS] = [const { AtomicUsize::new(0) }; BLOCKS];
+        let completed = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for t in 0..8usize {
+                let active = &active;
+                let completed = &completed;
+                s.spawn(move || {
+                    for iter in 0..200usize {
+                        if (t + iter) % 3 == 0 {
+                            let idx = (t + iter) % BLOCKS;
+                            let _one = ClaimOne::wait_for(BASE + idx);
+                            assert_eq!(active[idx].fetch_add(1, Ordering::AcqRel), 0, "concurrent ClaimOne overlap");
+                            std::hint::black_box(iter);
+                            active[idx].fetch_sub(1, Ordering::AcqRel);
+                        } else {
+                            let a = (t + iter) % BLOCKS;
+                            let b = (a + 1) % BLOCKS;
+                            let pair = if a < b { [BASE + a, BASE + b] } else { [BASE + b, BASE + a] };
+                            let _many = Claims::wait_for(&pair);
+                            assert_eq!(active[a].fetch_add(1, Ordering::AcqRel), 0, "concurrent Claims overlap on a");
+                            assert_eq!(active[b].fetch_add(1, Ordering::AcqRel), 0, "concurrent Claims overlap on b");
+                            std::hint::black_box(iter);
+                            active[a].fetch_sub(1, Ordering::AcqRel);
+                            active[b].fetch_sub(1, Ordering::AcqRel);
+                        }
+                        completed.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+        assert_eq!(completed.load(Ordering::Acquire), 8 * 200);
+        for i in 0..BLOCKS {
+            assert_eq!(claim_stripe(BASE + i).waiters.load(Ordering::Acquire), 0);
+        }
     }
 }

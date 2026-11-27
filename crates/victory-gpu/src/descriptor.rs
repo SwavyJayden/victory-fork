@@ -482,16 +482,18 @@ pub(crate) fn sync_heaps() {
         // Ranges of the heap to look at, and whether a range is one the
         // fallback of renderer port #2 looks at whole.
         let mut parts: Vec<(usize, usize, bool)> = Vec::new();
+        // Slot intervals `[lo, hi)` that `port_descriptors::take` drained AND
+        // that lie inside a `check=true` fallback page this pass: kept disjoint
+        // from `parts` (no parallel data race on `copied`) and suppressed from
+        // false-miss counting inside the `check=true` pass.
+        let mut taken_in_checked: Vec<(u32, u32)> = Vec::new();
         let port = crate::port_descriptors::adopted(start);
         if port {
             // Renderer port #2: the slots the title's patched stores and our
             // calls marked, in place of the changed pages; and a few of the
             // pages the watch says were written, looked at whole.
             let phase = crate::timeline::span("the heaps' records: the marks taken (renderer port 2)");
-            for (first, n) in crate::port_descriptors::take(start).unwrap_or_default() {
-                let from = start as usize + first as usize * step as usize;
-                parts.push((from, from + n as usize * step as usize, false));
-            }
+            let runs = crate::port_descriptors::take(start).unwrap_or_default();
             phase.end();
             if crate::port_descriptors::ask_due(frame) {
                 let began = std::time::Instant::now();
@@ -501,9 +503,15 @@ pub(crate) fn sync_heaps() {
                 spent[0] += since(began);
                 crate::port_descriptors::asked(&taken);
             }
-            for page in crate::port_descriptors::to_check(frame) {
-                parts.push((page.max(start as usize), (page + crate::watch::PAGE).min(end as usize), true));
-            }
+            let check_pages = crate::port_descriptors::to_check(frame);
+            (parts, taken_in_checked) = reconcile_port_parts(
+                start,
+                end,
+                step,
+                mirrored_count,
+                &runs,
+                &check_pages,
+            );
         } else {
             let began = std::time::Instant::now();
             let phase = crate::timeline::span("the heaps' records: asking");
@@ -597,7 +605,7 @@ pub(crate) fn sync_heaps() {
                     let w0 = word(0);
                     let w1 = word(1);
                     let w2 = word(2);
-                    if check {
+                    if check && !slot_in_ranges(&taken_in_checked, index) {
                         // Renderer port #2's fallback: what no mark told of.
                         crate::port_descriptors::missed(
                             index,
@@ -706,6 +714,92 @@ pub(crate) fn sync_heaps() {
     for (count, n) in SYNCED_KINDS.iter().zip(kinds) {
         count.fetch_add(n, Relaxed);
     }
+}
+
+/// Reconciles renderer port #2's marked slot runs (`take`) with the fallback
+/// pages (`to_check`) so every slot is scanned by at most one worker range
+/// (preserving `Copied::changes_in_place`'s disjoint-slot invariant and
+/// eliminating the parallel data race) while recording which slots inside
+/// `check=true` pages were already drained by `take()` so they are mirrored
+/// without falsely triggering `port_descriptors::missed`.
+#[cfg(windows)]
+fn reconcile_port_parts(
+    start: u64,
+    end: u64,
+    step: u64,
+    mirrored_count: u32,
+    runs: &[(u32, u32)],
+    check_pages: &[usize],
+) -> (Vec<(usize, usize, bool)>, Vec<(u32, u32)>) {
+    let start_usize = start as usize;
+    let end_usize = end as usize;
+    let step_usize = step as usize;
+    let mut checked: Vec<(usize, usize, u32, u32)> = check_pages
+        .iter()
+        .filter_map(|&page| {
+            let from = page.max(start_usize);
+            let to = page.saturating_add(crate::watch::PAGE).min(end_usize);
+            if from >= to {
+                return None;
+            }
+            let slots = changed_slots(from, to, start_usize, step, mirrored_count);
+            let first = ((from - start_usize) as u64).div_ceil(step).max(slots.start);
+            let lead = (start + first * step) as usize;
+            let count = (to.saturating_sub(lead) as u64 / step).min(slots.end.saturating_sub(first));
+            Some((from, to, first as u32, (first + count) as u32))
+        })
+        .collect();
+    checked.sort_unstable_by_key(|&(from, _, _, _)| from);
+    checked.dedup_by_key(|item| item.0);
+
+    let mut parts: Vec<(usize, usize, bool)> = Vec::with_capacity(runs.len() + checked.len());
+    let mut taken_in_checked: Vec<(u32, u32)> = Vec::new();
+    let mut ci = 0usize;
+    for &(first, count) in runs {
+        let mut lo = first.min(mirrored_count);
+        let hi = first.saturating_add(count).min(mirrored_count);
+        if lo >= hi {
+            continue;
+        }
+        while ci < checked.len() && checked[ci].3 <= lo {
+            ci += 1;
+        }
+        let mut j = ci;
+        while lo < hi && j < checked.len() && checked[j].2 < hi {
+            let (c_lo, c_hi) = (checked[j].2, checked[j].3);
+            if lo < c_lo {
+                let from = start_usize + lo as usize * step_usize;
+                let to = start_usize + c_lo as usize * step_usize;
+                parts.push((from, to, false));
+                lo = c_lo;
+            }
+            let ov_hi = hi.min(c_hi);
+            if lo < ov_hi {
+                match taken_in_checked.last_mut() {
+                    Some((_, prev_hi)) if *prev_hi == lo => *prev_hi = ov_hi,
+                    _ => taken_in_checked.push((lo, ov_hi)),
+                }
+                lo = ov_hi;
+            }
+            j += 1;
+        }
+        if lo < hi {
+            let from = start_usize + lo as usize * step_usize;
+            let to = start_usize + hi as usize * step_usize;
+            parts.push((from, to, false));
+        }
+    }
+    for (from, to, _, _) in checked {
+        parts.push((from, to, true));
+    }
+    (parts, taken_in_checked)
+}
+
+#[cfg(windows)]
+#[inline]
+fn slot_in_ranges(ranges: &[(u32, u32)], index: u32) -> bool {
+    let pos = ranges.partition_point(|&(_, hi)| hi <= index);
+    ranges.get(pos).is_some_and(|&(lo, hi)| index >= lo && index < hi)
 }
 
 /// Of those mirrored, since the last frame line: no view, a view of an object,
@@ -1474,6 +1568,8 @@ fn record(handle: u64, view: View) {
         return;
     }
     let [i, generation] = words_for(view);
+    #[cfg(windows)]
+    crate::port_descriptors::pre_mark(handle);
     // SAFETY: the handle is a descriptor slot, at least 16 bytes.
     unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
     #[cfg(windows)]
@@ -1678,6 +1774,8 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
     };
     let len = u64::from(count) * step;
     if dst != 0 && src != 0 {
+        #[cfg(windows)]
+        crate::port_descriptors::pre_mark_range(dst, count, step);
         // SAFETY: both ranges are descriptor slots the title owns.
         #[cfg(windows)]
         unsafe {
@@ -2139,5 +2237,76 @@ mod tests {
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reconcile_port_parts_keeps_runs_and_checked_pages_disjoint() {
+        let page = crate::watch::PAGE; // 64 KiB = 2048 slots of 32 bytes
+        let step = 32u64;
+        let slots_per_page = (page / step as usize) as u32;
+        let start = (page * 16) as u64;
+        let mirrored_count = slots_per_page * 6;
+        let end = start + u64::from(mirrored_count) * step;
+
+        // Check pages 1 and 3 (passed unsorted + duplicated to test normalization).
+        let p1 = start as usize + page;
+        let p3 = start as usize + page * 3;
+        let runs = [
+            (10, 5),                                  // fully outside (page 0)
+            (slots_per_page - 4, 10),                 // straddles entry into page 1
+            (slots_per_page + 100, 20),               // fully inside page 1
+            (slots_per_page * 2 - 3, 8),              // straddles exit out of page 1
+            (slots_per_page * 3 - 2, slots_per_page + 5), // spans across all of page 3
+        ];
+        let (parts, taken_in_checked) =
+            reconcile_port_parts(start, end, step, mirrored_count, &runs, &[p3, p1, p1]);
+
+        // Verify every returned part scans a strictly disjoint slot interval.
+        let mut intervals: Vec<(u32, u32, bool)> = parts
+            .iter()
+            .map(|&(from, to, check)| {
+                let slots = changed_slots(from, to, start as usize, step, mirrored_count);
+                let first = ((from - start as usize) as u64).div_ceil(step).max(slots.start);
+                let lead = (start + first * step) as usize;
+                let count = (to.saturating_sub(lead) as u64 / step).min(slots.end.saturating_sub(first));
+                (first as u32, (first + count) as u32, check)
+            })
+            .collect();
+        intervals.sort_unstable_by_key(|&(lo, _, _)| lo);
+        for pair in intervals.windows(2) {
+            assert!(
+                pair[0].1 <= pair[1].0,
+                "overlapping parts would race on Copied::seen: {:?} vs {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+
+        // Every taken slot must be covered by exactly one part (either check=false
+        // or check=true + recorded in `taken_in_checked`).
+        for &(first, count) in &runs {
+            for slot in first..first + count {
+                let covering: Vec<_> = intervals
+                    .iter()
+                    .copied()
+                    .filter(|&(lo, hi, _)| slot >= lo && slot < hi)
+                    .collect();
+                assert_eq!(covering.len(), 1, "slot {slot} covered {:?} times", covering);
+                let in_checked_page = covering[0].2;
+                assert_eq!(
+                    slot_in_ranges(&taken_in_checked, slot),
+                    in_checked_page,
+                    "slot {slot} taken_in_checked mismatch"
+                );
+            }
+        }
+
+        // Untaken slots inside checked pages must NOT be suppressed in `taken_in_checked`.
+        assert!(!slot_in_ranges(&taken_in_checked, slots_per_page + 50));
+        assert!(!slot_in_ranges(&taken_in_checked, slots_per_page + 99));
+        assert!(slot_in_ranges(&taken_in_checked, slots_per_page + 100));
+        assert!(slot_in_ranges(&taken_in_checked, slots_per_page + 119));
+        assert!(!slot_in_ranges(&taken_in_checked, slots_per_page + 120));
     }
 }

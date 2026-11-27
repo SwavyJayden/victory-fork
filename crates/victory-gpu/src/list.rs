@@ -2024,6 +2024,23 @@ extern "system" fn execute_indirect(
     count_offset: u64,
 ) {
     count_draw();
+    // Early-cull known-dropped / builder-off / `left_out` (`VICTORY_SKIP_DEAD_RT=1`)
+    // pipelines BEFORE touching signature tables, resource buffers, shadow
+    // refreshes, indirect clamps, or the global `SEEN` mutex.
+    #[cfg(windows)]
+    let host_p = {
+        let mut has_host = false;
+        let mut resolved = None;
+        with_state(this, |_, s| {
+            has_host = true;
+            resolved = s.pipeline_for_indirect();
+        });
+        if has_host && resolved.is_none() {
+            count_dropped_indirect();
+            return;
+        }
+        resolved
+    };
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
     };
@@ -2031,14 +2048,14 @@ extern "system" fn execute_indirect(
     let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
     let mut ran = false;
     #[cfg(windows)]
-    if let ([[kind, ..]], Some(address)) = (args, address)
+    if let (Some(p), [[kind, ..]], Some(address)) = (host_p, args, address)
         && (count.is_null() || counter.is_some())
     {
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
         with_state(this, |list, s| {
-            ran = s.execute_indirect(list, (kind, stride, max), address, counter);
+            ran = s.execute_indirect_with(list, p, (kind, stride, max), address, counter);
         });
     } else {
         #[cfg(all(windows, feature = "diagnostics"))]
@@ -2051,7 +2068,7 @@ extern "system" fn execute_indirect(
     if ran {
         return;
     }
-    INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    count_dropped_indirect();
     static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if !seen.contains(&(signature as usize)) {
@@ -2065,6 +2082,12 @@ extern "system" fn execute_indirect(
             "indirect execution dropped (first time for this signature)"
         );
     }
+}
+
+/// Counts a dropped indirect execution without touching `SEEN`.
+#[inline]
+pub(super) fn count_dropped_indirect() {
+    INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Indirect executions dropped since the last call.

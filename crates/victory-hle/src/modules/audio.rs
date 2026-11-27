@@ -19,7 +19,7 @@
 use std::alloc::Layout;
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard};
 use std::time::Instant;
 
@@ -62,6 +62,10 @@ static HEAP: Mutex<Heap> = Mutex::new(Heap {
     free: BTreeMap::new(),
     created: false,
 });
+
+/// Incremented whenever an APU heap block is freed so per-voice cached host
+/// spans detect invalidation in one atomic load without locking `HEAP`.
+static HEAP_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// Device addresses start above 0, which means "none" to titles.
 const APU_BASE: u32 = 0x0001_0000;
@@ -130,6 +134,7 @@ fn heap_free(ptr: *mut u8) {
     };
     heap.by_apu.remove(&block.apu);
     heap.give_back(block.apu, block.apu + block.layout.size() as u32);
+    HEAP_GENERATION.fetch_add(1, Ordering::AcqRel);
     drop(heap);
     // SAFETY: allocated by `heap_alloc` with this layout.
     unsafe { std::alloc::dealloc(ptr, block.layout) };
@@ -179,16 +184,67 @@ fn heap_unmap(apu: u32) -> Option<*mut u8> {
         .then(|| (host + (apu - start) as usize) as *mut u8)
 }
 
-/// `len` bytes of title memory at a device address, if one heap block holds
-/// them all.
-fn heap_bytes<'a>(apu: u32, len: usize) -> Option<&'a mut [u8]> {
+/// Resolves the APU heap block containing `[apu, apu + len)` along with the
+/// current [`HEAP_GENERATION`], for caching across XMA output chunks/frames.
+fn heap_block_for(apu: u32, len: usize) -> Option<(u32, usize, usize, u64)> {
     let heap = lock(&HEAP);
     let (&start, &host) = heap.by_apu.range(..=apu).next_back()?;
+    let block_size = heap.blocks[&host].size;
     let offset = (apu - start) as usize;
-    (offset + len <= heap.blocks[&host].size)
-        // SAFETY: inside a live heap block, which the title and the audio
-        // hardware share like on the console.
-        .then(|| unsafe { std::slice::from_raw_parts_mut((host + offset) as *mut u8, len) })
+    offset
+        .checked_add(len)
+        .is_some_and(|end| end <= block_size)
+        .then(|| (start, host, block_size, HEAP_GENERATION.load(Ordering::Acquire)))
+}
+
+/// Cached APU->host block span held by an active XMA voice, avoiding
+/// `HEAP.lock()` + `BTreeMap` lookup on every 256-byte output block and frame.
+#[derive(Clone, Copy, Default)]
+struct CachedHeapSpan {
+    generation: u64,
+    apu_start: u32,
+    host_start: usize,
+    block_size: usize,
+}
+
+impl CachedHeapSpan {
+    fn resolve<'a>(&mut self, apu: u32, len: usize) -> Option<&'a mut [u8]> {
+        let current_gen = HEAP_GENERATION.load(Ordering::Acquire);
+        if self.host_start != 0 && self.generation == current_gen && apu >= self.apu_start {
+            let offset = (apu - self.apu_start) as usize;
+            if offset
+                .checked_add(len)
+                .is_some_and(|end| end <= self.block_size)
+            {
+                // SAFETY: inside a live APU heap block whose generation has not
+                // changed since resolution; shared with the title like on console.
+                return Some(unsafe {
+                    std::slice::from_raw_parts_mut((self.host_start + offset) as *mut u8, len)
+                });
+            }
+        }
+        let (apu_start, host_start, block_size, generation) = heap_block_for(apu, len)?;
+        *self = CachedHeapSpan {
+            generation,
+            apu_start,
+            host_start,
+            block_size,
+        };
+        let offset = (apu - apu_start) as usize;
+        // SAFETY: resolved inside a live heap block under `HEAP`.
+        Some(unsafe { std::slice::from_raw_parts_mut((host_start + offset) as *mut u8, len) })
+    }
+}
+
+/// `len` bytes of title memory at a device address, if one heap block holds
+/// them all.
+#[cfg(feature = "diagnostics")]
+fn heap_bytes<'a>(apu: u32, len: usize) -> Option<&'a mut [u8]> {
+    let (start, host, _, _) = heap_block_for(apu, len)?;
+    let offset = (apu - start) as usize;
+    // SAFETY: inside a live heap block, which the title and the audio
+    // hardware share like on the console.
+    Some(unsafe { std::slice::from_raw_parts_mut((host + offset) as *mut u8, len) })
 }
 
 pub extern "system" fn ApuAlloc(
@@ -327,10 +383,44 @@ const INPUT_INVALID: u32 = 4;
 struct Voice {
     decoder: Option<xma::Decoder>,
     pcm: VecDeque<i16>,
+    /// Reusable frame bitstream scratch buffer (`xma::read_frame_into`).
+    frame_scratch: Vec<u8>,
+    /// Reusable decoded PCM scratch buffer (`xma::FRAME_SAMPLES * channels`).
+    pcm_scratch: Vec<i16>,
+    /// Cached APU->host block span for the output ring (word 7).
+    output_span: CachedHeapSpan,
+    /// Cached APU->host block spans for input buffers 0 and 1 (words 5 and 6).
+    input_spans: [CachedHeapSpan; 2],
     /// Samples per channel still to drop (start or loop subframe skips).
     skip: usize,
     ended: bool,
     trace: Trace,
+}
+
+impl Voice {
+    fn new(skip: usize) -> Self {
+        Self {
+            decoder: None,
+            pcm: VecDeque::new(),
+            frame_scratch: Vec::new(),
+            pcm_scratch: Vec::new(),
+            output_span: CachedHeapSpan::default(),
+            input_spans: [CachedHeapSpan::default(); 2],
+            skip,
+            ended: false,
+            trace: Trace {
+                since: Instant::now(),
+                produced: 0,
+                taken: 0,
+                takes: 0,
+                partial_takes: 0,
+                frames: 0,
+                bad_frames: 0,
+                peak: 0,
+                ended_ms: None,
+            },
+        }
+    }
 }
 
 /// What a voice did, for the debug log when it is disabled.
@@ -431,23 +521,9 @@ impl Xma {
         );
         #[cfg(feature = "diagnostics")]
         dump_input(index, context);
-        *slot = Some(Voice {
-            decoder: None,
-            pcm: VecDeque::new(),
-            skip: context.field(1, 24, 3) as usize * xma::SUBFRAME_SAMPLES,
-            ended: false,
-            trace: Trace {
-                since: Instant::now(),
-                produced: 0,
-                taken: 0,
-                takes: 0,
-                partial_takes: 0,
-                frames: 0,
-                bad_frames: 0,
-                peak: 0,
-                ended_ms: None,
-            },
-        });
+        *slot = Some(Voice::new(
+            context.field(1, 24, 3) as usize * xma::SUBFRAME_SAMPLES,
+        ));
         drop(slot);
         wake_decoder();
     }
@@ -547,7 +623,7 @@ fn pump(context: Context, voice: &mut Voice) {
         else {
             return;
         };
-        let Some(out) = heap_bytes(address, BLOCK_BYTES) else {
+        let Some(out) = voice.output_span.resolve(address, BLOCK_BYTES) else {
             return;
         };
         for pair in out.as_chunks_mut::<2>().0 {
@@ -591,9 +667,9 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
         if valid & (1 << (1 - current)) == 0 {
             // Out of input: the overlap tail, then nothing.
             if let Some(decoder) = &mut voice.decoder {
-                let mut tail = Vec::new();
-                decoder.flush(&mut tail);
-                voice.pcm.extend(tail);
+                voice.pcm_scratch.clear();
+                decoder.flush(&mut voice.pcm_scratch);
+                voice.pcm.extend(voice.pcm_scratch.iter().copied());
             }
             voice.ended = true;
             voice.trace.ended_ms = Some(voice.trace.since.elapsed().as_millis());
@@ -609,7 +685,9 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
         0 => (context.get(5), context.field(0, 0, 12)),
         _ => (context.get(6), context.field(1, 0, 12)),
     };
-    let Some(data) = heap_bytes(address & !0x7ff, packets as usize * xma::PACKET_BYTES) else {
+    let Some(data) = voice.input_spans[current as usize]
+        .resolve(address & !0x7ff, packets as usize * xma::PACKET_BYTES)
+    else {
         context.set_field(0, 20 + current, 1, 0);
         return true;
     };
@@ -617,7 +695,7 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
     if at < 32 {
         at = 32 + xma::packet(data, 0).map_or(0, |p| p.first_frame_bit as usize);
     }
-    let Some(frame) = xma::read_frame(data, at) else {
+    let Some(frame) = xma::read_frame_into(data, at, &mut voice.frame_scratch) else {
         // This input is used up.
         context.set_field(0, 20 + current, 1, 0);
         return true;
@@ -626,15 +704,19 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
         const RATES: [u32; 4] = [24_000, 32_000, 44_100, 48_000];
         xma::Decoder::new(channels, RATES[context.field(1, 27, 2) as usize])
     });
-    let mut pcm = Vec::with_capacity(xma::FRAME_SAMPLES * channels);
+    voice.pcm_scratch.clear();
+    let want_cap = xma::FRAME_SAMPLES * channels;
+    if voice.pcm_scratch.capacity() < want_cap {
+        voice.pcm_scratch.reserve(want_cap);
+    }
     voice.trace.frames += 1;
-    if let Err(e) = decoder.decode(&frame.data, frame.bits, &mut pcm) {
+    if let Err(e) = decoder.decode(&voice.frame_scratch, frame.bits, &mut voice.pcm_scratch) {
         voice.trace.bad_frames += 1;
         if voice.trace.bad_frames <= 2 {
             tracing::debug!(
                 at,
                 bits = frame.bits,
-                head = ?&frame.data[..frame.data.len().min(8)],
+                head = ?&voice.frame_scratch[..voice.frame_scratch.len().min(8)],
                 %e,
                 "XMA frame did not decode"
             );
@@ -649,7 +731,7 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
     let looping = loops > 0 && ends_loop;
     if looping {
         let keep = (context.field(1, 12, 2) as usize + 1) * xma::SUBFRAME_SAMPLES * channels;
-        pcm.truncate(keep);
+        voice.pcm_scratch.truncate(keep);
         next = context.field(3, 0, 26) as usize;
         if loops != 255 {
             context.set_field(0, 12, 8, loops - 1);
@@ -657,9 +739,9 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
     }
     // What is still to skip is this frame's (the stream's first, or a
     // loop's first when it is its last too).
-    let skip = (voice.skip * channels).min(pcm.len());
+    let skip = (voice.skip * channels).min(voice.pcm_scratch.len());
     voice.skip -= skip / channels;
-    voice.pcm.extend(&pcm[skip..]);
+    voice.pcm.extend(&voice.pcm_scratch[skip..]);
     if looping {
         // The loop's own skip is of its first frame, decoded next: not of
         // this one, its last.
@@ -1319,23 +1401,7 @@ mod tests {
         context.set(3, first);
         context.set(4, second);
         context.set(5, input_apu);
-        let mut voice = Voice {
-            decoder: None,
-            pcm: VecDeque::new(),
-            skip: 0,
-            ended: false,
-            trace: Trace {
-                since: Instant::now(),
-                produced: 0,
-                taken: 0,
-                takes: 0,
-                partial_takes: 0,
-                frames: 0,
-                bad_frames: 0,
-                peak: 0,
-                ended_ms: None,
-            },
-        };
+        let mut voice = Voice::new(0);
         let mut step = |expect_next: u32| {
             let before = voice.pcm.len();
             assert!(decode(context, &mut voice));
@@ -1440,5 +1506,29 @@ mod tests {
         assert_eq!((m.message_count)(acp), 1, "disconnected");
         (m.release)(acp);
         assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
+    }
+
+    #[test]
+    fn cached_heap_span_hits_and_invalidates_on_free() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let (mut ptr, mut apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut ptr, &mut apu, 0x400, 0x100, 1), S_OK);
+        let mut cache = CachedHeapSpan::default();
+        let first = cache.resolve(apu, BLOCK_BYTES).expect("first resolve");
+        first[0] = 0x5a;
+        let gen_before = cache.generation;
+        // Second chunk inside the same block hits the cached span directly.
+        let second = cache
+            .resolve(apu + BLOCK_BYTES as u32, BLOCK_BYTES)
+            .expect("cached hit");
+        second[0] = 0xa5;
+        assert_eq!(cache.generation, gen_before);
+        assert_eq!(cache.host_start, ptr as usize);
+        // Past the end of the block returns None.
+        assert!(cache.resolve(apu + 0x400, BLOCK_BYTES).is_none());
+        // Freeing the block bumps HEAP_GENERATION and invalidates the cache.
+        ApuFree(ptr);
+        assert_ne!(HEAP_GENERATION.load(Ordering::Acquire), gen_before);
+        assert!(cache.resolve(apu, BLOCK_BYTES).is_none());
     }
 }

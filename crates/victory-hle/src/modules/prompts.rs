@@ -76,6 +76,13 @@ fn configured_mode() -> PromptMode {
     })
 }
 
+/// Returns `true` if `VICTORY_PROMPTS` explicitly disabled PS5 prompt patching
+/// (`xbox` / `0` / `off` / `false`), allowing `files.rs` to skip all `data.rpf`
+/// handle/stream tracking with zero overhead.
+pub fn patching_disabled() -> bool {
+    configured_mode() == PromptMode::Xbox
+}
+
 /// Returns `true` if PS5 DualSense button prompt patching is currently enabled.
 pub fn ps5_enabled() -> bool {
     match configured_mode() {

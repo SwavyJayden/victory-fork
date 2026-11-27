@@ -3907,7 +3907,7 @@ impl Shadow {
                     // `merge_page_under_writes` reads title memory via `read_into`,
                     // preventing false `pin_touch` on pure landing echoes.
                     let should_retrim =
-                        gpu_only_active && self.gpu_only_probe_before_read_piece(piece, gpu_only_frame);
+                        gpu_only_active && self.gpu_only_probe_before_read_piece(piece, gpu_only_frame, true);
                     // SAFETY: the reference holds the copy's bytes at the
                     // copy's offsets, and these are in a declared range; the
                     // locks held above keep out what else writes them, and
@@ -3920,8 +3920,8 @@ impl Shadow {
                                 && let Some(card) = &self.card
                                 && let Some(block) = card.gpu_only.piece_block_if_whole(piece)
                                 && card.gpu_only.needs_trim(piece, gpu_only_frame, false)
-                                && crate::inplace::pages_of(block).len() <= 1
-                                && crate::gpu_only::trim_block(block)
+                                && let Some(views) = crate::gpu_only::block_views(block)
+                                && crate::gpu_only::trim_block_views(&views)
                             {
                                 card.gpu_only.mark_trimmed(piece, gpu_only_frame, false);
                             }
@@ -4475,7 +4475,7 @@ fn chunk_take_runs(
                         continue;
                     }
                     last_piece = piece;
-                    if self.gpu_only_probe_before_read_piece(piece, frame) {
+                    if self.gpu_only_probe_before_read_piece(piece, frame, true) {
                         retrim_pieces.push(piece);
                     }
                 }
@@ -4541,8 +4541,8 @@ fn chunk_take_runs(
                 }
                 if let Some(block) = card.gpu_only.piece_block_if_whole(piece)
                     && card.gpu_only.needs_trim(piece, gpu_only_frame, false)
-                    && crate::inplace::pages_of(block).len() <= 1
-                    && crate::gpu_only::trim_block(block)
+                    && let Some(views) = crate::gpu_only::block_views(block)
+                    && crate::gpu_only::trim_block_views(&views)
                 {
                     card.gpu_only.mark_trimmed(piece, gpu_only_frame, false);
                 }
@@ -4578,7 +4578,7 @@ fn chunk_take_runs(
                 let title = &mut title[..n];
                 let piece = at / PAGE - first_block;
                 let should_retrim =
-                    gpu_only_active && self.gpu_only_probe_before_read_piece(piece, gpu_only_frame);
+                    gpu_only_active && self.gpu_only_probe_before_read_piece(piece, gpu_only_frame, true);
                 // (Pages that are not there read as zeros.)
                 crate::host::copy_mapped(title.as_mut_ptr(), at as *const u8, n, false);
                 // SAFETY: inside the mapping of the copy's CPU side, which
@@ -4599,8 +4599,8 @@ fn chunk_take_runs(
                 } else if should_retrim
                     && let Some(block) = card.gpu_only.piece_block_if_whole(piece)
                     && card.gpu_only.needs_trim(piece, gpu_only_frame, false)
-                    && crate::inplace::pages_of(block).len() <= 1
-                    && crate::gpu_only::trim_block(block)
+                    && let Some(views) = crate::gpu_only::block_views(block)
+                    && crate::gpu_only::trim_block_views(&views)
                 {
                     card.gpu_only.mark_trimmed(piece, gpu_only_frame, false);
                 }
@@ -5095,12 +5095,14 @@ impl Shadow {
             skip
         };
         let is_guarded = self.watched.load(Ordering::Relaxed) == GUARDED;
+        let check_beside = is_guarded && land_beside_on() && land_anytime_on();
         let mut put = 0;
         for &(lo, hi, now) in pieces {
             if lo >= hi || hi > self.len as usize {
                 continue;
             }
-            self.gpu_only_before_land(lo, hi);
+            let uses_beside = check_beside && crate::inplace::beside_held(start + lo, hi - lo).is_some();
+            self.gpu_only_before_land(lo, hi, !uses_beside);
             let near: Vec<(usize, usize)> = skip.iter().copied().filter(|&(a, b)| a < hi && b > lo).collect();
             let parts: Vec<(usize, usize)> = outside(lo, hi, near).into_iter().map(|(a, b)| (a - lo, b - lo)).collect();
             // SAFETY: inside the mapping (checked above), in a range
@@ -5119,7 +5121,7 @@ impl Shadow {
                 self.note_landing(lo, hi);
             }
             if let Some(flags) = out_flags.as_deref_mut() {
-                flags.push((lo, hi, merged > 0));
+                flags.push((lo, hi, merged > 0 && !uses_beside));
             }
             put += merged;
         }
@@ -5376,7 +5378,7 @@ impl Shadow {
         }
     }
 
-    fn gpu_only_probe_before_read_piece(&self, piece: usize, frame: u64) -> bool {
+    fn gpu_only_probe_before_read_piece(&self, piece: usize, frame: u64, touches_title_va: bool) -> bool {
         use crate::gpu_only::{BeforeReadAction, ProbeOutcome};
         let Some(card) = &self.card else {
             return false;
@@ -5384,32 +5386,34 @@ impl Shadow {
         let Some(block) = card.gpu_only.piece_block_if_whole(piece) else {
             return false;
         };
-        match card.gpu_only.before_read_action(piece, frame) {
+        match card.gpu_only.before_read_action(piece, frame, touches_title_va) {
             BeforeReadAction::Skip => false,
             BeforeReadAction::ClearedSameFrame => true,
             BeforeReadAction::Probe => {
-                let touched = crate::gpu_only::query_working_set_block(block).map(|(t, _)| t);
-                let outcome = card.gpu_only.apply_probe_result(piece, frame, touched, true);
+                let touched = crate::gpu_only::query_working_set_block_views(block).map(|(t, _)| t);
+                let outcome = card.gpu_only.apply_probe_result(piece, frame, touched, touches_title_va);
                 matches!(outcome, ProbeOutcome::Untouched(_))
             }
         }
     }
 
     /// Probes previously trimmed pieces right before a landing reads/writes title memory.
-    pub(crate) fn gpu_only_before_land(&self, lo: usize, hi: usize) {
+    /// Pass `touches_title_va = false` when landing through `beside` (does not touch
+    /// title VA PTEs), or `true` when landing directly through the title's VA.
+    pub(crate) fn gpu_only_before_land(&self, lo: usize, hi: usize, touches_title_va: bool) {
         if !crate::gpu_only::enabled() || !self.gpu_only_eligible() || lo >= hi {
             return;
         }
         let frame = crate::frame::current();
         for piece in self.pieces(lo, hi) {
-            let _ = self.gpu_only_probe_before_read_piece(piece, frame);
+            let _ = self.gpu_only_probe_before_read_piece(piece, frame, touches_title_va);
         }
     }
 
     /// After landing completes (and `Notes::flush` has updated `copied` for
-    /// view memory): trims candidate pieces via `VirtualUnlock`, promotes
-    /// pieces satisfying all 5 rules to `GpuOnly`, and records compact
-    /// per-reason landing telemetry for periodic diagnostics.
+    /// view memory): trims candidate pieces (and all of their aliased views)
+    /// via `VirtualUnlock`, promotes pieces satisfying all 5 rules to
+    /// `GpuOnly`, and records compact per-reason landing telemetry.
     pub(crate) fn gpu_only_after_land(self: &Arc<Self>, pieces: &[(usize, usize, bool)]) {
         use crate::gpu_only::{
             AfterLandDecision, LAND_REASON_COUNT, LandBlockReason, bump_land_reason, record_land_summary,
@@ -5468,6 +5472,10 @@ impl Shadow {
                     bump_land_reason(&mut reasons, LandBlockReason::NotCopied, 1);
                     continue;
                 }
+                let Some(views) = crate::gpu_only::block_views(block) else {
+                    bump_land_reason(&mut reasons, LandBlockReason::Alias, 1);
+                    continue;
+                };
                 match card.gpu_only.after_land_decision(piece, frame, wrote_title) {
                     AfterLandDecision::ReadyToPromote { should_trim } => {
                         // For private `MEM_WRITE_WATCH` memory (`watched == 1`) where
@@ -5478,30 +5486,29 @@ impl Shadow {
                             watched == GUARDED || (!wrote_title && !self.has_landing_in_piece(piece));
                         if !can_promote_here || self.has_dirty_in_piece(piece) {
                             bump_land_reason(&mut reasons, LandBlockReason::DirtyOrLand, 1);
-                            if should_trim
-                                && crate::inplace::pages_of(block).len() <= 1
-                                && crate::gpu_only::trim_block(block)
-                            {
+                            if should_trim && crate::gpu_only::trim_block_views(&views) {
                                 card.gpu_only.mark_trimmed(piece, frame, false);
                             }
                             continue;
                         }
-                        if crate::inplace::pages_of(block).len() > 1
-                            || has_other_live_shadow_overlapping(self.id, block as u64, (block + PIECE) as u64)
-                        {
+                        if has_other_live_shadow_overlapping_views(self.id, &views) {
                             bump_land_reason(&mut reasons, LandBlockReason::Alias, 1);
                             continue;
                         }
-                        if crate::gpu_only::trim_block(block) && card.gpu_only.try_promote(piece, frame, false) {
+                        if !crate::gpu_only::trim_block_views(&views) {
+                            bump_land_reason(&mut reasons, LandBlockReason::TrimBusy, 1);
+                        } else if card.gpu_only.try_promote(piece, frame, false) {
                             bump_land_reason(&mut reasons, LandBlockReason::Promoted, 1);
                         } else {
                             bump_land_reason(&mut reasons, LandBlockReason::Probing, 1);
                         }
                     }
                     AfterLandDecision::NeedTrim(reason) => {
-                        bump_land_reason(&mut reasons, reason, 1);
-                        if crate::inplace::pages_of(block).len() <= 1 && crate::gpu_only::trim_block(block) {
+                        if crate::gpu_only::trim_block_views(&views) {
                             card.gpu_only.mark_trimmed(piece, frame, false);
+                            bump_land_reason(&mut reasons, reason, 1);
+                        } else {
+                            bump_land_reason(&mut reasons, LandBlockReason::TrimBusy, 1);
                         }
                     }
                     AfterLandDecision::Hold(reason) => {
@@ -5528,14 +5535,16 @@ impl Shadow {
             let Some(block) = card.gpu_only.piece_block_if_whole(piece) else {
                 continue;
             };
+            let Some(views) = crate::gpu_only::block_views(block) else {
+                continue;
+            };
             if self.has_landing_in_piece(piece)
                 || self.has_dirty_in_piece(piece)
-                || crate::inplace::pages_of(block).len() > 1
-                || has_other_live_shadow_overlapping(self.id, block as u64, (block + PIECE) as u64)
+                || has_other_live_shadow_overlapping_views(self.id, &views)
             {
                 continue;
             }
-            if crate::gpu_only::trim_block(block) {
+            if crate::gpu_only::trim_block_views(&views) {
                 let _ = card.gpu_only.try_promote(piece, frame, false);
             }
         }
@@ -5565,27 +5574,29 @@ impl Shadow {
                 if !self.piece_is_copied(piece)
                     || self.has_dirty_in_piece(piece)
                     || self.has_landing_in_piece(piece)
-                    || crate::inplace::pages_of(block).len() > 1
                 {
                     return false;
                 }
+                let Some(views) = crate::gpu_only::block_views(block) else {
+                    return false;
+                };
                 self.gpu_only_ensure_tracked();
-                if crate::gpu_only::trim_block(block) {
+                if crate::gpu_only::trim_block_views(&views) {
                     card.gpu_only.mark_trimmed(piece, frame, true);
                 }
                 true
             }
             UnflaggedAction::NeedQuery => {
                 self.gpu_only_ensure_tracked();
-                let touched = crate::gpu_only::query_working_set_block(block).map(|(t, _)| t);
+                let touched = crate::gpu_only::query_working_set_block_views(block).map(|(t, _)| t);
                 let outcome = card.gpu_only.apply_probe_result(piece, frame, touched, false);
                 if matches!(outcome, ProbeOutcome::Untouched(_))
                     && card.gpu_only.ready_to_promote(piece, frame, true)
                     && self.piece_is_copied(piece)
                     && !self.has_dirty_in_piece(piece)
                     && !self.has_landing_in_piece(piece)
-                    && crate::inplace::pages_of(block).len() <= 1
-                    && !has_other_live_shadow_overlapping(self.id, block as u64, (block + PIECE) as u64)
+                    && let Some(views) = crate::gpu_only::block_views(block)
+                    && !has_other_live_shadow_overlapping_views(self.id, &views)
                 {
                     let _ = card.gpu_only.try_promote(piece, frame, true);
                 }
@@ -5745,24 +5756,105 @@ fn has_other_live_shadow_overlapping(self_id: u64, from: u64, to: u64) -> bool {
     false
 }
 
+/// Mirrors `land::beside_on()` (`VICTORY_LAND_BESIDE != "0"`).
+fn land_beside_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_BESIDE").is_none_or(|v| v != "0"))
+}
+
+/// Mirrors `land::anytime()` (`VICTORY_LAND_ANYTIME != "0"`).
+fn land_anytime_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_ANYTIME").is_none_or(|v| v != "0"))
+}
+
+/// Checks Rule 2 across `block` and every aliased title view in `views`:
+/// whether any OTHER live `Shadow` in `BUFFERS`, `LOOSE`, or `EXACT` overlaps
+/// any `[view, view + PIECE)`.
+fn has_other_live_shadow_overlapping_views(self_id: u64, views: &[usize]) -> bool {
+    views
+        .iter()
+        .any(|&v| has_other_live_shadow_overlapping(self_id, v as u64, (v + PIECE) as u64))
+}
+
 /// Called after inserting a new `Shadow` (`new_id`, `[start, start + len)`)
-/// with all map locks dropped: pins overlapping pieces on any existing carded
-/// `Shadow` and queues any `GpuOnly` pieces for immediate lossless demotion at
-/// the start of the next `Host::submit`.
+/// with all map locks dropped: pins overlapping pieces (including aliased
+/// title views of the same physical pages) on any existing carded `Shadow`
+/// and queues any `GpuOnly` pieces for immediate lossless demotion at the
+/// start of the next `Host::submit`.
 fn notify_new_shadow_overlap(new_id: u64, start: u64, len: u64) {
     if !crate::gpu_only::enabled() || len == 0 {
         return;
     }
     let end = start.saturating_add(len);
+    let mut ranges: Vec<(usize, usize)> = vec![(start as usize, end as usize)];
+    for (_, others) in crate::inplace::shown_elsewhere(start as usize, end as usize) {
+        for other in others {
+            ranges.push((other, other.saturating_add(PIECE)));
+        }
+    }
+    if ranges.len() > 1 {
+        ranges.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+        for (a, b) in ranges {
+            if a >= b {
+                continue;
+            }
+            match merged.last_mut() {
+                Some(last) if a <= last.1 => last.1 = last.1.max(b),
+                _ => merged.push((a, b)),
+            }
+        }
+        ranges = merged;
+    }
     for shadow in crate::gpu_only::tracked_shadows() {
         if shadow.id == new_id || !shadow.gpu_only_eligible() {
             continue;
         }
-        if shadow.start >= end || shadow.start.saturating_add(shadow.len) <= start {
+        let s_start = shadow.start as usize;
+        let s_end = shadow.start.saturating_add(shadow.len) as usize;
+        let mut demoted = Vec::new();
+        for &(a, b) in &ranges {
+            if a < s_end && b > s_start {
+                demoted.extend(shadow.gpu_only_pin_range(a, b, crate::gpu_only::DemoteReason::Alias));
+            }
+        }
+        if !demoted.is_empty() {
+            demoted.sort_unstable();
+            demoted.dedup();
+            crate::gpu_only::queue_demotion(shadow, demoted, crate::gpu_only::DemoteReason::Alias, true);
+        }
+    }
+}
+
+/// Called by `watch::views_mapped` when a new title view is mapped over
+/// physical section pages shown at `ranges` (`(at, len)` pairs): pins
+/// overlapping pieces on any tracked shadow with active `GpuOnly` pieces and
+/// queues those pieces for immediate lossless demotion before the new view
+/// could be read without having been trimmed.
+pub(crate) fn gpu_only_notify_views_mapped(ranges: &[(usize, usize)]) {
+    if !crate::gpu_only::enabled() || ranges.is_empty() {
+        return;
+    }
+    for shadow in crate::gpu_only::tracked_shadows() {
+        if !shadow.any_gpu_only() {
             continue;
         }
-        let demoted = shadow.gpu_only_pin_range(start as usize, end as usize, crate::gpu_only::DemoteReason::Alias);
+        let s_start = shadow.start as usize;
+        let s_end = shadow.start.saturating_add(shadow.len) as usize;
+        let mut demoted = Vec::new();
+        for &(at, n) in ranges {
+            if n == 0 {
+                continue;
+            }
+            let end = at.saturating_add(n);
+            if at < s_end && end > s_start {
+                demoted.extend(shadow.gpu_only_pin_range(at, end, crate::gpu_only::DemoteReason::Alias));
+            }
+        }
         if !demoted.is_empty() {
+            demoted.sort_unstable();
+            demoted.dedup();
             crate::gpu_only::queue_demotion(shadow, demoted, crate::gpu_only::DemoteReason::Alias, true);
         }
     }

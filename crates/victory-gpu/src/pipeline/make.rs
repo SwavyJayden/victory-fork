@@ -73,32 +73,111 @@ fn required_initialization(shaders: &[Arc<Shader>]) -> bool {
     named(shaders, b"CS_ComputeBlendshapeMappings")
 }
 
-fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
-    static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
-    let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
-        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
-        if builder {
-            return false;
-        }
-        // Without BVH, ~1,000 CS_RaytracingResolve shaders shade no hits while
-        // clogging the cold compiler queue; skip unless VICTORY_RT_RESOLVE=1.
-        std::env::var_os("VICTORY_RT_RESOLVE").is_none_or(|v| v == "0")
-    });
-    if skip_rt && named(shaders, b"CS_RaytracingResolve") {
+/// Compute passes that must NEVER be skipped by `VICTORY_SKIP_DEAD_RT=1`:
+/// - `CS_CacheScreenSpaceRadiance`, `CS_ScreenProbes_TemporalResolve`, and
+///   `CS_AccumulateLocalLightInscatteringVolume` host the `ambient.rs`
+///   indirect-light stand-in.
+/// - `CS_CollisionRaytraced` serves gameplay/physics collision queries.
+/// - `CS_ComputeBlendshapeMappings` is a required one-time initialization pass.
+const PRESERVED_RT_COMPUTE: &[&[u8]] = &[
+    b"CS_CacheScreenSpaceRadiance",
+    b"CS_ScreenProbes_TemporalResolve",
+    b"CS_AccumulateLocalLightInscatteringVolume",
+    b"CS_CollisionRaytraced",
+    b"CS_ComputeBlendshapeMappings",
+];
+
+/// Compute passes that perform dead ray-tracing / ray-binning / BVH irradiance
+/// cache work when both `VICTORY_BVH_BUILDER` and `VICTORY_RAYS` are off
+/// (`VICTORY_SKIP_DEAD_RT=1`, opt-in, default `0`).
+const DEAD_RT_COMPUTE: &[&[u8]] = &[
+    b"CS_IrradianceCache_",
+    b"CS_Primary_",
+    b"CS_LaserLightShadowRaytracing",
+    b"CS_RaytraceVBuffer_",
+    b"CS_RaytraceShadows_",
+    b"CS_RTShadowTrace",
+    b"CS_RTDistantShadowTrace",
+    b"CS_RTDistantLODLightShadow",
+    b"CS_PPR_Raytrace",
+    b"CS_DeferredFallback_BVH",
+    b"CS_ScreenProbes_TraceRays_",
+    b"CS_ScreenProbes_EvaluateRayRequests",
+    b"CS_ScreenProbes_GenerateRayBins",
+    b"CS_ScreenProbes_ResolveRays_",
+    b"CS_ScreenProbe_RayMiss",
+    b"CS_RayMiss_",
+    b"CS_ClearRayBins",
+    b"CS_ClearRayCounts",
+    b"CS_GenerateRayBinOffsets",
+    b"CS_GenerateRayBins",
+    b"CS_GenerateRayCoords",
+    b"CS_ClassifyRayTiles",
+    b"CS_SortRayTiles",
+    b"CS_ResetRayTileArgs",
+    b"CS_RayBudgeting_",
+    b"CS_CalcRTClassificationListCounts",
+    b"CS_WriteRTClassificationResults",
+    b"CS_SetRTShadowsIndirectArgs",
+    b"CS_ShadowTileBalanceRTCost",
+    b"CS_RTConstantCostShadowsTileClassification",
+];
+
+fn is_dead_rt_compute(shaders: &[Arc<Shader>]) -> bool {
+    if PRESERVED_RT_COMPUTE.iter().any(|name| named(shaders, name)) {
+        return false;
+    }
+    DEAD_RT_COMPUTE.iter().any(|name| named(shaders, name))
+}
+
+fn left_out_for(
+    shaders: &[Arc<Shader>],
+    builder: bool,
+    rays: bool,
+    skip_rt_resolve: bool,
+    skip_activate_rays: bool,
+    skip_dead_rt: bool,
+) -> Option<&'static str> {
+    if skip_rt_resolve && named(shaders, b"CS_RaytracingResolve") {
         return Some("shades ray-tracing hits without BVH, left out");
     }
-    static SKIP_ACTIVATE_RAYS: OnceLock<bool> = OnceLock::new();
-    let skip_activate = *SKIP_ACTIVATE_RAYS.get_or_init(|| {
-        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
-        if builder {
-            return std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0");
-        }
-        std::env::var_os("VICTORY_ACTIVATE_RAYS").is_none_or(|v| v == "0")
-    });
-    if skip_activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
+    if skip_activate_rays && named(shaders, b"CS_ScreenProbes_ActivateRays") {
         return Some("ray activation shader without BVH, left out");
     }
+    if skip_dead_rt && !builder && !rays && is_dead_rt_compute(shaders) {
+        return Some("dead ray-tracing compute pass without BVH/rays (VICTORY_SKIP_DEAD_RT=1), left out");
+    }
     None
+}
+
+fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    static CONFIG: OnceLock<(bool, bool, bool, bool, bool)> = OnceLock::new();
+    let &(builder, rays, skip_rt, skip_activate, skip_dead_rt) = CONFIG.get_or_init(|| {
+        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
+        let rays = victory_shader::emit::rays();
+        // Without BVH, ~1,000 CS_RaytracingResolve shaders shade no hits while
+        // clogging the cold compiler queue; skip unless VICTORY_RT_RESOLVE=1.
+        let skip_rt = !builder && std::env::var_os("VICTORY_RT_RESOLVE").is_none_or(|v| v == "0");
+        let skip_activate = if builder {
+            std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0")
+        } else {
+            std::env::var_os("VICTORY_ACTIVATE_RAYS").is_none_or(|v| v == "0")
+        };
+        let skip_dead_rt = std::env::var_os("VICTORY_SKIP_DEAD_RT").is_some_and(|v| v == "1");
+        if skip_dead_rt {
+            if !builder && !rays {
+                tracing::info!("skipping dead ray-tracing compute passes (VICTORY_SKIP_DEAD_RT=1)");
+            } else {
+                tracing::info!(
+                    builder,
+                    rays,
+                    "VICTORY_SKIP_DEAD_RT=1 ignored because BVH builder or rays are enabled"
+                );
+            }
+        }
+        (builder, rays, skip_rt, skip_activate, skip_dead_rt)
+    });
+    left_out_for(shaders, builder, rays, skip_rt, skip_activate, skip_dead_rt)
 }
 
 /// Confirmed first-scene producers. Prepare these at creation even on a cold
@@ -189,6 +268,9 @@ impl Pending {
 /// not translate, else "refused" or "being made"; `None` if it has one.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn missing(p: &Pending) -> Option<String> {
+    if let Some(why) = p.left_out {
+        return Some(why.to_owned());
+    }
     match p.made.get() {
         Some(Some(_)) => None,
         None => Some("being made".into()),
@@ -775,5 +857,68 @@ mod tests {
         assert!(Arc::ptr_eq(&queue.pop(true, 1).unwrap(), &screen));
         assert!(queue.pop(true, 1).is_none());
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &world));
+    }
+
+    #[test]
+    fn skip_dead_rt_gates_on_opt_in_and_preserves_ambient_and_collision() {
+        let make_shader = |stage: &'static str, name: &[u8]| {
+            let data = [b"wave28-dead-rt:", stage.as_bytes(), b":", name].concat();
+            vec![super::super::shader(stage, &data)]
+        };
+        let dead_samples: [&[u8]; 10] = [
+            b"CS_IrradianceCache_Shade_823aad37_Wrapped",
+            b"CS_IrradianceCache_GatherVBuffer_WithFar_cc76bb5a_Wrapped",
+            b"CS_Primary_Shade_e186f854_Wrapped",
+            b"CS_Primary_GatherVBuffer_cc76bb5a_Wrapped",
+            b"CS_LaserLightShadowRaytracing_c3ab3042_Wrapped",
+            b"CS_RaytraceVBuffer_RayBinning_ShaderBinning_Mixed_ca043b62_Wrapped",
+            b"CS_RTShadowTrace32HQ_0c84ea88_Wrapped",
+            b"CS_ScreenProbes_TraceRays_BVH_Mixed_ShaderBinning_1b4df702_Wrapped",
+            b"CS_ClearRayBins_3eb23950_Wrapped",
+            b"CS_RayBudgeting_Accumulate_17727a59_Wrapped",
+        ];
+        for name in dead_samples {
+            let shaders = make_shader("compute", name);
+            // Default off (`skip_dead_rt = false`): never skipped.
+            assert!(
+                left_out_for(&shaders, false, false, true, true, false).is_none(),
+                "default must not skip {}",
+                String::from_utf8_lossy(name)
+            );
+            // Opt-in on with no BVH builder and no rays: skipped.
+            assert!(
+                left_out_for(&shaders, false, false, true, true, true).is_some(),
+                "VICTORY_SKIP_DEAD_RT=1 must skip {}",
+                String::from_utf8_lossy(name)
+            );
+            // Suppressed whenever BVH builder OR rays are active.
+            assert!(left_out_for(&shaders, true, false, false, false, true).is_none());
+            assert!(left_out_for(&shaders, false, true, true, true, true).is_none());
+            // Non-compute stages are never skipped by dead-RT compute rules.
+            let pixel = make_shader("pixel", name);
+            assert!(left_out_for(&pixel, false, false, true, true, true).is_none());
+        }
+
+        let preserved_samples: [&[u8]; 11] = [
+            b"CS_CacheScreenSpaceRadiance_eed2fc35_Wrapped",
+            b"CS_ScreenProbes_TemporalResolve_757be8ff_Wrapped",
+            b"CS_ScreenProbes_TemporalResolve_CB_ReflectiveCaustics_a1c765aa_Wrapped",
+            b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef_Wrapped",
+            b"CS_CollisionRaytraced_2776e795_Wrapped",
+            b"CS_ComputeBlendshapeMappings_54139280_Wrapped",
+            b"CS_Subdivision_PerformPrimaryJobs_d8f9b73e_Wrapped",
+            b"CS_RayPrePass_Opaque_SSR_a80bdf75_Wrapped",
+            b"CS_GatherRaymarchedLocalLights_30eb49d2_Wrapped",
+            b"CS_SkyRadianceCache_6349d88b_Wrapped",
+            b"CS_ApplyProbeIrradiance_458e0886_Wrapped",
+        ];
+        for name in preserved_samples {
+            let shaders = make_shader("compute", name);
+            assert!(
+                left_out_for(&shaders, false, false, true, true, true).is_none(),
+                "must preserve {}",
+                String::from_utf8_lossy(name)
+            );
+        }
     }
 }

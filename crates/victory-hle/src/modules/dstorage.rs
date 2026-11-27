@@ -21,7 +21,7 @@
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
@@ -125,8 +125,9 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     if path.is_null() {
         return E_INVALIDARG;
     }
-    // Goes through `files`, so paths on our virtual drives work too.
-    let handle = super::files::CreateFileW(
+    // Goes through `files` virtual-drive rewriting without polluting
+    // `DATA_RPF_HANDLES` (DirectStorage manages `is_data_rpf` and file close itself).
+    let handle = super::files::open_host_file_w(
         path,
         GENERIC_READ,
         FILE_SHARE_READ,
@@ -331,7 +332,9 @@ struct Files {
 
 impl Files {
     fn new(first: std::fs::File, io: Io) -> Files {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let workers = std::thread::available_parallelism()
+            .map_or(4, |n| n.get())
+            .max(worker_count());
         let others = match io {
             Io::One => 0,
             Io::Overlapped => 1,
@@ -559,6 +562,9 @@ struct Lanes {
     staging: u64,
     /// A start waited for staging space since the last finish.
     starved: bool,
+    /// Workers currently asleep on `Scheduler::work`, so `notify_one()` is only
+    /// issued when an idle worker actually exists.
+    idle_workers: usize,
     /// Weighted round robin: each class's virtual time (bytes × cost), and
     /// the time of the last start; within a class, the lane clock of the
     /// last start.
@@ -608,6 +614,46 @@ struct Job {
 // SAFETY: as for `Lane`.
 unsafe impl Send for Job {}
 
+/// Parses `VICTORY_DSTORAGE_WORKERS`, falling back to a 6-core-friendly cap:
+/// on <=12 logical threads (e.g. 6C/12T Ryzen 5600X) default to `4` (leaving 2
+/// physical cores free for `victory-submit` / `list::thin` / game main); on
+/// wider CPUs default to `(logical / 2).clamp(2, 6)`.
+fn parse_worker_count(env: Option<&str>, logical: usize) -> usize {
+    if let Some(n) = env.and_then(|v| v.trim().parse::<usize>().ok()) {
+        return n.clamp(1, 32);
+    }
+    if logical <= 12 {
+        (logical / 3).clamp(2, 4)
+    } else {
+        (logical / 2).clamp(2, 6)
+    }
+}
+
+fn worker_count() -> usize {
+    static COUNT: OnceLock<usize> = OnceLock::new();
+    *COUNT.get_or_init(|| {
+        let logical = std::thread::available_parallelism().map_or(8, |n| n.get());
+        let env = std::env::var("VICTORY_DSTORAGE_WORKERS").ok();
+        parse_worker_count(env.as_deref(), logical)
+    })
+}
+
+/// Whether DirectStorage decompression workers run at `THREAD_PRIORITY_BELOW_NORMAL`
+/// so streaming bursts never preempt `victory-submit` or `list::thin`. Default ON
+/// (`VICTORY_DSTORAGE_PRIORITY=normal` or `VICTORY_DSTORAGE_BELOW_NORMAL=0` opts out).
+fn worker_below_normal() -> bool {
+    static BELOW: OnceLock<bool> = OnceLock::new();
+    *BELOW.get_or_init(|| {
+        if std::env::var("VICTORY_DSTORAGE_PRIORITY")
+            .ok()
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("normal"))
+        {
+            return false;
+        }
+        std::env::var_os("VICTORY_DSTORAGE_BELOW_NORMAL").is_none_or(|v| v != "0")
+    })
+}
+
 /// The scheduler, with its workers started on first use; `None` if not
 /// even one worker could start.
 fn scheduler() -> Option<&'static Scheduler> {
@@ -623,6 +669,7 @@ fn scheduler() -> Option<&'static Scheduler> {
                     staged: 0,
                     staging: STAGING,
                     starved: false,
+                    idle_workers: 0,
                     clock: [0; 3],
                     now: 0,
                     lane_now: [0; 3],
@@ -637,17 +684,21 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let logical = std::thread::available_parallelism().map_or(8, |n| n.get());
-        let workers = (logical / 2).clamp(2, 6);
+        let workers = worker_count();
+        let below_normal = worker_below_normal();
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
                     .name(format!("dstorage {i}"))
-                    .spawn(|| work(scheduler))
+                    .spawn(move || work(scheduler, below_normal))
                     .is_ok()
             })
             .count();
-        tracing::info!(workers = started, "dstorage: workers");
+        tracing::info!(
+            workers = started,
+            below_normal,
+            "dstorage: workers (VICTORY_DSTORAGE_WORKERS)"
+        );
     });
     Some(scheduler)
 }
@@ -783,13 +834,27 @@ pub(crate) mod stream_log {
 }
 
 /// A worker: runs the next read of the most deserving queue.
-fn work(scheduler: &'static Scheduler) {
+fn work(scheduler: &'static Scheduler, below_normal: bool) {
+    if below_normal {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+        };
+        // SAFETY: plain priority adjustment on our own worker thread.
+        unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) };
+    }
     let mut lanes = scheduler.lock();
     loop {
         let Some(job) = lanes.start() else {
+            lanes.idle_workers += 1;
             lanes = scheduler.work.wait(lanes).unwrap_or_else(|e| e.into_inner());
+            lanes.idle_workers -= 1;
             continue;
         };
+        // Chain-wake one sleeping peer if another runnable request is queued,
+        // avoiding `notify_all()` thundering herds while keeping full parallelism.
+        if lanes.idle_workers > 0 && lanes.has_runnable_read() {
+            scheduler.work.notify_one();
+        }
         drop(lanes);
         let started = std::time::Instant::now();
         let traced = Traced::start(&job);
@@ -804,8 +869,9 @@ fn work(scheduler: &'static Scheduler) {
         lanes = scheduler.lock();
         lanes.finish(&job, result);
         lanes.count(&job, started);
-        if std::mem::take(&mut lanes.starved) {
-            scheduler.work.notify_all();
+        if std::mem::take(&mut lanes.starved) && lanes.idle_workers > 0 && lanes.has_runnable_read()
+        {
+            scheduler.work.notify_one();
         }
         scheduler.finished.notify_all();
     }
@@ -843,6 +909,28 @@ impl Lanes {
             self.bcpack = Default::default();
             self.since = None;
         }
+    }
+
+    /// Whether at least one queued read can start immediately under the
+    /// current staging budget.
+    fn has_runnable_read(&self) -> bool {
+        let busy = || self.lanes.iter().filter(|(_, l)| !l.reads.is_empty());
+        let Some((_, class)) = busy().map(|(_, l)| (self.clock[l.class], l.class)).min() else {
+            return false;
+        };
+        let Some((_, _, id)) = busy()
+            .filter(|(_, l)| l.class == class)
+            .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
+            .min()
+        else {
+            return false;
+        };
+        let Some((_, Read { request, .. })) = self.lanes.get(&id).and_then(|l| l.reads.front())
+        else {
+            return false;
+        };
+        let staging = staging_bytes(request);
+        self.staged == 0 || self.staged + staging <= self.staging
     }
 
     /// Starts the next read of the class with the least virtual time, from
@@ -1340,7 +1428,9 @@ fn queue(this: QueueRef, command: Command) {
                 "dstorage: a queue full of commands that are not submitted submits itself"
             );
             lanes.submit(id, true);
-            scheduler.work.notify_all();
+            if lanes.idle_workers > 0 && lanes.has_runnable_read() {
+                scheduler.work.notify_one();
+            }
             continue;
         }
         lanes = scheduler
@@ -1354,7 +1444,9 @@ fn queue(this: QueueRef, command: Command) {
     lane.unsubmitted.push(command);
     if half_submits() && lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
         lanes.submit(id, true);
-        scheduler.work.notify_all();
+        if lanes.idle_workers > 0 && lanes.has_runnable_read() {
+            scheduler.work.notify_one();
+        }
     }
 }
 
@@ -1372,7 +1464,9 @@ extern "system" fn submit(this: QueueRef) {
     let pending = lanes.lanes.get(&id).map_or(0, |l| l.unsubmitted.len());
     tracing::debug!(commands = pending, "dstorage: submit");
     lanes.submit(id, false);
-    scheduler.work.notify_all();
+    if lanes.idle_workers > 0 && lanes.has_runnable_read() {
+        scheduler.work.notify_one();
+    }
 }
 
 /// Ends the queue whatever its reference count: what was not started never
@@ -1383,8 +1477,63 @@ extern "system" fn close(this: QueueRef) {
     close_lane(unsafe { &*this }.state.id);
 }
 
+/// Maximum retained byte capacity per thread-local scratch buffer after a
+/// request finishes (caps memory after rare multi-10 MB outlier chunks).
+const SCRATCH_CAP_LIMIT: usize = 8 << 20;
+
+/// Per-worker reusable scratch buffers avoiding per-request heap allocations
+/// for compressed input, zlib->BCPack intermediate data, non-contiguous page
+/// staging, and BCPack's rANS record/history rings.
+#[derive(Default)]
+struct WorkerScratch {
+    compressed: Vec<u8>,
+    intermediate: Vec<u8>,
+    pages_staging: Vec<u8>,
+    bcpack: bcpack::Scratch,
+}
+
+impl WorkerScratch {
+    fn trim(&mut self) {
+        if self.compressed.capacity() > SCRATCH_CAP_LIMIT {
+            self.compressed = Vec::new();
+        }
+        if self.intermediate.capacity() > SCRATCH_CAP_LIMIT {
+            self.intermediate = Vec::new();
+        }
+        if self.pages_staging.capacity() > SCRATCH_CAP_LIMIT {
+            self.pages_staging = Vec::new();
+        }
+        self.bcpack.trim(SCRATCH_CAP_LIMIT);
+    }
+}
+
+fn resize_scratch(buf: &mut Vec<u8>, len: usize) {
+    if buf.len() < len {
+        buf.resize(len, 0);
+    } else {
+        buf.truncate(len);
+    }
+}
+
 /// Reads, inflates and/or unpacks, and writes one request.
 fn execute(request: &Request) -> Result<(), HRESULT> {
+    thread_local! {
+        static SCRATCH: RefCell<WorkerScratch> = RefCell::new(WorkerScratch::default());
+    }
+    SCRATCH.with_borrow_mut(|scratch| {
+        struct TrimGuard<'a>(&'a mut WorkerScratch);
+        impl Drop for TrimGuard<'_> {
+            fn drop(&mut self) {
+                self.0.trim();
+            }
+        }
+        let guard = TrimGuard(scratch);
+        let s = &mut *guard.0;
+        execute_with_scratch(request, s)
+    })
+}
+
+fn execute_with_scratch(request: &Request, scratch: &mut WorkerScratch) -> Result<(), HRESULT> {
     let options = request.options;
     let fail = |hr: HRESULT, why: &str| {
         tracing::warn!(
@@ -1416,9 +1565,10 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             return Err(fail(E_INVALIDARG, "source larger than destination"));
         }
         let size = request.source_size as usize;
-        return into_destination(request, size, |out| {
+        return into_destination_with_scratch(request, size, &mut scratch.pages_staging, |out| {
             read_into(request, out)?;
-            if is_data_rpf && super::prompts::patch_data_rpf_compressed_region(request.offset, out) {
+            if is_data_rpf && super::prompts::patch_data_rpf_compressed_region(request.offset, out)
+            {
                 super::prompts::log_patched_once("DirectStorage raw");
             }
             Ok(size)
@@ -1426,34 +1576,38 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
-    let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
+    let source = read_source_into(request, &mut scratch.compressed)
+        .map_err(|hr| fail(hr, "reading the source"))?;
     // The console's order: zlib first, then BCPack.
-    let source = if bc != 0 && options & ZLIB != 0 {
-        let mut packed = vec![0; request.intermediate_size as usize];
-        let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
-        packed.truncate(n);
-        // The compressed bytes aren't needed past here: not held while BCPack unpacks.
-        drop(source);
-        Cow::Owned(packed)
+    let payload: &[u8] = if bc != 0 && options & ZLIB != 0 {
+        let inter_len = request.intermediate_size as usize;
+        resize_scratch(&mut scratch.intermediate, inter_len);
+        let n = inflate(source, &mut scratch.intermediate[..inter_len])
+            .map_err(|hr| fail(hr, "zlib"))?;
+        &scratch.intermediate[..n]
     } else {
         source
     };
     let check_prompts = is_data_rpf || options & MEMORY_SOURCE != 0;
-    into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
-            .map(|()| out.len())
-            .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => {
-            let n = inflate(&source, out).map_err(|hr| fail(hr, "zlib"))?;
-            if check_prompts
-                && n == super::prompts::INPUT_ICONS_INFLATED_LEN
-                && out[..n].starts_with(b"GFX")
-                && super::prompts::ps5_enabled()
-                && super::prompts::patch_input_icons_gfx(&mut out[..n])
-            {
-                super::prompts::log_patched_once("DirectStorage");
+    into_destination_with_scratch(request, size, &mut scratch.pages_staging, |out| {
+        match tables {
+            Some(tables) => {
+                bcpack::decode_with_scratch(bc, payload, out, tables, &mut scratch.bcpack)
+                    .map(|()| out.len())
+                    .map_err(|e| fail(INVALID_DATA, &e.to_string()))
             }
-            Ok(n)
+            None => {
+                let n = inflate(payload, out).map_err(|hr| fail(hr, "zlib"))?;
+                if check_prompts
+                    && n == super::prompts::INPUT_ICONS_INFLATED_LEN
+                    && out[..n].starts_with(b"GFX")
+                    && super::prompts::ps5_enabled()
+                    && super::prompts::patch_input_icons_gfx(&mut out[..n])
+                {
+                    super::prompts::log_patched_once("DirectStorage");
+                }
+                Ok(n)
+            }
         }
     })?;
     tracing::trace!(
@@ -1553,17 +1707,16 @@ fn load_bcpack_tables() -> Result<Tables, String> {
 }
 
 /// A compressed request's source: borrowed from memory, or read from the
-/// file.
-fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
+/// file into reusable `scratch`.
+fn read_source_into<'a>(request: &Request, scratch: &'a mut Vec<u8>) -> Result<&'a [u8], HRESULT> {
     let size = request.source_size as usize;
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `size` bytes until completion.
-        let bytes = unsafe { std::slice::from_raw_parts(request.source.cast(), size) };
-        return Ok(Cow::Borrowed(bytes));
+        return Ok(unsafe { std::slice::from_raw_parts(request.source.cast(), size) });
     }
-    let mut bytes = vec![0; size];
-    read_into(request, &mut bytes)?;
-    Ok(Cow::Owned(bytes))
+    resize_scratch(scratch, size);
+    read_into(request, &mut scratch[..size])?;
+    Ok(&scratch[..size])
 }
 
 /// Nanoseconds workers spent reading files, for the debug summary.
@@ -1624,10 +1777,21 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
 /// many it produced. GPU-visible destinations are host memory like the
 /// rest (GPU address = CPU address), so an address is written in place;
 /// physical pages are too when they are consecutive pages of one
-/// allocation, and otherwise go through a buffer.
+/// allocation, and otherwise go through reusable `pages_staging`.
+#[cfg(test)]
 fn into_destination(
     request: &Request,
     len: usize,
+    fill: impl FnMut(&mut [u8]) -> Result<usize, HRESULT>,
+) -> Result<(), HRESULT> {
+    let mut scratch = Vec::new();
+    into_destination_with_scratch(request, len, &mut scratch, fill)
+}
+
+fn into_destination_with_scratch(
+    request: &Request,
+    len: usize,
+    pages_staging: &mut Vec<u8>,
     mut fill: impl FnMut(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
@@ -1657,7 +1821,7 @@ fn into_destination(
     // (Said aloud: by the title's protocol a submitted request's list stays
     // as it is.)
     for _ in 0..3 {
-        into_pages(&pages, offset, len, &mut fill)?;
+        into_pages(&pages, offset, len, pages_staging, &mut fill)?;
         let now = read_list(list, offset, len);
         if now == pages || !super::xmem::pages_known(&now, offset, len) {
             break;
@@ -1680,6 +1844,7 @@ fn into_pages(
     pages: &[usize],
     offset: usize,
     len: usize,
+    pages_staging: &mut Vec<u8>,
     mut fill: impl FnMut(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
     // Consecutive pages of one allocation (the usual case): written in
@@ -1689,8 +1854,9 @@ fn into_pages(
         super::xmem::pages_written(pages, offset, len);
         return filled;
     }
-    let mut data = vec![0; len];
-    let n = fill(&mut data)?;
+    resize_scratch(pages_staging, len);
+    let data = &mut pages_staging[..len];
+    let n = fill(data)?;
     // A page the title has just made, or a view the host refuses for a moment (commit
     // or address space short while a load maps many at once), can come right a little
     // later: tried again before the request fails (`VICTORY_DSTORAGE_RETRIES`, default 12,
@@ -2245,6 +2411,7 @@ mod tests {
             staged: 0,
             staging,
             starved: false,
+            idle_workers: 0,
             clock: [0; 3],
             now: 0,
             lane_now: [0; 3],
@@ -2584,5 +2751,36 @@ mod tests {
         assert_eq!(inflate(&bad_body, &mut out), Err(INVALID_DATA));
         assert_eq!(inflate(&packed, &mut out), Ok(plain.len()));
         assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn worker_count_cap_and_scratch_reuse() {
+        // 6C/12T Ryzen 5600X defaults to 4 workers (leaving 2 physical cores free).
+        assert_eq!(parse_worker_count(None, 12), 4);
+        assert_eq!(parse_worker_count(None, 6), 2);
+        assert_eq!(parse_worker_count(None, 16), 6);
+        assert_eq!(parse_worker_count(None, 24), 6);
+        assert_eq!(parse_worker_count(Some("3"), 12), 3);
+        assert_eq!(parse_worker_count(Some("0"), 12), 1);
+        assert_eq!(parse_worker_count(Some("99"), 12), 32);
+        assert_eq!(parse_worker_count(Some("invalid"), 12), 4);
+
+        // Repeated zlib->BCPack execution reuses `WorkerScratch` buffers without reallocating.
+        with_test_tables();
+        let packed = compress_zlib(&BC4_STREAM);
+        let (_dir, file) = file_with(&packed);
+        let mut scratch = WorkerScratch::default();
+        let mut out = [0u8; 16];
+        let mut r = request(ZLIB | (4 << 1), out.as_mut_ptr().cast(), 16, file, 0, packed.len());
+        r.intermediate_size = BC4_STREAM.len() as u32;
+        assert_eq!(execute_with_scratch(&r, &mut scratch), Ok(()));
+        assert_eq!(out, bc4_blocks());
+        let comp_ptr = scratch.compressed.as_ptr() as usize;
+        let inter_ptr = scratch.intermediate.as_ptr() as usize;
+        out.fill(0);
+        assert_eq!(execute_with_scratch(&r, &mut scratch), Ok(()));
+        assert_eq!(out, bc4_blocks());
+        assert_eq!(scratch.compressed.as_ptr() as usize, comp_ptr);
+        assert_eq!(scratch.intermediate.as_ptr() as usize, inter_ptr);
     }
 }

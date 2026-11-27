@@ -79,6 +79,49 @@ pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
 pub(crate) static BLOB: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SAVED: AtomicU64 = AtomicU64::new(0);
 
+/// Whether the host pipeline library is split into 64 lazy on-demand shards
+/// under `<dir>/shards/<mode>/shard-<00..3f>.bin`. On by default;
+/// `VICTORY_LIBRARY_SHARDS=0` uses the legacy monolithic `host-pipelines.bin`.
+fn sharded() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_SHARDS").is_none_or(|v| v != "0"))
+}
+
+const SHARD_COUNT: usize = 64;
+const SHARDS_DIR: &str = "shards";
+
+fn shard_mode(vram_cbv: bool) -> &'static str {
+    if vram_cbv { "vram_cbv" } else { "classic" }
+}
+
+fn shard_dir(root: &std::path::Path, vram_cbv: bool) -> PathBuf {
+    root.join(SHARDS_DIR).join(shard_mode(vram_cbv))
+}
+
+fn shard_path(root: &std::path::Path, vram_cbv: bool, shard: usize) -> PathBuf {
+    shard_dir(root, vram_cbv).join(format!("shard-{shard:02x}.bin"))
+}
+
+fn shard_next_path(root: &std::path::Path, vram_cbv: bool, shard: usize) -> PathBuf {
+    shard_dir(root, vram_cbv).join(format!("shard-{shard:02x}.next"))
+}
+
+/// Deterministic shard index `0..64` for pipeline name `name`.
+/// Uses the first byte of the hex BLAKE3 digest (`& 63`) when `name` starts
+/// with two ASCII hex digits, with an FNV-1a fallback for arbitrary names.
+fn shard_index(name: &str) -> usize {
+    if name.len() >= 2
+        && name.is_char_boundary(2)
+        && let Ok(byte) = u8::from_str_radix(&name[..2], 16)
+    {
+        return usize::from(byte) & (SHARD_COUNT - 1);
+    }
+    let hash = name.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    (hash as usize) & (SHARD_COUNT - 1)
+}
+
 /// Whether the library's file is mapped ([`Blob`]) and saved through a
 /// mapping. On by default; `VICTORY_LIBRARY_MAP=0` uses buffers, as before.
 fn mapped() -> bool {
@@ -209,17 +252,27 @@ impl Blob {
     /// The library file in `dir`: a library a save left beside it
     /// ([`NEXT_FILE`]) takes its place first.
     fn of(dir: &std::path::Path) -> Blob {
-        let path = dir.join(LIBRARY_FILE);
-        let next = dir.join(NEXT_FILE);
-        if next.exists() && std::fs::rename(&next, &path).is_err() {
-            tracing::warn!("the host pipeline library saved last could not take the old one's place");
+        Blob::of_paths(&dir.join(LIBRARY_FILE), &dir.join(NEXT_FILE))
+    }
+
+    /// The library file at `path`: a pending `next` file from an earlier save
+    /// takes its place first.
+    fn of_paths(path: &std::path::Path, next: &std::path::Path) -> Blob {
+        if next.exists() && std::fs::rename(next, path).is_err() {
+            tracing::warn!(path = %path.display(), "the host pipeline library saved last could not take the old one's place");
         }
+        Blob::of_readonly(path)
+    }
+
+    /// Maps or reads an existing library file read-only without renaming or
+    /// mutating anything on disk.
+    fn of_readonly(path: &std::path::Path) -> Blob {
         if mapped()
-            && let Some(file) = Mapped::open(&path)
+            && let Some(file) = Mapped::open(path)
         {
             return Blob::Mapped(file);
         }
-        match std::fs::read(&path) {
+        match std::fs::read(path) {
             Ok(bytes) if !bytes.is_empty() => Blob::Held(bytes),
             _ => Blob::None,
         }
@@ -234,19 +287,29 @@ impl Blob {
     }
 }
 
-/// The mapped library file's view (address, bytes; 0: not mapped), when a
-/// pipeline was last loaded from the library (`crate::host::now_ms`), and
-/// whether the view's pages were let go since ([`trim`]).
-static VIEW: [std::sync::atomic::AtomicUsize; 2] = [const { std::sync::atomic::AtomicUsize::new(0) }; 2];
+/// Live mapped library views (`(base, len)` — either the monolithic file or
+/// lazily mapped shards + read-only legacy fallback). Never unmapped while the
+/// process lives, so [`trim`] and [`removal_note`] can safely inspect them.
+static MAPPED_VIEWS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 static LOADED_AT: AtomicU64 = AtomicU64::new(0);
 static TRIMMED: AtomicBool = AtomicBool::new(false);
-/// The bytes of the view let go so far, for the memory line.
+/// The bytes of the views let go so far, for the memory line.
 pub(crate) static TRIMMED_BYTES: AtomicU64 = AtomicU64::new(0);
-/// When the view's pages were last let go (`crate::host::now_ms`), and how
-/// often and when a save of this run last renamed a new library over the
+/// When the views' pages were last let go (`crate::host::now_ms`), and how
+/// often and when a save of this run last renamed a new library over a
 /// mapped file: for [`removal_note`].
 static TRIMMED_AT: AtomicU64 = AtomicU64::new(0);
 static REPLACED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn register_mapped(file: &Mapped) {
+    MAPPED_VIEWS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((file.at.Value as usize, file.len));
+    LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
+    TRIMMED.store(false, Ordering::Relaxed);
+}
 
 /// The library calls running now: thread, what (load, make, store,
 /// serialise), the pipeline, and since when (`crate::host::now_us`).
@@ -309,24 +372,28 @@ pub(crate) fn removal_note() -> String {
             );
         }
     }
-    let at = VIEW[0].load(Ordering::Acquire);
-    let len = VIEW[1].load(Ordering::Relaxed);
-    if at == 0 {
+    let views: Vec<(usize, usize)> = MAPPED_VIEWS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if views.is_empty() {
         text.push_str("; its file is not mapped");
         return text;
     }
+    let total_len: usize = views.iter().map(|&(_, len)| len).sum();
     let ago = |ms: u64| crate::host::now_ms().saturating_sub(ms) as f64 / 1000.0;
     let _ = write!(
         text,
-        "; its file is mapped ({len} bytes), the handle {}",
+        "; {} mapped library file(s) ({total_len} bytes), the handle {}",
+        views.len(),
         if holds() { "kept open" } else { "closed (VICTORY_LIBRARY_HANDLE=0)" }
     );
     match REPLACED[0].load(Ordering::Relaxed) {
-        0 => text.push_str("; this run has not replaced the file"),
+        0 => text.push_str("; this run has not replaced a mapped file"),
         n => {
             let _ = write!(
                 text,
-                "; this run replaced the file under the mapping {n} times, last {:.1} s ago",
+                "; this run replaced a mapped file {n} times, last {:.1} s ago",
                 ago(REPLACED[1].load(Ordering::Relaxed))
             );
         }
@@ -336,19 +403,21 @@ pub(crate) fn removal_note() -> String {
     }
     // Within two seconds: pages not in memory come from the disk.
     let started = std::time::Instant::now();
-    // SAFETY: the view lives as long as the library, which is never dropped.
-    let bytes = unsafe { std::slice::from_raw_parts(at as *const u8, len) };
     let (mut zero, mut looked, mut first) = (0u64, 0u64, None);
-    for (n, page) in bytes.chunks(4096).enumerate() {
-        if n % 4096 == 0 && started.elapsed() > std::time::Duration::from_secs(2) {
-            break;
-        }
-        looked += 1;
-        if page.iter().all(|&b| b == 0) {
-            zero += 1;
-            if first.is_none() {
-                first = Some(n);
+    'scan: for &(at, len) in &views {
+        // SAFETY: each registered view lives for the process lifetime.
+        let bytes = unsafe { std::slice::from_raw_parts(at as *const u8, len) };
+        for page in bytes.chunks(4096) {
+            if looked.is_multiple_of(4096) && started.elapsed() > std::time::Duration::from_secs(2) {
+                break 'scan;
             }
+            if page.iter().all(|&b| b == 0) {
+                zero += 1;
+                if first.is_none() {
+                    first = Some(looked);
+                }
+            }
+            looked += 1;
         }
     }
     let _ = write!(text, "; {zero} of the {looked} pages looked at read as zeros now");
@@ -370,12 +439,16 @@ pub(crate) fn removal_note() -> String {
 /// `VICTORY_LIBRARY_TRIM=0`: the pages stay until Windows takes them.
 pub(crate) fn trim() {
     static ON: OnceLock<bool> = OnceLock::new();
-    let at = VIEW[0].load(Ordering::Acquire);
-    let len = VIEW[1].load(Ordering::Relaxed);
-    if at == 0
-        || TRIMMED.load(Ordering::Relaxed)
+    if TRIMMED.load(Ordering::Relaxed)
         || !*ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_TRIM").is_none_or(|v| v != "0"))
     {
+        return;
+    }
+    let views: Vec<(usize, usize)> = MAPPED_VIEWS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if views.is_empty() {
         return;
     }
     let quiet_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
@@ -385,14 +458,18 @@ pub(crate) fn trim() {
         return;
     }
     let work = move || {
-        // SAFETY: the view lives as long as the library, which is never
-        // dropped. Unlocking pages that are not locked fails, as expected,
-        // and takes them out of the working set: the documented way to let
-        // pages of a mapped file go.
-        unsafe { windows_sys::Win32::System::Memory::VirtualUnlock(at as *const _, len) };
-        TRIMMED_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+        let mut total = 0u64;
+        for (at, len) in views {
+            // SAFETY: each registered view lives for the process lifetime.
+            // Unlocking pages that are not locked fails, as expected, and
+            // takes them out of the working set: the documented way to let
+            // pages of a mapped file go.
+            unsafe { windows_sys::Win32::System::Memory::VirtualUnlock(at as *const _, len) };
+            total += len as u64;
+        }
+        TRIMMED_BYTES.fetch_add(total, Ordering::Relaxed);
         TRIMMED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
-        crate::host::trail(|| format!("pipeline library: the mapped file's pages let go from memory ({len} bytes)"));
+        crate::host::trail(|| format!("pipeline library: mapped files' pages let go from memory ({total} bytes)"));
     };
     if std::thread::Builder::new().name("victory-library-trim".into()).spawn(work).is_err() {
         TRIMMED.store(false, Ordering::Relaxed);
@@ -459,9 +536,312 @@ fn library() -> Option<&'static Library> {
         .as_ref()
 }
 
+/// 64 lazily opened mode-separated pipeline library shards with a read-only
+/// fallback to legacy monolithic `host-pipelines.bin` (zero-loss migration).
+struct ShardedLibrary {
+    device: ID3D12Device1,
+    dir: Option<PathBuf>,
+    vram_cbv: bool,
+    track_globals: bool,
+    shards: [OnceLock<Option<Library>>; SHARD_COUNT],
+    legacy: OnceLock<Option<Library>>,
+    migrated: AtomicU64,
+}
+
+// SAFETY: D3D12 devices and pipeline libraries are free-threaded; per-shard
+// access is synchronised by `same_name` and each `Library`'s `saving` RwLock.
+unsafe impl Send for ShardedLibrary {}
+// SAFETY: as above.
+unsafe impl Sync for ShardedLibrary {}
+
+impl ShardedLibrary {
+    fn new(device: ID3D12Device1, dir: Option<PathBuf>, vram_cbv: bool, track_globals: bool) -> Self {
+        Self {
+            device,
+            dir,
+            vram_cbv,
+            track_globals,
+            shards: [const { OnceLock::new() }; SHARD_COUNT],
+            legacy: OnceLock::new(),
+            migrated: AtomicU64::new(0),
+        }
+    }
+
+    /// Lazily opens and maps shard `idx` on first access. Unvisited shards
+    /// remain uninitialized (0 RAM, 0 open handles).
+    fn shard(&self, idx: usize) -> Option<&Library> {
+        self.shards[idx]
+            .get_or_init(|| {
+                let blob = self.dir.as_deref().map_or(Blob::None, |d| {
+                    Blob::of_paths(&shard_path(d, self.vram_cbv, idx), &shard_next_path(d, self.vram_cbv, idx))
+                });
+                open_with(&self.device, blob, self.track_globals, Some(idx))
+            })
+            .as_ref()
+    }
+
+    /// Lazily opens existing legacy `host-pipelines.bin` read-only on a shard
+    /// miss. Returns `None` if absent, empty, or rejected by the host driver.
+    fn legacy(&self) -> Option<&Library> {
+        self.legacy
+            .get_or_init(|| {
+                let dir = self.dir.as_deref()?;
+                let blob = Blob::of_readonly(&dir.join(LIBRARY_FILE));
+                open_readonly_fallback(&self.device, blob, self.track_globals)
+            })
+            .as_ref()
+    }
+
+    fn any_dirty(&self) -> bool {
+        self.shards.iter().any(|slot| {
+            slot.get()
+                .and_then(Option::as_ref)
+                .is_some_and(|s| s.added.load(Ordering::Relaxed) > 0)
+        })
+    }
+
+    fn load_or_create(
+        &self,
+        name: &str,
+        mut load: impl FnMut(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
+        create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
+    ) -> windows::core::Result<ID3D12PipelineState> {
+        let idx = shard_index(name);
+        let wide = HSTRING::from(name);
+        let Some(shard) = self.shard(idx) else {
+            if self.track_globals {
+                MADE.fetch_add(1, Ordering::Relaxed);
+            }
+            return create();
+        };
+        let began = std::time::Instant::now();
+        // Step 1: check the target shard first (lock order: OnceLock -> one_call -> same_name).
+        let loaded = {
+            let _all = one_call();
+            let _one = same_name(name);
+            let _call = call("load", name);
+            load(&shard.library, PCWSTR(wide.as_ptr()))
+        };
+        if self.track_globals {
+            LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
+            TRIMMED.store(false, Ordering::Relaxed);
+        }
+        let refused = match loaded {
+            Ok(pso) => {
+                if self.track_globals {
+                    LOADED.fetch_add(1, Ordering::Relaxed);
+                    crate::host::trail(|| {
+                        let label = LABEL.with(|l| l.borrow().clone());
+                        format!(
+                            "pipeline library: loaded {label} from shard-{idx:02x} in {:.1} ms",
+                            began.elapsed().as_secs_f64() * 1e3
+                        )
+                    });
+                }
+                return Ok(pso);
+            }
+            Err(e) => e,
+        };
+        // Step 2: on shard miss, lazily check read-only legacy `host-pipelines.bin`
+        // (outside any lock) and migrate hits into the target shard with zero recompile.
+        if let Some(legacy) = self.legacy() {
+            let migrated = {
+                let _all = one_call();
+                let _one = same_name(name);
+                let _call = call("load-legacy", name);
+                // Re-check shard in case a racing thread just migrated `name`.
+                match load(&shard.library, PCWSTR(wide.as_ptr())) {
+                    Ok(pso) => Some(pso),
+                    Err(_) => match load(&legacy.library, PCWSTR(wide.as_ptr())) {
+                        Ok(pso) => {
+                            let _stores = shard.saving.read().unwrap_or_else(|e| e.into_inner());
+                            // SAFETY: live PSO and library; duplicate name is harmlessly ignored.
+                            if unsafe { shard.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
+                                shard.added.fetch_add(1, Ordering::Relaxed);
+                                self.migrated.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Some(pso)
+                        }
+                        Err(_) => None,
+                    },
+                }
+            };
+            if self.track_globals {
+                LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
+                TRIMMED.store(false, Ordering::Relaxed);
+            }
+            if let Some(pso) = migrated {
+                if self.track_globals {
+                    LOADED.fetch_add(1, Ordering::Relaxed);
+                    crate::host::trail(|| {
+                        let label = LABEL.with(|l| l.borrow().clone());
+                        format!(
+                            "pipeline library: migrated {label} from legacy into shard-{idx:02x} in {:.1} ms",
+                            began.elapsed().as_secs_f64() * 1e3
+                        )
+                    });
+                }
+                return Ok(pso);
+            }
+        }
+        // Step 3: compile outside any lock, then store into the target shard.
+        let pso = {
+            let _call = call("make", name);
+            create()?
+        };
+        if self.track_globals {
+            MADE.fetch_add(1, Ordering::Relaxed);
+            crate::host::trail(|| {
+                let label = LABEL.with(|l| l.borrow().clone());
+                format!(
+                    "pipeline library: made {label} for shard-{idx:02x} in {:.1} ms (not loaded: {refused})",
+                    began.elapsed().as_secs_f64() * 1e3
+                )
+            });
+        }
+        let _all = one_call();
+        let _one = same_name(name);
+        let _stores = shard.saving.read().unwrap_or_else(|e| e.into_inner());
+        let _call = call("store", name);
+        // SAFETY: a live pipeline; a name already stored (a description that
+        // differs) is refused, which leaves the library as it was.
+        if unsafe { shard.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
+            shard.added.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(pso)
+    }
+
+    /// Serializes and atomically replaces ONLY shards marked dirty (`added > 0`),
+    /// preserving open mapped file handles (`holds()`) and never touching clean
+    /// shards or legacy `host-pipelines.bin`.
+    fn save_dirty(&self) -> (usize, usize, std::io::Result<()>) {
+        let Some(dir) = self.dir.as_deref() else {
+            return (0, 0, Ok(()));
+        };
+        let sdir = shard_dir(dir, self.vram_cbv);
+        let mut dir_created = false;
+        let mut total_bytes = 0usize;
+        let mut shards_saved = 0usize;
+        let mut first_err: Option<std::io::Error> = None;
+
+        for (idx, slot) in self.shards.iter().enumerate() {
+            let Some(Some(shard)) = slot.get() else {
+                continue;
+            };
+            if shard.added.load(Ordering::Relaxed) == 0 {
+                continue;
+            }
+            if !dir_created {
+                if let Err(e) = std::fs::create_dir_all(&sdir) {
+                    return (0, 0, Err(e));
+                }
+                dir_created = true;
+            }
+            let _all = one_call();
+            // Hold saving.write() across serialize + atomic replace so concurrent
+            // periodic/shutdown saves never race an older rename over a newer one.
+            let _alone = shard.saving.write().unwrap_or_else(|e| e.into_inner());
+            if shard.added.load(Ordering::Relaxed) == 0 {
+                continue;
+            }
+            // SAFETY: a plain query.
+            let size = unsafe { shard.library.GetSerializedSize() };
+            let seq = SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
+            let tmp = sdir.join(format!("shard-{idx:02x}.bin.{}.{seq}.tmp", std::process::id()));
+            let target = shard_path(dir, self.vram_cbv, idx);
+            let next = shard_next_path(dir, self.vram_cbv, idx);
+            let label = format!("shard-{idx:02x}");
+            let _call = call("serialise", &label);
+            if let Err(e) = serialise(&shard.library, &tmp, size) {
+                tracing::warn!(shard = idx, error = %e, "host pipeline shard not serialised");
+                let _ = std::fs::remove_file(&tmp);
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+                continue;
+            }
+            match replace_file(&tmp, &target, &next) {
+                Ok(in_place) => {
+                    shard.added.store(0, Ordering::Relaxed);
+                    total_bytes += size;
+                    shards_saved += 1;
+                    if self.track_globals && in_place && matches!(shard._blob, Blob::Mapped(_)) {
+                        REPLACED[1].store(crate::host::now_ms(), Ordering::Relaxed);
+                        REPLACED[0].fetch_add(1, Ordering::Relaxed);
+                    }
+                    if self.track_globals {
+                        crate::host::trail(|| {
+                            format!(
+                                "pipeline library: saved shard-{idx:02x} ({size} bytes), {}",
+                                if in_place {
+                                    "renamed over shard file"
+                                } else {
+                                    "left beside shard file for next start"
+                                }
+                            )
+                        });
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(shard = idx, error = %e, "host pipeline shard not replaced");
+                    let _ = std::fs::remove_file(&tmp);
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
+        if self.track_globals && total_bytes > 0 {
+            SAVED.store(total_bytes as u64, Ordering::Relaxed);
+        }
+        (total_bytes, shards_saved, first_err.map_or(Ok(()), Err))
+    }
+
+    #[cfg(test)]
+    fn opened_shards(&self) -> usize {
+        self.shards.iter().filter(|s| s.get().is_some()).count()
+    }
+
+    #[cfg(test)]
+    fn is_shard_opened(&self, idx: usize) -> bool {
+        self.shards[idx].get().is_some()
+    }
+
+    #[cfg(test)]
+    fn is_legacy_opened(&self) -> bool {
+        self.legacy.get().is_some()
+    }
+
+    #[cfg(test)]
+    fn migrated_count(&self) -> u64 {
+        self.migrated.load(Ordering::Relaxed)
+    }
+}
+
+fn sharded_library() -> Option<&'static ShardedLibrary> {
+    static SHARDED: OnceLock<Option<ShardedLibrary>> = OnceLock::new();
+    SHARDED
+        .get_or_init(|| {
+            let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
+            let vram_cbv = victory_shader::emit::vram_cbv();
+            let dir = DIR.get().cloned();
+            tracing::info!(
+                mode = shard_mode(vram_cbv),
+                shards = SHARD_COUNT,
+                "sharded on-demand host pipeline library enabled"
+            );
+            Some(ShardedLibrary::new(device, dir, vram_cbv, true))
+        })
+        .as_ref()
+}
+
 /// The library in `blob`, or an empty one if the host rejects the blob (an
 /// adapter or driver change, damage).
 fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
+    open_with(device, blob, true, None)
+}
+
+fn open_with(device: &ID3D12Device1, blob: Blob, track_globals: bool, shard: Option<usize>) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
         // SAFETY: the bytes outlive the library (kept beside it).
         unsafe {
@@ -472,12 +852,19 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
         match make(blob.bytes()) {
             Ok(library) => {
                 let bytes = blob.bytes().len();
-                BLOB.store(bytes as u64, Ordering::Relaxed);
-                tracing::info!(bytes, mapped = matches!(blob, Blob::Mapped(_)), "host pipeline library loaded");
-                if let Blob::Mapped(file) = &blob {
-                    VIEW[1].store(file.len, Ordering::Relaxed);
-                    VIEW[0].store(file.at.Value as usize, Ordering::Release);
-                    LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
+                if track_globals {
+                    if shard.is_some() {
+                        BLOB.fetch_add(bytes as u64, Ordering::Relaxed);
+                    } else {
+                        BLOB.store(bytes as u64, Ordering::Relaxed);
+                    }
+                    if let Blob::Mapped(file) = &blob {
+                        register_mapped(file);
+                    }
+                }
+                match shard {
+                    Some(idx) => tracing::debug!(shard = idx, bytes, mapped = matches!(blob, Blob::Mapped(_)), "host pipeline shard loaded"),
+                    None => tracing::info!(bytes, mapped = matches!(blob, Blob::Mapped(_)), "host pipeline library loaded"),
                 }
                 return Some(Library {
                     library,
@@ -486,9 +873,12 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
                     saving: RwLock::new(()),
                 });
             }
-            Err(e) => tracing::info!(error = %e, "host pipeline library rejected; starting an empty one"),
+            Err(e) => match shard {
+                Some(idx) => tracing::info!(shard = idx, error = %e, "host pipeline shard rejected; starting an empty one"),
+                None => tracing::info!(error = %e, "host pipeline library rejected; starting an empty one"),
+            },
         }
-    } else {
+    } else if shard.is_none() {
         tracing::info!("no host pipeline library yet; starting an empty one");
     }
     // The rejected bytes are let go (a mapped file is unmapped) before the
@@ -501,6 +891,47 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
         added: AtomicU64::new(0),
         saving: RwLock::new(()),
     })
+}
+
+/// Opens a read-only fallback library from `blob`, returning `None` if `blob`
+/// is empty or rejected by the host (never allocates an empty fallback library).
+fn open_readonly_fallback(device: &ID3D12Device1, blob: Blob, track_globals: bool) -> Option<Library> {
+    if blob.bytes().is_empty() {
+        return None;
+    }
+    // SAFETY: the bytes outlive the library (kept beside it in `Library::_blob`).
+    let made: windows::core::Result<ID3D12PipelineLibrary1> = unsafe {
+        device
+            .CreatePipelineLibrary::<ID3D12PipelineLibrary>(blob.bytes())
+            .and_then(|l| l.cast())
+    };
+    match made {
+        Ok(library) => {
+            let bytes = blob.bytes().len();
+            if track_globals {
+                BLOB.fetch_add(bytes as u64, Ordering::Relaxed);
+                if let Blob::Mapped(file) = &blob {
+                    register_mapped(file);
+                }
+            }
+            tracing::info!(
+                bytes,
+                mapped = matches!(blob, Blob::Mapped(_)),
+                "legacy host-pipelines.bin opened read-only for zero-loss shard migration"
+            );
+            Some(Library {
+                library,
+                _blob: blob,
+                added: AtomicU64::new(0),
+                saving: RwLock::new(()),
+            })
+        }
+        Err(e) => {
+            tracing::info!(error = %e, "legacy host-pipelines.bin rejected; skipping read-only fallback");
+            drop(blob);
+            None
+        }
+    }
 }
 
 /// A pipeline's name in the library: the hash of what its host
@@ -523,9 +954,16 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
 /// there with the same description, else made by `create` and stored.
 pub(crate) fn pipeline(
     name: &str,
-    load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
+    mut load: impl FnMut(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
+    if sharded() {
+        let Some(store) = sharded_library() else {
+            MADE.fetch_add(1, Ordering::Relaxed);
+            return create();
+        };
+        return store.load_or_create(name, load, create);
+    }
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
@@ -576,12 +1014,56 @@ pub(crate) fn pipeline(
     Ok(pso)
 }
 
-/// Writes the library and the early list if pipelines were added since the
-/// last save and `SAVE_EVERY` has passed (or `now`).
+/// Writes the library (or dirty shards) and the early list if pipelines were
+/// added since the last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+    let Some(dir) = DIR.get() else { return };
+    if sharded() {
+        let Some(store) = sharded_library() else { return };
+        {
+            let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+            if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
+                return;
+            }
+            *last = Some(std::time::Instant::now());
+        }
+        let dirty = store.any_dirty();
+        let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
+        if !dirty && !used_changed {
+            return;
+        }
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            tracing::warn!(error = %e, "host pipeline library not saved");
+            return;
+        }
+        let (bytes, shards_saved, library_written) = if dirty {
+            store.save_dirty()
+        } else {
+            (0, 0, Ok(()))
+        };
+        let used: Vec<String> = used().iter().flatten().cloned().collect();
+        let slow: Vec<String> = slow_ones().iter().flatten().map(|(key, ms)| format!("{key} {ms}")).collect();
+        let written = library_written
+            .and_then(|()| write_atomically(&dir.join(SLOW_FILE), slow.join("\n").as_bytes()))
+            .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
+        match written {
+            Ok(()) => tracing::info!(
+                bytes,
+                shards_saved,
+                migrated = store.migrated.load(Ordering::Relaxed),
+                early = used.len(),
+                made = MADE.load(Ordering::Relaxed),
+                loaded = LOADED.load(Ordering::Relaxed),
+                started_early = EARLY.load(Ordering::Relaxed),
+                "host pipeline library saved"
+            ),
+            Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+        }
+        return;
+    }
+    let Some(library) = library() else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
@@ -593,7 +1075,6 @@ pub(crate) fn save(now: bool) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
     }
-    static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = dir.join(format!("{LIBRARY_FILE}.{}.{seq}.tmp", std::process::id()));
     // The bytes of the library written to `tmp`; 0 when no pipeline was
@@ -631,7 +1112,7 @@ pub(crate) fn save(now: bool) {
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
         let in_place = !dir.join(NEXT_FILE).exists();
-        if in_place && VIEW[0].load(Ordering::Acquire) != 0 {
+        if in_place && matches!(library._blob, Blob::Mapped(_)) {
             REPLACED[1].store(crate::host::now_ms(), Ordering::Relaxed);
             REPLACED[0].fetch_add(1, Ordering::Relaxed);
         }
@@ -678,6 +1159,22 @@ fn serialise(library: &ID3D12PipelineLibrary1, tmp: &std::path::Path, size: usiz
     std::fs::write(tmp, &bytes)
 }
 
+/// Renames `tmp` over `target`, falling back to `next` if the OS refuses to
+/// replace a mapped file in place. Returns `Ok(true)` when replaced in place.
+fn replace_file(
+    tmp: &std::path::Path,
+    target: &std::path::Path,
+    next: &std::path::Path,
+) -> std::io::Result<bool> {
+    match std::fs::rename(tmp, target) {
+        Ok(()) => Ok(true),
+        Err(_) => {
+            std::fs::rename(tmp, next)?;
+            Ok(false)
+        }
+    }
+}
+
 /// Renames the written library `tmp` over the library's file in `dir`. This
 /// run may have that file mapped: Windows 11 replaces a mapped file, and
 /// the mapping goes on reading the old one for as long as a handle on it
@@ -685,7 +1182,7 @@ fn serialise(library: &ID3D12PipelineLibrary1, tmp: &std::path::Path, size: usiz
 /// stay: the rest read as zeros). Where a system refuses, the new library
 /// is left beside it as [`NEXT_FILE`] for the next start.
 fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Result<()> {
-    std::fs::rename(tmp, dir.join(LIBRARY_FILE)).or_else(|_| std::fs::rename(tmp, dir.join(NEXT_FILE)))
+    replace_file(tmp, &dir.join(LIBRARY_FILE), &dir.join(NEXT_FILE)).map(|_| ())
 }
 
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
@@ -957,5 +1454,448 @@ mod tests {
             h.update(part);
         }
         assert_eq!(off, h.finalize().to_hex()[..32]);
+    }
+
+    /// Minimal valid SM 6.6 compute DXIL with `[numthreads(threads_x, 1, 1)]`
+    /// and an empty root signature for real D3D12 pipeline library tests.
+    fn test_compute_pso_desc(
+        device: &ID3D12Device1,
+        threads_x: u32,
+    ) -> (ID3D12RootSignature, Vec<u8>) {
+        let code_bytes = 0xBF81_0000u32.to_le_bytes().to_vec(); // s_endpgm
+        let native = victory_shader::NativeProgram {
+            stage: victory_shader::HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io: victory_shader::native::StageIo::Cs(victory_shader::native::ComputeIo {
+                rsrc2: 0,
+                threads: [threads_x, 1, 1],
+            }),
+            code: code_bytes,
+        };
+        let c = victory_shader::Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: Vec::new(),
+        };
+        let p = victory_shader::ir::build(&native.code, false, native.vgprs).unwrap();
+        let st = victory_shader::structure::structure(&p).unwrap();
+        let res = victory_shader::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = victory_shader::io::raise(&p, &native).unwrap();
+        let shader = victory_shader::emit::emit(&c, &native, &p, &st, &io, &res).unwrap();
+
+        let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+            Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
+            Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+                Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
+                    Flags: D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
+                        | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED,
+                    ..Default::default()
+                },
+            },
+        };
+        // SAFETY: valid root signature description and device.
+        let root: ID3D12RootSignature = unsafe {
+            let mut blob = None;
+            let mut err = None;
+            D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut err)).unwrap();
+            let blob = blob.unwrap();
+            let bytes = std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
+            device.CreateRootSignature(0, bytes).unwrap()
+        };
+        (root, shader.dxil)
+    }
+
+    fn make_compute_desc(root: &ID3D12RootSignature, dxil: &[u8]) -> D3D12_COMPUTE_PIPELINE_STATE_DESC {
+        D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            // SAFETY: borrowed pointer outlived by caller's `root`.
+            pRootSignature: unsafe { std::mem::transmute_copy(root) },
+            CS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: dxil.as_ptr().cast(),
+                BytecodeLength: dxil.len(),
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn shard_index_is_deterministic_and_covers_all_64_shards() {
+        let mut seen = [false; SHARD_COUNT];
+        for b in 0..=255u8 {
+            let name = format!("{b:02x}0123456789abcdef0123456789abcd");
+            let idx = shard_index(&name);
+            assert_eq!(idx, usize::from(b) & 63);
+            assert_eq!(idx, shard_index(&name));
+            seen[idx] = true;
+        }
+        assert!(seen.iter().all(|&s| s), "all 64 shards must be reachable");
+        // Non-hex arbitrary names also map deterministically into 0..64.
+        for label in ["", "a", "pso-alpha", "pso-beta", "mesh_triangles"] {
+            let idx = shard_index(label);
+            assert!(idx < SHARD_COUNT);
+            assert_eq!(idx, shard_index(label));
+        }
+    }
+
+    #[test]
+    fn sharded_library_opens_lazily_and_saves_only_dirty_shards() {
+        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (root1, dxil1) = test_compute_pso_desc(&device, 1);
+        let (root2, dxil2) = test_compute_pso_desc(&device, 2);
+        let (root3, dxil3) = test_compute_pso_desc(&device, 4);
+        let desc1 = make_compute_desc(&root1, &dxil1);
+        let desc2 = make_compute_desc(&root2, &dxil2);
+        let desc3 = make_compute_desc(&root3, &dxil3);
+
+        // Two names routed into distinct shards (0x05 and 0x2a), plus a third into 0x2a.
+        let name1 = "05aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let name2 = "2abbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let name3 = "2acccccccccccccccccccccccccccccc";
+        let s1 = shard_index(name1);
+        let s2 = shard_index(name2);
+        assert_ne!(s1, s2);
+        assert_eq!(s2, shard_index(name3));
+
+        // Session 1: compile name1 + name2 -> only 2 of 64 shards open & saved.
+        {
+            let store = ShardedLibrary::new(device.clone(), Some(dir.path().to_path_buf()), true, false);
+            assert_eq!(store.opened_shards(), 0);
+            assert!(!store.is_legacy_opened());
+            let mut created = 0usize;
+            store
+                .load_or_create(
+                    name1,
+                    |lib, w| unsafe { lib.LoadComputePipeline(w, &desc1) },
+                    || {
+                        created += 1;
+                        unsafe { device.CreateComputePipelineState(&desc1) }
+                    },
+                )
+                .unwrap();
+            assert_eq!(created, 1);
+            assert_eq!(store.opened_shards(), 1);
+            assert!(store.is_shard_opened(s1));
+            assert!(!store.is_shard_opened(s2));
+
+            store
+                .load_or_create(
+                    name2,
+                    |lib, w| unsafe { lib.LoadComputePipeline(w, &desc2) },
+                    || {
+                        created += 1;
+                        unsafe { device.CreateComputePipelineState(&desc2) }
+                    },
+                )
+                .unwrap();
+            assert_eq!(created, 2);
+            assert_eq!(store.opened_shards(), 2);
+
+            let (bytes, saved, res) = store.save_dirty();
+            res.unwrap();
+            assert_eq!(saved, 2);
+            assert!(bytes > 0);
+            assert!(shard_path(dir.path(), true, s1).is_file());
+            assert!(shard_path(dir.path(), true, s2).is_file());
+            assert!(!shard_path(dir.path(), true, 0).exists());
+            // A second save with no new PSOs writes nothing.
+            let (bytes2, saved2, res2) = store.save_dirty();
+            res2.unwrap();
+            assert_eq!((bytes2, saved2), (0, 0));
+        }
+
+        // Session 2: load name1 (clean hit!), compile name3 into s2 -> save_dirty
+        // writes ONLY s2 while s1 stays clean & untouched.
+        let s1_path = shard_path(dir.path(), true, s1);
+        let s1_bytes_before = std::fs::read(&s1_path).unwrap();
+        {
+            let store = ShardedLibrary::new(device.clone(), Some(dir.path().to_path_buf()), true, false);
+            let mut created = 0usize;
+            store
+                .load_or_create(
+                    name1,
+                    |lib, w| unsafe { lib.LoadComputePipeline(w, &desc1) },
+                    || {
+                        created += 1;
+                        unsafe { device.CreateComputePipelineState(&desc1) }
+                    },
+                )
+                .unwrap();
+            assert_eq!(created, 0, "name1 must hit shard-{s1:02x} without recompiling");
+            assert_eq!(store.opened_shards(), 1);
+            assert!(!store.is_legacy_opened());
+
+            store
+                .load_or_create(
+                    name3,
+                    |lib, w| unsafe { lib.LoadComputePipeline(w, &desc3) },
+                    || {
+                        created += 1;
+                        unsafe { device.CreateComputePipelineState(&desc3) }
+                    },
+                )
+                .unwrap();
+            assert_eq!(created, 1);
+
+            let (bytes, saved, res) = store.save_dirty();
+            res.unwrap();
+            assert_eq!(saved, 1, "only dirty shard-{s2:02x} may be written");
+            assert!(bytes > 0);
+        }
+        assert_eq!(std::fs::read(&s1_path).unwrap(), s1_bytes_before);
+    }
+
+    #[test]
+    fn sharded_library_migrates_from_legacy_host_pipelines_without_recompile_or_modifying_it() {
+        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (root, dxil) = test_compute_pso_desc(&device, 8);
+        let desc = make_compute_desc(&root, &dxil);
+        let pso_name = "13feedface00000013feedface000000";
+        let s = shard_index(pso_name);
+
+        // Seed a legacy monolithic `host-pipelines.bin` with `pso_name`.
+        let legacy_path = dir.path().join(LIBRARY_FILE);
+        {
+            let lib = open_with(&device, Blob::None, false, None).unwrap();
+            // SAFETY: valid device, desc, and live pipeline library.
+            let pso: ID3D12PipelineState = unsafe { device.CreateComputePipelineState(&desc) }.unwrap();
+            let wide = HSTRING::from(pso_name);
+            unsafe { lib.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.unwrap();
+            let size = unsafe { lib.library.GetSerializedSize() };
+            serialise(&lib.library, &legacy_path, size).unwrap();
+        }
+        let legacy_before = std::fs::read(&legacy_path).unwrap();
+        assert!(!legacy_before.is_empty());
+
+        // Session 1: empty shard misses -> lazily opens read-only `host-pipelines.bin`
+        // -> hits with ZERO recompile -> migrates into shard -> saves tiny shard.
+        {
+            let store = ShardedLibrary::new(device.clone(), Some(dir.path().to_path_buf()), true, false);
+            let mut created = 0usize;
+            store
+                .load_or_create(
+                    pso_name,
+                    |lib, w| unsafe { lib.LoadComputePipeline(w, &desc) },
+                    || {
+                        created += 1;
+                        unsafe { device.CreateComputePipelineState(&desc) }
+                    },
+                )
+                .unwrap();
+            assert_eq!(created, 0, "migrated PSO must load from legacy without recompiling");
+            assert!(store.is_legacy_opened());
+            assert_eq!(store.migrated_count(), 1);
+            let (bytes, saved, res) = store.save_dirty();
+            res.unwrap();
+            assert_eq!(saved, 1);
+            assert!(bytes > 0);
+            assert!(shard_path(dir.path(), true, s).is_file());
+        }
+        // Legacy monolithic file must stay 100% intact and unmodified.
+        assert_eq!(std::fs::read(&legacy_path).unwrap(), legacy_before);
+
+        // Session 2: fresh store hits the migrated shard directly and NEVER opens `host-pipelines.bin`.
+        {
+            let store = ShardedLibrary::new(device.clone(), Some(dir.path().to_path_buf()), true, false);
+            let mut created = 0usize;
+            store
+                .load_or_create(
+                    pso_name,
+                    |lib, w| unsafe { lib.LoadComputePipeline(w, &desc) },
+                    || {
+                        created += 1;
+                        unsafe { device.CreateComputePipelineState(&desc) }
+                    },
+                )
+                .unwrap();
+            assert_eq!(created, 0, "migrated shard must serve PSO directly");
+            assert_eq!(store.opened_shards(), 1);
+            assert!(!store.is_legacy_opened(), "legacy host-pipelines.bin must not be opened on shard hit");
+        }
+    }
+
+    #[test]
+    fn sharded_library_separates_vram_cbv_and_classic_modes() {
+        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (root_classic, dxil_classic) = test_compute_pso_desc(&device, 16);
+        let (root_vram, dxil_vram) = test_compute_pso_desc(&device, 32);
+        let desc_classic = make_compute_desc(&root_classic, &dxil_classic);
+        let desc_vram = make_compute_desc(&root_vram, &dxil_vram);
+        let pso_name = "09deadbeef00000009deadbeef000000";
+        let s = shard_index(pso_name);
+
+        // Store in classic mode (`shards/classic/shard-09.bin`).
+        {
+            let classic = ShardedLibrary::new(device.clone(), Some(dir.path().to_path_buf()), false, false);
+            classic
+                .load_or_create(
+                    pso_name,
+                    |lib, w| unsafe { lib.LoadComputePipeline(w, &desc_classic) },
+                    || unsafe { device.CreateComputePipelineState(&desc_classic) },
+                )
+                .unwrap();
+            assert_eq!(classic.save_dirty().1, 1);
+        }
+        assert!(shard_path(dir.path(), false, s).is_file());
+        assert!(!shard_path(dir.path(), true, s).exists());
+
+        // vram_cbv mode uses `shards/vram_cbv/shard-09.bin` and does not collide with classic.
+        {
+            let vram = ShardedLibrary::new(device.clone(), Some(dir.path().to_path_buf()), true, false);
+            let mut created = 0usize;
+            vram.load_or_create(
+                pso_name,
+                |lib, w| unsafe { lib.LoadComputePipeline(w, &desc_vram) },
+                || {
+                    created += 1;
+                    unsafe { device.CreateComputePipelineState(&desc_vram) }
+                },
+            )
+            .unwrap();
+            assert_eq!(created, 1, "vram_cbv shard must be separate from classic shard");
+            assert_eq!(vram.save_dirty().1, 1);
+        }
+        assert!(shard_path(dir.path(), true, s).is_file());
+
+        // Reloading both modes independently hits each mode's own shard with 0 compiles.
+        let classic_re = ShardedLibrary::new(device.clone(), Some(dir.path().to_path_buf()), false, false);
+        let mut c_made = 0usize;
+        classic_re
+            .load_or_create(
+                pso_name,
+                |lib, w| unsafe { lib.LoadComputePipeline(w, &desc_classic) },
+                || {
+                    c_made += 1;
+                    unsafe { device.CreateComputePipelineState(&desc_classic) }
+                },
+            )
+            .unwrap();
+        assert_eq!(c_made, 0);
+
+        let vram_re = ShardedLibrary::new(device.clone(), Some(dir.path().to_path_buf()), true, false);
+        let mut v_made = 0usize;
+        vram_re
+            .load_or_create(
+                pso_name,
+                |lib, w| unsafe { lib.LoadComputePipeline(w, &desc_vram) },
+                || {
+                    v_made += 1;
+                    unsafe { device.CreateComputePipelineState(&desc_vram) }
+                },
+            )
+            .unwrap();
+        assert_eq!(v_made, 0);
+    }
+
+    #[test]
+    fn replaced_shard_file_retains_live_mapped_pages_and_promotes_next() {
+        const LEN: usize = 8 << 20;
+        let dir = tempfile::tempdir().unwrap();
+        let sdir = shard_dir(dir.path(), true);
+        std::fs::create_dir_all(&sdir).unwrap();
+        let target = shard_path(dir.path(), true, 7);
+        let next = shard_next_path(dir.path(), true, 7);
+        if !write_uncached(&target, LEN) {
+            return;
+        }
+        // Keep the open handle (`holds() == true`) while replacing the shard file.
+        let mapped_old = Mapped::open_holding(&target, true).expect("mapped shard");
+        let tmp = sdir.join("shard-07.bin.tmp");
+        {
+            let mut file = Mapped::create(&tmp, LEN).expect("mapped tmp shard");
+            file.bytes_mut().fill(0xCC);
+        }
+        let in_place = replace_file(&tmp, &target, &next).unwrap();
+        assert!(!tmp.exists());
+
+        // Every unpaged 4 KiB page of the old shard mapping must still read the original data.
+        let mut expected = vec![0u8; 4096];
+        for (page, bytes) in mapped_old.bytes().chunks(4096).enumerate() {
+            pattern(page * 4096, &mut expected);
+            assert_eq!(
+                bytes,
+                &expected[..],
+                "page {page} of replaced shard lost its contents"
+            );
+        }
+        drop(mapped_old);
+
+        // Next start reads the replacement (promoting `.next` if it could not replace in place).
+        let reloaded = Blob::of_paths(&target, &next);
+        assert_eq!(reloaded.bytes().len(), LEN);
+        assert!(reloaded.bytes().iter().all(|&b| b == 0xCC));
+        if !in_place {
+            assert!(!next.exists());
+        }
+    }
+
+    #[test]
+    fn sharded_library_concurrent_migration_and_store_is_thread_safe() {
+        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (root, dxil) = test_compute_pso_desc(&device, 64);
+        let desc = make_compute_desc(&root, &dxil);
+        let pso_name = "3fcafebabe0000003fcafebabe000000";
+
+        // Seed legacy `host-pipelines.bin`.
+        let legacy_path = dir.path().join(LIBRARY_FILE);
+        {
+            let lib = open_with(&device, Blob::None, false, None).unwrap();
+            let pso: ID3D12PipelineState = unsafe { device.CreateComputePipelineState(&desc) }.unwrap();
+            let wide = HSTRING::from(pso_name);
+            unsafe { lib.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.unwrap();
+            let size = unsafe { lib.library.GetSerializedSize() };
+            serialise(&lib.library, &legacy_path, size).unwrap();
+        }
+
+        let store = std::sync::Arc::new(ShardedLibrary::new(
+            device.clone(),
+            Some(dir.path().to_path_buf()),
+            true,
+            false,
+        ));
+        let created = std::sync::Arc::new(AtomicU64::new(0));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let store = store.clone();
+                let created = created.clone();
+                let barrier = barrier.clone();
+                let device = device.clone();
+                let root = root.clone();
+                let dxil = dxil.clone();
+                scope.spawn(move || {
+                    let desc = make_compute_desc(&root, &dxil);
+                    barrier.wait();
+                    store
+                        .load_or_create(
+                            pso_name,
+                            |lib, w| unsafe { lib.LoadComputePipeline(w, &desc) },
+                            || {
+                                created.fetch_add(1, Ordering::Relaxed);
+                                unsafe { device.CreateComputePipelineState(&desc) }
+                            },
+                        )
+                        .unwrap();
+                });
+            }
+        });
+        assert_eq!(created.load(Ordering::Relaxed), 0, "all threads must load/migrate with 0 compiles");
+        assert_eq!(store.migrated_count(), 1, "exactly one thread should store the migrated entry");
+        let (_, saved, res) = store.save_dirty();
+        res.unwrap();
+        assert_eq!(saved, 1);
     }
 }

@@ -50,6 +50,158 @@ pub(crate) fn on_wine() -> bool {
 /// Standard memory the title has handed to the system.
 static TRANSFERRED: AtomicUsize = AtomicUsize::new(0);
 
+/// True title-only committed memory accounting, excluding VIctory / D3D12
+/// host overhead so `XMemGetWorkingSetStatistics` never reports host shadows
+/// as title usage or underflows `title_limit - title_used`.
+static TITLE_VIRTUAL_COMMITTED: AtomicUsize = AtomicUsize::new(0);
+static TITLE_PHYSICAL_BYTES: AtomicUsize = AtomicUsize::new(0);
+static TITLE_HEAP_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
+
+/// Tracks non-overlapping 4 KiB-aligned committed intervals from
+/// `XMemVirtualAlloc` (preventing double-counting on re-commit) and reserved
+/// base spans (so `VirtualFree(base, 0, MEM_RELEASE)` reclaims every committed
+/// subrange inside the reservation cleanly).
+#[derive(Default)]
+struct VirtualCommitTracker {
+    committed: BTreeMap<usize, usize>,
+    reservations: HashMap<usize, usize>,
+}
+
+impl VirtualCommitTracker {
+    fn align_range(start: usize, end: usize) -> Option<(usize, usize)> {
+        let start = start & !0xfff;
+        let end = end.checked_next_multiple_of(0x1000).unwrap_or(end & !0xfff);
+        (start < end).then_some((start, end))
+    }
+
+    fn note_reservation(&mut self, base: usize, size: usize) {
+        if let Some((start, end)) = Self::align_range(base, base.saturating_add(size)) {
+            self.reservations.insert(start, end);
+        }
+    }
+
+    fn add_committed(&mut self, base: usize, size: usize) -> usize {
+        let Some((start, end)) = Self::align_range(base, base.saturating_add(size)) else {
+            return 0;
+        };
+        let mut to_remove = Vec::new();
+        if let Some((&s, &e)) = self.committed.range(..=start).next_back()
+            && e >= start
+        {
+            to_remove.push((s, e));
+        }
+        for (&s, &e) in self.committed.range(start.saturating_add(1)..=end) {
+            to_remove.push((s, e));
+        }
+        let mut merged_start = start;
+        let mut merged_end = end;
+        let mut existing = 0usize;
+        for (s, e) in to_remove {
+            self.committed.remove(&s);
+            merged_start = merged_start.min(s);
+            merged_end = merged_end.max(e);
+            existing = existing.saturating_add(e - s);
+        }
+        self.committed.insert(merged_start, merged_end);
+        (merged_end - merged_start).saturating_sub(existing)
+    }
+
+    fn remove_committed(&mut self, base: usize, size: usize) -> usize {
+        let Some((start, end)) = Self::align_range(base, base.saturating_add(size)) else {
+            return 0;
+        };
+        let mut overlapping = Vec::new();
+        if let Some((&s, &e)) = self.committed.range(..=start).next_back()
+            && e > start
+        {
+            overlapping.push((s, e));
+        }
+        for (&s, &e) in self.committed.range(start.saturating_add(1)..end) {
+            overlapping.push((s, e));
+        }
+        let mut removed = 0usize;
+        for (s, e) in overlapping {
+            self.committed.remove(&s);
+            let ov_start = s.max(start);
+            let ov_end = e.min(end);
+            removed = removed.saturating_add(ov_end.saturating_sub(ov_start));
+            if s < start {
+                self.committed.insert(s, start);
+            }
+            if e > end {
+                self.committed.insert(end, e);
+            }
+        }
+        removed
+    }
+
+    fn take_reservation_len(&mut self, base: usize) -> Option<usize> {
+        let aligned = base & !0xfff;
+        self.reservations
+            .remove(&aligned)
+            .map(|end| end.saturating_sub(aligned))
+    }
+}
+
+static VIRTUAL_COMMIT: LazyLock<Mutex<VirtualCommitTracker>> = LazyLock::new(Default::default);
+
+fn saturating_sub_atomic(counter: &AtomicUsize, amount: usize) {
+    if amount == 0 {
+        return;
+    }
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+        Some(cur.saturating_sub(amount))
+    });
+}
+
+fn note_virtual_alloc(at: usize, size: usize, kind: u32, constrained: bool, placeholder: bool) {
+    if size == 0 {
+        return;
+    }
+    let commit = !placeholder && (kind & MEM_COMMIT != 0);
+    if !constrained && !commit {
+        return;
+    }
+    let mut tracker = VIRTUAL_COMMIT.lock().unwrap_or_else(|e| e.into_inner());
+    if constrained {
+        tracker.note_reservation(at, size);
+    }
+    if commit {
+        let added = tracker.add_committed(at, size);
+        if added > 0 {
+            TITLE_VIRTUAL_COMMITTED.fetch_add(added, Ordering::Relaxed);
+        }
+    }
+}
+
+fn note_virtual_free(address: usize, size: usize, kind: u32, fallback_span: usize) {
+    let plain_release = kind & MEM_RELEASE != 0;
+    let mut tracker = VIRTUAL_COMMIT.lock().unwrap_or_else(|e| e.into_inner());
+    let span = if plain_release {
+        tracker
+            .take_reservation_len(address)
+            .unwrap_or(if size > 0 { size } else { fallback_span })
+    } else {
+        size
+    };
+    if span > 0 {
+        let removed = tracker.remove_committed(address, span);
+        drop(tracker);
+        saturating_sub_atomic(&TITLE_VIRTUAL_COMMITTED, removed);
+    }
+}
+
+fn title_committed_bytes() -> usize {
+    TITLE_VIRTUAL_COMMITTED
+        .load(Ordering::Relaxed)
+        .saturating_add(TITLE_PHYSICAL_BYTES.load(Ordering::Relaxed))
+        .saturating_add(TITLE_HEAP_ALLOCATED.load(Ordering::Relaxed))
+}
+
+fn clamp_working_set_used(tracked_used: usize, title_limit: usize) -> usize {
+    tracked_used.min(title_limit)
+}
+
 // Console additions to the host's flags.
 /// 2 MiB pages; the host reads this bit as large pages, which need a
 /// privilege.
@@ -61,6 +213,13 @@ const PAGES_64K: u32 = PAGES_2M | PAGES_64K_BIT;
 /// adds GPU access bits (0x800-0x40000). Write-combining and uncached are
 /// dropped too: our GPU side reads this memory through the CPU.
 const HOST_PROTECTION: u32 = 0x1ff;
+/// Console protection bits that mark GPU-only / non-CPU-read allocations:
+/// `PAGE_NOCACHE` (`0x200`), `PAGE_WRITECOMBINE` (`0x400`), and `0x20000`.
+const PAGE_NOCACHE_HINT: u32 = 0x200;
+const PAGE_WRITECOMBINE_HINT: u32 = 0x400;
+const PAGE_GPU_ONLY_HINT_20000: u32 = 0x2_0000;
+const GPU_ONLY_HINT_PROTECT: u32 =
+    PAGE_NOCACHE_HINT | PAGE_WRITECOMBINE_HINT | PAGE_GPU_ONLY_HINT_20000;
 /// XMem flags of memory both processors reach: all of ours.
 const GRAPHICS: u64 = 3;
 /// XMem flag bit of 32-bit graphics memory.
@@ -114,6 +273,9 @@ pub extern "system" fn XMemVirtualAlloc(
     let placeholder = kind & PAGES_64K == PAGES_64K && kind & MEM_COMMIT == 0;
     if placeholder {
         if kind & MEM_REPLACE_PLACEHOLDER != 0 {
+            if !base.is_null() && size > 0 && asked & GPU_ONLY_HINT_PROTECT != 0 {
+                victory_gpu::title_memory_gpu_hint(base as usize, size, asked);
+            }
             // Part of a placeholder the title split: it stays one.
             return base;
         }
@@ -177,8 +339,14 @@ pub extern "system" fn XMemVirtualAlloc(
             "XMemVirtualAlloc"
         );
     }
-    if !at.is_null() && !placeholder {
-        victory_gpu::title_memory_allocated(at as usize, size);
+    if !at.is_null() {
+        if !placeholder {
+            victory_gpu::title_memory_allocated(at as usize, size);
+        }
+        if size > 0 && asked & GPU_ONLY_HINT_PROTECT != 0 {
+            victory_gpu::title_memory_gpu_hint(at as usize, size, asked);
+        }
+        note_virtual_alloc(at as usize, size, kind, constrained, placeholder);
     }
     // The title may pass MEM_RESERVE_PLACEHOLDER directly, without the
     // console's PAGES_64K bits (Grand Theft Auto VI asks for its 32-bit heap
@@ -350,6 +518,7 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
         tracing::warn!(size, "XMemAllocDefault: the host heap is out of memory");
         return block.cast();
     }
+    TITLE_HEAP_ALLOCATED.fetch_add(layout.size(), Ordering::Relaxed);
     // SAFETY: the block holds the alignment (at least the header) and then
     // `size` bytes.
     unsafe {
@@ -375,6 +544,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        saturating_sub_atomic(&TITLE_HEAP_ALLOCATED, size);
         dealloc(
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),
@@ -707,6 +877,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // Title memory is touched without our locks: a fault there may wait for
     // a mapping call, which takes them.
     drop(table);
+    TITLE_PHYSICAL_BYTES.fetch_add(size, Ordering::Relaxed);
     for index in 0..n {
         // SAFETY: the title passes room for `n` page numbers.
         unsafe { pages.add(index).write(first + index * FRAMES) };
@@ -730,7 +901,9 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
     // Dropped without the lock: the last page of a section unmaps its window.
     let gone: Vec<Slice> = numbers.iter().filter_map(|number| table.pages.remove(number)).collect();
     drop(table);
+    let freed_bytes = gone.len().saturating_mul(PAGE);
     drop(gone);
+    saturating_sub_atomic(&TITLE_PHYSICAL_BYTES, freed_bytes);
     1
 }
 
@@ -1933,44 +2106,41 @@ pub struct WorkingSet {
     pub kernel_pool_limit: u32,
 }
 
-/// The title's budget and our process's commit as what it uses. No tools
+/// The title's budget and true title-only committed memory (`XMemVirtualAlloc`
+/// committed + `XMemAllocatePhysicalPages` + `XMemAllocDefault`), excluding
+/// VIctory / D3D12 overhead and clamped `<= title_limit` so unsigned
+/// `title_limit - title_used` calculations can never underflow. No tools
 /// memory: a retail console.
-// shortcut: all fields are filled whatever the flags ask for, and use is
-// not split by bandwidth class (GPU-optimal use reads 0); track
-// allocations per class if a title budgets from that field.
 pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut WorkingSet) -> BOOL {
     if out.is_null() {
         return 0;
     }
-    let mut counters = PROCESS_MEMORY_COUNTERS {
-        cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
-        ..Default::default()
-    };
-    // SAFETY: our own process and a sized structure.
-    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
     let (gpu_optimal, standard) = victory_gpu::console::current().title_memory();
+    let title_limit = (gpu_optimal + standard).saturating_sub(TRANSFERRED.load(Ordering::Relaxed));
+    let tracked = title_committed_bytes();
+    let title_used = clamp_working_set_used(tracked, title_limit);
     let stats = WorkingSet {
-        title_limit: gpu_optimal + standard - TRANSFERRED.load(Ordering::Relaxed),
-        title_used: counters.PagefileUsage,
+        title_limit,
+        title_used,
         gpu_optimal_limit: gpu_optimal,
         ..Default::default()
     };
-    // What the title is told, logged at the first asking and at every
-    // 1,024th: "used" is all the process has committed, the layer's own
-    // memory and the card's included (27 GB in run 60's gameplay against a
-    // limit of 13.5 GB). A title that budgets its streaming from these two
-    // figures believes it is far over its limit.
-    // shortcut: the figure is not yet the title's own memory alone (its
-    // heaps and the pages it mapped); count those if this line shows the
-    // title asking.
     static ASKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let asked = ASKED.fetch_add(1, Ordering::Relaxed);
     if asked.is_multiple_of(1024) {
+        let mut counters = PROCESS_MEMORY_COUNTERS {
+            cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: our own process and a sized structure.
+        unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
         tracing::info!(
             asked = asked + 1,
             which = _which,
             limit_mb = stats.title_limit >> 20,
             used_mb = stats.title_used >> 20,
+            tracked_mb = tracked >> 20,
+            process_mb = counters.PagefileUsage >> 20,
             "the title asks how much memory it uses"
         );
     }
@@ -2009,6 +2179,7 @@ extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u
     const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
     let plain_release =
         kind & MEM_RELEASE != 0 && kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0;
+    let mut queried_span = 0usize;
     if !address.is_null() && kind & (MEM_COALESCE_PLACEHOLDERS | MEM_RELEASE) != 0 {
         let start = address as usize;
         let span = if size > 0 {
@@ -2028,6 +2199,7 @@ extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u
         } else {
             0
         };
+        queried_span = span;
         if span > 0 {
             let end = start.saturating_add(span);
             let mut physical = physical();
@@ -2050,11 +2222,17 @@ extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u
         }
     }
     // Splitting and joining placeholders changes nothing they show.
-    if kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0 {
+    let real_free = kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0;
+    if real_free {
         victory_gpu::title_memory_freed(address as usize, size);
+        victory_gpu::title_memory_gpu_hint_freed(address as usize, size);
     }
     // SAFETY: the title's own arguments.
-    unsafe { VirtualFree(address, size, kind) }
+    let ok = unsafe { VirtualFree(address, size, kind) };
+    if ok != 0 && !address.is_null() && real_free {
+        note_virtual_free(address as usize, size, kind, queried_span);
+    }
+    ok
 }
 
 pub(crate) fn module() -> HleModule {
@@ -2160,9 +2338,12 @@ mod tests {
 
     #[test]
     fn transfers_shrink_the_title_budget() {
+        let p = XMemAllocDefault(64 * 1024, 0);
+        assert!(!p.is_null());
         let mut before = WorkingSet::default();
         assert_eq!(XMemGetWorkingSetStatistics(0x2000_0001, &mut before), 1);
         assert!(before.title_used > 0);
+        assert!(before.title_used <= before.title_limit);
         assert_eq!(XMemTransferMemory(0, 128 * MIB - 1), 1);
         assert_eq!(XMemTransferMemory(2, MIB), 0, "no tools memory");
         let standard = victory_gpu::console::current().title_memory().1;
@@ -2170,6 +2351,74 @@ mod tests {
         let mut after = WorkingSet::default();
         XMemGetWorkingSetStatistics(0x2000_0001, &mut after);
         assert_eq!(before.title_limit - after.title_limit, 128 * MIB);
+        XMemFreeDefault(p, 0);
+    }
+
+    #[test]
+    fn working_set_tracks_title_memory_and_never_underflows() {
+        // Pure clamping guard: unsigned `title_limit - title_used` never wraps.
+        let limit = 13 * (1usize << 30);
+        assert_eq!(clamp_working_set_used(0, limit), 0);
+        assert_eq!(clamp_working_set_used(5 << 30, limit), 5 << 30);
+        assert_eq!(clamp_working_set_used(limit, limit), limit);
+        assert_eq!(clamp_working_set_used(27 << 30, limit), limit);
+        assert_eq!(
+            limit.checked_sub(clamp_working_set_used(usize::MAX, limit)),
+            Some(0)
+        );
+
+        // VirtualCommitTracker interval merging, idempotent re-commit, and partial decommit.
+        let mut tracker = VirtualCommitTracker::default();
+        tracker.note_reservation(0x1000_0000, 0x40000);
+        assert_eq!(tracker.add_committed(0x1000_0000, 0x10000), 0x10000);
+        assert_eq!(tracker.add_committed(0x1000_4000, 0x4000), 0); // already committed
+        assert_eq!(tracker.add_committed(0x1000_8000, 0x10000), 0x8000); // overlaps 0x8000
+        assert_eq!(tracker.remove_committed(0x1000_4000, 0x8000), 0x8000); // middle hole
+        let full = tracker.take_reservation_len(0x1000_0000).unwrap();
+        assert_eq!(full, 0x40000);
+        assert_eq!(tracker.remove_committed(0x1000_0000, full), 0x10000);
+        assert_eq!(tracker.remove_committed(0x1000_0000, full), 0);
+
+        // Live tracking across XMemVirtualAlloc (incl. WC hint), XMemAllocatePhysicalPages,
+        // and XMemAllocDefault, plus clean accounting release.
+        let mut stats0 = WorkingSet::default();
+        assert_eq!(XMemGetWorkingSetStatistics(0x2000_0001, &mut stats0), 1);
+
+        let v = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            2 * MIB,
+            MEM_RESERVE | MEM_COMMIT,
+            GRAPHICS,
+            PAGE_READWRITE | PAGE_WRITECOMBINE_HINT,
+        );
+        assert!(!v.is_null());
+        let phys = allocate(4); // 256 KiB
+        let heap = XMemAllocDefault(128 * 1024, 0);
+        assert!(!heap.is_null());
+
+        let mut stats1 = WorkingSet::default();
+        assert_eq!(XMemGetWorkingSetStatistics(0x2000_0001, &mut stats1), 1);
+        assert!(stats1.title_used <= stats1.title_limit);
+        assert!(
+            stats1.title_used >= stats0.title_used.saturating_add(2 * MIB),
+            "expected at least +2 MiB tracked: before={}, after={}",
+            stats0.title_used,
+            stats1.title_used
+        );
+
+        XMemFreeDefault(heap, 0);
+        assert_eq!(XMemFreePhysicalPages(phys.len(), phys.as_ptr()), 1);
+        assert_ne!(title_virtual_free(v, 0, MEM_RELEASE), 0);
+
+        let mut stats2 = WorkingSet::default();
+        assert_eq!(XMemGetWorkingSetStatistics(0x2000_0001, &mut stats2), 1);
+        assert!(stats2.title_used <= stats2.title_limit);
+        assert!(
+            stats2.title_used <= stats1.title_used.saturating_sub(2 * MIB),
+            "expected freed memory to drop tracked usage: peak={}, after={}",
+            stats1.title_used,
+            stats2.title_used
+        );
     }
 
     #[test]

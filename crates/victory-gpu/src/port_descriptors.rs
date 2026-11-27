@@ -150,6 +150,45 @@ pub(crate) fn adopted(start: u64) -> bool {
     ADOPTED.read().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|a| a.start == start)
 }
 
+/// Pre-marks the slot at `handle` before our own descriptor API writes bytes
+/// into title heap memory, closing the store-before-mark window against
+/// concurrent `sync_heaps` fallback scans. Does not increment `MARKED_BY_US`
+/// because the follow-up [`mark`] inside `descriptor::mirror` counts it once.
+#[inline]
+pub(crate) fn pre_mark(handle: u64) {
+    let len = MARKS.len.load(Acquire);
+    if len == 0 {
+        return;
+    }
+    let at = handle.wrapping_sub(MARKS.start.load(Relaxed));
+    if at >= len {
+        return;
+    }
+    mark_slot((at / 32) as usize);
+}
+
+/// Pre-marks `count` descriptor slots starting at `dst` spaced `step` bytes
+/// apart before a bulk copy (`descriptor::copy_simple`) writes into the heap.
+#[inline]
+pub(crate) fn pre_mark_range(dst: u64, count: u32, step: u64) {
+    let len = MARKS.len.load(Acquire);
+    if len == 0 || count == 0 || step == 0 {
+        return;
+    }
+    let start = MARKS.start.load(Relaxed);
+    let end = start + len;
+    let dst_end = dst.saturating_add(u64::from(count).saturating_mul(step));
+    let (lo, hi) = (dst.max(start), dst_end.min(end));
+    if lo >= hi {
+        return;
+    }
+    let first = ((lo - start) / 32) as usize;
+    let last = ((hi - 1 - start) / 32) as usize;
+    for slot in first..=last {
+        mark_slot(slot);
+    }
+}
+
 /// Marks the slot at `handle` (a record our own calls wrote), if it is in the
 /// marked heap.
 #[inline]
@@ -163,11 +202,7 @@ pub(crate) fn mark(handle: u64) {
         return;
     }
     let slot = (at / 32) as usize;
-    // SAFETY: the maps are leaked, as long as the length says.
-    unsafe {
-        (*MARKS.slots.load(Relaxed).add(slot)).store(1, Release);
-        (*MARKS.chunks.load(Relaxed).add(slot / CHUNK)).store(1, Release);
-    }
+    mark_slot(slot);
     MARKED_BY_US.fetch_add(1, Relaxed);
 }
 
@@ -373,27 +408,77 @@ unsafe fn copied(to: *mut u8, from: *const u8, n: usize, real: usize) -> *mut u8
     // SAFETY: the host's function, noted by `import` before the title ran.
     let real: Copy = unsafe { std::mem::transmute(real) };
     // SAFETY: by the caller.
-    let out = unsafe { real(to, from, n) };
+    unsafe { copied_with(to, from, n, |dst, src, len| real(dst, src, len)) }
+}
+
+/// Executes a `memcpy`/`memmove`-style copy into title memory, pre-marking any
+/// destination heap slots that will hold a `VIEW_TAG` BEFORE the bytes land and
+/// post-marking all touched `VIEW_TAG` slots AFTER the copy completes (covering
+/// both aligned and partial/unaligned slot copies).
+///
+/// # Safety
+/// `[from, from + n)` is readable and `[to, to + n)` is writable; `do_copy`
+/// performs the actual copy and returns `to`.
+#[inline]
+unsafe fn copied_with(
+    to: *mut u8,
+    from: *const u8,
+    n: usize,
+    do_copy: impl FnOnce(*mut u8, *const u8, usize) -> *mut u8,
+) -> *mut u8 {
     let len = MARKS.len.load(Acquire);
-    if len != 0 && n >= 4 {
+    let overlap = if len != 0 && n > 0 {
         let start = MARKS.start.load(Relaxed);
-        let (lo, hi) = ((to as u64).max(start), (to as u64 + n as u64).min(start + len));
-        if lo < hi {
-            COPIES[0].fetch_add(1, Relaxed);
-            // Each slot whose first word now lies in the copy and is a view's.
-            let mut slot = (lo - start).div_ceil(32);
-            let mut marked = 0;
-            while start + slot * 32 + 4 <= hi {
-                let at = start + slot * 32;
-                // SAFETY: just written by the copy, inside the heap.
-                if unsafe { (at as *const u32).read_unaligned() } == crate::descriptor::VIEW_TAG {
-                    mark_slot(slot as usize);
-                    marked += 1;
-                }
-                slot += 1;
+        let to_u64 = to as u64;
+        let lo = to_u64.max(start);
+        let hi = to_u64.saturating_add(n as u64).min(start + len);
+        (lo < hi).then_some((start, to_u64, lo, hi))
+    } else {
+        None
+    };
+    if let Some((start, to_u64, lo, hi)) = overlap {
+        let first_slot = (lo - start) / 32;
+        let last_slot = (hi - 1 - start) / 32;
+        // Pre-mark BEFORE writing so concurrent fallback scans never observe a
+        // fresh VIEW_TAG with `slots[slot] == 0`.
+        for slot in first_slot..=last_slot {
+            let at = start + slot * 32;
+            let has_tag = if at >= lo && at + 4 <= hi {
+                let src_off = (at - to_u64) as usize;
+                // SAFETY: `at..at+4` lies inside `to..to+n`, so `from+src_off..+4`
+                // lies inside `from..from+n`.
+                unsafe { (from.add(src_off) as *const u32).read_unaligned() == crate::descriptor::VIEW_TAG }
+            } else {
+                // Partial-slot write (e.g. updating words after the tag, or
+                // straddling the first 4 bytes): if the slot already has a
+                // VIEW_TAG or its first 4 bytes are being modified, pre-mark it.
+                // SAFETY: `at..at+4` lies inside the adopted heap `[start, start+len)`.
+                at + 4 > lo
+                    || unsafe { (at as *const u32).read_unaligned() == crate::descriptor::VIEW_TAG }
+            };
+            if has_tag {
+                mark_slot(slot as usize);
             }
-            COPIES[1].fetch_add(marked, Relaxed);
         }
+    }
+    let out = do_copy(to, from, n);
+    if let Some((start, _, lo, hi)) = overlap {
+        COPIES[0].fetch_add(1, Relaxed);
+        let first_slot = (lo - start) / 32;
+        let last_slot = (hi - 1 - start) / 32;
+        let mut marked = 0u64;
+        // Post-mark AFTER writing so even if `take()` drained the pre-mark
+        // mid-copy, the next `take()` still sees every updated VIEW_TAG slot.
+        for slot in first_slot..=last_slot {
+            let at = start + slot * 32;
+            // SAFETY: `at..at+4` lies inside the adopted heap `[start, start+len)`
+            // whose length is a multiple of 32 bytes.
+            if unsafe { (at as *const u32).read_unaligned() } == crate::descriptor::VIEW_TAG {
+                mark_slot(slot as usize);
+                marked += 1;
+            }
+        }
+        COPIES[1].fetch_add(marked, Relaxed);
     }
     out
 }
@@ -475,6 +560,9 @@ pub(crate) fn line(frames: f64) {
 mod tests {
     use super::*;
 
+    /// Serializes tests that mutate global `ADOPTED`/`MARKS`.
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn marks_layout_is_what_the_stores_read() {
         assert_eq!(size_of::<Marks>(), victory_loader_marks_len());
@@ -493,6 +581,7 @@ mod tests {
     /// each, as runs; outside the heap nothing is marked.
     #[test]
     fn marked_slots_are_taken_once_as_runs() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let start = 0x1000_0000u64;
         assert!(adopt_now(start, 1000));
         assert!(adopted(start) && !adopted(start + 32));
@@ -515,5 +604,76 @@ mod tests {
         mark(start + 5 * 32);
         assert!(take(start).is_none());
         assert_eq!(MARKS.len.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn copied_marks_aligned_unaligned_and_pre_post_orders() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut heap = vec![[0u32; 8]; 16];
+        let start = heap.as_mut_ptr() as u64;
+        assert!(adopt_now(start, 16));
+
+        // Build 3 source records: slots 0 & 2 carry VIEW_TAG, slot 1 is plain data.
+        let mut src = [[0u32; 8]; 3];
+        src[0][0] = crate::descriptor::VIEW_TAG;
+        src[0][1] = 11;
+        src[1][0] = 0x1234_5678;
+        src[2][0] = crate::descriptor::VIEW_TAG;
+        src[2][1] = 22;
+
+        COPIES[0].store(0, Relaxed);
+        COPIES[1].store(0, Relaxed);
+        let mut saw_pre_marks = false;
+        // Copy 3 records into slots 2..5, draining marks mid-copy to prove both
+        // pre-mark (before bytes land) and post-mark (after bytes land).
+        // SAFETY: `src` and `heap[2..5]` are valid, non-overlapping 96-byte slices.
+        unsafe {
+            copied_with(
+                heap.as_mut_ptr().add(2).cast::<u8>(),
+                src.as_ptr().cast::<u8>(),
+                3 * 32,
+                |dst, from, len| {
+                    let pre = take(start).unwrap();
+                    saw_pre_marks = pre == [(2, 1), (4, 1)];
+                    std::ptr::copy_nonoverlapping(from, dst, len);
+                    dst
+                },
+            );
+        }
+        assert!(saw_pre_marks, "VIEW_TAG slots must be pre-marked before copy writes bytes");
+        assert_eq!(COPIES[0].load(Relaxed), 1);
+        assert_eq!(COPIES[1].load(Relaxed), 2);
+        assert_eq!(take(start).unwrap(), [(2, 1), (4, 1)], "post-mark must re-mark after mid-copy take");
+
+        // Unaligned / partial-slot copy starting at +4 bytes of slot 2 (which
+        // already has VIEW_TAG at +0): previously skipped by div_ceil(32).
+        let patch = [99u32, 100];
+        let mut partial_pre = false;
+        // SAFETY: updating bytes +4..+12 of slot 2 inside `heap`.
+        unsafe {
+            copied_with(
+                (heap.as_mut_ptr().add(2) as *mut u8).add(4),
+                patch.as_ptr().cast::<u8>(),
+                8,
+                |dst, from, len| {
+                    partial_pre = take(start).unwrap() == [(2, 1)];
+                    std::ptr::copy_nonoverlapping(from, dst, len);
+                    dst
+                },
+            );
+        }
+        assert!(partial_pre, "partial-slot update to existing VIEW_TAG must pre-mark");
+        assert_eq!(take(start).unwrap(), [(2, 1)], "partial-slot update must post-mark");
+        assert_eq!(heap[2][1], 99);
+        assert_eq!(heap[2][2], 100);
+
+        // `pre_mark` and `pre_mark_range` mark without inflating `MARKED_BY_US`.
+        let before_ours = MARKED_BY_US.load(Relaxed);
+        pre_mark(start + 7 * 32);
+        pre_mark_range(start + 10 * 32, 3, 32);
+        assert_eq!(MARKED_BY_US.load(Relaxed), before_ours);
+        assert_eq!(take(start).unwrap(), [(7, 1), (10, 3)]);
+
+        let_go(start);
     }
 }

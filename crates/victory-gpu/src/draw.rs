@@ -585,6 +585,9 @@ impl HostRootCache {
 #[derive(Default)]
 pub(crate) struct State {
     pipeline: usize,
+    /// True when `pipeline` is permanently dropped for this run (null,
+    /// skipped/hair shader, or BVH builder while `VICTORY_BVH_BUILDER != 1`).
+    pipeline_known_dropped: bool,
     /// View heap, sampler heap.
     heaps: [usize; 2],
     graphics: Vec<Root>,
@@ -1150,6 +1153,42 @@ pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(
 pub(crate) static HEAP_TEXTURES_PARTLY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
+/// Whether `VICTORY_BVH_BUILDER=1` was set at process start (non-blocking,
+/// lock-free check safe to call from the title's recording threads).
+#[inline]
+pub(crate) fn builder_allowed_env() -> bool {
+    static ALLOWED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
+}
+
+/// Non-blocking check for pipelines known permanently dropped for this run
+/// (null pipeline, skipped/hair shader, or BVH builder when
+/// `VICTORY_BVH_BUILDER != 1`). Safe on title recording threads (`thin::Front`).
+#[inline]
+pub(crate) fn known_dropped_pipeline(pipeline: This) -> bool {
+    pipeline.is_null()
+        || crate::pipeline::is_skipped(pipeline)
+        || (!builder_allowed_env() && crate::pipeline::is_builder(pipeline))
+}
+
+/// Accounts a direct draw/dispatch culled early on `thin::Front` before it
+/// enters the recording stream.
+pub(crate) fn note_front_dropped(pipeline: This, is_dispatch: bool) {
+    DROPPED.fetch_add(1, Ordering::Relaxed);
+    #[cfg(feature = "diagnostics")]
+    {
+        if is_dispatch && crate::pipeline::is_builder(pipeline) && !builder_allowed_env() {
+            crate::pipeline::note_why(
+                "a stage of the ray-tracing structure builder, which is off".to_owned(),
+            );
+        } else {
+            crate::pipeline::note_drop(pipeline);
+        }
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = (pipeline, is_dispatch);
+}
+
 /// Marks the last traced draw as not run on the host.
 #[cfg(feature = "diagnostics")]
 fn dropped(pipeline: usize) {
@@ -1415,6 +1454,7 @@ impl State {
         self.flush_retired();
         let Self {
             pipeline: state_pipeline,
+            pipeline_known_dropped,
             heaps,
             graphics,
             compute,
@@ -1473,6 +1513,7 @@ impl State {
             crate::descriptor::release_dynamic(heap, id, first, n);
         }
         *state_pipeline = pipeline as usize;
+        *pipeline_known_dropped = known_dropped_pipeline(pipeline);
         *heaps = [0; 2];
         graphics.clear();
         compute.clear();
@@ -1554,6 +1595,31 @@ impl State {
 
     pub(crate) fn set_pipeline(&mut self, pipeline: This) {
         self.pipeline = pipeline as usize;
+        self.pipeline_known_dropped = known_dropped_pipeline(pipeline);
+    }
+
+    /// Resolves the host pipeline for an indirect draw/dispatch BEFORE
+    /// `list::execute_indirect` inspects signatures, shadow buffers, or locks
+    /// diagnostic tables. Returns `None` for known-dropped, skipped,
+    /// builder-off, or `left_out` (`VICTORY_SKIP_DEAD_RT=1`) pipelines.
+    pub(crate) fn pipeline_for_indirect(&self) -> Option<&'static HostPipeline> {
+        let pipeline = self.pipeline as This;
+        if self.pipeline_known_dropped || pipeline.is_null() {
+            #[cfg(feature = "diagnostics")]
+            if !(crate::pipeline::is_builder(pipeline) && !builder_allowed_env()) {
+                crate::pipeline::note_drop(pipeline);
+            }
+            return None;
+        }
+        if crate::pipeline::is_builder(pipeline) && !crate::pipeline::builder_runs() {
+            return None;
+        }
+        let p = crate::pipeline::host_pipeline(pipeline);
+        #[cfg(feature = "diagnostics")]
+        if p.is_none() {
+            crate::pipeline::note_drop(pipeline);
+        }
+        p
     }
 
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
@@ -2023,19 +2089,31 @@ impl State {
 
     /// Brings the host list up to date for a draw; false if the draw cannot
     /// run on the host.
+    #[allow(dead_code)]
     fn prepare(&mut self, list: &HostList, indexed: bool) -> bool {
         self.prepare_for(list, indexed, false)
     }
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
+    #[allow(dead_code)]
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
-        #[cfg(feature = "diagnostics")]
-        if crate::pipeline::is_skipped(self.pipeline as This) {
+        if self.pipeline_known_dropped || self.pipeline == 0 {
             return false;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return false;
         };
+        self.prepare_for_pipeline(list, p, indexed, mesh)
+    }
+
+    /// As [`State::prepare_for`], with the resolved host pipeline already in hand.
+    fn prepare_for_pipeline(
+        &mut self,
+        list: &HostList,
+        p: &HostPipeline,
+        indexed: bool,
+        mesh: bool,
+    ) -> bool {
         if p.compute || p.mesh != mesh {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
             return false;
@@ -3870,16 +3948,24 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
-        // It may write the arguments a window holds clamped.
-        self.window = None;
-        #[cfg(feature = "diagnostics")]
-        if crate::pipeline::is_skipped(self.pipeline as This) {
+        let pipeline = self.pipeline as This;
+        if self.pipeline_known_dropped || pipeline.is_null() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            crate::pipeline::note_drop(self.pipeline as This);
+            #[cfg(feature = "diagnostics")]
+            {
+                if crate::pipeline::is_builder(pipeline) && !builder_allowed_env() {
+                    crate::pipeline::note_why(
+                        "a stage of the ray-tracing structure builder, which is off".to_owned(),
+                    );
+                    self.list_dropped_roots([x, y, z]);
+                } else {
+                    crate::pipeline::note_drop(pipeline);
+                }
+            }
             return;
         }
         // The ray-tracing structure builder's stages run all or none.
-        if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+        if crate::pipeline::is_builder(pipeline) && !crate::pipeline::builder_runs() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             {
@@ -3888,7 +3974,7 @@ impl State {
             }
             return;
         }
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::host_pipeline(pipeline) else {
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
@@ -3896,7 +3982,7 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             {
-                crate::pipeline::note_drop(self.pipeline as This);
+                crate::pipeline::note_drop(pipeline);
                 self.list_dropped_roots([x, y, z]);
             }
             return;
@@ -3905,6 +3991,8 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        // It may write the arguments a window holds clamped.
+        self.window = None;
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
@@ -4271,21 +4359,33 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
-        self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
-        let ran = mesh_test() != 1
-            && mesh_kept(self.pipeline)
-            && self.prepare_for(list, false, true)
+        if self.pipeline_known_dropped
+            || self.pipeline == 0
+            || mesh_test() == 1
+            || !mesh_kept(self.pipeline)
+        {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            dropped(self.pipeline);
+            return;
+        }
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            dropped(self.pipeline);
+            return;
+        };
+        self.window = None;
+        let ran = self.prepare_for_pipeline(list, p, false, true)
             && match list.list6() {
                 Some(l6) => {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     self.mesh_scissor(list, true);
                     #[cfg(feature = "diagnostics")]
-                    if let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) {
-                        list.ran_indirect(p.pso.as_raw() as usize, &p.name, crate::host::indirects::DIRECT, x, &self.user);
-                    }
+                    list.ran_indirect(p.pso.as_raw() as usize, &p.name, crate::host::indirects::DIRECT, x, &self.user);
                     // (The host takes 65,535 groups in a dimension: more is
                     // undefined there.)
                     if x > 65_535 {
@@ -4293,7 +4393,7 @@ impl State {
                     }
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) };
-                    self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
+                    self.drew(Some(p));
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
@@ -5055,14 +5155,26 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
-        self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
-        let ready = self.prepare(list, false);
+        if self.pipeline_known_dropped || self.pipeline == 0 {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            dropped(self.pipeline);
+            return;
+        }
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            dropped(self.pipeline);
+            return;
+        };
+        self.window = None;
+        let ready = self.prepare_for_pipeline(list, p, false, false);
         // A pipeline with the rectangle geometry stage draws the title's
         // vertices as they are; any other gets its rectangles expanded.
-        let rects = self.topology == RECTANGLES && !self.completes_rects();
-        let ran = ready && (!rects || self.rectangles(list, vertices, first));
+        let rects = self.topology == RECTANGLES && !p.rects;
+        let ran = ready && (!rects || self.rectangles(list, p, vertices, first));
         if ran {
             // Rectangles were expanded into their own vertex buffers.
             let (count, from) = if rects {
@@ -5077,7 +5189,7 @@ impl State {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
-            self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
+            self.drew(Some(p));
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -5087,18 +5199,9 @@ impl State {
         }
     }
 
-    /// Whether the bound pipeline completes rectangles itself, in the
-    /// geometry stage rectangle pipelines get (`HostPipeline::rects`).
-    fn completes_rects(&self) -> bool {
-        crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.rects)
-    }
-
     /// Binds vertex buffers holding the rectangles of vertices `first..first
     /// + count` as triangles, made when the list is submitted.
-    fn rectangles(&mut self, list: &HostList, count: u32, first: u32) -> bool {
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
-            return false;
-        };
+    fn rectangles(&mut self, list: &HostList, p: &HostPipeline, count: u32, first: u32) -> bool {
         let rects = u64::from(count / 3);
         for slot in 0..32 {
             let elements: Vec<(u32, u32)> = p
@@ -5168,16 +5271,32 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
-        self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
+        if self.pipeline_known_dropped || self.pipeline == 0 {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            dropped(self.pipeline);
+            return;
+        }
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            dropped(self.pipeline);
+            return;
+        };
         // Indexed rectangles are drawn by the rectangle geometry stage
         // alone (nothing expands them on the CPU).
-        let lost = self.topology == RECTANGLES && !self.completes_rects();
+        let lost = self.topology == RECTANGLES && !p.rects;
         if lost {
             once!("indexed rectangles not drawn");
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            dropped(self.pipeline);
+            return;
         }
-        let ran = !lost && self.prepare(list, true);
+        self.window = None;
+        let ran = self.prepare_for_pipeline(list, p, true, false);
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
@@ -5186,7 +5305,7 @@ impl State {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
-            self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
+            self.drew(Some(p));
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -5270,6 +5389,7 @@ impl State {
     /// record count at `count` if the title gives one: the GPU reads them
     /// from the buffer's host copy, where earlier dispatches may have
     /// written them. False if it cannot run on the host.
+    #[allow(dead_code)]
     pub(crate) fn execute_indirect(
         &mut self,
         list: &HostList,
@@ -5277,15 +5397,23 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
-        // Skip before the argument clamp can mutate the indirect buffer.
-        #[cfg(feature = "diagnostics")]
-        if crate::pipeline::is_skipped(self.pipeline as This) {
-            crate::pipeline::note_drop(self.pipeline as This);
+        let Some(p) = self.pipeline_for_indirect() else {
             return false;
-        }
-        if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
-            return false;
-        }
+        };
+        self.execute_indirect_with(list, p, (kind, stride, max), arguments, count)
+    }
+
+    /// As [`State::execute_indirect`], with the resolved host pipeline already
+    /// in hand so known-dropped pipelines bypass signature, shadow, and clamp
+    /// work altogether.
+    pub(crate) fn execute_indirect_with(
+        &mut self,
+        list: &HostList,
+        p: &HostPipeline,
+        (kind, stride, max): (u32, u32, u32),
+        arguments: u64,
+        count: Option<u64>,
+    ) -> bool {
         const DRAW: u32 = 0;
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
@@ -5294,11 +5422,6 @@ impl State {
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
-            #[cfg(feature = "diagnostics")]
-            crate::pipeline::note_drop(self.pipeline as This);
-            return false;
-        };
         // Indirect rectangles (the title's tiled lighting, 256
         // indirect draws a frame, makes their corners from the vertex
         // number) are completed by the pipeline's geometry stage: the
@@ -5329,6 +5452,10 @@ impl State {
             ));
             return false;
         }
+        if kind == MESH && (mesh_test() == 1 || !mesh_kept(self.pipeline)) {
+            why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
+            return false;
+        }
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find_any(arguments, len) else {
             why("arguments outside title buffers");
@@ -5351,10 +5478,6 @@ impl State {
             why("no host signature");
             return false;
         };
-        if kind == MESH && (mesh_test() == 1 || !mesh_kept(self.pipeline)) {
-            why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
-            return false;
-        }
         // One record without a count: clamped in a batch (`batches`).
         let batch = if batches() > 0 && max == 1 && count.is_none() {
             args.refresh(list, arguments, len);
@@ -5448,8 +5571,8 @@ impl State {
             }
         };
         let ran = match kind {
-            DRAW | INDEXED => self.prepare(list, kind == INDEXED),
-            MESH => self.prepare_for(list, false, true),
+            DRAW | INDEXED => self.prepare_for_pipeline(list, p, kind == INDEXED, false),
+            MESH => self.prepare_for_pipeline(list, p, false, true),
             DISPATCH => self.bind(list, p, true),
             _ => false,
         };
@@ -6540,11 +6663,50 @@ void main() { output.Store(0, a); output.Store(4, b); }
         // `State::reset` releases live dynamic slots directly while preserving capacities.
         let _ = state.alloc_dynamic(heap, h, 8).unwrap();
         state.set_constants(false, 0, &[9; 20], 0); // exercises inline->spill `Few::resize`
-        state.reset(0x1234 as This);
-        assert_eq!(state.pipeline, 0x1234);
+        #[repr(C)]
+        struct Bytecode {
+            code: *const u8,
+            size: usize,
+        }
+        #[repr(C)]
+        struct ComputeHead {
+            root: This,
+            stage: Bytecode,
+        }
+        let dummy_shader = b"CS_DummyForStateResetTest";
+        let pso_desc = ComputeHead {
+            root: std::ptr::null(),
+            stage: Bytecode {
+                code: dummy_shader.as_ptr(),
+                size: dummy_shader.len(),
+            },
+        };
+        let mut pso: This = std::ptr::null();
+        let pso_iid = crate::object::guid(
+            0x765a30f3,
+            0xf624,
+            0x4c6f,
+            [0xa8, 0x28, 0xac, 0xe9, 0x48, 0x62, 0x24, 0x45],
+        );
+        assert_eq!(
+            crate::pipeline::create_compute(
+                std::ptr::null(),
+                (&raw const pso_desc).cast(),
+                &pso_iid,
+                &mut pso,
+            ),
+            0
+        );
+        let _pso = Title(pso);
+        state.reset(pso);
+        assert_eq!(state.pipeline, pso as usize);
+        assert!(!state.pipeline_known_dropped);
         assert_eq!(h.dynamic_free(), initial_free);
         assert!(state.graphics.capacity() >= gfx_cap);
         assert!(state.fresh_tables.capacity() >= fresh_cap);
+        state.reset(std::ptr::null());
+        assert_eq!(state.pipeline, 0);
+        assert!(state.pipeline_known_dropped);
 
         // `Few::sort_dedup` works cleanly for both inline and spilled lengths.
         let mut inline: Few<u32, 4> = Few::from_slice(&[3, 1, 3, 2]);

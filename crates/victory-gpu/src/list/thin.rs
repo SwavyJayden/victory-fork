@@ -66,6 +66,11 @@ pub(super) struct Front {
     words: Vec<u64>,
     closed: bool,
     submitted: bool,
+    /// Currently bound title pipeline on this list (for non-blocking early cull
+    /// of permanently dropped pipelines: null, skipped/hair, or BVH builder
+    /// when `VICTORY_BVH_BUILDER != 1`).
+    pipeline: usize,
+    dropped_pipeline: bool,
 }
 
 impl Drop for Front {
@@ -91,6 +96,49 @@ impl Front {
             }
         }
         self.words.clear();
+        self.pipeline = 0;
+        self.dropped_pipeline = false;
+    }
+
+    #[inline]
+    fn track_pipeline(&mut self, pipeline: This) {
+        self.pipeline = pipeline as usize;
+        self.dropped_pipeline = crate::draw::known_dropped_pipeline(pipeline);
+    }
+
+    /// Returns `true` when an execution call (`draw*`, `dispatch*`,
+    /// `execute_indirect`) should be dropped immediately on the recording
+    /// thread (either closed/unbegun or bound to a permanently dropped
+    /// pipeline). State-setting calls are never culled because D3D12 root and
+    /// pipeline state persists across subsequent `SetPipelineState` calls.
+    #[inline]
+    fn cull_exec(&self, is_dispatch: bool, is_indirect: bool) -> bool {
+        if self.closed || self.recording.is_none() {
+            return true;
+        }
+        if !self.dropped_pipeline {
+            return false;
+        }
+        STATS[4].fetch_add(1, Relaxed);
+        if is_indirect {
+            super::count_draw();
+            super::count_dropped_indirect();
+            #[cfg(feature = "diagnostics")]
+            {
+                let p = self.pipeline as This;
+                if !(crate::pipeline::is_builder(p) && !crate::draw::builder_allowed_env()) {
+                    crate::pipeline::note_drop(p);
+                }
+            }
+        } else {
+            if is_dispatch {
+                super::count_dispatch();
+            } else {
+                super::count_draw();
+            }
+            crate::draw::note_front_dropped(self.pipeline as This, is_dispatch);
+        }
+        true
     }
 
     /// Begins a recording, with `pipeline` bound.
@@ -99,6 +147,7 @@ impl Front {
         self.recording = Some(Arc::new(Recording::new(kind)));
         self.closed = false;
         self.submitted = false;
+        self.track_pipeline(pipeline);
         self.put(RESET, &[pipeline as u64]);
     }
 
@@ -174,10 +223,11 @@ static WORK: Condvar = Condvar::new();
 /// Lists of ours nobody uses, closed.
 static BACKS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 /// Since the last line of the log: streams handed over; calls translated and
-/// the microseconds that took (all threads), recordings translated, and
-/// recordings let go of in the middle.
+/// the microseconds that took (all threads), recordings translated,
+/// recordings let go of in the middle, and execution calls culled early on
+/// the recording thread for permanently dropped pipelines.
 static CHUNKS: AtomicU64 = AtomicU64::new(0);
-static STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 fn held<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -372,12 +422,13 @@ pub(crate) fn line(frames: f64) {
     }
     let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Relaxed) as f64 / frames).collect();
     tracing::info!(
-        "list calls translated by threads of ours per frame (VICTORY_THIN): {:.0} in {:.1} ms (all threads), {:.1} lists, {:.1} pieces; left in the middle {:.2}",
+        "list calls translated by threads of ours per frame (VICTORY_THIN): {:.0} in {:.1} ms (all threads), {:.1} lists, {:.1} pieces; left in the middle {:.2}, culled early {:.0}",
         s[0],
         s[1] / 1000.0,
         s[2],
         CHUNKS.swap(0, Relaxed) as f64 / frames,
-        s[3]
+        s[3],
+        s[4]
     );
 }
 
@@ -416,17 +467,35 @@ impl Word for f32 {
 /// The methods whose arguments are all plain values: the one the title calls,
 /// and the call made of it later.
 macro_rules! plain {
-    ($($op:ident $name:ident = $was:path, ($($a:ident: $t:ty),*);)*) => {
+    (
+        @plain $($op:ident $name:ident = $was:path, ($($a:ident: $t:ty),*);)*
+        @exec $($eop:ident $ename:ident ($is_dispatch:expr, $is_indirect:expr) = $ewas:path, ($($ea:ident: $et:ty),*);)*
+        @pipeline $pop:ident $pname:ident = $pwas:path, ($pa:ident: $pt:ty);
+    ) => {
         #[allow(clippy::upper_case_acronyms, non_camel_case_types)]
         #[repr(u64)]
-        enum Plain { $($op),* , END }
+        enum Plain { $($op,)* $($eop,)* $pop, END }
         mod plain_op {
             use super::Plain;
             $(pub(super) const $op: u64 = Plain::$op as u64;)*
+            $(pub(super) const $eop: u64 = Plain::$eop as u64;)*
+            pub(super) const $pop: u64 = Plain::$pop as u64;
         }
         $(extern "system" fn $name(this: This $(, $a: $t)*) {
             front(this).put(Plain::$op as u64, &[$(Word::word($a)),*]);
         })*
+        $(extern "system" fn $ename(this: This $(, $ea: $et)*) {
+            let f = front(this);
+            if f.cull_exec($is_dispatch, $is_indirect) {
+                return;
+            }
+            f.put(Plain::$eop as u64, &[$(Word::word($ea)),*]);
+        })*
+        extern "system" fn $pname(this: This, $pa: $pt) {
+            let f = front(this);
+            f.track_pipeline($pa);
+            f.put(Plain::$pop as u64, &[Word::word($pa)]);
+        }
         /// Whether `op` was one of them; done on `list`.
         #[inline]
         fn run_plain(op: u64, list: This, w: &[u64]) -> bool {
@@ -437,6 +506,18 @@ macro_rules! plain {
                     let _ = words;
                     $was(list $(, $a)*);
                 })*
+                $(plain_op::$eop => {
+                    let mut words = w.iter();
+                    $(let $ea: $et = Word::unword(words.next().copied().unwrap_or(0));)*
+                    let _ = words;
+                    $ewas(list $(, $ea)*);
+                })*
+                plain_op::$pop => {
+                    let mut words = w.iter();
+                    let $pa: $pt = Word::unword(words.next().copied().unwrap_or(0));
+                    let _ = words;
+                    $pwas(list, $pa);
+                }
                 _ => return false,
             }
             true
@@ -445,6 +526,7 @@ macro_rules! plain {
 }
 
 plain! {
+    @plain
     TOPOLOGY topology = state::topology, (v: u32);
     STENCIL_REF stencil_ref = state::stencil_ref, (v: u32);
     DEPTH_BOUNDS depth_bounds = state::depth_bounds, (min: f32, max: f32);
@@ -454,25 +536,27 @@ plain! {
     GRAPHICS_CONSTANT graphics_constant = state::graphics_constant, (slot: u32, value: u32, offset: u32);
     COMPUTE_VIEW compute_view = state::compute_view, (slot: u32, address: u64);
     GRAPHICS_VIEW graphics_view = state::graphics_view, (slot: u32, address: u64);
-    SET_PIPELINE set_pipeline = super::set_pipeline, (pipeline: This);
-    DRAW draw = state::draw, (vertices: u32, instances: u32, first: u32, first_instance: u32);
-    DRAW_INDEXED draw_indexed = state::draw_indexed, (indices: u32, instances: u32, first: u32, base: i32, first_instance: u32);
-    DISPATCH dispatch = state::dispatch, (x: u32, y: u32, z: u32);
-    DISPATCH_X dispatch_x = super::dispatch_x, (x: u32, y: u32, z: u32, flags: u32);
-    DISPATCH_MESH dispatch_mesh = state::dispatch_mesh, (x: u32, y: u32, z: u32);
-    DISPATCH_MESH_X dispatch_mesh_x = state::dispatch_mesh_x, (x: u32, flags: u64, indirect: u64, payload: u64);
     COPY_BUFFER copy_buffer_region = super::copy_buffer_region, (dst: This, dst_offset: u64, src: This, src_offset: u64, len: u64);
     COPY_RESOURCE copy_resource = super::copy_resource, (dst: This, src: This);
     COPY_RESOURCE_X copy_resource_x = super::copy_resource_x, (dst: This, src: This, flags: u32);
     COPY_MEMORY copy_memory = super::copy_memory, (dst: u64, src: u64, len: u64, flags: u32);
     RESOLVE resolve = super::resolve, (dst: This, dst_sub: u32, src: This, src_sub: u32, format: u32);
     RESOLVE_QUERIES resolve_queries = super::resolve_queries, (heap: This, kind: u32, first: u32, count: u32, buffer: This, offset: u64);
-    EXECUTE_INDIRECT execute_indirect = super::execute_indirect, (signature: This, max: u32, arguments: This, offset: u64, count: This, count_offset: u64);
     WRITE32 write32 = super::write32, (address: u64, value: u32, flush: u32, flags: u32);
     WRITE64 write64 = super::write64, (address: u64, value: u64, flush: u32, flags: u32);
     WAIT_VALUE wait_value = super::wait_value, (address: u64, comparison: u32, reference: u64);
     WAIT_VALUE64 wait_value64 = super::wait_value64, (address: u64, comparison: u32, reference: u64);
     SYNC sync = super::sync, (flags: u32, control: u32, address: u64, size: u64);
+    @exec
+    DRAW draw (false, false) = state::draw, (vertices: u32, instances: u32, first: u32, first_instance: u32);
+    DRAW_INDEXED draw_indexed (false, false) = state::draw_indexed, (indices: u32, instances: u32, first: u32, base: i32, first_instance: u32);
+    DISPATCH dispatch (true, false) = state::dispatch, (x: u32, y: u32, z: u32);
+    DISPATCH_X dispatch_x (true, false) = super::dispatch_x, (x: u32, y: u32, z: u32, flags: u32);
+    DISPATCH_MESH dispatch_mesh (false, false) = state::dispatch_mesh, (x: u32, y: u32, z: u32);
+    DISPATCH_MESH_X dispatch_mesh_x (false, false) = state::dispatch_mesh_x, (x: u32, flags: u64, indirect: u64, payload: u64);
+    EXECUTE_INDIRECT execute_indirect (false, true) = super::execute_indirect, (signature: This, max: u32, arguments: This, offset: u64, count: This, count_offset: u64);
+    @pipeline
+    SET_PIPELINE set_pipeline = super::set_pipeline, (pipeline: This);
 }
 
 const fn after(n: u64) -> u64 {
@@ -990,5 +1074,106 @@ mod tests {
         assert!(closed);
         assert_eq!(super::ACTIVE_STATE.get(), (0, 0, 0));
         crate::object::release(back);
+    }
+
+    #[test]
+    fn front_culls_dropped_pipeline_executions_while_preserving_state_ops() {
+        let mut raw_list = super::boxed(0, std::ptr::null(), true);
+        raw_list.thin.begin(0, std::ptr::null());
+        let list_ptr: This = Box::into_raw(raw_list).cast_const().cast();
+
+        // Bound to null pipeline: permanently dropped on Front.
+        assert!(front(list_ptr).dropped_pipeline);
+        // State ops MUST still be recorded (D3D12 state persists across SetPipelineState).
+        topology(list_ptr, 4);
+        compute_constant(list_ptr, 1, 0xdead_beef, 0);
+        graphics_table(list_ptr, 0, 0x1000);
+        // Execution ops MUST be culled without entering the word stream.
+        draw(list_ptr, 3, 1, 0, 0);
+        draw_indexed(list_ptr, 6, 1, 0, 0, 0);
+        dispatch(list_ptr, 4, 1, 1);
+        dispatch_x(list_ptr, 4, 1, 1, 0);
+        dispatch_mesh(list_ptr, 2, 1, 1);
+        dispatch_mesh_x(list_ptr, 2, 0, 0, 0);
+        execute_indirect(list_ptr, std::ptr::null(), 1, std::ptr::null(), 0, std::ptr::null(), 0);
+
+        let ops_in = |words: &[u64]| -> Vec<u64> {
+            let mut out = Vec::new();
+            let mut i = 0;
+            while i < words.len() {
+                let op = words[i] & 0xffff;
+                let len = (words[i] >> 16) as usize;
+                out.push(op);
+                i += 1 + len;
+            }
+            out
+        };
+        let recorded = ops_in(&front(list_ptr).words);
+        assert_eq!(
+            recorded,
+            [
+                RESET,
+                Plain::TOPOLOGY as u64,
+                Plain::COMPUTE_CONSTANT as u64,
+                Plain::GRAPHICS_TABLE as u64,
+            ]
+        );
+
+        // Bind a non-dropped compute pipeline: execution ops must resume recording.
+        #[repr(C)]
+        struct Bytecode {
+            code: *const u8,
+            size: usize,
+        }
+        #[repr(C)]
+        struct ComputeHead {
+            root: This,
+            stage: Bytecode,
+        }
+        let dummy_shader = b"CS_DummyNonDroppedForThinCullTest";
+        let desc = ComputeHead {
+            root: std::ptr::null(),
+            stage: Bytecode {
+                code: dummy_shader.as_ptr(),
+                size: dummy_shader.len(),
+            },
+        };
+        let mut pso: This = std::ptr::null();
+        let iid = crate::object::guid(
+            0x765a30f3,
+            0xf624,
+            0x4c6f,
+            [0xa8, 0x28, 0xac, 0xe9, 0x48, 0x62, 0x24, 0x45],
+        );
+        assert_eq!(
+            crate::pipeline::create_compute(
+                std::ptr::null(),
+                (&raw const desc).cast(),
+                &iid,
+                &mut pso,
+            ),
+            S_OK
+        );
+        assert!(!pso.is_null());
+
+        set_pipeline(list_ptr, pso);
+        assert!(!front(list_ptr).dropped_pipeline);
+        dispatch(list_ptr, 8, 1, 1);
+
+        let recorded_after = ops_in(&front(list_ptr).words);
+        assert_eq!(
+            recorded_after,
+            [
+                RESET,
+                Plain::TOPOLOGY as u64,
+                Plain::COMPUTE_CONSTANT as u64,
+                Plain::GRAPHICS_TABLE as u64,
+                Plain::SET_PIPELINE as u64,
+                Plain::DISPATCH as u64,
+            ]
+        );
+
+        crate::object::release(list_ptr);
+        crate::object::release(pso);
     }
 }

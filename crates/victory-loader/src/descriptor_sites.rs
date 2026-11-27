@@ -81,11 +81,29 @@ fn lea_of(store: &[u8]) -> Option<[u8; 4]> {
     Some([0x48 | u8::from(x) << 1 | u8::from(b), 0x8d, 0x04, sib])
 }
 
-/// The code at `to` for the store `store` at `at`: the store, the marks, back
-/// to `at + store.len()`.
+/// The code at `to` for the store `store` at `at`:
+/// - Check whether `[base+index]` falls inside `[marks.start, marks.start + marks.len)`.
+/// - If outside: restore registers, run `<store>`, and jump back (fast path).
+/// - If inside: **pre-mark** `slots[slot] = 1` and `chunks[chunk] = 1` BEFORE
+///   `<store>` (closing the store-before-mark race against `sync_heaps`
+///   fallback scans), restore all registers + `rsp` so `<store>` runs in its
+///   exact original context (VEH-safe on guard-page faults), run `<store>`,
+///   then **post-mark** `slots[slot] = 1` and `chunks[chunk] = 1` AFTER
+///   `<store>` (so a concurrent `take()` that drained the pre-mark before
+///   `<store>` landed still observes the new bytes on the next `take()`), and
+///   jump back to `at + store.len()`.
 fn stub(store: &[u8], at: usize, to: usize, marks: usize) -> Option<Vec<u8>> {
     let lea = lea_of(store)?;
-    let mut out = store.to_vec();
+    let mark_body: [u8; 24] = [
+        0x48, 0xc1, 0xe8, 0x05, // shr rax, 5: the slot
+        0x48, 0x8b, 0x4a, 0x10, // mov rcx, [rdx+16]
+        0xc6, 0x04, 0x01, 0x01, // mov byte [rcx+rax], 1
+        0x48, 0xc1, 0xe8, 0x07, // shr rax, 7: the chunk
+        0x48, 0x8b, 0x4a, 0x18, // mov rcx, [rdx+24]
+        0xc6, 0x04, 0x01, 0x01, // mov byte [rcx+rax], 1
+    ];
+    let mut out = Vec::with_capacity(144);
+    // Phase 1: range check + pre-mark before the store.
     out.push(0x50); // push rax
     out.extend(lea); // lea rax, [base+index]
     out.extend([0x52, 0x51]); // push rdx ; push rcx
@@ -93,16 +111,34 @@ fn stub(store: &[u8], at: usize, to: usize, marks: usize) -> Option<Vec<u8>> {
     out.extend((marks as u64).to_le_bytes());
     out.extend([0x48, 0x2b, 0x02]); // sub rax, [rdx]
     out.extend([0x48, 0x3b, 0x42, 0x08]); // cmp rax, [rdx+8]
-    out.extend([0x73, 0x18]); // jae past the marks
-    out.extend([0x48, 0xc1, 0xe8, 0x05]); // shr rax, 5: the slot
-    out.extend([0x48, 0x8b, 0x4a, 0x10]); // mov rcx, [rdx+16]
-    out.extend([0xc6, 0x04, 0x01, 0x01]); // mov byte [rcx+rax], 1
-    out.extend([0x48, 0xc1, 0xe8, 0x07]); // shr rax, 7: the chunk
-    out.extend([0x48, 0x8b, 0x4a, 0x18]); // mov rcx, [rdx+24]
-    out.extend([0xc6, 0x04, 0x01, 0x01]); // mov byte [rcx+rax], 1
+    out.extend([0x73, 0x00]); // jae .outside (patched below)
+    let jae_outside_disp = out.len() - 1;
+    let jae_outside_next = out.len();
+    out.extend(mark_body);
     out.extend([0x59, 0x5a, 0x58]); // pop rcx ; pop rdx ; pop rax
-    let back = crate::console_insn::jump(to + out.len(), at + store.len())?;
-    out.extend(back);
+    out.extend(store); // original store with pristine registers & rsp
+    // Phase 2: post-mark after the store (re-checks marks.len for let_go safety).
+    out.push(0x50); // push rax
+    out.extend(lea); // lea rax, [base+index]
+    out.extend([0x52, 0x51]); // push rdx ; push rcx
+    out.extend([0x48, 0xba]); // mov rdx, marks
+    out.extend((marks as u64).to_le_bytes());
+    out.extend([0x48, 0x2b, 0x02]); // sub rax, [rdx]
+    out.extend([0x48, 0x3b, 0x42, 0x08]); // cmp rax, [rdx+8]
+    out.extend([0x73, mark_body.len() as u8]); // jae .done
+    out.extend(mark_body);
+    // .done:
+    out.extend([0x59, 0x5a, 0x58]); // pop rcx ; pop rdx ; pop rax
+    let back_in = crate::console_insn::jump(to + out.len(), at + store.len())?;
+    out.extend(back_in);
+    // .outside:
+    let outside = out.len();
+    let outside_disp = i8::try_from(outside.checked_sub(jae_outside_next)?).ok()?;
+    out[jae_outside_disp] = outside_disp as u8;
+    out.extend([0x59, 0x5a, 0x58]); // pop rcx ; pop rdx ; pop rax
+    out.extend(store);
+    let back_out = crate::console_insn::jump(to + out.len(), at + store.len())?;
+    out.extend(back_out);
     Some(out)
 }
 
@@ -316,6 +352,152 @@ mod tests {
             assert_eq!(std::slice::from_raw_parts(place.add(0x100), bytes.len()), &bytes[..]);
             let outside = [Site { window: 0xfff0, ..SITES[0] }];
             assert!(matches!(apply(place as usize, 0x10000, 0, &outside)[..], [Hooked::Failed(_)]));
+        }
+    }
+
+    /// Proves on real x86-64 execution that every site stub **pre-marks** the
+    /// slot and chunk BEFORE `<original vmovups>` faults on a guarded page,
+    /// runs `<original vmovups>` with pristine registers/stack, and
+    /// **post-marks** the slot and chunk again AFTER `<original vmovups>` even
+    /// if a concurrent `take()` drained the pre-mark right at the store.
+    #[test]
+    fn stub_pre_marks_before_store_and_post_marks_after_store() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use windows_sys::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION;
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            AddVectoredExceptionHandler, EXCEPTION_POINTERS, RemoveVectoredExceptionHandler,
+        };
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, PAGE_READONLY, PAGE_READWRITE,
+            VirtualAlloc, VirtualProtect,
+        };
+
+        const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
+        const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
+
+        static TARGET_ADDR: AtomicUsize = AtomicUsize::new(0);
+        static SLOT_PTR: AtomicUsize = AtomicUsize::new(0);
+        static CHUNK_PTR: AtomicUsize = AtomicUsize::new(0);
+        static SAW_FAULT: AtomicBool = AtomicBool::new(false);
+        static PRE_MARKED_OK: AtomicBool = AtomicBool::new(false);
+
+        unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
+            // SAFETY: Windows passes valid exception pointers.
+            let rec = unsafe { &*(*info).ExceptionRecord };
+            if rec.ExceptionCode != EXCEPTION_ACCESS_VIOLATION || rec.NumberParameters < 2 {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+            let fault_addr = rec.ExceptionInformation[1];
+            let target = TARGET_ADDR.load(Ordering::Acquire);
+            if target == 0 || fault_addr != target {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+            let slot_p = SLOT_PTR.load(Ordering::Acquire) as *mut u8;
+            let chunk_p = CHUNK_PTR.load(Ordering::Acquire) as *mut u8;
+            // SAFETY: valid test vectors alive for the duration of the hooked call.
+            unsafe {
+                let pre_ok = *slot_p == 1 && *chunk_p == 1;
+                PRE_MARKED_OK.store(pre_ok, Ordering::Release);
+                // Simulate concurrent `port_descriptors::take()` draining the pre-mark
+                // right before the store lands; post-mark must re-set both to 1.
+                *slot_p = 0;
+                *chunk_p = 0;
+                let mut old = 0u32;
+                let page = target & !0xfff;
+                assert_ne!(VirtualProtect(page as *const _, 0x1000, PAGE_READWRITE, &mut old), 0);
+            }
+            SAW_FAULT.store(true, Ordering::Release);
+            EXCEPTION_CONTINUE_EXECUTION
+        }
+
+        let mov = |to: u8, from: u8| [0x48 | (from >> 3) << 2 | (to >> 3), 0x89, 0xc0 | (from & 7) << 3 | (to & 7)];
+        // SAFETY: scoped VEH handler removed before returning.
+        let veh = unsafe { AddVectoredExceptionHandler(1, Some(handler)) };
+        assert!(!veh.is_null());
+        struct RemoveVeh(*mut std::ffi::c_void);
+        impl Drop for RemoveVeh {
+            fn drop(&mut self) {
+                TARGET_ADDR.store(0, Ordering::Release);
+                // SAFETY: handle returned by `AddVectoredExceptionHandler`.
+                unsafe { RemoveVectoredExceptionHandler(self.0) };
+            }
+        }
+        let _guard = RemoveVeh(veh);
+
+        for site in &SITES {
+            let store = &site.bytes[site.store..site.store + site.len];
+            let lea = lea_of(store).unwrap();
+            let base = lea[3] & 7 | (lea[0] & 1) << 3;
+            let index = lea[3] >> 3 & 7 | (lea[0] & 2) << 2;
+            let load_at = site.store - if site.bytes[site.store - 5] == 0xc4 { 5 } else { 4 };
+            let load = &site.bytes[load_at..site.store];
+            let load_reg = if load[0] == 0xc4 { load[4] & 7 | 8 } else { load[3] & 7 };
+            let mut code: Vec<u8> = vec![0x56, 0x57, 0x53];
+            code.extend(mov(11, 1));
+            code.extend(mov(3, 2));
+            code.extend(mov(6, 8));
+            for scratch in [7, 10, 2] {
+                code.extend(mov(scratch, 9));
+            }
+            let rex = usize::from(site.bytes[0] == 0x41);
+            let offset = site.bytes[rex + 1] & 7 | if rex == 1 { 8 } else { 0 };
+            let table = if offset == base { index } else { base };
+            code.extend(mov(load_reg, 6));
+            code.extend(mov(table, 3));
+            code.extend(mov(offset, 11));
+            let at = code.len();
+            code.extend(site.bytes);
+            code.extend(lea);
+            code.extend([0x5b, 0x5f, 0x5e]);
+            code.extend([0xc5, 0xf8, 0x77, 0xc3]);
+            type F = unsafe extern "system" fn(u64, *mut u8, *const u8, *mut u8) -> u64;
+
+            // SAFETY: fresh executable/data allocations owned by this test.
+            unsafe {
+                let place = VirtualAlloc(std::ptr::null(), 0x10000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as usize;
+                assert_ne!(place, 0);
+                let (plain_addr, hooked_addr) = (place + 0x100 - at, place + 0x1100 - at);
+                std::ptr::copy_nonoverlapping(code.as_ptr(), plain_addr as *mut u8, code.len());
+                std::ptr::copy_nonoverlapping(code.as_ptr(), hooked_addr as *mut u8, code.len());
+                let heap = VirtualAlloc(std::ptr::null(), 0x10000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) as *mut u8;
+                let scratch = [0u8; 64];
+                let (mut slots, mut chunks) = (vec![0u8; 0x8000 / 32], vec![0u8; 0x8000 / 32 / 128]);
+                let marks = Box::new(Marks {
+                    start: heap as u64 + 0x2000,
+                    len: 0x8000,
+                    slots: slots.as_mut_ptr(),
+                    chunks: chunks.as_mut_ptr(),
+                });
+                let mine = [Site { window: 0x1100, ..*site }];
+                assert_eq!(apply(place, 0x10000, &raw const *marks as usize, &mine), [Hooked::Done]);
+                let (plain, hooked): (F, F) = (
+                    std::mem::transmute::<usize, F>(plain_addr),
+                    std::mem::transmute::<usize, F>(hooked_addr),
+                );
+                let record: [u8; 32] = std::array::from_fn(|k| (k as u8).wrapping_mul(3) ^ 0xa5);
+                let table = heap.add(0x2000 + 0x40 * 32);
+                let expected = plain(0x60, table.add(0x4000), record.as_ptr(), scratch.as_ptr().cast_mut());
+                let target = table.add(0x60);
+                let slot = 0x40 + 3;
+                SLOT_PTR.store(slots.as_mut_ptr().add(slot) as usize, Ordering::Release);
+                CHUNK_PTR.store(chunks.as_mut_ptr().add(slot / 128) as usize, Ordering::Release);
+                SAW_FAULT.store(false, Ordering::Release);
+                PRE_MARKED_OK.store(false, Ordering::Release);
+                TARGET_ADDR.store(target as usize, Ordering::Release);
+                let mut old = 0u32;
+                assert_ne!(VirtualProtect((target as usize & !0xfff) as *const _, 0x1000, PAGE_READONLY, &mut old), 0);
+
+                let ret = hooked(0x60, table, record.as_ptr(), scratch.as_ptr().cast_mut());
+                TARGET_ADDR.store(0, Ordering::Release);
+
+                assert!(SAW_FAULT.load(Ordering::Acquire), "store must have faulted on read-only page");
+                assert!(PRE_MARKED_OK.load(Ordering::Acquire), "slot & chunk must be pre-marked BEFORE store executes");
+                assert_eq!(ret, expected.wrapping_sub(0x4000), "registers must survive VEH fault and post-mark");
+                assert_eq!(std::slice::from_raw_parts(target, 32), &record);
+                assert_eq!(slots[slot], 1, "post-mark must re-set slot after concurrent take() drained pre-mark");
+                assert_eq!(chunks[slot / 128], 1, "post-mark must re-set chunk after concurrent take() drained pre-mark");
+                drop(marks);
+            }
         }
     }
 }

@@ -3543,7 +3543,7 @@ fn run_gpu_only_watchdog() {
                 }
                 left -= 1;
                 last_global_slot = Some(offset + piece + 1);
-                if let Some((touched, _)) = crate::gpu_only::query_working_set_block(block)
+                if let Some((touched, _)) = crate::gpu_only::query_working_set_block_views_watchdog(block)
                     && touched > 0
                 {
                     touched_pieces.push(piece);
@@ -5854,7 +5854,7 @@ impl Host {
                     // SAFETY: as below.
                     unsafe { check.look(i, data) };
                 }
-                shadow.gpu_only_before_land(*lo, *hi);
+                shadow.gpu_only_before_land(*lo, *hi, true);
                 // SAFETY: the mapping of the fetched bytes, `total` of them;
                 // the copy into it has run.
                 let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
@@ -6153,7 +6153,7 @@ impl Host {
                         Box::new(move || {
                             let mut title = Vec::new();
                             for (shadow, i, lo, hi, at) in chunk {
-                                shadow.gpu_only_before_land(lo, hi);
+                                shadow.gpu_only_before_land(lo, hi, true);
                                 // SAFETY: the mapping of the fetched bytes;
                                 // the copy into it has run, and the caller
                                 // waits for this job.
@@ -6174,7 +6174,7 @@ impl Host {
             } else {
                 let mut title = Vec::new();
                 for &(i, lo, hi, at) in &pieces {
-                    plan.ranges[i].shadow.gpu_only_before_land(lo, hi);
+                    plan.ranges[i].shadow.gpu_only_before_land(lo, hi, true);
                     // SAFETY: the mapping of the fetched bytes, `total` of
                     // them; the copy into it has run.
                     let gpu = unsafe { std::slice::from_raw_parts((*data + at as usize) as *const u8, hi - lo) };
@@ -6639,6 +6639,31 @@ impl Host {
                     match step_ranges.last_mut() {
                         Some(last) if from <= last.1 => last.1 = last.1.max(to),
                         _ => step_ranges.push((from, to)),
+                    }
+                }
+                // Expand coalesced step ranges with any aliased title views so
+                // CPU copies/uploads through view A also note/demote a GpuOnly
+                // shadow mapped at view B of the same physical 64 KiB page.
+                let mut added_alias = false;
+                for &(from, to) in step_ranges.as_slice() {
+                    for (_, others) in crate::inplace::shown_elsewhere(from, to) {
+                        for other in others {
+                            raw_steps.push((other, other.saturating_add(crate::gpu_only::PIECE)));
+                            added_alias = true;
+                        }
+                    }
+                }
+                if added_alias {
+                    raw_steps.sort_unstable();
+                    step_ranges.clear();
+                    for &(from, to) in raw_steps.as_slice() {
+                        if from >= to {
+                            continue;
+                        }
+                        match step_ranges.last_mut() {
+                            Some(last) if from <= last.1 => last.1 = last.1.max(to),
+                            _ => step_ranges.push((from, to)),
+                        }
                     }
                 }
             }

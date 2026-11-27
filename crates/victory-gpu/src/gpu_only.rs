@@ -11,17 +11,19 @@
 //! unlocked pages) and page-table inspection (`K32QueryWorkingSetEx`) — never
 //! `PAGE_NOACCESS` traps — gated by five airtight rules:
 //! 1. Size & carded (`shadow.carded() && shadow.len >= 64 KiB`, whole 64 KiB block).
-//! 2. Disjoint / non-aliased (`inplace::pages_of(block).len() <= 1` and no other
-//!    live `Shadow` overlapping `[block, block + 64 KiB)`).
-//! 3. CPU-write-quiet and step-quiet for `>= 30` consecutive frames.
-//! 4. Working-set verified (`K32QueryWorkingSetEx` sees 0 of 16 4 KiB pages in
-//!    working set across `>= 8` landed probes or `>= 6` unflagged probes).
+//! 2. Disjoint shadows / bounded aliases (`block_views(block)` within
+//!    `MAX_ALIAS_VIEWS` and no other live `Shadow` overlapping any view).
+//! 3. CPU-write-quiet and step-quiet for `>= 30` consecutive frames (`>= 4`
+//!    when inside a title-declared GPU-only WC/NC hint range).
+//! 4. Working-set verified (`K32QueryWorkingSetEx` across all alias views sees
+//!    0 resident 4 KiB pages across `>= 8` landed or `>= 6` unflagged probes;
+//!    `>= 2` when GPU-hinted).
 //! 5. Instant lossless demotion + permanent session pin on any CPU write, CPU
 //!    step (`Copy`/`Placed`/`Fill`/`Texture`/`Plane`/`Host`/`Run`), alias/new
 //!    overlapping shadow, or background watchdog working-set touch.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 /// Size of one residency-tracked piece (matches `shadow::PIECE` / `watch::BLOCK`).
 pub(crate) const PIECE: usize = 64 << 10;
@@ -44,10 +46,28 @@ pub(crate) const WATCHDOG_BUDGET_PER_FRAME: usize = 256;
 /// Minimum shadow byte length eligible for unflagged-only promotion (`256 KiB`).
 /// Small `< 256 KiB` buffers (e.g. occlusion/streaming feedback buffers that may
 /// sit unchanged across a cutscene) still promote via active landed probes (`>= 64 KiB`),
-/// but are kept out of unflagged-only promotion.
+/// but are kept out of unflagged-only promotion unless backed by a GPU-only
+/// `PAGE_WRITECOMBINE` / `PAGE_NOCACHE` / `0x20000` hint range.
 pub(crate) const UNFLAGGED_MIN_SHADOW_LEN: usize = 256 << 10;
 /// Maximum unflagged candidate piece actions (trim or probe) per frame.
 pub(crate) const UNFLAGGED_BUDGET_PER_FRAME: usize = 64;
+/// Fast-track quiet frames for buffers inside a title-declared GPU-only hint
+/// range (`PAGE_WRITECOMBINE` `0x400` / `PAGE_NOCACHE` `0x200` / `0x20000`).
+pub(crate) const HINTED_QUIET_FRAMES: u64 = 4;
+/// Fast-track untouched working-set probes required on hinted landed pieces.
+pub(crate) const HINTED_LANDED_CLEAN_PROBES: u16 = 2;
+/// Fast-track untouched working-set probes required on hinted unflagged pieces.
+pub(crate) const HINTED_UNFLAGGED_CLEAN_PROBES: u16 = 2;
+/// Fast-track initial quiet delay before first trim on hinted unflagged pieces.
+pub(crate) const HINTED_UNFLAGGED_MIN_QUIET: u64 = 2;
+/// Bitmask of Xbox `XMemVirtualAlloc` protection flags indicating GPU-only /
+/// CPU-never-reads allocations (`PAGE_NOCACHE` `0x200`, `PAGE_WRITECOMBINE`
+/// `0x400`, and console GPU-private bit `0x20000`).
+pub(crate) const GPU_HINT_PROTECT_MASK: u32 = 0x20600;
+/// Maximum number of aliased virtual views (`inplace::pages_of(block)`) of one
+/// physical 64 KiB page that `gpu_only` will jointly trim, working-set probe,
+/// and watchdog-audit. Covers console physical direct-map + GPU WC view aliases.
+pub(crate) const MAX_ALIAS_VIEWS: usize = 8;
 /// Number of pre-promotion working-set touches required before permanently
 /// pinning a piece for the session. Strikes 1 and 2 enter exponential cooldown
 /// backoff (`TOUCH_BACKOFF_FRAMES`) so one-time boot/load CPU touches never
@@ -55,6 +75,126 @@ pub(crate) const UNFLAGGED_BUDGET_PER_FRAME: usize = 64;
 pub(crate) const TOUCH_STRIKE_LIMIT: u8 = 3;
 /// Cooldown frames after pre-promotion working-set touch strike 1 and strike 2.
 pub(crate) const TOUCH_BACKOFF_FRAMES: [u64; 2] = [180, 600];
+
+/// Sorted non-overlapping title VA ranges allocated with GPU-only protection
+/// hints (`PAGE_WRITECOMBINE` / `PAGE_NOCACHE` / `0x20000`), registered from
+/// `victory-hle::modules::xmem` via [`title_memory_gpu_hint`].
+static GPU_HINTS: RwLock<Vec<(usize, usize)>> = RwLock::new(Vec::new());
+/// Monotonic generation bumped whenever [`GPU_HINTS`] changes (`0` = empty).
+static GPU_HINTS_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// Registers `[at, at + len)` as a GPU-only hint range when `protect` includes
+/// `PAGE_NOCACHE` (`0x200`), `PAGE_WRITECOMBINE` (`0x400`), or `0x20000`.
+/// Safe to call for placeholder reservations (e.g. `0xfa6400000+0xd3230000`).
+pub fn title_memory_gpu_hint(at: usize, len: usize, protect: u32) {
+    if at == 0 || len == 0 || (protect & GPU_HINT_PROTECT_MASK) == 0 {
+        return;
+    }
+    let end = at.saturating_add(len);
+    if end <= at {
+        return;
+    }
+    let mut hints = GPU_HINTS.write().unwrap_or_else(|e| e.into_inner());
+    let mut next: Vec<(usize, usize)> = Vec::with_capacity(hints.len() + 1);
+    let mut inserted = false;
+    for &(lo, hi) in hints.iter() {
+        if hi <= at {
+            next.push((lo, hi));
+            continue;
+        }
+        if lo >= end {
+            if !inserted {
+                next.push((at, end));
+                inserted = true;
+            }
+            next.push((lo, hi));
+            continue;
+        }
+        // Overlaps `[at, end)`: keep any non-overlapping prefix/suffix and
+        // preserve distinct reservation bases for `len == 0` `MEM_RELEASE`.
+        if lo < at {
+            next.push((lo, at));
+        }
+        if !inserted {
+            next.push((at, end));
+            inserted = true;
+        }
+        if hi > end {
+            next.push((end, hi));
+        }
+    }
+    if !inserted {
+        next.push((at, end));
+    }
+    *hints = next;
+    GPU_HINTS_GEN.fetch_add(1, Ordering::Release);
+}
+
+/// Unregisters GPU-only hint coverage at `at`:
+/// - `len == 0`: full `MEM_RELEASE` at reservation base `at` (removes entries
+///   starting at `at`).
+/// - `len > 0`: decommit/partial free of `[at, at + len)` (trims or splits
+///   overlapping hint spans).
+pub fn title_memory_gpu_hint_freed(at: usize, len: usize) {
+    if at == 0 || GPU_HINTS_GEN.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let mut hints = GPU_HINTS.write().unwrap_or_else(|e| e.into_inner());
+    if hints.is_empty() {
+        return;
+    }
+    let mut changed = false;
+    if len == 0 {
+        let before = hints.len();
+        hints.retain(|&(lo, _)| lo != at);
+        changed = hints.len() != before;
+    } else {
+        let end = at.saturating_add(len);
+        let mut next: Vec<(usize, usize)> = Vec::with_capacity(hints.len() + 1);
+        for &(lo, hi) in hints.iter() {
+            if hi <= at || lo >= end {
+                next.push((lo, hi));
+            } else {
+                changed = true;
+                if lo < at {
+                    next.push((lo, at));
+                }
+                if hi > end {
+                    next.push((end, hi));
+                }
+            }
+        }
+        if changed {
+            *hints = next;
+        }
+    }
+    if changed {
+        GPU_HINTS_GEN.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// Whether the entire title range `[start, end)` lies inside registered
+/// GPU-only hint ranges (`PAGE_WRITECOMBINE` / `PAGE_NOCACHE` / `0x20000`).
+pub(crate) fn range_is_gpu_hinted(start: usize, end: usize) -> bool {
+    if start >= end || GPU_HINTS_GEN.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    let hints = GPU_HINTS.read().unwrap_or_else(|e| e.into_inner());
+    if hints.is_empty() {
+        return false;
+    }
+    let mut idx = hints.partition_point(|&(_, hi)| hi <= start);
+    let mut covered = start;
+    while idx < hints.len() && covered < end {
+        let (lo, hi) = hints[idx];
+        if lo > covered {
+            return false;
+        }
+        covered = covered.max(hi);
+        idx += 1;
+    }
+    covered >= end
+}
 
 /// Whether `VICTORY_GPU_ONLY_BACK` is enabled (default ON = `1`; `0` disables).
 pub(crate) fn enabled() -> bool {
@@ -114,9 +254,10 @@ pub(crate) enum LandBlockReason {
     Alias = 12,
     DirtyOrLand = 13,
     Promoted = 14,
+    TrimBusy = 15,
 }
 
-pub(crate) const LAND_REASON_COUNT: usize = 15;
+pub(crate) const LAND_REASON_COUNT: usize = 16;
 
 impl LandBlockReason {
     const fn label(self) -> &'static str {
@@ -136,6 +277,7 @@ impl LandBlockReason {
             Self::Alias => "alias",
             Self::DirtyOrLand => "dirty",
             Self::Promoted => "promoted",
+            Self::TrimBusy => "trim_busy",
         }
     }
 
@@ -155,7 +297,8 @@ impl LandBlockReason {
             11 => Self::Probing,
             12 => Self::Alias,
             13 => Self::DirtyOrLand,
-            _ => Self::Promoted,
+            14 => Self::Promoted,
+            _ => Self::TrimBusy,
         }
     }
 }
@@ -400,7 +543,7 @@ pub(crate) fn log_line(frames: f64) {
         tracing::info!(
             "gpu-only landing breakdown/frame ({:.0} pcs): small={:.0} partial={:.0} unwatched={:.0} not_copied={:.0} \
              pin(touch={:.0} write={:.0} step={:.0} alias={:.0} read={:.0}) backoff={:.0} unquiet={:.0} probing={:.0} \
-             alias={:.0} dirty={:.0} promoted={:.0} | top: {top_str}",
+             trim_busy={:.0} alias={:.0} dirty={:.0} promoted={:.0} | top: {top_str}",
             land_total as f64 / frames,
             r(LandBlockReason::SmallBuf),
             r(LandBlockReason::PartialPiece),
@@ -414,6 +557,7 @@ pub(crate) fn log_line(frames: f64) {
             r(LandBlockReason::Backoff),
             r(LandBlockReason::Unquiet),
             r(LandBlockReason::Probing),
+            r(LandBlockReason::TrimBusy),
             r(LandBlockReason::Alias),
             r(LandBlockReason::DirtyOrLand),
             r(LandBlockReason::Promoted),
@@ -591,6 +735,10 @@ pub(crate) struct Tracker {
     piece_count: usize,
     /// Whether this shadow has been registered in [`TRACKED_SHADOWS`].
     registered: AtomicBool,
+    /// Cached generation of [`GPU_HINTS_GEN`] for lock-free [`Self::is_gpu_hinted`].
+    hint_gen: AtomicU64,
+    /// Cached result of `range_is_gpu_hinted(start, start + len)` at `hint_gen`.
+    hinted: AtomicBool,
     /// Number of pieces currently in `PieceState::GpuOnly`.
     active_count: AtomicU32,
     /// Lock-free bitmap of `GpuOnly` pieces (1 bit per 64 KiB piece).
@@ -616,6 +764,8 @@ impl Tracker {
             len: 0,
             piece_count: 0,
             registered: AtomicBool::new(false),
+            hint_gen: AtomicU64::new(0),
+            hinted: AtomicBool::new(false),
             active_count: AtomicU32::new(0),
             gpu_only_bits: Box::new([]),
             states: Mutex::new(Vec::new()),
@@ -658,10 +808,29 @@ impl Tracker {
             len,
             piece_count,
             registered: AtomicBool::new(false),
+            hint_gen: AtomicU64::new(0),
+            hinted: AtomicBool::new(false),
             active_count: AtomicU32::new(0),
             gpu_only_bits: gpu_only_bits.into_boxed_slice(),
             states: Mutex::new(vec![initial; piece_count]),
         }
+    }
+
+    /// Lock-free check whether this shadow lies inside a title-declared
+    /// GPU-only hint range (`PAGE_WRITECOMBINE` / `PAGE_NOCACHE` / `0x20000`).
+    #[inline]
+    pub(crate) fn is_gpu_hinted(&self) -> bool {
+        let current_gen = GPU_HINTS_GEN.load(Ordering::Acquire);
+        if current_gen == 0 {
+            return false;
+        }
+        if self.hint_gen.load(Ordering::Acquire) == current_gen {
+            return self.hinted.load(Ordering::Acquire);
+        }
+        let hinted = range_is_gpu_hinted(self.start, self.start.saturating_add(self.len));
+        self.hinted.store(hinted, Ordering::Release);
+        self.hint_gen.store(current_gen, Ordering::Release);
+        hinted
     }
 
     /// Whether this shadow has already been registered in [`TRACKED_SHADOWS`].
@@ -1036,12 +1205,17 @@ impl Tracker {
     ///
     /// - If trimmed on an earlier frame (`trimmed_at_frame < frame`), returns
     ///   [`BeforeReadAction::Probe`].
-    /// - If trimmed earlier on the same frame (`trimmed_at_frame >= frame`),
-    ///   clears `trimmed = false` immediately and returns
-    ///   [`BeforeReadAction::ClearedSameFrame`] so our own memory access does
-    ///   not leave resident pages under `trimmed = true` and trigger a false
-    ///   working-set pin on the next frame.
-    pub(crate) fn before_read_action(&self, piece: usize, frame: u64) -> BeforeReadAction {
+    /// - If trimmed earlier on the same frame (`trimmed_at_frame >= frame`):
+    ///   - When `touches_title_va` is `true` (direct title-VA landing,
+    ///     `take_landed`, `merge_under_writes`, or `Shadow::take`), clears
+    ///     `trimmed = false` immediately and returns
+    ///     [`BeforeReadAction::ClearedSameFrame`] so our own memory access
+    ///     cannot leave resident pages under `trimmed = true` and trigger a
+    ///     false working-set pin next frame.
+    ///   - When `touches_title_va` is `false` (`GUARDED` view memory landing
+    ///     through `beside`, which does not touch any title VA PTE), keeps
+    ///     `trimmed = true` intact and returns [`BeforeReadAction::Skip`].
+    pub(crate) fn before_read_action(&self, piece: usize, frame: u64, touches_title_va: bool) -> BeforeReadAction {
         if piece >= self.piece_count {
             return BeforeReadAction::Skip;
         }
@@ -1057,8 +1231,12 @@ impl Tracker {
                 trimmed_at_frame,
                 ..
             }) if *trimmed && *trimmed_at_frame >= frame => {
-                *trimmed = false;
-                BeforeReadAction::ClearedSameFrame
+                if touches_title_va {
+                    *trimmed = false;
+                    BeforeReadAction::ClearedSameFrame
+                } else {
+                    BeforeReadAction::Skip
+                }
             }
             _ => BeforeReadAction::Skip,
         }
@@ -1066,9 +1244,12 @@ impl Tracker {
 
     /// Decides what unflagged probe action (if any) to take for `piece` at `frame`.
     pub(crate) fn unflagged_action(&self, piece: usize, frame: u64) -> UnflaggedAction {
-        if self.len < UNFLAGGED_MIN_SHADOW_LEN || self.piece_block_if_whole(piece).is_none() {
+        let hinted = self.is_gpu_hinted();
+        let min_len = if hinted { PIECE } else { UNFLAGGED_MIN_SHADOW_LEN };
+        if self.len < min_len || self.piece_block_if_whole(piece).is_none() {
             return UnflaggedAction::Skip;
         }
+        let start_quiet = if hinted { HINTED_UNFLAGGED_MIN_QUIET } else { 8 };
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         match states.get(piece) {
             Some(PieceState::Normal {
@@ -1081,8 +1262,8 @@ impl Tracker {
                 // Start probing once the piece has been quiet for a few frames
                 // and is outside any pre-promotion working-set touch cooldown.
                 if frame >= *backoff_until_frame
-                    && frame.saturating_sub(*last_cpu_write_frame) >= 8
-                    && frame.saturating_sub(*last_step_frame) >= 8
+                    && frame.saturating_sub(*last_cpu_write_frame) >= start_quiet
+                    && frame.saturating_sub(*last_step_frame) >= start_quiet
                 {
                     UnflaggedAction::NeedTrim
                 } else {
@@ -1181,6 +1362,13 @@ impl Tracker {
         if self.piece_block_if_whole(piece).is_none() {
             return AfterLandDecision::Hold(LandBlockReason::PartialPiece);
         }
+        let hinted = self.is_gpu_hinted();
+        let quiet_needed = if hinted { HINTED_QUIET_FRAMES } else { QUIET_FRAMES };
+        let probes_needed = if hinted {
+            HINTED_LANDED_CLEAN_PROBES
+        } else {
+            LANDED_CLEAN_PROBES
+        };
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         match states.get(piece) {
             Some(PieceState::Normal {
@@ -1196,9 +1384,9 @@ impl Tracker {
                     return AfterLandDecision::Hold(LandBlockReason::Backoff);
                 }
                 let should_trim = force_retrim || !*trimmed || *trimmed_at_frame < frame;
-                let quiet = frame.saturating_sub(*last_cpu_write_frame) >= QUIET_FRAMES
-                    && frame.saturating_sub(*last_step_frame) >= QUIET_FRAMES;
-                if quiet && *clean_probes >= LANDED_CLEAN_PROBES {
+                let quiet = frame.saturating_sub(*last_cpu_write_frame) >= quiet_needed
+                    && frame.saturating_sub(*last_step_frame) >= quiet_needed;
+                if quiet && *clean_probes >= probes_needed {
                     AfterLandDecision::ReadyToPromote { should_trim }
                 } else {
                     let reason = if !quiet {
@@ -1222,13 +1410,17 @@ impl Tracker {
     /// Whether `piece` meets Rule 3 & Rule 4 counts for promotion at `frame`
     /// (caller must also verify Rule 1, Rule 2, `copied`, and working-set trim).
     pub(crate) fn ready_to_promote(&self, piece: usize, frame: u64, unflagged: bool) -> bool {
-        if (unflagged && self.len < UNFLAGGED_MIN_SHADOW_LEN) || self.piece_block_if_whole(piece).is_none() {
+        let hinted = self.is_gpu_hinted();
+        let min_len = if hinted { PIECE } else { UNFLAGGED_MIN_SHADOW_LEN };
+        if (unflagged && self.len < min_len) || self.piece_block_if_whole(piece).is_none() {
             return false;
         }
-        let needed = if unflagged {
-            UNFLAGGED_CLEAN_PROBES
-        } else {
-            LANDED_CLEAN_PROBES
+        let quiet_needed = if hinted { HINTED_QUIET_FRAMES } else { QUIET_FRAMES };
+        let needed = match (unflagged, hinted) {
+            (true, true) => HINTED_UNFLAGGED_CLEAN_PROBES,
+            (true, false) => UNFLAGGED_CLEAN_PROBES,
+            (false, true) => HINTED_LANDED_CLEAN_PROBES,
+            (false, false) => LANDED_CLEAN_PROBES,
         };
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         matches!(
@@ -1241,8 +1433,8 @@ impl Tracker {
                 ..
             }) if frame >= *backoff_until_frame
                 && *clean_probes >= needed
-                && frame.saturating_sub(*last_cpu_write_frame) >= QUIET_FRAMES
-                && frame.saturating_sub(*last_step_frame) >= QUIET_FRAMES
+                && frame.saturating_sub(*last_cpu_write_frame) >= quiet_needed
+                && frame.saturating_sub(*last_step_frame) >= quiet_needed
         )
     }
 
@@ -1291,13 +1483,17 @@ impl Tracker {
     /// `note_steps_and_collect_gpu_only`, or `pin_range_and_demote` can never
     /// race with promotion.
     pub(crate) fn try_promote(&self, piece: usize, frame: u64, unflagged: bool) -> bool {
-        if (unflagged && self.len < UNFLAGGED_MIN_SHADOW_LEN) || self.piece_block_if_whole(piece).is_none() {
+        let hinted = self.is_gpu_hinted();
+        let min_len = if hinted { PIECE } else { UNFLAGGED_MIN_SHADOW_LEN };
+        if (unflagged && self.len < min_len) || self.piece_block_if_whole(piece).is_none() {
             return false;
         }
-        let needed = if unflagged {
-            UNFLAGGED_CLEAN_PROBES
-        } else {
-            LANDED_CLEAN_PROBES
+        let quiet_needed = if hinted { HINTED_QUIET_FRAMES } else { QUIET_FRAMES };
+        let needed = match (unflagged, hinted) {
+            (true, true) => HINTED_UNFLAGGED_CLEAN_PROBES,
+            (true, false) => UNFLAGGED_CLEAN_PROBES,
+            (false, true) => HINTED_LANDED_CLEAN_PROBES,
+            (false, false) => LANDED_CLEAN_PROBES,
         };
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         let Some(st) = states.get_mut(piece) else {
@@ -1313,8 +1509,8 @@ impl Tracker {
                 ..
             } if frame >= backoff_until_frame
                 && clean_probes >= needed
-                && frame.saturating_sub(last_cpu_write_frame) >= QUIET_FRAMES
-                && frame.saturating_sub(last_step_frame) >= QUIET_FRAMES
+                && frame.saturating_sub(last_cpu_write_frame) >= quiet_needed
+                && frame.saturating_sub(last_step_frame) >= quiet_needed
         );
         if !ok {
             return false;
@@ -1455,16 +1651,30 @@ pub(crate) fn merge_demoted_piece(gpu: &[u8], old_data: &[u8], title: &[u8]) -> 
     }
 }
 
-/// Zero-fault working-set query on all 16 4 KiB pages of `[block, block + 64 KiB)`.
-///
-/// Returns `Some((touched_pages, 16))` on success, or `None` if title memory
-/// remapping is currently active or Windows did not answer. Never faults and
-/// never touches any page.
-pub(crate) fn query_working_set_block(block: usize) -> Option<(u32, u32)> {
+/// Returns every title virtual address mapping the physical 64 KiB page at
+/// `block` (including `block` itself, or `[block]` for private memory), or
+/// `None` if the page is aliased in more than [`MAX_ALIAS_VIEWS`] views.
+pub(crate) fn block_views(block: usize) -> Option<Vec<usize>> {
+    let mut views = crate::inplace::pages_of(block);
+    if views.is_empty() {
+        return Some(vec![block]);
+    }
+    if views.len() > MAX_ALIAS_VIEWS {
+        return None;
+    }
+    if !views.contains(&block) {
+        if views.len() >= MAX_ALIAS_VIEWS {
+            return None;
+        }
+        views.push(block);
+    }
+    Some(views)
+}
+
+fn query_working_set_block_locked(block: usize) -> Option<(u32, u32)> {
     use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
-    let _still = crate::watch::title_memory_reading_now()?;
     // SAFETY: plain zeroed Win32 struct array.
     let mut info: [PSAPI_WORKING_SET_EX_INFORMATION; PAGES_PER_PIECE] = unsafe { std::mem::zeroed() };
     for (i, entry) in info.iter_mut().enumerate() {
@@ -1494,20 +1704,86 @@ pub(crate) fn query_working_set_block(block: usize) -> Option<(u32, u32)> {
     Some((touched, PAGES_PER_PIECE as u32))
 }
 
-/// Soft-trims all 16 4 KiB pages of `[block, block + 64 KiB)` out of the
+/// Zero-fault working-set query on all 16 4 KiB pages of `[block, block + 64 KiB)`.
+///
+/// Returns `Some((touched_pages, 16))` on success, or `None` if title memory
+/// remapping is currently active or Windows did not answer. Never faults and
+/// never touches any page.
+#[cfg(test)]
+pub(crate) fn query_working_set_block(block: usize) -> Option<(u32, u32)> {
+    let _still = crate::watch::title_memory_reading_now()?;
+    query_working_set_block_locked(block)
+}
+
+/// Zero-fault working-set query across `block` AND every aliased title view in
+/// `inplace::pages_of(block)` (holding `title_memory_reading_now()` across both
+/// view lookup and all `K32QueryWorkingSetEx` calls). Returns `None` if title
+/// memory remapping is active, views exceed [`MAX_ALIAS_VIEWS`], or any query fails.
+pub(crate) fn query_working_set_block_views(block: usize) -> Option<(u32, u32)> {
+    let _still = crate::watch::title_memory_reading_now()?;
+    let views = block_views(block)?;
+    let (mut touched, mut total) = (0u32, 0u32);
+    for &view in &views {
+        let (t, n) = query_working_set_block_locked(view)?;
+        touched = touched.saturating_add(t);
+        total = total.saturating_add(n);
+    }
+    Some((touched, total))
+}
+
+/// Watchdog variant of [`query_working_set_block_views`]: if an active `GpuOnly`
+/// block exceeds [`MAX_ALIAS_VIEWS`], reports `Some((1, 1))` so the caller
+/// immediately demotes it losslessly rather than skipping the audit.
+pub(crate) fn query_working_set_block_views_watchdog(block: usize) -> Option<(u32, u32)> {
+    let _still = crate::watch::title_memory_reading_now()?;
+    let Some(views) = block_views(block) else {
+        return Some((1, 1));
+    };
+    let (mut touched, mut total) = (0u32, 0u32);
+    for &view in &views {
+        let (t, n) = query_working_set_block_locked(view)?;
+        touched = touched.saturating_add(t);
+        total = total.saturating_add(n);
+    }
+    Some((touched, total))
+}
+
+/// Soft-trims all 16 4 KiB pages of each 64 KiB view in `views` out of the
 /// process working set via `VirtualUnlock` on unlocked pages (zero faults,
 /// zero protection changes, RAM data intact). Returns `false` with nothing
 /// done while the runtime is actively remapping title memory.
-pub(crate) fn trim_block(block: usize) -> bool {
+pub(crate) fn trim_block_views(views: &[usize]) -> bool {
     use windows_sys::Win32::System::Memory::VirtualUnlock;
 
+    if views.is_empty() {
+        return false;
+    }
     let Some(_still) = crate::watch::title_memory_reading_now() else {
         return false;
     };
-    // SAFETY: `VirtualUnlock` on unlocked pages is Windows' documented way to
-    // soft-trim pages from the working set without changing protections or
-    // discarding contents; an unmapped address fails cleanly and does nothing.
-    unsafe { VirtualUnlock(block as *const _, PIECE) };
+    for &view in views {
+        // SAFETY: `VirtualUnlock` on unlocked pages is Windows' documented way
+        // to soft-trim pages from the working set without changing protections
+        // or discarding contents; an unmapped address fails cleanly.
+        unsafe { VirtualUnlock(view as *const _, PIECE) };
+    }
+    true
+}
+
+/// Soft-trims `block` AND all of its aliased views (`block_views(block)`).
+/// Returns `false` if remapping is active or views exceed [`MAX_ALIAS_VIEWS`].
+pub(crate) fn trim_block(block: usize) -> bool {
+    let Some(_still) = crate::watch::title_memory_reading_now() else {
+        return false;
+    };
+    let Some(views) = block_views(block) else {
+        return false;
+    };
+    use windows_sys::Win32::System::Memory::VirtualUnlock;
+    for &view in &views {
+        // SAFETY: as in `trim_block_views`.
+        unsafe { VirtualUnlock(view as *const _, PIECE) };
+    }
     true
 }
 
@@ -1668,11 +1944,11 @@ mod tests {
         let tracker = Tracker::with_frame(0x4000_0000, 2 * PIECE, 0);
 
         // Untrimmed piece returns Skip.
-        assert_eq!(tracker.before_read_action(0, 10), BeforeReadAction::Skip);
+        assert_eq!(tracker.before_read_action(0, 10, true), BeforeReadAction::Skip);
 
-        // Trim at frame 10; same-frame read at frame 10 clears `trimmed` without pinning.
+        // Trim at frame 10; same-frame read touching title VA clears `trimmed` without pinning.
         tracker.mark_trimmed(0, 10, false);
-        assert_eq!(tracker.before_read_action(0, 10), BeforeReadAction::ClearedSameFrame);
+        assert_eq!(tracker.before_read_action(0, 10, true), BeforeReadAction::ClearedSameFrame);
         assert!(matches!(
             tracker.state_of(0),
             Some(PieceState::Normal {
@@ -1683,14 +1959,29 @@ mod tests {
         ));
         // Because `trimmed` was cleared before our own read touched title memory,
         // frame 11 sees `Skip` instead of probing our own resident pages and false-pinning.
-        assert_eq!(tracker.before_read_action(0, 11), BeforeReadAction::Skip);
+        assert_eq!(tracker.before_read_action(0, 11, true), BeforeReadAction::Skip);
         assert!(!matches!(tracker.state_of(0), Some(PieceState::Pinned(_))));
 
         // Trim at frame 11; next-frame read at frame 12 requests a working-set probe.
         tracker.mark_trimmed(0, 11, false);
-        assert_eq!(tracker.before_read_action(0, 12), BeforeReadAction::Probe);
+        assert_eq!(tracker.before_read_action(0, 12, true), BeforeReadAction::Probe);
         assert_eq!(
             tracker.apply_probe_result(0, 12, Some(0), true),
+            ProbeOutcome::Untouched(1)
+        );
+
+        // `GUARDED` view memory landing via `beside` (`touches_title_va == false`)
+        // does not touch title VA PTEs, so same-frame landings keep `trimmed = true`
+        // and the next frame probes cleanly.
+        tracker.mark_trimmed(1, 20, false);
+        assert_eq!(tracker.before_read_action(1, 20, false), BeforeReadAction::Skip);
+        assert!(matches!(
+            tracker.state_of(1),
+            Some(PieceState::Normal { trimmed: true, .. })
+        ));
+        assert_eq!(tracker.before_read_action(1, 21, false), BeforeReadAction::Probe);
+        assert_eq!(
+            tracker.apply_probe_result(1, 21, Some(0), false),
             ProbeOutcome::Untouched(1)
         );
     }
@@ -1917,5 +2208,178 @@ mod tests {
 
         // SAFETY: release our test allocation.
         unsafe { VirtualFree(ptr as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn gpu_hint_ranges_fast_track_promotion_and_release_cleanly() {
+        const BASE: usize = 0x5100_0000_0000;
+        const OTHER: usize = BASE + 16 * PIECE;
+
+        // Clean slate in case of re-runs.
+        title_memory_gpu_hint_freed(BASE, 32 * PIECE);
+
+        // Plain PAGE_READWRITE (0x4) is NOT a GPU-only WC/NC hint.
+        title_memory_gpu_hint(BASE, 4 * PIECE, 0x4);
+        assert!(!range_is_gpu_hinted(BASE, BASE + 4 * PIECE));
+
+        // PAGE_WRITECOMBINE | PAGE_READWRITE (0x404) marks the range hinted.
+        title_memory_gpu_hint(BASE, 4 * PIECE, 0x404);
+        assert!(range_is_gpu_hinted(BASE, BASE + 4 * PIECE));
+        assert!(range_is_gpu_hinted(BASE + PIECE, BASE + 2 * PIECE));
+
+        // Hinted 128 KiB buffer (< UNFLAGGED_MIN_SHADOW_LEN = 256 KiB) qualifies for
+        // fast-track landed AND unflagged promotion (4 quiet frames, 2 clean probes).
+        let hinted = Tracker::with_frame(BASE, 2 * PIECE, 0);
+        let unhinted = Tracker::with_frame(BASE + 8 * PIECE, 2 * PIECE, 0);
+        assert!(hinted.is_gpu_hinted());
+        assert!(!unhinted.is_gpu_hinted());
+
+        assert_eq!(
+            hinted.unflagged_action(1, HINTED_UNFLAGGED_MIN_QUIET),
+            UnflaggedAction::NeedTrim
+        );
+        assert_eq!(
+            unhinted.unflagged_action(1, HINTED_UNFLAGGED_MIN_QUIET),
+            UnflaggedAction::Skip
+        );
+
+        // Piece 0 (landed): 2 clean probes + 4 quiet frames promotes hinted, not unhinted.
+        for i in 0..HINTED_LANDED_CLEAN_PROBES {
+            let f = u64::from(i) * 2 + 1;
+            hinted.mark_trimmed(0, f, false);
+            assert_eq!(
+                hinted.apply_probe_result(0, f + 1, Some(0), true),
+                ProbeOutcome::Untouched(i + 1)
+            );
+            unhinted.mark_trimmed(0, f, false);
+            assert_eq!(
+                unhinted.apply_probe_result(0, f + 1, Some(0), true),
+                ProbeOutcome::Untouched(i + 1)
+            );
+        }
+        assert!(!hinted.try_promote(0, HINTED_QUIET_FRAMES - 1, false));
+        assert!(hinted.try_promote(0, HINTED_QUIET_FRAMES, false));
+        assert!(hinted.is_gpu_only(0));
+        assert!(!unhinted.try_promote(0, HINTED_QUIET_FRAMES, false));
+
+        // Piece 1 (unflagged on < 256 KiB WC buffer): 2 clean probes + 4 quiet frames promotes.
+        for i in 0..HINTED_UNFLAGGED_CLEAN_PROBES {
+            let f = u64::from(i) * 2 + 1;
+            hinted.mark_trimmed(1, f, true);
+            assert_eq!(
+                hinted.apply_probe_result(1, f + 1, Some(0), false),
+                ProbeOutcome::Untouched(i + 1)
+            );
+        }
+        assert!(hinted.try_promote(1, HINTED_QUIET_FRAMES, true));
+        assert!(hinted.is_gpu_only(1));
+
+        // PAGE_NOCACHE (0x200) and Xbox GPU flag (0x20000) also register hints.
+        title_memory_gpu_hint(OTHER, PIECE, 0x200);
+        title_memory_gpu_hint(OTHER + 2 * PIECE, PIECE, 0x20000);
+        assert!(range_is_gpu_hinted(OTHER, OTHER + PIECE));
+        assert!(range_is_gpu_hinted(OTHER + 2 * PIECE, OTHER + 3 * PIECE));
+
+        // Partial decommit/free (`len > 0`) splits the hinted range cleanly and
+        // invalidates cached `hint_gen` on existing Trackers.
+        let prefix = Tracker::with_frame(BASE, PIECE, 0);
+        assert!(prefix.is_gpu_hinted());
+        title_memory_gpu_hint_freed(BASE + PIECE, 2 * PIECE);
+        assert!(range_is_gpu_hinted(BASE, BASE + PIECE));
+        assert!(!range_is_gpu_hinted(BASE + PIECE, BASE + 3 * PIECE));
+        assert!(range_is_gpu_hinted(BASE + 3 * PIECE, BASE + 4 * PIECE));
+        // `hinted` spans `[BASE, BASE + 2*PIECE)`: because its second piece is no
+        // longer hinted, full-range coverage is now `false`, while `prefix`
+        // (`[BASE, BASE + PIECE)`) remains wholly hinted until `BASE` is released.
+        assert!(!hinted.is_gpu_hinted());
+        assert!(prefix.is_gpu_hinted());
+
+        // `MEM_RELEASE` (`len == 0`) drops the entry starting at `BASE`, leaving `OTHER` intact.
+        title_memory_gpu_hint_freed(BASE, 0);
+        assert!(!range_is_gpu_hinted(BASE, BASE + PIECE));
+        assert!(!prefix.is_gpu_hinted());
+        assert!(range_is_gpu_hinted(OTHER, OTHER + PIECE));
+
+        // Clean up all test hint entries.
+        title_memory_gpu_hint_freed(BASE, 32 * PIECE);
+        assert!(!range_is_gpu_hinted(BASE, BASE + 32 * PIECE));
+    }
+
+    #[test]
+    fn multi_view_trim_and_query_detect_alias_read_on_real_section() {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            PAGE_READWRITE, UnmapViewOfFile,
+        };
+
+        // SAFETY: private 64 KiB anonymous section with two independent views owned by this test.
+        unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                PIECE as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let v1 = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, PIECE).Value as usize;
+            let v2 = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, PIECE).Value as usize;
+            assert_ne!(v1, 0);
+            assert_ne!(v2, 0);
+            assert_ne!(v1, v2);
+            assert_eq!(v1 % PIECE, 0);
+            assert_eq!(v2 % PIECE, 0);
+
+            crate::inplace::title_memory_section(section as usize, PIECE as u64, true);
+            crate::inplace::title_memory_view(v1, PIECE, section as usize, 0);
+            crate::inplace::title_memory_view(v2, PIECE, section as usize, 0);
+
+            let views = block_views(v1).expect("two alias views must be within MAX_ALIAS_VIEWS");
+            assert_eq!(views.len(), 2);
+            assert!(views.contains(&v1));
+            assert!(views.contains(&v2));
+
+            // Touch both views so pages are resident in both virtual mappings.
+            for page in 0..PAGES_PER_PIECE {
+                ((v1 + page * KERNEL_PAGE) as *mut u8).write_volatile((page as u8).wrapping_add(0x31));
+                let _ = ((v2 + page * KERNEL_PAGE) as *const u8).read_volatile();
+            }
+            let (touched_before, total) =
+                query_working_set_block_views(v1).expect("multi-view working-set query succeeded");
+            assert_eq!(total, (2 * PAGES_PER_PIECE) as u32);
+            assert!(touched_before > 0);
+
+            // Soft-trim ALL alias views via `trim_block_views` -> both views report 0 resident pages.
+            assert!(trim_block_views(&views));
+            let (touched_after_trim, total_after_trim) =
+                query_working_set_block_views(v1).expect("multi-view query after trim succeeded");
+            assert_eq!(total_after_trim, (2 * PAGES_PER_PIECE) as u32);
+            assert_eq!(
+                touched_after_trim, 0,
+                "trim_block_views must trim both alias views to 0 resident pages"
+            );
+
+            // Reading ONLY through the alias view `v2` must be detected when querying `v1`!
+            let byte = (v2 as *const u8).read_volatile();
+            assert_eq!(byte, 0x31);
+            let (touched_alias, _) =
+                query_working_set_block_views(v1).expect("multi-view query after alias read succeeded");
+            assert!(
+                touched_alias >= 1,
+                "CPU read on alias view v2 must be detected by query_working_set_block_views(v1)"
+            );
+            let (touched_watchdog, _) =
+                query_working_set_block_views_watchdog(v1).expect("watchdog query succeeded");
+            assert!(touched_watchdog >= 1);
+
+            crate::inplace::views_gone(v1, PIECE);
+            crate::inplace::views_gone(v2, PIECE);
+            crate::inplace::title_memory_section_gone(section as usize);
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: v1 as *mut _ });
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: v2 as *mut _ });
+            CloseHandle(section);
+        }
     }
 }

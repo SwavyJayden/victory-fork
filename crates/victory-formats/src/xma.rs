@@ -123,15 +123,30 @@ impl Cursor<'_> {
     }
 }
 
+/// Metadata for one frame decoded into a caller-provided scratch buffer by
+/// [`read_frame_into`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameMeta {
+    pub bits: usize,
+    /// Bit offset in the buffer where it starts, and where the next frame
+    /// starts (`None` when the buffer has no further frame).
+    pub start: usize,
+    pub next: Option<usize>,
+}
+
 /// Reads the frame starting at bit `start` (a frame start inside a packet's
-/// payload) of `data`, a buffer of whole packets of one stream.
-pub fn read_frame(data: &[u8], start: usize) -> Option<Frame> {
+/// payload) of `data` into `out` (cleared and reused), returning its metadata.
+pub fn read_frame_into(data: &[u8], start: usize, out: &mut Vec<u8>) -> Option<FrameMeta> {
+    out.clear();
     let mut cursor = Cursor { data, pos: start };
     let bits = cursor.bits(LENGTH_BITS)? as usize;
     if bits <= LENGTH_BITS as usize || bits == 0x7fff {
         return None;
     }
-    let mut out = Vec::with_capacity(bits.div_ceil(8));
+    let needed = bits.div_ceil(8);
+    if out.capacity() < needed {
+        out.reserve(needed);
+    }
     let mut cursor = Cursor { data, pos: start };
     for _ in 0..bits / 8 {
         out.push(cursor.byte()?);
@@ -142,11 +157,19 @@ pub fn read_frame(data: &[u8], start: usize) -> Option<Frame> {
     }
     let end = cursor.pos;
     let next = next_frame(data, start, end);
+    Some(FrameMeta { bits, start, next })
+}
+
+/// Reads the frame starting at bit `start` (a frame start inside a packet's
+/// payload) of `data`, a buffer of whole packets of one stream.
+pub fn read_frame(data: &[u8], start: usize) -> Option<Frame> {
+    let mut out = Vec::new();
+    let meta = read_frame_into(data, start, &mut out)?;
     Some(Frame {
         data: out,
-        bits,
-        start,
-        next,
+        bits: meta.bits,
+        start: meta.start,
+        next: meta.next,
     })
 }
 
@@ -200,13 +223,23 @@ struct Bits<'a> {
 }
 
 impl Bits<'_> {
+    #[inline(always)]
     fn peek32(&self) -> u32 {
-        let mut v = 0u64;
         let byte = self.pos / 8;
+        let shift = self.pos & 7;
+        if let Some(window) = self.data.get(byte..byte + 8) {
+            // SAFETY: `window` has length 8.
+            let word = u64::from_be_bytes([
+                window[0], window[1], window[2], window[3], window[4], window[5], window[6],
+                window[7],
+            ]);
+            return ((word << shift) >> 32) as u32;
+        }
+        let mut v = 0u64;
         for i in 0..5 {
             v = v << 8 | *self.data.get(byte + i).unwrap_or(&0) as u64;
         }
-        (v << (24 + self.pos % 8) >> 32) as u32
+        (v << (24 + shift) >> 32) as u32
     }
 
     fn read(&mut self, n: u32) -> u32 {
@@ -235,10 +268,24 @@ impl Bits<'_> {
     }
 }
 
+/// Direct lookup bits for [`Vlc`]: 10 bits = 1024 entries (4 KiB per table),
+/// resolving >95% of Huffman symbols in one indexed load without binary search.
+const VLC_LUT_BITS: u32 = 10;
+const VLC_LUT_SIZE: usize = 1 << VLC_LUT_BITS;
+
+#[derive(Clone, Copy)]
+struct VlcLutEntry {
+    symbol: i16,
+    /// Code length in bits (`1..=VLC_LUT_BITS`), or `0` to fall back to `codes`.
+    len: u8,
+}
+
 /// A prefix code built like FFmpeg's `ff_vlc_init_from_lengths`: codes are
 /// handed out in table order, each the next free one of its length.
 struct Vlc {
-    /// Left-aligned code, length, symbol; sorted by code.
+    /// Direct 10-bit lookup table for short/common codes (`len <= VLC_LUT_BITS`).
+    lut: Box<[VlcLutEntry; VLC_LUT_SIZE]>,
+    /// Left-aligned code, length, symbol; sorted by code (fallback for longer codes).
     codes: Vec<(u32, u8, i32)>,
 }
 
@@ -246,15 +293,35 @@ impl Vlc {
     fn new(entries: impl Iterator<Item = (i32, u8)>) -> Vlc {
         let mut code = 0u64;
         let mut codes = Vec::new();
+        let mut lut = Box::new([VlcLutEntry { symbol: 0, len: 0 }; VLC_LUT_SIZE]);
         for (symbol, len) in entries {
-            codes.push((code as u32, len, symbol));
-            code += 1 << (32 - len);
+            let c = code as u32;
+            codes.push((c, len, symbol));
+            if u32::from(len) <= VLC_LUT_BITS
+                && let Ok(sym16) = i16::try_from(symbol)
+            {
+                let base = (c >> (32 - VLC_LUT_BITS)) as usize;
+                let span = 1usize << (VLC_LUT_BITS - u32::from(len));
+                lut[base..base + span].fill(VlcLutEntry { symbol: sym16, len });
+            }
+            code += 1u64 << (32 - len);
         }
-        Vlc { codes }
+        Vlc { lut, codes }
     }
 
+    #[inline(always)]
     fn read(&self, bits: &mut Bits) -> i32 {
         let v = bits.peek32();
+        let entry = self.lut[(v >> (32 - VLC_LUT_BITS)) as usize];
+        if entry.len != 0 {
+            bits.pos += entry.len as usize;
+            return i32::from(entry.symbol);
+        }
+        self.read_slow(bits, v)
+    }
+
+    #[cold]
+    fn read_slow(&self, bits: &mut Bits, v: u32) -> i32 {
         let i = self.codes.partition_point(|c| c.0 <= v) - 1;
         let (_, len, symbol) = self.codes[i];
         bits.pos += len as usize;
@@ -1823,5 +1890,88 @@ mod tests {
             );
             assert!(errors == 0 && snr > 40.0);
         }
+    }
+
+    #[test]
+    fn vlc_lut_matches_binary_search_for_every_table_and_code() {
+        let c = codes();
+        let tables: [(&str, &Vlc); 7] = [
+            ("scale", &c.scale),
+            ("scale_rl", &c.scale_rl),
+            ("coef0", &c.coef[0]),
+            ("coef1", &c.coef[1]),
+            ("vec4", &c.vec4),
+            ("vec2", &c.vec2),
+            ("vec1", &c.vec1),
+        ];
+        let reference = |vlc: &Vlc, word: u32| -> (i32, usize) {
+            let i = vlc.codes.partition_point(|c| c.0 <= word) - 1;
+            (vlc.codes[i].2, vlc.codes[i].1 as usize)
+        };
+        for (name, vlc) in tables {
+            // Every exact code entry (start, middle, and end of its 32-bit interval).
+            for &(code, len, expected_sym) in &vlc.codes {
+                let width = 1u64 << (32 - len);
+                for word in [
+                    code,
+                    code.wrapping_add((width / 2) as u32),
+                    code.wrapping_add((width - 1) as u32),
+                ] {
+                    // Check at multiple bit alignments (0..8) and both fast/tail `peek32` paths.
+                    for shift in [0usize, 3, 7] {
+                        let mut buf = [0u8; 16];
+                        put_bits(&mut buf, shift, 32, word);
+                        let mut b = Bits {
+                            data: &buf,
+                            pos: shift,
+                            end: buf.len() * 8,
+                        };
+                        let sym = vlc.read(&mut b);
+                        assert_eq!(
+                            (sym, b.pos - shift),
+                            (expected_sym, len as usize),
+                            "{name}: word={word:#010x} shift={shift}"
+                        );
+                    }
+                }
+            }
+            // Exhaustively verify every 10-bit LUT prefix with varying trailing bits.
+            for prefix in 0..VLC_LUT_SIZE as u32 {
+                for tail in [0u32, 0x0015_5555, 0x003f_ffff] {
+                    let word = (prefix << (32 - VLC_LUT_BITS)) | (tail & ((1 << (32 - VLC_LUT_BITS)) - 1));
+                    let bytes = word.to_be_bytes();
+                    let mut b = Bits {
+                        data: &bytes,
+                        pos: 0,
+                        end: 32,
+                    };
+                    let got_sym = vlc.read(&mut b);
+                    let (want_sym, want_len) = reference(vlc, word);
+                    assert_eq!(
+                        (got_sym, b.pos),
+                        (want_sym, want_len),
+                        "{name}: prefix={prefix:#x} word={word:#010x}"
+                    );
+                }
+            }
+        }
+
+        // `read_frame_into` reuses the scratch buffer and matches `read_frame` byte-for-byte.
+        let mut noise = Noise(0x9e37_79b9_7f4a_7c15);
+        let (data, _) = noise_stream(&mut noise, 3, 0);
+        let mut scratch = Vec::new();
+        let mut at = Some(HEADER_BITS + packet(&data, 0).unwrap().first_frame_bit as usize);
+        let mut count = 0;
+        while let Some(pos) = at {
+            let expected = read_frame(&data, pos).unwrap();
+            let meta = read_frame_into(&data, pos, &mut scratch).unwrap();
+            assert_eq!(
+                (meta.bits, meta.start, meta.next, scratch.as_slice()),
+                (expected.bits, expected.start, expected.next, expected.data.as_slice())
+            );
+            at = meta.next;
+            count += 1;
+        }
+        assert!(count > 0);
     }
 }

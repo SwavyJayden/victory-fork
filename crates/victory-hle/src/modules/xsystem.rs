@@ -267,15 +267,64 @@ mod device_type {
         host!("advapi32.dll", "RegCloseKey": extern "system" fn(Key) -> u32)(key)
     }
 
+    // ETW stubs: `libHttpClient.GDK.dll` registers and emits ETW trace events
+    // through ADVAPI32 / `api-ms-win-eventing-provider-*`. Return `ERROR_SUCCESS`
+    // (0) with zero host kernel ETW overhead.
+
+    pub extern "system" fn EventRegister(
+        _provider_id: *const c_void,
+        _enable_callback: *const c_void,
+        _callback_context: *mut c_void,
+        reg_handle: *mut u64,
+    ) -> u32 {
+        if !reg_handle.is_null() {
+            // SAFETY: caller passes room for one `REGHANDLE` (`u64`).
+            unsafe { reg_handle.write(1) };
+        }
+        SUCCESS
+    }
+
+    pub extern "system" fn EventUnregister(_reg_handle: u64) -> u32 {
+        SUCCESS
+    }
+
+    pub extern "system" fn EventSetInformation(
+        _reg_handle: u64,
+        _information_class: u32,
+        _event_information: *const c_void,
+        _information_length: u32,
+    ) -> u32 {
+        SUCCESS
+    }
+
+    pub extern "system" fn EventWriteTransfer(
+        _reg_handle: u64,
+        _event_descriptor: *const c_void,
+        _activity_id: *const c_void,
+        _related_activity_id: *const c_void,
+        _user_data_count: u32,
+        _user_data: *const c_void,
+    ) -> u32 {
+        SUCCESS
+    }
+
     pub(crate) fn module() -> HleModule {
         HleModule {
             name: "device type",
-            dlls: &["advapi32.dll", "api-ms-win-core-registry-*"],
+            dlls: &[
+                "advapi32.dll",
+                "api-ms-win-core-registry-*",
+                "api-ms-win-eventing-provider-*",
+            ],
             exports: vec![
                 hle_export!(RegOpenKeyW),
                 hle_export!(RegOpenKeyExW),
                 hle_export!(RegQueryValueExW),
                 hle_export!(RegCloseKey),
+                hle_export!(EventRegister),
+                hle_export!(EventUnregister),
+                hle_export!(EventSetInformation),
+                hle_export!(EventWriteTransfer),
             ],
         }
     }
@@ -359,6 +408,51 @@ mod device_type {
             );
             assert!(size > 0);
             assert_eq!(RegCloseKey(key), SUCCESS);
+        }
+
+        #[test]
+        fn etw_stubs_return_success_and_are_registered() {
+            let mut reg_handle = 0u64;
+            assert_eq!(
+                EventRegister(
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    &mut reg_handle,
+                ),
+                SUCCESS
+            );
+            assert_ne!(reg_handle, 0);
+            assert_eq!(
+                EventSetInformation(reg_handle, 2, std::ptr::null(), 0),
+                SUCCESS
+            );
+            assert_eq!(
+                EventWriteTransfer(
+                    reg_handle,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                ),
+                SUCCESS
+            );
+            assert_eq!(EventUnregister(reg_handle), SUCCESS);
+
+            for dll in ["advapi32.dll", "api-ms-win-eventing-provider-l1-1-0.dll"] {
+                for sym in [
+                    "EventRegister",
+                    "EventUnregister",
+                    "EventSetInformation",
+                    "EventWriteTransfer",
+                ] {
+                    assert!(
+                        crate::registry::lookup(dll, sym).is_some(),
+                        "missing {dll}!{sym}"
+                    );
+                }
+            }
         }
     }
 }
