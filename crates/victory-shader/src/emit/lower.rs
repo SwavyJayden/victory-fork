@@ -6158,6 +6158,77 @@ impl<'a> Lower<'a> {
         out
     }
 
+    /// `count` dwords from byte `addr` on of a constant buffer read as raw
+    /// bytes (`VICTORY_VRAM_CBV=1`). Aligns `addr` down to 4 bytes (`addr & !3`)
+    /// to match GCN `s_buffer_load_dword` and `cbufferLoadLegacy` while keeping
+    /// DXIL `rawBufferLoad` (`alignment = 4`) valid for arbitrary offsets.
+    /// Constant 4-byte-aligned offsets emit zero extra instructions.
+    fn raw_cbv_dwords(&mut self, h: V, addr: V, count: u32) -> Vec<V> {
+        let aligned = match self.s.m.int_value(addr) {
+            Some(v) if (v as u32) & 3 == 0 => addr,
+            Some(v) => self.s.m.i32((v as u32) & !3),
+            None => {
+                let mask = self.s.m.i32(!3);
+                self.s.m.bin(self.cur, Bin::And, addr, mask)
+            }
+        };
+        self.raw_dwords(h, aligned, count)
+    }
+
+    /// Wave 27 (`VICTORY_VRAM_CBV=1`, [`super::shader::vram_cbv`]): the raw
+    /// buffer SRV handle (`ByteAddressBuffer`) a constant buffer `src` is read
+    /// through, or `None` to keep the default constant buffer view path.
+    ///
+    /// Works on NVIDIA's 1M descriptor heap without AMD `raw_twins`
+    /// (`raw_views() == 0`, reading the slot directly clamped to
+    /// `view_heap_limit()`), and transparently routes through `raw_twin` when
+    /// `raw_views() != 0`.
+    /// - A root CBV (`Source::Built` without `root_copy`): lowered to root SRV
+    ///   `t<slot>` in [`super::shader::ROOT_CBV_SPACE`] (with `USER_VIEW_BIAS`
+    ///   from [`Self::root_bias`] so 4-byte-aligned root CBVs work zero-copy).
+    /// - A table or heap CBV (`Loaded`, `Fetched`, `Phi`, `Select`, `Lanes`,
+    ///   `LanePhi` whose leaves all come from `Table` or `ResourceHeap`):
+    ///   lowered to `self.handle(site, src, false, (11, 0))`.
+    fn vram_cbv_handle(&mut self, site: Site, src: &Source) -> Result<Option<V>, Why> {
+        if !super::shader::vram_cbv() {
+            return Ok(None);
+        }
+        if let Source::Built { address, .. } = src {
+            if self.root_copy.is_some() {
+                return Ok(None);
+            }
+            let Some(&rp) = self.x.native.layout.get(address.param) else {
+                return Ok(None);
+            };
+            let kind = self
+                .x
+                .native
+                .used
+                .iter()
+                .find(|u| u.user_data == rp.user_data)
+                .map(|u| u.kind);
+            if rp.root == RootType::Descriptor && matches!(kind, Some(ResourceType::Cbv) | None) {
+                return Ok(Some(self.s.root_srv_handle(rp.slot)));
+            }
+            return Ok(None);
+        }
+        let x = self.x;
+        let scalar = &self.scalar;
+        let leaves = src.leaves();
+        let through_heap = !leaves.is_empty()
+            && leaves.iter().all(|leaf| match leaf {
+                Source::Loaded { load, .. } | Source::Fetched { load, .. } => scalar
+                    .get(load)
+                    .and_then(|a| x.native.layout.get(a.param))
+                    .is_some_and(|p| matches!(p.root, RootType::Table | RootType::ResourceHeap)),
+                _ => false,
+            });
+        if !through_heap {
+            return Ok(None);
+        }
+        Ok(Some(self.handle(site, src, false, (11, 0))?))
+    }
+
     fn smem(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Fields::Smem {
             data,
@@ -6266,13 +6337,28 @@ impl<'a> Lower<'a> {
             let raw = self.end_guarded(at, &raw);
             let other = self.s.m.cmp(self.cur, pred::EQ, stride, zero);
             let at = self.begin_guarded(Some(other));
-            let h = self.handle(site, src, false, (13, 0x1_0000))?;
+            let as_raw = super::shader::vram_cbv();
+            let h = if as_raw {
+                self.handle(site, src, false, (11, 0))?
+            } else {
+                self.handle(site, src, false, (13, 0x1_0000))?
+            };
+            let dwords = if as_raw {
+                self.raw_cbv_dwords(h, addr, count)
+            } else {
+                Vec::new()
+            };
             let mut both = Vec::new();
             for (k, &r) in raw.iter().enumerate() {
-                let b = self.cur;
-                let off = self.s.m.i32(4 * k as u32);
-                let a = self.s.m.bin(b, Bin::Add, addr, off);
-                let x = self.cbuffer_dword(h, a);
+                let x = match dwords.get(k) {
+                    Some(&x) => x,
+                    None => {
+                        let b = self.cur;
+                        let off = self.s.m.i32(4 * k as u32);
+                        let a = self.s.m.bin(b, Bin::Add, addr, off);
+                        self.cbuffer_dword(h, a)
+                    }
+                };
                 both.push((x, r));
             }
             let both = self.end_guarded(at, &both);
@@ -6325,6 +6411,12 @@ impl<'a> Lower<'a> {
                     let sane = self.s.m.cmp(c, pred::IULT, x, most);
                     x = self.s.m.select(c, sane, x, zero);
                 }
+                self.write(inst, Reg::S(code + k as u8), x, None);
+            }
+            return Ok(());
+        }
+        if let Some(h) = self.vram_cbv_handle(site, src)? {
+            for (k, x) in self.raw_cbv_dwords(h, addr, count).into_iter().enumerate() {
                 self.write(inst, Reg::S(code + k as u8), x, None);
             }
             return Ok(());
@@ -7186,7 +7278,9 @@ impl<'a> Lower<'a> {
             .iter()
             .find(|u| u.user_data == rp.user_data)
             .map(|u| u.kind);
-        (kind == Some(ResourceType::Uav)).then(|| self.host_word(RootType::Other(USER_VIEW_BIAS), rp.slot, 0))
+        (kind == Some(ResourceType::Uav)
+            || (super::shader::vram_cbv() && matches!(kind, Some(ResourceType::Cbv) | None)))
+            .then(|| self.host_word(RootType::Other(USER_VIEW_BIAS), rp.slot, 0))
     }
 
     /// The used-resource entry a descriptor loaded from a table falls in.
@@ -11797,7 +11891,6 @@ impl<'a> Lower<'a> {
             // A constant buffer read per lane (a dynamically indexed array).
             // shortcut: the console's CBV descriptor is taken to have a 16-byte
             // stride, as the vector loads of whole rows suggest.
-            let h = self.handle(site, src, false, (13, 0x1_0000))?;
             let byte = match index {
                 Some(i) => {
                     let sixteen = self.s.m.i32(16);
@@ -11809,6 +11902,13 @@ impl<'a> Lower<'a> {
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
+            if let Some(h) = self.vram_cbv_handle(site, src)? {
+                for (k, x) in self.raw_cbv_dwords(h, byte, count).into_iter().enumerate() {
+                    self.write(inst, Reg::V(reg + k as u8), x, guard);
+                }
+                return Ok(());
+            }
+            let h = self.handle(site, src, false, (13, 0x1_0000))?;
             for k in 0..count {
                 let four = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, byte, four);

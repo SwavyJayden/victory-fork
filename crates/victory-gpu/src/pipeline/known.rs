@@ -202,10 +202,18 @@ pub fn keys(dir: &Path) -> Vec<String> {
 /// What a driver's cached pipelines depend on besides the title's: the
 /// translator with its settings, and the driver.
 pub fn fingerprint() -> String {
+    // Open the host device first so wave width, RDNA flags, and adapter
+    // driver version are initialized deterministically before hashing
+    // `shader_cache::translation()`.
+    let driver = crate::host::host().map(|host| host.driver());
+    fingerprint_for(&crate::shader_cache::translation(), driver)
+}
+
+fn fingerprint_for(translation: &[u8; 32], driver: Option<i64>) -> String {
     let mut h = blake3::Hasher::new();
-    h.update(&crate::shader_cache::translation());
-    if let Some(host) = crate::host::host() {
-        h.update(&host.driver().to_le_bytes());
+    h.update(translation);
+    if let Some(driver) = driver {
+        h.update(&driver.to_le_bytes());
     }
     h.finalize().to_hex()[..16].to_owned()
 }
@@ -480,5 +488,19 @@ mod tests {
         assert_eq!(walk_shaders(&dir, |stage, hash, at, len| seen.push((stage, hash[0], at, len))), one);
         assert_eq!(seen, [(5, 9, 37, 4)]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fingerprint_changes_when_translation_or_driver_changes() {
+        let cbv0 = [0x11u8; 32];
+        let cbv1 = [0x22u8; 32];
+        let fp0 = fingerprint_for(&cbv0, Some(572_000));
+        let fp1 = fingerprint_for(&cbv1, Some(572_000));
+        let fp0_new_drv = fingerprint_for(&cbv0, Some(572_001));
+        assert_eq!(fp0.len(), 16);
+        assert_eq!(fp1.len(), 16);
+        assert_eq!(fp0, fingerprint_for(&cbv0, Some(572_000)));
+        assert_ne!(fp0, fp1, "distinct shader translation modes must isolate warm fingerprints");
+        assert_ne!(fp0, fp0_new_drv, "driver updates must isolate warm fingerprints");
     }
 }

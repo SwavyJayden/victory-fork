@@ -38,26 +38,13 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     let bad_file = dir.join("warm-bad.txt");
     let keys = known::keys(&dir);
     let listed = std::fs::read_to_string(&done_file).unwrap_or_default();
-    let mut done: HashSet<&str> = HashSet::new();
-    for line in listed.lines() {
-        if let Some((of, key)) = line.split_once(' ')
-            && of == fingerprint
-        {
-            done.insert(key);
-        }
-    }
-    let bad = std::fs::read_to_string(&bad_file).unwrap_or_default();
-    let bad: HashSet<&str> = bad.lines().filter_map(|l| l.split(' ').next()).collect();
+    let done = parse_done(&listed, &fingerprint);
+    let bad_text = std::fs::read_to_string(&bad_file).unwrap_or_default();
+    let bad = parse_bad(&bad_text, &fingerprint);
     let early = std::fs::read_to_string(dir.join("early-pipelines.txt")).unwrap_or_default();
-    let early: HashSet<&str> = early.lines().collect();
+    let early: HashSet<&str> = early.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
     // Those earlier runs drew with first, the others in no order (by key).
-    let mut all: Vec<usize> = (0..keys.len())
-        .filter(|&n| {
-            let key = keys[n].as_str();
-            (again || !done.contains(key)) && !bad.contains(key) && (!used || early.contains(key))
-        })
-        .collect();
-    all.sort_by_key(|&n| (!early.contains(keys[n].as_str()), &keys[n]));
+    let mut all = select_pipelines(&keys, &done, &bad, &early, again, used);
     all.truncate(limit.unwrap_or(usize::MAX));
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
     let jobs = jobs.unwrap_or(cores * 2 / 3).max(1);
@@ -73,7 +60,13 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     let state = Mutex::new((Vec::<f64>::new(), 0usize, 0usize));
     let done_out = Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(&done_file)?);
     // (Read back by the runs: these are made beside the others, not before.)
-    let slow_out = Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(dir.join("slow-pipelines.txt"))?);
+    let slow_path = dir.join("slow-pipelines.txt");
+    let slow_needs_nl = std::fs::read(&slow_path).ok().is_some_and(|b| !b.is_empty() && !b.ends_with(b"\n"));
+    let mut slow_file = std::fs::OpenOptions::new().create(true).append(true).open(&slow_path)?;
+    if slow_needs_nl {
+        let _ = writeln!(slow_file);
+    }
+    let slow_out = Mutex::new(slow_file);
     let bad_out = Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(&bad_file)?);
     std::thread::scope(|s| {
         for _ in 0..jobs.min(chunks.len()) {
@@ -83,7 +76,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
                     while !rest.is_empty() {
                         let (made, ended) = child(rest, |n, ms, there| {
                             if ms >= SLOW_MS {
-                                let _ = writeln!(lock(&slow_out), "\n{} {ms:.0}", keys[n]);
+                                let _ = writeln!(lock(&slow_out), "{} {ms:.0}", keys[n]);
                             }
                             let mut state = lock(&state);
                             state.0.push(ms);
@@ -100,7 +93,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
                             (Some(why), Some((&n, after))) => {
                                 // The one it was at.
                                 println!("pipeline {n} {}: {why}", keys[n]);
-                                let _ = writeln!(lock(&bad_out), "{} {why}", keys[n]);
+                                let _ = writeln!(lock(&bad_out), "{fingerprint} {} {why}", keys[n]);
                                 lock(&state).2 += 1;
                                 rest = after;
                             }
@@ -129,6 +122,58 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Parses `warm-done.txt` (`<fingerprint> <key>`), returning only keys warmed
+/// under `fingerprint`.
+fn parse_done<'a>(listed: &'a str, fingerprint: &str) -> HashSet<&'a str> {
+    let mut done = HashSet::new();
+    for line in listed.lines() {
+        if let Some((of, key)) = line.split_once(' ')
+            && of == fingerprint
+            && let Some(key) = key.split_whitespace().next()
+        {
+            done.insert(key);
+        }
+    }
+    done
+}
+
+/// Parses `warm-bad.txt` (`<fingerprint> <key> <why>`), returning only keys
+/// that failed under `fingerprint` so a failure in one translation mode
+/// (e.g. `VICTORY_VRAM_CBV=0` vs `=1`) never suppresses warming in another.
+fn parse_bad<'a>(listed: &'a str, fingerprint: &str) -> HashSet<&'a str> {
+    let mut bad = HashSet::new();
+    for line in listed.lines() {
+        if let Some((of, rest)) = line.split_once(' ')
+            && of == fingerprint
+            && let Some(key) = rest.split_whitespace().next()
+        {
+            bad.insert(key);
+        }
+    }
+    bad
+}
+
+/// Picks pipeline indices to warm: skips keys already in `done` (unless
+/// `again`) or `bad`, restricts to `early` when `used` is set, and sorts
+/// `early` pipelines ahead of the rest by key.
+fn select_pipelines(
+    keys: &[String],
+    done: &HashSet<&str>,
+    bad: &HashSet<&str>,
+    early: &HashSet<&str>,
+    again: bool,
+    used: bool,
+) -> Vec<usize> {
+    let mut all: Vec<usize> = (0..keys.len())
+        .filter(|&n| {
+            let key = keys[n].as_str();
+            (again || !done.contains(key)) && !bad.contains(key) && (!used || early.contains(key))
+        })
+        .collect();
+    all.sort_by_key(|&n| (!early.contains(keys[n].as_str()), &keys[n]));
+    all
 }
 
 /// Has a process make `these`; how many it made, and how it ended if not well.
@@ -207,4 +252,89 @@ fn make(dir: &Path, these: &str) -> Result<()> {
     // Without what a run's end does (nothing to save, the host's threads).
     let _ = out.flush();
     std::process::exit(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn done_and_bad_lists_are_isolated_by_fingerprint() {
+        let done_text = "\
+0123456789abcdef aaaa1111aaaa1111aaaa1111aaaa1111
+fedcba9876543210 bbbb2222bbbb2222bbbb2222bbbb2222
+";
+        let bad_text = "\
+legacyunfingerprintedkey exit code: 1
+0123456789abcdef cccc3333cccc3333cccc3333cccc3333 hung for 180 s
+fedcba9876543210 dddd4444dddd4444dddd4444dddd4444 exit code: 1
+";
+        let fp_cbv0 = "0123456789abcdef";
+        let fp_cbv1 = "fedcba9876543210";
+
+        let done0 = parse_done(done_text, fp_cbv0);
+        let done1 = parse_done(done_text, fp_cbv1);
+        assert!(done0.contains("aaaa1111aaaa1111aaaa1111aaaa1111"));
+        assert!(!done0.contains("bbbb2222bbbb2222bbbb2222bbbb2222"));
+        assert!(done1.contains("bbbb2222bbbb2222bbbb2222bbbb2222"));
+        assert!(!done1.contains("aaaa1111aaaa1111aaaa1111aaaa1111"));
+
+        let bad0 = parse_bad(bad_text, fp_cbv0);
+        let bad1 = parse_bad(bad_text, fp_cbv1);
+        assert!(bad0.contains("cccc3333cccc3333cccc3333cccc3333"));
+        assert!(!bad0.contains("dddd4444dddd4444dddd4444dddd4444"));
+        assert!(!bad0.contains("legacyunfingerprintedkey"));
+        assert!(bad1.contains("dddd4444dddd4444dddd4444dddd4444"));
+        assert!(!bad1.contains("cccc3333cccc3333cccc3333cccc3333"));
+        assert!(!bad1.contains("legacyunfingerprintedkey"));
+    }
+
+    #[test]
+    fn select_pipelines_respects_used_again_and_fingerprint_isolation() {
+        let keys = vec![
+            "k_unused".to_owned(),
+            "k_early_done0".to_owned(),
+            "k_early_bad0".to_owned(),
+            "k_early_fresh".to_owned(),
+        ];
+        let early: HashSet<&str> = ["k_early_done0", "k_early_bad0", "k_early_fresh"]
+            .into_iter()
+            .collect();
+        let done_text = "fp0 k_early_done0\n";
+        let bad_text = "fp0 k_early_bad0 hung\n";
+
+        // Under fp0 with --used: skips done0 and bad0, picks only k_early_fresh.
+        let got0 = select_pipelines(
+            &keys,
+            &parse_done(done_text, "fp0"),
+            &parse_bad(bad_text, "fp0"),
+            &early,
+            false,
+            true,
+        );
+        assert_eq!(got0, vec![3]);
+
+        // Under fp0 with --used --again: retries done0, still skips bad0.
+        let got0_again = select_pipelines(
+            &keys,
+            &parse_done(done_text, "fp0"),
+            &parse_bad(bad_text, "fp0"),
+            &early,
+            true,
+            true,
+        );
+        assert_eq!(got0_again, vec![1, 3]);
+
+        // Under fp1 (e.g. VICTORY_VRAM_CBV=1) with --used: fp0's done/bad entries
+        // do NOT suppress warming any of the 3 early pipelines.
+        let got1 = select_pipelines(
+            &keys,
+            &parse_done(done_text, "fp1"),
+            &parse_bad(bad_text, "fp1"),
+            &early,
+            false,
+            true,
+        );
+        assert_eq!(got1, vec![2, 1, 3]);
+    }
 }

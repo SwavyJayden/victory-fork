@@ -24,6 +24,152 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 const NULL_KIND_LIVE: u8 = u8::MAX;
 /// [`NullCache`] slot index for the default null texture view (`TEXTURE2D`).
 const NULL_KIND_VIEW: u8 = (NullCache::SRV_TEX_BASE + 2) as u8;
+/// [`NullCache`] slot index for the null raw buffer SRV (`R32_TYPELESS`, RAW).
+const NULL_KIND_BUFFER: u8 = NullCache::SRV_BUFFER as u8;
+
+/// Whether constant buffers are bound as raw `ByteAddressBuffer` (`R32_TYPELESS`)
+/// SRVs pointing directly into GDDR7 VRAM (`shadow.buffer`) when 16-byte aligned
+/// and shadow-backed (`VICTORY_VRAM_CBV=1`; default off).
+#[inline]
+pub(crate) fn vram_cbv() -> bool {
+    victory_shader::emit::vram_cbv()
+}
+
+/// Telemetry counters for `VICTORY_VRAM_CBV=1`:
+/// `[0]` direct table hits, `[1]` direct bytes, `[2]` unbacked fallbacks,
+/// `[3]` unaligned/OOB fallbacks, `[4]` title-heap direct views.
+static VRAM_CBV_STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+static VRAM_CBV_LOG_MS: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+pub(crate) fn vram_cbv_note_direct(bytes: u64) {
+    VRAM_CBV_STATS[0].fetch_add(1, Ordering::Relaxed);
+    VRAM_CBV_STATS[1].fetch_add(bytes, Ordering::Relaxed);
+}
+
+#[inline]
+pub(crate) fn vram_cbv_note_fallback(unbacked: bool) {
+    VRAM_CBV_STATS[if unbacked { 2 } else { 3 }].fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+fn vram_cbv_note_title() {
+    VRAM_CBV_STATS[4].fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn vram_cbv_stats() -> [u64; 5] {
+    VRAM_CBV_STATS.each_ref().map(|c| c.load(Ordering::Relaxed))
+}
+
+/// Periodically logs `VICTORY_VRAM_CBV=1` direct VRAM hit vs scratch fallback
+/// stats (at most every 5 s; no-op when off).
+pub(crate) fn vram_cbv_maybe_log(frame: u64) {
+    if !vram_cbv() {
+        return;
+    }
+    let now = crate::host::now_ms().max(1);
+    let next = VRAM_CBV_LOG_MS.load(Ordering::Relaxed);
+    if now < next {
+        return;
+    }
+    if VRAM_CBV_LOG_MS
+        .compare_exchange(next, now + 5000, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    let direct = VRAM_CBV_STATS[0].load(Ordering::Relaxed);
+    let bytes = VRAM_CBV_STATS[1].load(Ordering::Relaxed);
+    let unbacked = VRAM_CBV_STATS[2].load(Ordering::Relaxed);
+    let unaligned = VRAM_CBV_STATS[3].load(Ordering::Relaxed);
+    let title = VRAM_CBV_STATS[4].load(Ordering::Relaxed);
+    if direct + unbacked + unaligned + title == 0 {
+        return;
+    }
+    let total = direct + unbacked + unaligned;
+    let pct = if total > 0 {
+        direct as f64 * 100.0 / total as f64
+    } else {
+        0.0
+    };
+    tracing::info!(
+        frame,
+        direct,
+        direct_mb = bytes >> 20,
+        fallback_unbacked = unbacked,
+        fallback_align_or_oob = unaligned,
+        hit_pct = format_args!("{pct:.1}%"),
+        title_heap_cbvs = title,
+        "VRAM CBV stats (VICTORY_VRAM_CBV=1)"
+    );
+}
+
+/// Builds a D3D12 raw `ByteAddressBuffer` SRV descriptor for a constant buffer
+/// slice at 16-byte-aligned `offset` with `bytes` whole dwords (`>= 4`).
+#[inline]
+fn raw_cbv_srv_desc(offset: u64, bytes: u64) -> Option<D3D12_SHADER_RESOURCE_VIEW_DESC> {
+    if !offset.is_multiple_of(16) || bytes < 4 || !bytes.is_multiple_of(4) {
+        return None;
+    }
+    let elements = u32::try_from(bytes / 4).ok()?;
+    Some(D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_TYPELESS,
+        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_SRV {
+                FirstElement: offset / 4,
+                NumElements: elements,
+                StructureByteStride: 0,
+                Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+            },
+        },
+    })
+}
+
+/// Resolves direct GDDR7 VRAM backing for constant buffer `(address, size)`.
+/// Returns `Ok((shadow, address, bytes))` when shadow-backed at a 16-byte-aligned
+/// offset with `bytes >= 4` (clamped to 64 KiB and the shadow's remaining length),
+/// or `Err(true)` when unbacked and `Err(false)` when unaligned/out-of-bounds.
+pub(crate) fn constant_vram_lookup(
+    address: u64,
+    size: u32,
+) -> Result<(std::sync::Arc<crate::shadow::Shadow>, u64, u64), bool> {
+    const LARGEST: u32 = 64 << 10;
+    if size == 0 {
+        return Err(false);
+    }
+    let req = u64::from(size.min(LARGEST).next_multiple_of(4));
+    let Some(shadow) = crate::shadow::find(address, req)
+        .or_else(|| crate::shadow::find(address, 1))
+    else {
+        return Err(true);
+    };
+    let Some(offset) = shadow.offset_in(address) else {
+        return Err(false);
+    };
+    let width = shadow.width();
+    if offset >= width || !offset.is_multiple_of(16) {
+        return Err(false);
+    }
+    let avail = shadow.left(address).min(width - offset);
+    let bytes = req.min(avail) & !3;
+    if bytes == 0 {
+        return Err(false);
+    }
+    Ok((shadow, address, bytes))
+}
+
+/// Direct GDDR7 VRAM backing for a constant buffer view `(address, size)` when
+/// `VICTORY_VRAM_CBV=1`.
+#[inline]
+pub(crate) fn constant_vram_copy(
+    address: u64,
+    size: u32,
+) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
+    constant_vram_lookup(address, size).ok()
+}
 
 /// A set of a heap's slots, a bit for each: no lock (a pass that went through
 /// a set of 70,000 under its lock kept everyone who writes slots waiting for
@@ -3402,7 +3548,8 @@ impl HostHeap {
         let (stride, kind) = view_stride_and_kind(view);
         self.write_stride(index, stride.unwrap_or(0) | kind);
         self.write_address(index, view_address(view).unwrap_or(0));
-        let was = if stride.is_some() {
+        let tracked = stride.is_some() || (vram_cbv() && matches!(view, View::Constant(..)));
+        let was = if tracked {
             self.buffers.put(index);
             true
         } else {
@@ -3647,6 +3794,112 @@ impl HostHeap {
         Some(made)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn make_listed_constant_in<'v>(
+        &self,
+        views: &'v mut ListViews,
+        words: [u32; 3],
+        address: u64,
+        size: u32,
+        index: u32,
+        batch: &mut CopyBatch,
+        retired: Option<&mut Vec<ID3D12Resource>>,
+    ) -> ListedConstant<'v> {
+        let has_twins = self.raw != 0;
+        let step = if has_twins { 2 } else { 1 };
+        let twins = has_twins && self.twins.get(index as usize).is_some();
+        let (start, slot_step) = (views.start, views.step);
+        let slot_at = |i: u32| D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: start + i as usize * slot_step,
+        };
+        let next_at = step * views.made.len() as u32;
+        let made = match views.made.entry(words) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let at = next_at;
+                if at + step > ListViews::SLOTS {
+                    return ListedConstant::Full;
+                }
+                let (shadow, addr, bytes) = match constant_vram_lookup(address, size) {
+                    Ok(found) => found,
+                    Err(unbacked) => return ListedConstant::Fallback(unbacked),
+                };
+                let offset = shadow.offset(addr);
+                let Some(raw) = raw_cbv_srv_desc(offset, bytes) else {
+                    return ListedConstant::Fallback(false);
+                };
+                let Some(host) = host() else {
+                    return ListedConstant::Fallback(true);
+                };
+                if has_twins {
+                    let gpu = shadow.gpu(addr);
+                    let cbv = if gpu.is_multiple_of(256) {
+                        D3D12_CONSTANT_BUFFER_VIEW_DESC {
+                            BufferLocation: gpu,
+                            SizeInBytes: constant_bytes(size),
+                        }
+                    } else {
+                        D3D12_CONSTANT_BUFFER_VIEW_DESC::default()
+                    };
+                    // SAFETY: slots in this thread's CPU-only `ListViews` heap; live shadow buffer.
+                    unsafe {
+                        host.device.CreateConstantBufferView(Some(&cbv), slot_at(at));
+                        host.device.CreateShaderResourceView(
+                            &shadow.buffer,
+                            Some(&raw),
+                            slot_at(at + 1),
+                        );
+                    }
+                } else {
+                    // SAFETY: slot in this thread's CPU-only `ListViews` heap; live shadow buffer.
+                    unsafe {
+                        host.device
+                            .CreateShaderResourceView(&shadow.buffer, Some(&raw), slot_at(at));
+                    }
+                }
+                let kept = Some(shadow.buffer.clone());
+                entry.insert(ListView {
+                    view: View::Constant(address, size),
+                    buffer: Some((shadow, addr, bytes)),
+                    at,
+                    twin: has_twins,
+                    stride_word: 0,
+                    address: 0,
+                    kept,
+                    listed: Listed {
+                        kind: Some(victory_shader::native::ResourceType::Cbv),
+                        texture: false,
+                        ready: (0, 0, false),
+                        tabled: None,
+                    },
+                })
+            }
+        };
+        let Some(buffer) = made.buffer.as_ref() else {
+            return ListedConstant::Fallback(true);
+        };
+        #[cfg(feature = "diagnostics")]
+        if let Some(written) = self.written.get(index as usize) {
+            written.store(crate::host::coarse_ms() as u32, Ordering::Relaxed);
+        }
+        self.set_null_kind(index, NULL_KIND_LIVE);
+        batch.push(self.cpu(index), slot_at(made.at));
+        if made.twin && twins {
+            #[cfg(feature = "diagnostics")]
+            if let Some(written) = self.written.get((self.raw + index) as usize) {
+                written.store(crate::host::coarse_ms() as u32, Ordering::Relaxed);
+            }
+            batch.push(self.cpu(self.raw + index), slot_at(made.at + 1));
+            self.twins[index as usize].store(true, Ordering::Relaxed);
+        } else if has_twins {
+            self.clear_twin_batched(index, batch);
+        }
+        self.write_stride(index, 0);
+        self.write_address(index, 0);
+        self.keep_ref(index, made.kept.as_ref(), retired);
+        ListedConstant::Hit(buffer, &mut made.listed)
+    }
+
     /// As [`HostHeap::copy_to`], from the slot `from`, which the card does not
     /// see.
     #[allow(dead_code)]
@@ -3739,6 +3992,53 @@ impl HostHeap {
             }
         } else {
             null_view(self.at(index));
+            self.put(index);
+        }
+        self.write_stride(index, 0);
+        self.write_address(index, 0);
+        self.clear_twin_batched(index, batch);
+        self.keep_ref(index, None, Some(retired));
+    }
+
+    /// As [`HostHeap::make_null_batched`], writing a typed null raw buffer SRV
+    /// (`NullCache::SRV_BUFFER` / `R32_TYPELESS`, RAW) for `VICTORY_VRAM_CBV=1`
+    /// constant-buffer slots that have no valid backing.
+    pub(crate) fn make_null_buffer_batched(
+        &self,
+        index: u32,
+        batch: &mut CopyBatch,
+        retired: &mut Vec<ID3D12Resource>,
+    ) {
+        if self.sampler {
+            self.null_sampler(index);
+            self.clear_twin_batched(index, batch);
+            self.keep_ref(index, None, Some(retired));
+            return;
+        }
+        if let Some((kind, src)) = null_buffer_slot() {
+            let same_null = self.is_same_null(index, kind);
+            let kept_empty = self
+                .kept_slot(index)
+                .is_none_or(|k| self.kept_raw[k].load(Ordering::Relaxed) == 0);
+            let has_twin = self
+                .twins
+                .get(index as usize)
+                .is_some_and(|made| made.load(Ordering::Relaxed));
+            if same_null && kept_empty && !has_twin {
+                self.write_stride(index, 0);
+                self.write_address(index, 0);
+                return;
+            }
+            if !same_null {
+                #[cfg(feature = "diagnostics")]
+                if let Some(written) = self.written.get(index as usize) {
+                    written.store(crate::host::coarse_ms() as u32, Ordering::Relaxed);
+                }
+                batch.push(self.cpu(index), src);
+                self.set_null_kind(index, kind);
+            }
+        } else {
+            null_buffer_view(self.at(index));
             self.put(index);
         }
         self.write_stride(index, 0);
@@ -4045,6 +4345,62 @@ impl HostHeap {
     ) {
         let holds = slot_holds();
         let Some(host) = host() else { return };
+        if vram_cbv() {
+            // SAFETY: a live buffer belonging to the caller.
+            let (base, width) = unsafe { (buffer.GetGPUVirtualAddress(), buffer.GetDesc().Width) };
+            let offset = gpu.saturating_sub(base);
+            let req = u64::from(size.min(64 << 10).next_multiple_of(4));
+            let bytes = if gpu >= base && offset < width {
+                req.min(width - offset) & !3
+            } else {
+                0
+            };
+            let raw = raw_cbv_srv_desc(offset, bytes);
+            if self.raw == 0 {
+                if let Some(raw) = raw {
+                    // SAFETY: a slot of our heap and a live buffer covering the range.
+                    unsafe {
+                        host.device
+                            .CreateShaderResourceView(buffer, Some(&raw), self.at(index))
+                    };
+                } else {
+                    null_buffer_view(self.at(index));
+                }
+                self.put(index);
+                self.twin_made(index, false);
+                self.write_stride(index, 0);
+                self.write_address(index, 0);
+                self.keep_ref(index, (holds && raw.is_some()).then_some(buffer), retired);
+                return;
+            }
+            let cbv = if gpu.is_multiple_of(256) {
+                D3D12_CONSTANT_BUFFER_VIEW_DESC {
+                    BufferLocation: gpu,
+                    SizeInBytes: constant_bytes(size),
+                }
+            } else {
+                D3D12_CONSTANT_BUFFER_VIEW_DESC::default()
+            };
+            // SAFETY: a slot of our heap; the memory is the caller's.
+            unsafe {
+                host.device
+                    .CreateConstantBufferView(Some(&cbv), self.at(index))
+            };
+            self.put(index);
+            let twin = self.twin(index).filter(|_| raw.is_some());
+            if let (Some(twin), Some(raw)) = (twin, raw) {
+                // SAFETY: a live buffer covering the range and a slot of our heaps.
+                unsafe {
+                    host.device
+                        .CreateShaderResourceView(buffer, Some(&raw), twin)
+                };
+            }
+            self.twin_made(index, twin.is_some());
+            self.write_stride(index, 0);
+            self.write_address(index, 0);
+            self.keep_ref(index, (holds && raw.is_some()).then_some(buffer), retired);
+            return;
+        }
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
             SizeInBytes: constant_bytes(size),
@@ -4082,6 +4438,106 @@ impl HostHeap {
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
         self.keep_ref(index, holds.then_some(buffer), retired);
+    }
+
+    /// Writes a direct GDDR7 VRAM raw `ByteAddressBuffer` SRV for a constant
+    /// buffer into dynamic slot `index` (used when `ListViews` is off or full).
+    #[allow(clippy::too_many_arguments)]
+    fn constant_raw_at_inner(
+        &self,
+        index: u32,
+        buffer: &ID3D12Resource,
+        offset: u64,
+        bytes: u64,
+        size: u32,
+        retired: Option<&mut Vec<ID3D12Resource>>,
+    ) {
+        let Some(host) = host() else { return };
+        let Some(raw) = raw_cbv_srv_desc(offset, bytes) else {
+            null_buffer_view(self.at(index));
+            self.put(index);
+            self.clear_twin(index);
+            self.write_stride(index, 0);
+            self.write_address(index, 0);
+            self.keep_ref(index, None, retired);
+            return;
+        };
+        if self.raw == 0 {
+            // SAFETY: a slot of our heap and a live shadow buffer covering the range.
+            unsafe {
+                host.device
+                    .CreateShaderResourceView(buffer, Some(&raw), self.at(index))
+            };
+            self.put(index);
+            self.twin_made(index, false);
+        } else {
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() } + offset;
+            let cbv = if gpu.is_multiple_of(256) {
+                D3D12_CONSTANT_BUFFER_VIEW_DESC {
+                    BufferLocation: gpu,
+                    SizeInBytes: constant_bytes(size),
+                }
+            } else {
+                D3D12_CONSTANT_BUFFER_VIEW_DESC::default()
+            };
+            // SAFETY: slots of our heap and a live shadow buffer.
+            unsafe {
+                host.device
+                    .CreateConstantBufferView(Some(&cbv), self.at(index))
+            };
+            self.put(index);
+            let twin = self.twin(index);
+            if let Some(twin) = twin {
+                // SAFETY: a live buffer covering the range and a slot of our heaps.
+                unsafe {
+                    host.device
+                        .CreateShaderResourceView(buffer, Some(&raw), twin)
+                };
+            }
+            self.twin_made(index, twin.is_some());
+        }
+        self.write_stride(index, 0);
+        self.write_address(index, 0);
+        self.keep_ref(index, Some(buffer), retired);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn constant_raw_at_staged(
+        &self,
+        stage: &mut CbvStage,
+        index: u32,
+        buffer: &ID3D12Resource,
+        offset: u64,
+        bytes: u64,
+        batch: &mut CopyBatch,
+        retired: &mut Vec<ID3D12Resource>,
+    ) {
+        let Some(host) = host() else { return };
+        let Some(raw) = raw_cbv_srv_desc(offset, bytes) else {
+            self.make_null_buffer_batched(index, batch, retired);
+            return;
+        };
+        if batch.is_full() || stage.next >= CbvStage::SLOTS {
+            batch.flush();
+            stage.next = 0;
+        }
+        let stage_cpu = stage.slot(stage.next);
+        stage.next += 1;
+        // SAFETY: valid slot in this thread's CPU-only `CbvStage` heap; live shadow buffer.
+        unsafe {
+            host.device
+                .CreateShaderResourceView(buffer, Some(&raw), stage_cpu)
+        };
+        #[cfg(feature = "diagnostics")]
+        if let Some(written) = self.written.get(index as usize) {
+            written.store(crate::host::coarse_ms() as u32, Ordering::Relaxed);
+        }
+        self.set_null_kind(index, NULL_KIND_LIVE);
+        batch.push(self.cpu(index), stage_cpu);
+        self.write_stride(index, 0);
+        self.write_address(index, 0);
+        self.keep_ref(index, Some(buffer), Some(retired));
     }
 
     /// Whether this heap keeps raw buffer twins past the view limit (`raw != 0`).
@@ -4141,12 +4597,36 @@ impl HostHeap {
         }
         let stage_cpu = stage.slot(stage.next);
         stage.next += 1;
-        let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
-            BufferLocation: gpu,
-            SizeInBytes: constant_bytes(size),
+        let keep_buf = if vram_cbv() {
+            // SAFETY: a live buffer belonging to the caller.
+            let (base, width) = unsafe { (buffer.GetGPUVirtualAddress(), buffer.GetDesc().Width) };
+            let offset = gpu.saturating_sub(base);
+            let req = u64::from(size.min(64 << 10).next_multiple_of(4));
+            let bytes = if gpu >= base && offset < width {
+                req.min(width - offset) & !3
+            } else {
+                0
+            };
+            if let Some(raw) = raw_cbv_srv_desc(offset, bytes) {
+                // SAFETY: valid slot in this thread's CPU-only `CbvStage` heap; live buffer.
+                unsafe {
+                    host.device
+                        .CreateShaderResourceView(buffer, Some(&raw), stage_cpu)
+                };
+                true
+            } else {
+                null_buffer_view(stage_cpu);
+                false
+            }
+        } else {
+            let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
+                BufferLocation: gpu,
+                SizeInBytes: constant_bytes(size),
+            };
+            // SAFETY: valid slot in this thread's CPU-only `CbvStage` heap; memory is the caller's.
+            unsafe { host.device.CreateConstantBufferView(Some(&desc), stage_cpu) };
+            true
         };
-        // SAFETY: valid slot in this thread's CPU-only `CbvStage` heap; memory is the caller's.
-        unsafe { host.device.CreateConstantBufferView(Some(&desc), stage_cpu) };
         #[cfg(feature = "diagnostics")]
         if let Some(written) = self.written.get(index as usize) {
             written.store(crate::host::coarse_ms() as u32, Ordering::Relaxed);
@@ -4155,7 +4635,11 @@ impl HostHeap {
         batch.push(self.cpu(index), stage_cpu);
         self.write_stride(index, 0);
         self.write_address(index, 0);
-        self.keep_ref(index, slot_holds().then_some(buffer), Some(retired));
+        self.keep_ref(
+            index,
+            (slot_holds() && keep_buf).then_some(buffer),
+            Some(retired),
+        );
     }
 
     /// Where a descriptor for slot `index` is made, then [`HostHeap::put`]:
@@ -4795,6 +5279,11 @@ fn view_extent() -> bool {
 /// buffer object. The slot then showed a copy nothing brought up to date,
 /// and what shaders wrote through it was looked for in the other copy.
 pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
+    if vram_cbv()
+        && let &View::Constant(address, size) = view
+    {
+        return constant_vram_copy(address, size);
+    }
     let (address, len) = buffer_range(view)?;
     if len == 0 {
         return None;
@@ -5339,6 +5828,34 @@ fn make_twinned(
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
+            if vram_cbv() {
+                let (shadow, addr, bytes) = constant_vram_copy(address, size)?;
+                let offset = shadow.offset(addr);
+                let raw = raw_cbv_srv_desc(offset, bytes)?;
+                if let Some(twin) = twin {
+                    let gpu = shadow.gpu(addr);
+                    let cbv = if gpu.is_multiple_of(256) {
+                        D3D12_CONSTANT_BUFFER_VIEW_DESC {
+                            BufferLocation: gpu,
+                            SizeInBytes: constant_bytes(size),
+                        }
+                    } else {
+                        D3D12_CONSTANT_BUFFER_VIEW_DESC::default()
+                    };
+                    // SAFETY: slots of our heap; the range lies in the host copy.
+                    unsafe {
+                        device.CreateConstantBufferView(Some(&cbv), at);
+                        device.CreateShaderResourceView(&shadow.buffer, Some(&raw), twin);
+                    }
+                } else {
+                    // SAFETY: a slot of our heap and a live buffer covering the range.
+                    unsafe {
+                        device.CreateShaderResourceView(&shadow.buffer, Some(&raw), at);
+                    }
+                }
+                vram_cbv_note_title();
+                return Some(Some(shadow.buffer.clone()));
+            }
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
             if gpu % 256 != 0 {
@@ -6119,6 +6636,11 @@ fn null_view_handle() -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
 }
 
 #[inline]
+fn null_buffer_slot() -> Option<(u8, D3D12_CPU_DESCRIPTOR_HANDLE)> {
+    Some((NULL_KIND_BUFFER, NullCache::get()?.slot(NullCache::SRV_BUFFER)))
+}
+
+#[inline]
 fn null_buffer_handle() -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
     Some(NullCache::get()?.slot(NullCache::SRV_BUFFER))
 }
@@ -6164,7 +6686,13 @@ fn null_slot_for(view: &View) -> Option<(u8, D3D12_CPU_DESCRIPTOR_HANDLE)> {
         View::Placed(false, resource, _) if resource[0] == 1 => NullCache::SRV_BUFFER,
         View::Shader(_, Some(desc)) => tex_slot(desc[1]),
         View::Placed(false, _, desc) => tex_slot(desc[1]),
-        View::Constant(..) => NullCache::CBV,
+        View::Constant(..) => {
+            if vram_cbv() && victory_shader::emit::raw_views() == 0 {
+                NullCache::SRV_BUFFER
+            } else {
+                NullCache::CBV
+            }
+        }
         _ => NullCache::SRV_TEX_BASE + 2,
     };
     Some((slot as u8, cache.slot(slot)))
@@ -6202,6 +6730,9 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
             return null_like(desc[..10].try_into().unwrap_or(&[0; 10]), at);
         }
         View::Constant(..) => {
+            if vram_cbv() && victory_shader::emit::raw_views() == 0 {
+                return null_buffer_view(at);
+            }
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
             // SAFETY: a slot of our heap; a zero location makes a null view.
             return unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
@@ -7703,6 +8234,140 @@ mod tests {
         // SAFETY: plain device health query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
+
+    #[test]
+    fn vram_cbv_descriptors_and_nulls_work_for_both_modes() {
+        let (Some(host), Some(heap)) = (host(), HostHeap::new(false, 16)) else {
+            return; // no host GPU
+        };
+        let memory = vec![0u64; 1 << 11];
+        let base = (memory.as_ptr() as u64).next_multiple_of(4096);
+        let addr_256 = base;
+        let addr_16 = base + 16;
+        let addr_4 = base + 4;
+
+        let mut slot_256 = [0u32; 8];
+        let mut slot_16 = [0u32; 8];
+        let mut slot_4 = [0u32; 8];
+        crate::descriptor::record(slot_256.as_mut_ptr() as u64, View::Constant(addr_256, 256));
+        crate::descriptor::record(slot_16.as_mut_ptr() as u64, View::Constant(addr_16, 64));
+        crate::descriptor::record(slot_4.as_mut_ptr() as u64, View::Constant(addr_4, 64));
+        let rec_256 = [slot_256[0], slot_256[1], slot_256[2]];
+        let rec_16 = [slot_16[0], slot_16[1], slot_16[2]];
+        let rec_4 = [slot_4[0], slot_4[1], slot_4[2]];
+        let handle_256 = slot_256.as_ptr() as u64;
+        let handle_16 = slot_16.as_ptr() as u64;
+
+        let mut retired = Vec::new();
+        let read_stride = |index: u32| -> u32 {
+            let (_, _, ptr) = heap.strides.as_ref().unwrap();
+            // SAFETY: valid test heap slot within `SLOT_STRIDES_COUNT`.
+            unsafe { (*ptr as *const u32).add(index as usize).read_volatile() }
+        };
+
+        // 1. Classic mode (`VICTORY_VRAM_CBV=0`): 16B-aligned CBV is rejected in title heap,
+        //    null kind is CBV, and `buffer_copy` returns None for `View::Constant`.
+        victory_shader::emit::with_vram_cbv(false, || {
+            assert_eq!(
+                null_slot_for(&View::Constant(addr_16, 64)).map(|(k, _)| k),
+                Some(NullCache::CBV as u8)
+            );
+            assert!(buffer_copy(&View::Constant(addr_16, 64)).is_none());
+            assert!(heap.mirror_record_into(0, handle_16, rec_16, true, Some(&mut retired)).is_some());
+            assert_eq!(heap.kept_raw_at(0), 0, "16B-aligned CBV cannot bind as 256B CBV");
+            assert!(!heap.buffers.has(0));
+            assert!(heap.mirror_record_into(1, handle_256, rec_256, true, Some(&mut retired)).is_some());
+            assert_ne!(heap.kept_raw_at(1), 0, "256B-aligned CBV binds in title heap");
+            assert!(!heap.buffers.has(1));
+        });
+
+        // 2. GDDR7 VRAM CBV mode (`VICTORY_VRAM_CBV=1`): accepts 16B alignment, rejects 4B/zero,
+        //    tracks title-heap CBVs in `buffers` with `SLOT_STRIDES == 0`, uses raw null SRV on
+        //    `raw_views == 0`, and caches/reuses direct VRAM raw SRVs in `TableCache`.
+        let dyn_slot = heap.dynamic(4).unwrap();
+        let mut batch = CopyBatch::new();
+        victory_shader::emit::with_vram_cbv(true, || {
+            let expected_null = if victory_shader::emit::raw_views() == 0 {
+                NullCache::SRV_BUFFER as u8
+            } else {
+                NullCache::CBV as u8
+            };
+            assert_eq!(
+                null_slot_for(&View::Constant(addr_16, 64)).map(|(k, _)| k),
+                Some(expected_null)
+            );
+            let (shadow, a, bytes) = constant_vram_lookup(addr_16, 64).expect("16B-aligned CBV hits shadow");
+            assert_eq!((a, bytes), (addr_16, 64));
+            assert_eq!(constant_vram_lookup(addr_4, 64).err(), Some(false));
+            assert_eq!(constant_vram_lookup(addr_16, 0).err(), Some(false));
+            let (_, bc_addr, bc_bytes) = buffer_copy(&View::Constant(addr_16, 64)).expect("buffer_copy handles VRAM CBV");
+            assert_eq!((bc_addr, bc_bytes), (addr_16, 64));
+
+            assert!(heap.mirror_record_into(2, handle_16, rec_16, true, Some(&mut retired)).is_some());
+            assert_ne!(heap.kept_raw_at(2), 0, "16B-aligned CBV binds directly into title heap");
+            assert!(heap.buffers.has(2), "bindless VRAM CBV is tracked for heap_buffer_pass");
+            assert_eq!(read_stride(2), 0, "SLOT_STRIDES must stay 0 for CBVs");
+
+            with_table_cache(0x7777, true, !heap.has_raw_twins(), |cache| {
+                match cache.make_listed_constant(&heap, rec_16, addr_16, 64, dyn_slot, &mut batch, &mut retired) {
+                    ListedConstant::Hit((_, ha, hb), listed) => {
+                        assert_eq!((*ha, *hb), (addr_16, 64));
+                        assert_eq!(listed.ready.0, 0);
+                        listed.ready.0 = 42;
+                    }
+                    _ => panic!("expected ListedConstant::Hit on first insert"),
+                }
+                match cache.make_listed_constant(&heap, rec_16, addr_16, 64, dyn_slot + 1, &mut batch, &mut retired) {
+                    ListedConstant::Hit((_, ha, hb), listed) => {
+                        assert_eq!((*ha, *hb), (addr_16, 64));
+                        assert_eq!(listed.ready.0, 42, "second lookup must hit ListViews cache");
+                    }
+                    _ => panic!("expected ListedConstant::Hit on cache reuse"),
+                }
+                assert!(matches!(
+                    cache.make_listed_constant(&heap, rec_4, addr_4, 64, dyn_slot + 2, &mut batch, &mut retired),
+                    ListedConstant::Fallback(false)
+                ));
+                cache.constant_raw_at(
+                    &heap,
+                    dyn_slot + 2,
+                    &shadow.buffer,
+                    shadow.offset(addr_16),
+                    64,
+                    64,
+                    &mut batch,
+                    &mut retired,
+                );
+                cache.constant_at(
+                    &heap,
+                    dyn_slot + 3,
+                    &shadow.buffer,
+                    shadow.gpu(addr_256),
+                    256,
+                    &mut batch,
+                    &mut retired,
+                );
+            });
+            batch.flush();
+            assert_ne!(heap.kept_raw_at(dyn_slot), 0);
+            assert_ne!(heap.kept_raw_at(dyn_slot + 1), 0);
+            assert_ne!(heap.kept_raw_at(dyn_slot + 2), 0);
+
+            heap.make_null_buffer_batched(dyn_slot + 3, &mut batch, &mut retired);
+            assert_eq!(batch.len, 1);
+            batch.flush();
+            assert_eq!(heap.kept_raw_at(dyn_slot + 3), 0);
+            heap.make_null_buffer_batched(dyn_slot + 3, &mut batch, &mut retired);
+            if sync_null_skip() {
+                assert_eq!(batch.len, 0, "repeat null raw buffer copy must be skipped");
+            }
+        });
+
+        heap.release(heap.id(), dyn_slot, 4);
+        crate::host::retire_resources(retired);
+        // SAFETY: plain device health query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
 }
 
 /// What is known of a record a list's tables hold, in that recording of the
@@ -7731,6 +8396,21 @@ struct ListView {
     address: u64,
     kept: Kept,
     listed: Listed,
+}
+
+/// Result of looking up or inserting a direct-VRAM constant buffer descriptor
+/// in [`ListViews`] (`VICTORY_VRAM_CBV=1`).
+pub(crate) enum ListedConstant<'a> {
+    /// Cached or newly created raw SRV pointing into GDDR7 VRAM (`shadow.buffer`).
+    Hit(
+        &'a (std::sync::Arc<crate::shadow::Shadow>, u64, u64),
+        &'a mut Listed,
+    ),
+    /// `ListViews` is unavailable or full; caller may still bind directly via
+    /// [`TableCache::constant_raw_at`].
+    Full,
+    /// Constant buffer cannot use direct VRAM (`true` = unbacked, `false` = unaligned/OOB).
+    Fallback(bool),
 }
 
 /// Per-table hoisted borrow of this thread's [`ListViews`] and [`CbvStage`]
@@ -7764,6 +8444,29 @@ impl TableCache<'_> {
         Some((&made.view, made.buffer.as_ref(), &mut made.listed))
     }
 
+    /// Binds a direct GDDR7 VRAM raw-SRV constant buffer through [`ListViews`],
+    /// reusing the CPU descriptor across draws in the same recording (`VICTORY_VRAM_CBV=1`).
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn make_listed_constant(
+        &mut self,
+        host: &HostHeap,
+        words: [u32; 3],
+        address: u64,
+        size: u32,
+        index: u32,
+        batch: &mut CopyBatch,
+        retired: &mut Vec<ID3D12Resource>,
+    ) -> ListedConstant<'_> {
+        if host.sampler {
+            return ListedConstant::Fallback(false);
+        }
+        let Some(views) = self.views.as_deref_mut() else {
+            return ListedConstant::Full;
+        };
+        host.make_listed_constant_in(views, words, address, size, index, batch, Some(retired))
+    }
+
     #[inline]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn constant_at(
@@ -7786,6 +8489,32 @@ impl TableCache<'_> {
         };
         host.constant_at_staged(stage, index, buffer, gpu, size, batch, retired);
     }
+
+    /// Writes a direct GDDR7 VRAM raw `ByteAddressBuffer` SRV for a constant
+    /// buffer into dynamic slot `index` via [`CbvStage`] + [`CopyBatch`].
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn constant_raw_at(
+        &mut self,
+        host: &HostHeap,
+        index: u32,
+        buffer: &ID3D12Resource,
+        offset: u64,
+        bytes: u64,
+        size: u32,
+        batch: &mut CopyBatch,
+        retired: &mut Vec<ID3D12Resource>,
+    ) {
+        if host.raw != 0 {
+            host.constant_raw_at_inner(index, buffer, offset, bytes, size, Some(retired));
+            return;
+        }
+        let Some(stage) = self.cbv.as_deref_mut() else {
+            host.constant_raw_at_inner(index, buffer, offset, bytes, size, Some(retired));
+            return;
+        };
+        host.constant_raw_at_staged(stage, index, buffer, offset, bytes, batch, retired);
+    }
 }
 
 /// Runs `f` with a [`TableCache`] holding this thread's `ListViews` and
@@ -7796,6 +8525,7 @@ pub(crate) fn with_table_cache<R>(
     use_cbv_stage: bool,
     f: impl FnOnce(&mut TableCache<'_>) -> R,
 ) -> R {
+    let mode = vram_cbv();
     LIST_VIEWS.with(|lv_cell| {
         let mut lv_guard = use_list_views.then(|| lv_cell.borrow_mut());
         let views = lv_guard.as_mut().and_then(|slot| {
@@ -7803,8 +8533,9 @@ pub(crate) fn with_table_cache<R>(
                 **slot = ListViews::new();
             }
             let v = slot.as_mut()?;
-            if v.recording != recording {
+            if v.recording != recording || v.vram_cbv != mode {
                 v.recording = recording;
+                v.vram_cbv = mode;
                 v.made.clear();
             }
             Some(v)
@@ -7835,6 +8566,7 @@ pub(crate) fn with_table_cache<R>(
 /// copies its descriptor.
 struct ListViews {
     recording: u64,
+    vram_cbv: bool,
     _heap: ID3D12DescriptorHeap,
     step: usize,
     start: usize,
@@ -7858,7 +8590,14 @@ impl ListViews {
                 .ok()?;
             let step = host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
             let start = heap.GetCPUDescriptorHandleForHeapStart().ptr;
-            Some(ListViews { recording: 0, _heap: heap, step, start, made: Default::default() })
+            Some(ListViews {
+                recording: 0,
+                vram_cbv: false,
+                _heap: heap,
+                step,
+                start,
+                made: Default::default(),
+            })
         }
     }
 }

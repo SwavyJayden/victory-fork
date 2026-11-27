@@ -511,6 +511,11 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
         h.update(&(part.len() as u64).to_le_bytes());
         h.update(part);
     }
+    if victory_shader::emit::vram_cbv() {
+        let tag = b"vram_cbv=1";
+        h.update(&(tag.len() as u64).to_le_bytes());
+        h.update(tag);
+    }
     h.finalize().to_hex()[..32].to_owned()
 }
 
@@ -934,5 +939,23 @@ mod tests {
         let final_bytes = std::fs::read(&target).unwrap();
         assert_eq!(final_bytes.len(), 4096);
         assert!(final_bytes.iter().all(|&b| b == final_bytes[0]));
+    }
+
+    #[test]
+    fn library_name_preserves_baseline_when_vram_cbv_off_and_separates_when_on() {
+        let off = victory_shader::emit::with_vram_cbv(false, || {
+            name("graphics", b"root", &[b"vs", b"ps"], "state")
+        });
+        let on = victory_shader::emit::with_vram_cbv(true, || {
+            name("graphics", b"root", &[b"vs", b"ps"], "state")
+        });
+        assert_ne!(off, on, "VRAM CBV pipelines must not collide with classic CBV entries");
+
+        let mut h = blake3::Hasher::new();
+        for part in [b"graphics".as_slice(), b"root", b"vs", b"ps", b"state"] {
+            h.update(&(part.len() as u64).to_le_bytes());
+            h.update(part);
+        }
+        assert_eq!(off, h.finalize().to_hex()[..32]);
     }
 }

@@ -107,6 +107,8 @@ mod probe_tests;
 mod size_tests;
 #[cfg(all(test, windows))]
 mod valu_tests;
+#[cfg(test)]
+mod vram_cbv_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
 #[cfg(all(test, windows))]
@@ -126,7 +128,7 @@ pub use shader::{
     SLOT_MEMORY, SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, SLOT_VIEW_ADDRESSES,
     USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X,
     USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS, raw_views,
-    set_raw_views, set_view_heap_limit, view_heap_limit,
+    set_raw_views, set_view_heap_limit, view_heap_limit, vram_cbv, with_vram_cbv,
 };
 
 /// Whether programs that reach memory by address (ray tracing and what
@@ -311,6 +313,9 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.extend_from_slice(&loop_limit().to_le_bytes());
     out.push(group_sync());
     out.extend_from_slice(&shader_opt().to_le_bytes());
+    if shader::vram_cbv() {
+        out.extend_from_slice(b"VICTORY_VRAM_CBV=1");
+    }
     out
 }
 

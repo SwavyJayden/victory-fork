@@ -48,6 +48,13 @@ pub(crate) const WATCHDOG_BUDGET_PER_FRAME: usize = 256;
 pub(crate) const UNFLAGGED_MIN_SHADOW_LEN: usize = 256 << 10;
 /// Maximum unflagged candidate piece actions (trim or probe) per frame.
 pub(crate) const UNFLAGGED_BUDGET_PER_FRAME: usize = 64;
+/// Number of pre-promotion working-set touches required before permanently
+/// pinning a piece for the session. Strikes 1 and 2 enter exponential cooldown
+/// backoff (`TOUCH_BACKOFF_FRAMES`) so one-time boot/load CPU touches never
+/// condemn a GPU-only buffer for the rest of the session.
+pub(crate) const TOUCH_STRIKE_LIMIT: u8 = 3;
+/// Cooldown frames after pre-promotion working-set touch strike 1 and strike 2.
+pub(crate) const TOUCH_BACKOFF_FRAMES: [u64; 2] = [180, 600];
 
 /// Whether `VICTORY_GPU_ONLY_BACK` is enabled (default ON = `1`; `0` disables).
 pub(crate) fn enabled() -> bool {
@@ -67,6 +74,104 @@ pub(crate) enum DemoteReason {
     CpuRead,
 }
 
+/// Permanent session pin cause recorded on `PieceState::Pinned`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PinReason {
+    Touch,
+    CpuWrite,
+    Step,
+    Alias,
+    CpuRead,
+}
+
+impl From<DemoteReason> for PinReason {
+    fn from(reason: DemoteReason) -> Self {
+        match reason {
+            DemoteReason::CpuWrite => Self::CpuWrite,
+            DemoteReason::Step => Self::Step,
+            DemoteReason::Alias => Self::Alias,
+            DemoteReason::CpuRead => Self::CpuRead,
+        }
+    }
+}
+
+/// Classification of why a landed carded piece did (or did not) promote to `GpuOnly`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+pub(crate) enum LandBlockReason {
+    SmallBuf = 0,
+    PartialPiece = 1,
+    Unwatched = 2,
+    NotCopied = 3,
+    PinTouch = 4,
+    PinWrite = 5,
+    PinStep = 6,
+    PinAlias = 7,
+    PinRead = 8,
+    Backoff = 9,
+    Unquiet = 10,
+    Probing = 11,
+    Alias = 12,
+    DirtyOrLand = 13,
+    Promoted = 14,
+}
+
+pub(crate) const LAND_REASON_COUNT: usize = 15;
+
+impl LandBlockReason {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::SmallBuf => "small",
+            Self::PartialPiece => "partial",
+            Self::Unwatched => "unwatched",
+            Self::NotCopied => "not_copied",
+            Self::PinTouch => "pin_touch",
+            Self::PinWrite => "pin_write",
+            Self::PinStep => "pin_step",
+            Self::PinAlias => "pin_alias",
+            Self::PinRead => "pin_read",
+            Self::Backoff => "backoff",
+            Self::Unquiet => "unquiet",
+            Self::Probing => "probing",
+            Self::Alias => "alias",
+            Self::DirtyOrLand => "dirty",
+            Self::Promoted => "promoted",
+        }
+    }
+
+    fn from_index(i: usize) -> Self {
+        match i {
+            0 => Self::SmallBuf,
+            1 => Self::PartialPiece,
+            2 => Self::Unwatched,
+            3 => Self::NotCopied,
+            4 => Self::PinTouch,
+            5 => Self::PinWrite,
+            6 => Self::PinStep,
+            7 => Self::PinAlias,
+            8 => Self::PinRead,
+            9 => Self::Backoff,
+            10 => Self::Unquiet,
+            11 => Self::Probing,
+            12 => Self::Alias,
+            13 => Self::DirtyOrLand,
+            _ => Self::Promoted,
+        }
+    }
+}
+
+impl From<PinReason> for LandBlockReason {
+    fn from(reason: PinReason) -> Self {
+        match reason {
+            PinReason::Touch => Self::PinTouch,
+            PinReason::CpuWrite => Self::PinWrite,
+            PinReason::Step => Self::PinStep,
+            PinReason::Alias => Self::PinAlias,
+            PinReason::CpuRead => Self::PinRead,
+        }
+    }
+}
+
 /// Live gauge of active `GpuOnly` pieces across all shadows.
 static ACTIVE_GPU_ONLY_PIECES: AtomicU64 = AtomicU64::new(0);
 /// Per-interval counters reset once per second in [`log_line`]:
@@ -78,7 +183,78 @@ static ACTIVE_GPU_ONLY_PIECES: AtomicU64 = AtomicU64::new(0);
 /// 5: demoted_alias
 /// 6: demoted_read
 /// 7: pinned_by_touch
-static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// 8: touch_backoff
+static STATS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+/// Per-interval landing blocker counters reset once per second in [`log_line`].
+static LAND_REASONS: [AtomicU64; LAND_REASON_COUNT] = [const { AtomicU64::new(0) }; LAND_REASON_COUNT];
+
+/// Compact per-shadow landing summary for periodic telemetry (bounded to top 64
+/// landing shadows per 1-second interval, updated once per shadow landing call).
+struct LandShadowSample {
+    id: u64,
+    start: u64,
+    len: u64,
+    watched: u8,
+    pieces: u64,
+    reasons: [u64; LAND_REASON_COUNT],
+}
+
+static LAND_SHADOWS: Mutex<Vec<LandShadowSample>> = Mutex::new(Vec::new());
+
+/// Records one shadow's landing reason histogram for the periodic breakdown log.
+/// Called at most once per shadow per landing batch on background landing threads.
+pub(crate) fn record_land_summary(
+    shadow_id: u64,
+    start: u64,
+    len: u64,
+    watched: u8,
+    counts: &[u64; LAND_REASON_COUNT],
+) {
+    let mut total = 0u64;
+    for (i, &c) in counts.iter().enumerate() {
+        if c > 0 {
+            LAND_REASONS[i].fetch_add(c, Ordering::Relaxed);
+            total += c;
+        }
+    }
+    if total == 0 {
+        return;
+    }
+    let mut samples = LAND_SHADOWS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(entry) = samples.iter_mut().find(|e| e.id == shadow_id) {
+        entry.watched = watched;
+        entry.pieces += total;
+        for (dst, &src) in entry.reasons.iter_mut().zip(counts.iter()) {
+            *dst += src;
+        }
+    } else if samples.len() < 64 {
+        samples.push(LandShadowSample {
+            id: shadow_id,
+            start,
+            len,
+            watched,
+            pieces: total,
+            reasons: *counts,
+        });
+    } else if let Some(min_entry) = samples.iter_mut().min_by_key(|e| e.pieces)
+        && total > min_entry.pieces
+    {
+        *min_entry = LandShadowSample {
+            id: shadow_id,
+            start,
+            len,
+            watched,
+            pieces: total,
+            reasons: *counts,
+        };
+    }
+}
+
+/// Convenience helper for adding one piece count to a local histogram array.
+#[inline]
+pub(crate) fn bump_land_reason(counts: &mut [u64; LAND_REASON_COUNT], reason: LandBlockReason, n: u64) {
+    counts[reason as usize] += n;
+}
 
 /// Compact registry of only the shader-written shadows that have entered
 /// `gpu_only` tracking (~10–40 shadows instead of all ~3,600 carded shadows).
@@ -158,8 +334,15 @@ pub(crate) fn log_line(frames: f64) {
     }
     let active = ACTIVE_GPU_ONLY_PIECES.load(Ordering::Relaxed);
     let tracked = TRACKED_SHADOW_COUNT.load(Ordering::Relaxed);
-    let [compare_skipped, pending_skipped, promoted, d_write, d_step, d_alias, d_read, pin_touch] =
-        [0, 1, 2, 3, 4, 5, 6, 7].map(|i| STATS[i].swap(0, Ordering::Relaxed));
+    let [compare_skipped, pending_skipped, promoted, d_write, d_step, d_alias, d_read, pin_touch, touch_backoff] =
+        [0, 1, 2, 3, 4, 5, 6, 7, 8].map(|i| STATS[i].swap(0, Ordering::Relaxed));
+    let reasons: [u64; LAND_REASON_COUNT] =
+        std::array::from_fn(|i| LAND_REASONS[i].swap(0, Ordering::Relaxed));
+    let land_total: u64 = reasons.iter().sum();
+    let mut top_shadows = {
+        let mut guard = LAND_SHADOWS.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *guard)
+    };
     if active == 0
         && compare_skipped == 0
         && pending_skipped == 0
@@ -169,18 +352,73 @@ pub(crate) fn log_line(frames: f64) {
         && d_alias == 0
         && d_read == 0
         && pin_touch == 0
+        && touch_backoff == 0
+        && land_total == 0
     {
         return;
     }
     tracing::info!(
         "gpu-only readback residency (VICTORY_GPU_ONLY_BACK=1): {active} active pieces ({:.1} MiB, {tracked} shadows), \
          skipped/frame: {:.0} compare pieces, {:.0} pending ranges; \
-         promoted +{promoted}, pin_touch {pin_touch}, demoted -{} (write {d_write}, step {d_step}, alias {d_alias}, read {d_read})",
+         promoted +{promoted}, pin_touch {pin_touch}, backoff {touch_backoff}, demoted -{} (write {d_write}, step {d_step}, alias {d_alias}, read {d_read})",
         (active as f64 * PIECE as f64) / (1 << 20) as f64,
         compare_skipped as f64 / frames,
         pending_skipped as f64 / frames,
         d_write + d_step + d_alias + d_read,
     );
+    if land_total > 0 {
+        top_shadows.sort_unstable_by_key(|a| std::cmp::Reverse(a.pieces));
+        let mut top_str = String::new();
+        for (idx, s) in top_shadows.iter().take(5).enumerate() {
+            if idx > 0 {
+                top_str.push_str(", ");
+            }
+            let dom_idx = s
+                .reasons
+                .iter()
+                .enumerate()
+                .max_by_key(|&(_, &v)| v)
+                .map_or(0, |(i, _)| i);
+            let dom = LandBlockReason::from_index(dom_idx).label();
+            let size_str = if s.len >= 1 << 20 {
+                format!("{:.1}M", s.len as f64 / (1 << 20) as f64)
+            } else if s.len >= 1 << 10 {
+                format!("{}K", s.len >> 10)
+            } else {
+                format!("{}B", s.len)
+            };
+            top_str.push_str(&format!(
+                "{:#x}({},w={}, {:.0}/f,{})",
+                s.start,
+                size_str,
+                s.watched,
+                s.pieces as f64 / frames,
+                dom
+            ));
+        }
+        let r = |b: LandBlockReason| reasons[b as usize] as f64 / frames;
+        tracing::info!(
+            "gpu-only landing breakdown/frame ({:.0} pcs): small={:.0} partial={:.0} unwatched={:.0} not_copied={:.0} \
+             pin(touch={:.0} write={:.0} step={:.0} alias={:.0} read={:.0}) backoff={:.0} unquiet={:.0} probing={:.0} \
+             alias={:.0} dirty={:.0} promoted={:.0} | top: {top_str}",
+            land_total as f64 / frames,
+            r(LandBlockReason::SmallBuf),
+            r(LandBlockReason::PartialPiece),
+            r(LandBlockReason::Unwatched),
+            r(LandBlockReason::NotCopied),
+            r(LandBlockReason::PinTouch),
+            r(LandBlockReason::PinWrite),
+            r(LandBlockReason::PinStep),
+            r(LandBlockReason::PinAlias),
+            r(LandBlockReason::PinRead),
+            r(LandBlockReason::Backoff),
+            r(LandBlockReason::Unquiet),
+            r(LandBlockReason::Probing),
+            r(LandBlockReason::Alias),
+            r(LandBlockReason::DirtyOrLand),
+            r(LandBlockReason::Promoted),
+        );
+    }
 }
 
 /// Per-frame watchdog gate: returns `true` at most once per frame number.
@@ -284,13 +522,15 @@ pub(crate) enum PieceState {
         trimmed_at_frame: u64,
         trimmed: bool,
         unflagged_probe: bool,
+        touch_strikes: u8,
+        backoff_until_frame: u64,
     },
     GpuOnly {
         promoted_frame: u64,
     },
-    /// Permanently pinned for this session (CPU read/write/step/alias/remap
-    /// touched this piece while trimmed or `GpuOnly`) so it never thrashes.
-    Pinned,
+    /// Permanently pinned for this session (repeated working-set touches or
+    /// post-promotion CPU read/write/step/alias/remap) so it never thrashes.
+    Pinned(PinReason),
 }
 
 /// Action decided before a landing or `take_landed` reads/writes title memory.
@@ -319,8 +559,25 @@ pub(crate) enum UnflaggedAction {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ProbeOutcome {
     Untouched(u16),
+    /// Pre-promotion touch strike `< TOUCH_STRIKE_LIMIT`: entered cooldown backoff.
+    BackedOff(u8),
+    /// Reached `TOUCH_STRIKE_LIMIT` touches: permanently pinned for the session.
     Pinned,
     Skipped,
+}
+
+/// Single-lock post-landing decision for a whole 64 KiB piece.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AfterLandDecision {
+    /// Piece satisfies `clean_probes` + `QUIET_FRAMES` + not in backoff.
+    /// `should_trim` indicates whether to soft-trim if external promotion gates
+    /// (e.g. private landing echo or dirty bytes) defer promotion on this frame.
+    ReadyToPromote { should_trim: bool },
+    /// Normal piece not yet ready to promote that should be soft-trimmed now.
+    NeedTrim(LandBlockReason),
+    /// Piece should not be trimmed on this frame (already trimmed, in backoff,
+    /// permanently pinned, or already `GpuOnly`).
+    Hold(LandBlockReason),
 }
 
 /// Compact per-shadow 64 KiB piece residency tracker.
@@ -393,6 +650,8 @@ impl Tracker {
             trimmed_at_frame: 0,
             trimmed: false,
             unflagged_probe: false,
+            touch_strikes: 0,
+            backoff_until_frame: 0,
         };
         Self {
             start,
@@ -598,33 +857,110 @@ impl Tracker {
         }
     }
 
-    /// Atomically records an overlapping CPU step (`Copy`/`Placed`/`Fill`/
-    /// `Texture`/`Plane`/`Host`) on `[from_addr, to_addr)` AND returns any
-    /// overlapping pieces that are currently `GpuOnly` (linearizable against
-    /// concurrent `try_promote`!).
-    pub(crate) fn note_step_and_collect_gpu_only(&self, from_addr: usize, to_addr: usize, frame: u64) -> Vec<usize> {
-        let range = self.piece_range(from_addr, to_addr);
-        if range.is_empty() {
+    /// Batched single-lock CPU write notification for shadow-relative `(lo, hi)`
+    /// offset runs (avoids locking `states` tens of thousands of times per frame
+    /// when `merge_under_writes` or `take_landed` produces many dword runs).
+    pub(crate) fn note_cpu_write_offsets(&self, runs: &[(usize, usize)], frame: u64) {
+        if self.piece_count == 0 || runs.is_empty() {
+            return;
+        }
+        let first_block = self.start / PIECE;
+        let end = self.start + self.len;
+        let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        let mut last_piece = usize::MAX;
+        for &(lo_off, hi_off) in runs {
+            if lo_off >= hi_off {
+                continue;
+            }
+            let a = self.start.saturating_add(lo_off).max(self.start);
+            let b = self.start.saturating_add(hi_off).min(end);
+            if a >= b {
+                continue;
+            }
+            let lo = a / PIECE - first_block;
+            let hi = ((b - 1) / PIECE - first_block + 1).min(self.piece_count);
+            if lo + 1 == hi && lo == last_piece {
+                continue;
+            }
+            for piece in lo..hi {
+                if piece == last_piece {
+                    continue;
+                }
+                if let Some(PieceState::Normal {
+                    clean_probes,
+                    last_cpu_write_frame,
+                    trimmed,
+                    ..
+                }) = states.get_mut(piece)
+                {
+                    *clean_probes = 0;
+                    *last_cpu_write_frame = (*last_cpu_write_frame).max(frame);
+                    *trimmed = false;
+                }
+                last_piece = piece;
+            }
+        }
+    }
+
+    /// Batched single-lock CPU write notification for an explicit list of piece indices.
+    pub(crate) fn note_cpu_write_pieces(&self, pieces: &[usize], frame: u64) {
+        if self.piece_count == 0 || pieces.is_empty() {
+            return;
+        }
+        let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        for &piece in pieces {
+            if let Some(PieceState::Normal {
+                clean_probes,
+                last_cpu_write_frame,
+                trimmed,
+                ..
+            }) = states.get_mut(piece)
+            {
+                *clean_probes = 0;
+                *last_cpu_write_frame = (*last_cpu_write_frame).max(frame);
+                *trimmed = false;
+            }
+        }
+    }
+
+    /// Atomically records sorted overlapping CPU step ranges (`Copy`/`Placed`/
+    /// `Fill`/`Texture`/`Plane`/`Host`) in a SINGLE `states` lock acquisition
+    /// and returns any overlapping `GpuOnly` pieces (deduplicated).
+    pub(crate) fn note_steps_and_collect_gpu_only(&self, ranges: &[(usize, usize)], frame: u64) -> Vec<usize> {
+        if self.piece_count == 0 || ranges.is_empty() {
             return Vec::new();
         }
         let mut to_demote = Vec::new();
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        for piece in range {
-            match states.get_mut(piece) {
-                Some(PieceState::Normal {
-                    clean_probes,
-                    last_step_frame,
-                    trimmed,
-                    ..
-                }) => {
-                    *clean_probes = 0;
-                    *last_step_frame = (*last_step_frame).max(frame);
-                    *trimmed = false;
+        let mut last_piece = usize::MAX;
+        for &(from_addr, to_addr) in ranges {
+            let range = self.piece_range(from_addr, to_addr);
+            if range.is_empty() {
+                continue;
+            }
+            let start = if last_piece != usize::MAX && range.start <= last_piece {
+                last_piece + 1
+            } else {
+                range.start
+            };
+            for piece in start..range.end {
+                match states.get_mut(piece) {
+                    Some(PieceState::Normal {
+                        clean_probes,
+                        last_step_frame,
+                        trimmed,
+                        ..
+                    }) => {
+                        *clean_probes = 0;
+                        *last_step_frame = (*last_step_frame).max(frame);
+                        *trimmed = false;
+                    }
+                    Some(PieceState::GpuOnly { .. }) => {
+                        to_demote.push(piece);
+                    }
+                    _ => {}
                 }
-                Some(PieceState::GpuOnly { .. }) => {
-                    to_demote.push(piece);
-                }
-                _ => {}
+                last_piece = piece;
             }
         }
         to_demote
@@ -638,6 +974,7 @@ impl Tracker {
         if range.is_empty() {
             return Vec::new();
         }
+        let pin_reason = PinReason::from(reason);
         let mut demoted = Vec::new();
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         for piece in range {
@@ -647,8 +984,10 @@ impl Tracker {
             if matches!(*st, PieceState::GpuOnly { .. }) {
                 self.clear_gpu_only_bit(piece);
                 demoted.push(piece);
+                *st = PieceState::Pinned(pin_reason);
+            } else if !matches!(*st, PieceState::Pinned(_)) {
+                *st = PieceState::Pinned(pin_reason);
             }
-            *st = PieceState::Pinned;
         }
         drop(states);
         if !demoted.is_empty() {
@@ -667,6 +1006,7 @@ impl Tracker {
         if self.piece_count == 0 || pieces.is_empty() {
             return Vec::new();
         }
+        let pin_reason = PinReason::from(reason);
         let mut demoted = Vec::new();
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         for &piece in pieces {
@@ -675,10 +1015,10 @@ impl Tracker {
             };
             if matches!(*st, PieceState::GpuOnly { .. }) {
                 self.clear_gpu_only_bit(piece);
-                *st = PieceState::Pinned;
+                *st = PieceState::Pinned(pin_reason);
                 demoted.push(piece);
-            } else {
-                *st = PieceState::Pinned;
+            } else if !matches!(*st, PieceState::Pinned(_)) {
+                *st = PieceState::Pinned(pin_reason);
             }
         }
         drop(states);
@@ -735,11 +1075,13 @@ impl Tracker {
                 trimmed: false,
                 last_cpu_write_frame,
                 last_step_frame,
+                backoff_until_frame,
                 ..
             }) => {
                 // Start probing once the piece has been quiet for a few frames
-                // so hot CPU-written buffers don't waste VirtualUnlock calls.
-                if frame.saturating_sub(*last_cpu_write_frame) >= 8
+                // and is outside any pre-promotion working-set touch cooldown.
+                if frame >= *backoff_until_frame
+                    && frame.saturating_sub(*last_cpu_write_frame) >= 8
                     && frame.saturating_sub(*last_step_frame) >= 8
                 {
                     UnflaggedAction::NeedTrim
@@ -750,8 +1092,11 @@ impl Tracker {
             Some(PieceState::Normal {
                 trimmed: true,
                 trimmed_at_frame,
+                backoff_until_frame,
                 ..
-            }) if frame >= trimmed_at_frame.saturating_add(UNFLAGGED_MIN_PROBE_GAP) => {
+            }) if frame >= *backoff_until_frame
+                && frame >= trimmed_at_frame.saturating_add(UNFLAGGED_MIN_PROBE_GAP) =>
+            {
                 UnflaggedAction::NeedQuery
             }
             _ => UnflaggedAction::Skip,
@@ -762,8 +1107,11 @@ impl Tracker {
     /// - `touched == None`: sample discarded safely (remapping busy); clears `trimmed`.
     /// - `touched == Some(0)`: increments `clean_probes`, updates `trimmed_at_frame`
     ///   if keeping trimmed (`!clear_trimmed`), else clears `trimmed`.
-    /// - `touched == Some(n > 0)`: marks `Pinned` permanently for this session and
-    ///   increments `STATS[7]` (`pin_touch`).
+    /// - `touched == Some(n > 0)`: resets `clean_probes = 0`, clears `trimmed`,
+    ///   and increments `touch_strikes`. Strikes 1..`TOUCH_STRIKE_LIMIT` enter
+    ///   exponential cooldown backoff (`TOUCH_BACKOFF_FRAMES`, incrementing
+    ///   `STATS[8]`); strike `TOUCH_STRIKE_LIMIT` permanently transitions to
+    ///   `PieceState::Pinned(PinReason::Touch)` and increments `STATS[7]`.
     pub(crate) fn apply_probe_result(
         &self,
         piece: usize,
@@ -782,6 +1130,8 @@ impl Tracker {
             clean_probes,
             trimmed,
             trimmed_at_frame,
+            touch_strikes,
+            backoff_until_frame,
             ..
         } = st
         else {
@@ -803,10 +1153,69 @@ impl Tracker {
             }
             ProbeOutcome::Untouched(*clean_probes)
         } else {
-            *st = PieceState::Pinned;
-            drop(states);
-            STATS[7].fetch_add(1, Ordering::Relaxed);
-            ProbeOutcome::Pinned
+            *clean_probes = 0;
+            *trimmed = false;
+            *touch_strikes = touch_strikes.saturating_add(1);
+            let strikes = *touch_strikes;
+            if strikes >= TOUCH_STRIKE_LIMIT {
+                *st = PieceState::Pinned(PinReason::Touch);
+                drop(states);
+                STATS[7].fetch_add(1, Ordering::Relaxed);
+                ProbeOutcome::Pinned
+            } else {
+                let wait = TOUCH_BACKOFF_FRAMES
+                    .get((strikes - 1) as usize)
+                    .copied()
+                    .unwrap_or(600);
+                *backoff_until_frame = frame.saturating_add(wait);
+                drop(states);
+                STATS[8].fetch_add(1, Ordering::Relaxed);
+                ProbeOutcome::BackedOff(strikes)
+            }
+        }
+    }
+
+    /// Single-lock post-landing decision combining promotion readiness, trim
+    /// eligibility, and exact landing-blocker classification for `piece`.
+    pub(crate) fn after_land_decision(&self, piece: usize, frame: u64, force_retrim: bool) -> AfterLandDecision {
+        if self.piece_block_if_whole(piece).is_none() {
+            return AfterLandDecision::Hold(LandBlockReason::PartialPiece);
+        }
+        let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        match states.get(piece) {
+            Some(PieceState::Normal {
+                clean_probes,
+                last_cpu_write_frame,
+                last_step_frame,
+                trimmed,
+                trimmed_at_frame,
+                backoff_until_frame,
+                ..
+            }) => {
+                if frame < *backoff_until_frame {
+                    return AfterLandDecision::Hold(LandBlockReason::Backoff);
+                }
+                let should_trim = force_retrim || !*trimmed || *trimmed_at_frame < frame;
+                let quiet = frame.saturating_sub(*last_cpu_write_frame) >= QUIET_FRAMES
+                    && frame.saturating_sub(*last_step_frame) >= QUIET_FRAMES;
+                if quiet && *clean_probes >= LANDED_CLEAN_PROBES {
+                    AfterLandDecision::ReadyToPromote { should_trim }
+                } else {
+                    let reason = if !quiet {
+                        LandBlockReason::Unquiet
+                    } else {
+                        LandBlockReason::Probing
+                    };
+                    if should_trim {
+                        AfterLandDecision::NeedTrim(reason)
+                    } else {
+                        AfterLandDecision::Hold(reason)
+                    }
+                }
+            }
+            Some(PieceState::Pinned(reason)) => AfterLandDecision::Hold(LandBlockReason::from(*reason)),
+            Some(PieceState::GpuOnly { .. }) => AfterLandDecision::Hold(LandBlockReason::Promoted),
+            None => AfterLandDecision::Hold(LandBlockReason::PartialPiece),
         }
     }
 
@@ -828,17 +1237,19 @@ impl Tracker {
                 clean_probes,
                 last_cpu_write_frame,
                 last_step_frame,
+                backoff_until_frame,
                 ..
-            }) if *clean_probes >= needed
+            }) if frame >= *backoff_until_frame
+                && *clean_probes >= needed
                 && frame.saturating_sub(*last_cpu_write_frame) >= QUIET_FRAMES
                 && frame.saturating_sub(*last_step_frame) >= QUIET_FRAMES
         )
     }
 
-    /// Whether `piece` is `Normal` and should be soft-trimmed via `VirtualUnlock`.
-    /// Passing `force_retrim: true` (e.g., after a landing writes title memory
-    /// directly) forces re-trimming even if `piece` was already trimmed earlier
-    /// on the same `frame`.
+    /// Whether `piece` is `Normal`, not in touch backoff, and should be
+    /// soft-trimmed via `VirtualUnlock`. Passing `force_retrim: true` (e.g.,
+    /// after a landing writes title memory directly) forces re-trimming even if
+    /// `piece` was already trimmed earlier on the same `frame`.
     pub(crate) fn needs_trim(&self, piece: usize, frame: u64, force_retrim: bool) -> bool {
         if self.piece_block_if_whole(piece).is_none() {
             return false;
@@ -849,8 +1260,10 @@ impl Tracker {
             Some(PieceState::Normal {
                 trimmed,
                 trimmed_at_frame,
+                backoff_until_frame,
                 ..
-            }) if force_retrim || !*trimmed || *trimmed_at_frame < frame
+            }) if frame >= *backoff_until_frame
+                && (force_retrim || !*trimmed || *trimmed_at_frame < frame)
         )
     }
 
@@ -875,7 +1288,7 @@ impl Tracker {
 
     /// Final linearizable promotion commit: re-verifies `Normal` state and
     /// thresholds under `states` lock so a concurrent `note_cpu_write`,
-    /// `note_step_and_collect_gpu_only`, or `pin_range_and_demote` can never
+    /// `note_steps_and_collect_gpu_only`, or `pin_range_and_demote` can never
     /// race with promotion.
     pub(crate) fn try_promote(&self, piece: usize, frame: u64, unflagged: bool) -> bool {
         if (unflagged && self.len < UNFLAGGED_MIN_SHADOW_LEN) || self.piece_block_if_whole(piece).is_none() {
@@ -896,8 +1309,10 @@ impl Tracker {
                 clean_probes,
                 last_cpu_write_frame,
                 last_step_frame,
+                backoff_until_frame,
                 ..
-            } if clean_probes >= needed
+            } if frame >= backoff_until_frame
+                && clean_probes >= needed
                 && frame.saturating_sub(last_cpu_write_frame) >= QUIET_FRAMES
                 && frame.saturating_sub(last_step_frame) >= QUIET_FRAMES
         );
@@ -1216,15 +1631,36 @@ mod tests {
         assert!(promote_piece(&tracker, 1, 40 + QUIET_FRAMES, false));
         assert!(tracker.is_gpu_only(1));
 
-        // Rule 4: any working-set touch pins the piece permanently.
+        // Rule 4: pre-promotion working-set touches enter bounded exponential
+        // backoff (strikes 1 & 2) and permanently pin on strike 3 (`TOUCH_STRIKE_LIMIT`).
         tracker.mark_trimmed(2, 20, false);
         assert_eq!(
             tracker.apply_probe_result(2, 21, Some(1), true),
+            ProbeOutcome::BackedOff(1)
+        );
+        assert!(!tracker.needs_trim(2, 21 + TOUCH_BACKOFF_FRAMES[0] - 1, true));
+        assert_eq!(
+            tracker.after_land_decision(2, 21 + TOUCH_BACKOFF_FRAMES[0] - 1, false),
+            AfterLandDecision::Hold(LandBlockReason::Backoff)
+        );
+        let f2 = 21 + TOUCH_BACKOFF_FRAMES[0];
+        assert!(tracker.needs_trim(2, f2, false));
+        tracker.mark_trimmed(2, f2, false);
+        assert_eq!(
+            tracker.apply_probe_result(2, f2 + 1, Some(2), true),
+            ProbeOutcome::BackedOff(2)
+        );
+        let f3 = f2 + 1 + TOUCH_BACKOFF_FRAMES[1];
+        assert!(!tracker.needs_trim(2, f3 - 1, true));
+        assert!(tracker.needs_trim(2, f3, false));
+        tracker.mark_trimmed(2, f3, false);
+        assert_eq!(
+            tracker.apply_probe_result(2, f3 + 1, Some(1), true),
             ProbeOutcome::Pinned
         );
-        assert_eq!(tracker.state_of(2), Some(PieceState::Pinned));
-        assert!(!tracker.try_promote(2, 1000, false));
-        assert!(!tracker.try_promote(2, 1000, true));
+        assert_eq!(tracker.state_of(2), Some(PieceState::Pinned(PinReason::Touch)));
+        assert!(!tracker.try_promote(2, f3 + 10_000, false));
+        assert!(!tracker.try_promote(2, f3 + 10_000, true));
     }
 
     #[test]
@@ -1248,7 +1684,7 @@ mod tests {
         // Because `trimmed` was cleared before our own read touched title memory,
         // frame 11 sees `Skip` instead of probing our own resident pages and false-pinning.
         assert_eq!(tracker.before_read_action(0, 11), BeforeReadAction::Skip);
-        assert_ne!(tracker.state_of(0), Some(PieceState::Pinned));
+        assert!(!matches!(tracker.state_of(0), Some(PieceState::Pinned(_))));
 
         // Trim at frame 11; next-frame read at frame 12 requests a working-set probe.
         tracker.mark_trimmed(0, 11, false);
@@ -1274,10 +1710,14 @@ mod tests {
         assert!(tracker.needs_trim(0, 10, true));
         assert!(tracker.needs_trim(0, 11, false));
 
-        // Pinned and GpuOnly pieces never trim, even with force_retrim: true.
-        tracker.apply_probe_result(0, 11, Some(1), true);
-        assert_eq!(tracker.state_of(0), Some(PieceState::Pinned));
+        // Backoff suppresses even force_retrim until cooldown elapses.
+        assert_eq!(tracker.apply_probe_result(0, 11, Some(1), true), ProbeOutcome::BackedOff(1));
         assert!(!tracker.needs_trim(0, 11, true));
+
+        // Pinned and GpuOnly pieces never trim, even with force_retrim: true.
+        let _ = tracker.demote_and_pin(&[0], DemoteReason::CpuRead);
+        assert_eq!(tracker.state_of(0), Some(PieceState::Pinned(PinReason::CpuRead)));
+        assert!(!tracker.needs_trim(0, 1000, true));
 
         assert!(promote_piece(&tracker, 1, QUIET_FRAMES, false));
         assert!(tracker.is_gpu_only(1));
@@ -1292,17 +1732,100 @@ mod tests {
         assert!(tracker.is_registered());
         assert!(!tracker.mark_registered());
 
-        let before = STATS[7].load(Ordering::Relaxed);
-        // Clean probe and discarded (None) probe do NOT increment pin_touch.
+        let before_pin = STATS[7].load(Ordering::Relaxed);
+        let before_backoff = STATS[8].load(Ordering::Relaxed);
+        // Clean probe and discarded (None) probe do NOT increment pin_touch or backoff.
         tracker.mark_trimmed(0, 5, false);
         assert_eq!(tracker.apply_probe_result(0, 6, Some(0), true), ProbeOutcome::Untouched(1));
         tracker.mark_trimmed(0, 6, false);
         assert_eq!(tracker.apply_probe_result(0, 7, None, true), ProbeOutcome::Skipped);
-        // Non-zero touch transitions Normal -> Pinned and increments STATS[7].
-        tracker.mark_trimmed(0, 7, false);
-        assert_eq!(tracker.apply_probe_result(0, 8, Some(4), true), ProbeOutcome::Pinned);
-        let after = STATS[7].load(Ordering::Relaxed);
-        assert!(after > before, "STATS[7] (pin_touch) must increment on touched > 0 ({before} -> {after})");
+        // Strikes 1 & 2 increment touch_backoff (`STATS[8]`), strike 3 pins and increments `STATS[7]`.
+        let mut f = 7u64;
+        for strike in 1..TOUCH_STRIKE_LIMIT {
+            tracker.mark_trimmed(0, f, false);
+            assert_eq!(tracker.apply_probe_result(0, f + 1, Some(4), true), ProbeOutcome::BackedOff(strike));
+            f = f + 1 + TOUCH_BACKOFF_FRAMES[(strike - 1) as usize];
+        }
+        assert!(STATS[8].load(Ordering::Relaxed) >= before_backoff + u64::from(TOUCH_STRIKE_LIMIT - 1));
+        tracker.mark_trimmed(0, f, false);
+        assert_eq!(tracker.apply_probe_result(0, f + 1, Some(4), true), ProbeOutcome::Pinned);
+        let after_pin = STATS[7].load(Ordering::Relaxed);
+        assert!(after_pin > before_pin, "STATS[7] (pin_touch) must increment on strike 3 ({before_pin} -> {after_pin})");
+
+        // Transient single touch during boot/load recovers and promotes cleanly after backoff!
+        tracker.mark_trimmed(1, 10, false);
+        assert_eq!(tracker.apply_probe_result(1, 11, Some(16), true), ProbeOutcome::BackedOff(1));
+        let recover_start = 11 + TOUCH_BACKOFF_FRAMES[0];
+        for i in 0..LANDED_CLEAN_PROBES {
+            let pf = recover_start + u64::from(i) * 2;
+            tracker.mark_trimmed(1, pf, false);
+            assert_eq!(
+                tracker.apply_probe_result(1, pf + 1, Some(0), true),
+                ProbeOutcome::Untouched(i + 1)
+            );
+        }
+        let promote_frame = recover_start + u64::from(LANDED_CLEAN_PROBES) * 2 + QUIET_FRAMES;
+        assert!(tracker.try_promote(1, promote_frame, false));
+        assert!(tracker.is_gpu_only(1));
+    }
+
+    #[test]
+    fn batched_cpu_write_offsets_and_steps_deduplicate_pieces_in_one_lock() {
+        let base = 0x8000_0000usize;
+        let tracker = Tracker::with_frame(base, 4 * PIECE, 0);
+        assert!(promote_piece(&tracker, 2, QUIET_FRAMES, false));
+        assert!(tracker.is_gpu_only(2));
+
+        // Many tiny runs inside pieces 0 and 1 reset clean_probes & trimmed once.
+        tracker.mark_trimmed(0, 10, false);
+        tracker.mark_trimmed(1, 10, false);
+        let runs: Vec<(usize, usize)> = (0..1000)
+            .map(|i| (i * 16, i * 16 + 4))
+            .chain((0..1000).map(|i| (PIECE + i * 16, PIECE + i * 16 + 4)))
+            .collect();
+        tracker.note_cpu_write_offsets(&runs, 50);
+        assert!(matches!(
+            tracker.state_of(0),
+            Some(PieceState::Normal {
+                trimmed: false,
+                clean_probes: 0,
+                last_cpu_write_frame: 50,
+                ..
+            })
+        ));
+        assert!(matches!(
+            tracker.state_of(1),
+            Some(PieceState::Normal {
+                trimmed: false,
+                clean_probes: 0,
+                last_cpu_write_frame: 50,
+                ..
+            })
+        ));
+        // Piece 3 untouched.
+        assert!(matches!(
+            tracker.state_of(3),
+            Some(PieceState::Normal {
+                last_cpu_write_frame: 0,
+                ..
+            })
+        ));
+
+        // Sorted overlapping step ranges touching piece 1 (Normal) and piece 2 (GpuOnly).
+        let step_ranges = [
+            (base + PIECE + 100, base + PIECE + 200),
+            (base + PIECE + 300, base + 2 * PIECE + 64),
+            (base + 2 * PIECE + 128, base + 2 * PIECE + 512),
+        ];
+        let hit = tracker.note_steps_and_collect_gpu_only(&step_ranges, 60);
+        assert_eq!(hit, vec![2], "GpuOnly piece 2 must be reported exactly once");
+        assert!(matches!(
+            tracker.state_of(1),
+            Some(PieceState::Normal {
+                last_step_frame: 60,
+                ..
+            })
+        ));
     }
 
     #[test]

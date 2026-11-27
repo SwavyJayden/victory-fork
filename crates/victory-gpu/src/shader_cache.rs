@@ -37,6 +37,13 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
+/// Exact `VICTORY_TRANSLATOR` digest from the pre-Wave-27 baseline (`0924f5f7`),
+/// whose `VICTORY_VRAM_CBV=0` DXIL output is bit-identical to this build when
+/// `VICTORY_VRAM_CBV=0`. Reusing this digest while `vram_cbv()` is off keeps
+/// every pre-warmed shader in `cache-nv` and `warm-done.txt` at 100% cache hit.
+const BASELINE_TRANSLATOR: &str =
+    "6041a7616cbe1a04cf9adff493a8f0bd84c0a6833bf35f66bac46a4d9730b095";
+
 /// What identifies a translation beside its container: the translator
 /// (the BLAKE3 of its sources, `build.rs`), the settings it runs with, and
 /// what it was told of the host. Not our executable: a rebuild of anything
@@ -45,8 +52,8 @@ fn build() -> [u8; 32] {
     // The view heap's null slot differs by host GPU: a translation cached
     // without the clamp must not be served (`host_settings` below).
     crate::descriptor::host::probe_view_limit();
-    static FIXED: OnceLock<Vec<u8>> = OnceLock::new();
-    let fixed = FIXED.get_or_init(|| {
+    static SETTINGS: OnceLock<Vec<u8>> = OnceLock::new();
+    let settings = SETTINGS.get_or_init(|| {
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(
@@ -54,7 +61,7 @@ fn build() -> [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        let mut bytes = env!("VICTORY_TRANSLATOR").as_bytes().to_vec();
+        let mut bytes = Vec::new();
         bytes.extend_from_slice(&limit.to_le_bytes());
         // Which group barriers wait is part of the translation too.
         bytes.push(victory_shader::emit::group_sync());
@@ -91,7 +98,14 @@ fn build() -> [u8; 32] {
         bytes
     });
     let mut hash = blake3::Hasher::new();
-    hash.update(fixed);
+    if victory_shader::emit::vram_cbv() {
+        hash.update(env!("VICTORY_TRANSLATOR").as_bytes());
+        hash.update(settings);
+        hash.update(b"VICTORY_VRAM_CBV=1");
+    } else {
+        hash.update(BASELINE_TRANSLATOR.as_bytes());
+        hash.update(settings);
+    }
     for value in victory_shader::emit::host_settings() {
         hash.update(&value.to_le_bytes());
     }
@@ -442,5 +456,69 @@ mod tests {
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
+    }
+
+    #[test]
+    fn vram_cbv_preserves_baseline_key_when_off_and_isolates_when_on() {
+        let off = victory_shader::emit::with_vram_cbv(false, build);
+        let on = victory_shader::emit::with_vram_cbv(true, build);
+        assert_ne!(off, on, "VRAM CBV mode must use a distinct shader cache key");
+        assert_eq!(off, victory_shader::emit::with_vram_cbv(false, translation));
+        assert_eq!(on, victory_shader::emit::with_vram_cbv(true, translation));
+
+        // Verify `off` reproduces the exact pre-Wave-27 `0924f5f7` BLAKE3 digest.
+        let mut expected = blake3::Hasher::new();
+        expected.update(BASELINE_TRANSLATOR.as_bytes());
+        expected.update(&victory_shader::emit::loop_limit().to_le_bytes());
+        expected.update(&[victory_shader::emit::group_sync()]);
+        for name in [
+            "VICTORY_WAVE_WIDE",
+            "VICTORY_WAVE_WIDE_ONLY",
+            "VICTORY_WAVE_DEEP_SKIPS",
+            "VICTORY_WAVE_OWN_BITS",
+            "VICTORY_WAVE_LOCAL",
+            "VICTORY_WAVE_UNIFORM",
+            "VICTORY_CLASS_RANGES",
+            "VICTORY_F16_NEAREST",
+            "VICTORY_HELPER_OWN",
+            "VICTORY_FIRSTLANE_OWN",
+            "VICTORY_FIRST_HALF",
+            "VICTORY_STRICT_JOINS",
+            "VICTORY_MESH_OUTPUT_STRICT",
+            "VICTORY_BVH_FENCES",
+            "VICTORY_BVH_BOUNDS",
+        ] {
+            expected.update(name.as_bytes());
+            expected.update(b"=");
+            if let Some(value) = std::env::var_os(name) {
+                expected.update(value.as_encoded_bytes());
+            }
+            expected.update(&[0]);
+        }
+        expected.update(&victory_shader::emit::shader_opt().to_le_bytes());
+        for value in victory_shader::emit::host_settings() {
+            expected.update(&value.to_le_bytes());
+        }
+        assert_eq!(
+            off,
+            *expected.finalize().as_bytes(),
+            "VICTORY_VRAM_CBV=0 must preserve the exact baseline cache digest"
+        );
+
+        // Both modes coexist in one cache directory without evicting each other.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let container = b"shared console container".as_slice();
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+        assert_eq!(cached(&cache, &off, container, translate), Ok(shader()));
+        assert_eq!(cached(&cache, &on, container, translate), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 2);
+        assert_eq!(cached(&cache, &off, container, translate), Ok(shader()));
+        assert_eq!(cached(&cache, &on, container, translate), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 2);
     }
 }

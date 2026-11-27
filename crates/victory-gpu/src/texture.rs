@@ -102,9 +102,11 @@ pub(crate) struct Staging {
     /// ([`upload`]).
     waiting: std::sync::atomic::AtomicU64,
     /// Recorded for a one-shot decoration bake (`BAKING`): submission-time
-    /// refresh must wait for title memory to stop remapping
-    /// (`title_memory_reading`) instead of taking `no_wait()` /
-    /// `refresh_unlocked()` or the 30-frame partial-read throttle.
+    /// refresh must capture an exact snapshot (bypassing write-watch/guard
+    /// skips and the 30-frame partial-read throttle, and never leaving stale
+    /// bytes behind when `no_wait()` reads lock-free; only falling back to
+    /// `title_memory_reading` if this texture's own pages stay transiently
+    /// missing).
     exact: std::sync::atomic::AtomicBool,
 }
 
@@ -1611,14 +1613,24 @@ impl Staging {
         // stays mapped (see `crate::watch::title_memory_reading`; without
         // it a page went between the asking and the read in runs 71 and
         // 74).
-        let _mapped = if no_wait() && !exact {
+        let _mapped = if no_wait() {
             // Not waited for: while the runtime remaps title memory the
-            // texture is read through the kernel instead, whole or not at
-            // all (`no_wait`).
-            let Some(mapped) = crate::watch::title_memory_reading_now() else {
-                return self.refresh_unlocked(last, size);
-            };
-            mapped
+            // texture is read through `safecopy` / the kernel instead,
+            // avoiding global `MAPPING` stalls (`no_wait`). Even for
+            // decoration bakes (`exact`), 99%+ of textures lie outside the
+            // view being remapped and read cleanly without blocking; only a
+            // texture whose own pages stay transiently missing falls back to
+            // `title_memory_reading`.
+            match crate::watch::title_memory_reading_now() {
+                Some(mapped) => mapped,
+                None if !exact => return self.refresh_unlocked(last, size, &found_blind),
+                None => {
+                    if let Some(read) = self.refresh_exact_unlocked(last, size, &found_blind) {
+                        return read;
+                    }
+                    waited(2, crate::watch::title_memory_reading)
+                }
+            }
         } else {
             waited(2, crate::watch::title_memory_reading)
         };
@@ -1699,16 +1711,26 @@ impl Staging {
     /// next refresh (what was learnt about writes to it is forgotten, so
     /// that it is not passed over as unwritten); one never filled takes the
     /// pages that are there ([`Staging::fill`]). Returns the bytes read.
-    fn refresh_unlocked(&self, last: &mut Last, size: usize) -> usize {
+    fn refresh_unlocked(
+        &self,
+        last: &mut Last,
+        size: usize,
+        found_blind: &impl Fn(&mut Last),
+    ) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         let read = with_read(size, |read| {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
             let hash = digest(read);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             if last.hash != Some(hash) {
                 last.hash = Some(hash);
+                found_blind(last);
                 self.detile(read);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
             }
             true
         });
@@ -1726,6 +1748,91 @@ impl Staging {
             0
         }
     }
+
+    /// Lock-free exact refresh for a decoration bake (`exact`) while the
+    /// runtime holds `MAPPING.write()` remapping title memory. Reads all pages
+    /// via `read_into` (or bounded `read_there` + `change_over` for genuinely
+    /// partial textures) without leaving stale bytes in the staging buffer.
+    /// Returns `None` only if this texture's own pages stayed transiently
+    /// missing across retries, signaling the caller to fall back to waiting on
+    /// `title_memory_reading`.
+    fn refresh_exact_unlocked(
+        &self,
+        last: &mut Last,
+        size: usize,
+        found_blind: &impl Fn(&mut Last),
+    ) -> Option<usize> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let expected = self.expected.load(Relaxed);
+        let (full, changed) = with_read(size, |read| {
+            let (full, got) = read_exact_snapshot(self.memory, read, expected)?;
+            let hash = digest(read);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+            let changed = if last.hash == Some(hash) {
+                false
+            } else {
+                last.hash = Some(hash);
+                if !full && (got == 0 || read.iter().all(|&b| b == 0)) {
+                    false
+                } else {
+                    self.detile(read);
+                    true
+                }
+            };
+            Some((full, changed))
+        })?;
+        if full {
+            UNLOCKED[0].fetch_add(1, Relaxed);
+        } else {
+            last.partial = Some(crate::frame::current());
+            UNLOCKED[2].fetch_add(1, Relaxed);
+        }
+        if changed {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+            found_blind(last);
+        }
+        Some(size)
+    }
+}
+
+/// Reads a complete fault-safe snapshot of `[memory, memory + read.len())`
+/// without taking `MAPPING.read()`.
+///
+/// - Returns `Some((true, read.len() as u64))` when every page is mapped and
+///   copied cleanly via `read_into`.
+/// - Returns `Some((false, got))` for a genuinely partially-mapped texture
+///   when `read_there` reads at least `mapped_bytes(memory, len).max(expected)`
+///   bytes (zeros for unmapped pages).
+/// - Returns `None` if pages stayed transiently missing across bounded
+///   `change_over()` retries so an `exact` caller can fall back to
+///   `title_memory_reading()`.
+fn read_exact_snapshot(memory: *const u8, read: &mut [u8], expected: u64) -> Option<(bool, u64)> {
+    let size = read.len();
+    if size == 0 {
+        return Some((true, 0));
+    }
+    if crate::host::read_into(memory, read) {
+        return Some((true, size as u64));
+    }
+    for attempt in 0..4 {
+        if attempt > 0 {
+            crate::watch::change_over();
+            if crate::host::read_into(memory, read) {
+                return Some((true, size as u64));
+            }
+        }
+        let got = crate::host::read_there(memory, read) as u64;
+        let target = mapped_bytes(memory, size).max(expected);
+        if got >= target && (got > 0 || crate::watch::changes().is_multiple_of(2)) {
+            return Some((false, got));
+        }
+    }
+    None
+}
+
+impl Staging {
 
     /// The first filling of the staging buffer while the runtime is
     /// remapping title memory, of a texture not all of which can be read:
@@ -2853,5 +2960,91 @@ mod prelude_upload_tests {
         super::forget(fake as usize);
         assert!(!super::host_wrote(fake as usize));
         assert_eq!(super::HOST_WRITTEN_COUNT.load(Acquire), before);
+    }
+
+    struct HoldRemapping {
+        release: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl HoldRemapping {
+        fn start() -> Self {
+            use std::sync::{
+                Arc,
+                atomic::{AtomicBool, Ordering},
+            };
+            let acquired = Arc::new(AtomicBool::new(false));
+            let release = Arc::new(AtomicBool::new(false));
+            let acquired_bg = Arc::clone(&acquired);
+            let release_bg = Arc::clone(&release);
+            let thread = std::thread::spawn(move || {
+                let _remap = crate::watch::title_memory_remapping();
+                acquired_bg.store(true, Ordering::Release);
+                while !release_bg.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+            });
+            while !acquired.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            Self { release, thread: Some(thread) }
+        }
+    }
+
+    impl Drop for HoldRemapping {
+        fn drop(&mut self) {
+            self.release.store(true, std::sync::atomic::Ordering::Release);
+            if let Some(t) = self.thread.take() {
+                let _ = t.join();
+            }
+        }
+    }
+
+    #[test]
+    fn exact_unlocked_reads_committed_without_waiting_for_remapping() {
+        let _remap = HoldRemapping::start();
+        assert!(
+            crate::watch::title_memory_reading_now().is_none(),
+            "MAPPING.write() must be held during the test"
+        );
+        let src: Vec<u8> = (0..(128usize << 10))
+            .map(|i| ((i.wrapping_mul(31) ^ (i >> 5) ^ 0xA5) & 0xFF) as u8)
+            .collect();
+        let mut dst = vec![0xEEu8; src.len()];
+        let got = super::read_exact_snapshot(src.as_ptr(), &mut dst, src.len() as u64);
+        assert_eq!(got, Some((true, src.len() as u64)));
+        assert_eq!(dst, src);
+    }
+
+    #[test]
+    fn exact_unlocked_reads_partial_and_signals_short_for_fallback() {
+        use windows_sys::Win32::System::Memory::*;
+        const HEAD: usize = 128 << 10;
+        const SIZE: usize = 256 << 10;
+        // SAFETY: private reservation with committed head and uncommitted tail.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            assert_eq!(VirtualAlloc(base.cast(), HEAD, MEM_COMMIT, PAGE_READWRITE), base.cast());
+            base.write_bytes(0x5a, HEAD);
+
+            {
+                let _remap = HoldRemapping::start();
+                assert!(crate::watch::title_memory_reading_now().is_none());
+
+                let mut dst = vec![0x77u8; SIZE];
+                // Genuinely partial texture: expected matches committed head -> completes lock-free.
+                let partial = super::read_exact_snapshot(base, &mut dst, HEAD as u64);
+                assert_eq!(partial, Some((false, HEAD as u64)));
+                assert!(dst[..HEAD].iter().all(|&b| b == 0x5a));
+                assert!(dst[HEAD..].iter().all(|&b| b == 0));
+
+                // Transiently missing pages: expected > mapped -> returns None so exact falls back to waiting.
+                let short = super::read_exact_snapshot(base, &mut dst, SIZE as u64);
+                assert_eq!(short, None);
+            }
+
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
     }
 }

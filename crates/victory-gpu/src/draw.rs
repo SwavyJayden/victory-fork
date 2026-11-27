@@ -1179,7 +1179,7 @@ type TargetKey = (usize, (usize, [u32; 7]));
 /// streams of a cutscene frame reach further, and what lay past the first
 /// megabyte was never brought up to date - meshes without bodies, exploded
 /// triangles. `VICTORY_ROOT_VIEW_MB` sets a limit again.)
-fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
+fn root_view(list: &HostList, address: u64, srv: bool, cbv_cap: bool) -> Option<u64> {
     static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
         std::env::var("VICTORY_ROOT_VIEW_MB")
@@ -1190,7 +1190,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     let shadow = crate::shadow::find(address, 1)?;
     let len = shadow
         .left(address)
-        .min(if srv { limit } else { 1 << 16 });
+        .min(if srv && !cbv_cap { limit } else { 1 << 16 });
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
@@ -1265,7 +1265,9 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     // an unordered view.
     let look = |index: u32| {
         // A draw's table's: the draw brings what it reads up to date.
-        if host.copied_tabled(index, frame) {
+        if host.copied_tabled(index, frame)
+            || (host.table_buffers_on() && host.buffer_tabled_lately(index, frame))
+        {
             return None;
         }
         let view = host.mirror(index, heap.handle(index)?, true)?;
@@ -2398,11 +2400,27 @@ impl State {
                         continue;
                     }
                     let tabled = srv && crate::pipeline::host::bounded_root_srvs();
+                    let root_cbv_as_srv = srv
+                        && crate::descriptor::host::vram_cbv()
+                        && !t.used.iter().any(|u| {
+                            u.root == RootType::Descriptor
+                                && u.slot == slot
+                                && matches!(u.kind, ResourceType::Srv | ResourceType::Uav)
+                        });
                     let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
                         // A table left unset is undefined: a null view.
-                        if tabled && !self.root_srv_table(list, None, param, compute, false) {
+                        if tabled
+                            && !self.root_srv_table(
+                                list,
+                                None,
+                                param,
+                                compute,
+                                false,
+                                root_cbv_as_srv,
+                            )
+                        {
                             return false;
                         }
                         continue;
@@ -2414,12 +2432,19 @@ impl State {
                                 && u.root == RootType::Other(victory_shader::emit::USER_VIEW_BIAS)
                         });
                     if tabled {
-                        if !self.root_srv_table(list, Some(address), param, compute, biased) {
+                        if !self.root_srv_table(
+                            list,
+                            Some(address),
+                            param,
+                            compute,
+                            biased,
+                            root_cbv_as_srv,
+                        ) {
                             return false;
                         }
                         continue;
                     }
-                    let Some(mut gpu) = root_view(list, address, srv) else {
+                    let Some(mut gpu) = root_view(list, address, srv, root_cbv_as_srv) else {
                         continue;
                     };
                     if biased {
@@ -2684,6 +2709,7 @@ impl State {
         param: u32,
         compute: bool,
         biased: bool,
+        cbv_cap: bool,
     ) -> bool {
         let heap = match self.heaps[0] {
             0 => None,
@@ -2693,33 +2719,50 @@ impl State {
             once!("a root SRV without a bound view heap: the draw is dropped");
             return false;
         };
-        // A view that begins early is another view than one that does not
-        // (title addresses stay below bit 63).
+        // A view that begins early or caps to 64 KiB (lowered root CBV) is
+        // another view than an unbounded raw SRV (title addresses stay below
+        // bit 62).
         let key = (
             std::ptr::from_ref(heap) as usize,
-            address.unwrap_or(0) | u64::from(biased) << 63,
+            address.unwrap_or(0) | (u64::from(biased) << 63) | (u64::from(cbv_cap) << 62),
         );
         let (index, shadow) = match self.root_srv_slots.get(&key) {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
-                let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
+                let mut shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
                 let Some(index) = self.alloc_dynamic(heap, host, 1) else {
                     return false;
                 };
-                self.root_srv_slots
-                    .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
                 match &shadow {
                     Some((a, s)) => {
                         // SAFETY: a live buffer.
                         let base = unsafe { s.buffer.GetGPUVirtualAddress() };
                         let offset = s.gpu(*a) - base;
+                        let max_len = if cbv_cap {
+                            s.left(*a).min(1 << 16)
+                        } else {
+                            s.left(*a)
+                        };
                         if biased {
                             // From the 16 bytes below; the shader adds the
                             // rest (`victory_shader::emit::USER_VIEW_BIAS`).
                             let bias = offset & 15;
-                            host.raw_at(index, &s.buffer, offset - bias, s.left(*a) + bias);
+                            host.raw_at(index, &s.buffer, offset - bias, max_len + bias);
                         } else if offset.is_multiple_of(16) {
-                            host.raw_at(index, &s.buffer, offset, s.left(*a));
+                            host.raw_at(index, &s.buffer, offset, max_len);
+                        } else if cbv_cap {
+                            let bytes = max_len.clamp(4, 1 << 16).next_multiple_of(4);
+                            if let Some((buffer, gpu, to)) = list.scratch_held(bytes) {
+                                // SAFETY: a live scratch buffer.
+                                let scratch_base = unsafe { buffer.GetGPUVirtualAddress() };
+                                let slot_ref = (std::ptr::from_ref(heap) as usize, index);
+                                list.defer_constants(to, *a as *const u8, max_len as usize, slot_ref);
+                                host.raw_at(index, &buffer, gpu - scratch_base, bytes);
+                                shadow = None;
+                            } else {
+                                host.null_raw_at(index);
+                                shadow = None;
+                            }
                         } else {
                             // Raw views start on 16 bytes; one from the
                             // aligned start would shift every read.
@@ -2732,14 +2775,20 @@ impl State {
                     }
                     None => host.null_raw_at(index),
                 }
+                self.root_srv_slots
+                    .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
                 (index, shadow)
             }
         };
         // As for root descriptors (`root_view`): all that is left of the
-        // buffer is brought up to date. The first 1 MiB only left what lay
-        // past it stale (most mesh vertex streams reach further).
+        // buffer is brought up to date (capped to 64 KiB for lowered root CBVs).
         if let Some((a, s)) = &shadow {
-            s.refresh(list, *a, s.left(*a));
+            let len = if cbv_cap {
+                s.left(*a).min(1 << 16)
+            } else {
+                s.left(*a)
+            };
+            s.refresh(list, *a, len);
         }
         let handle = host.gpu_handle(index);
         self.set_root_table(list, compute, param, handle);
@@ -4559,12 +4608,34 @@ impl State {
                         }
                     }
                 };
+                let vram_cbv = crate::descriptor::host::vram_cbv();
                 for (e, u) in entries.iter().enumerate() {
                     if u.kind == ResourceType::Cbv {
                         if let Some(title) = title_first {
                             let k = u.table_offset_dwords / 8;
                             if k < own_count {
                                 host.buffer_slot_tabled_at(title + k, frame);
+                            }
+                        }
+                        if vram_cbv {
+                            let handle = table + u64::from(u.table_offset_dwords) * 4;
+                            let words = if u.table_offset_dwords.is_multiple_of(8) {
+                                records[(u.table_offset_dwords / 8) as usize]
+                            } else {
+                                // SAFETY: a descriptor slot in title memory.
+                                unsafe { (handle as *const [u32; 3]).read_unaligned() }
+                            };
+                            let cbv = crate::descriptor::inline_constant(words).or_else(|| {
+                                match crate::descriptor::view_from_record(words) {
+                                    Some(View::Constant(addr, size)) => Some((addr, size)),
+                                    _ => None,
+                                }
+                            });
+                            if let Some((address, size)) = cbv
+                                && let Some((shadow, addr, bytes)) =
+                                    crate::descriptor::host::constant_vram_copy(address, size)
+                            {
+                                shadow.refresh(list, addr, bytes);
                             }
                         }
                         continue;
@@ -4587,11 +4658,39 @@ impl State {
                     }
                     let handle = table + u64::from(k) * 32;
                     let words = records[k as usize];
-                    if let Some(view) = crate::descriptor::view_from_record(words)
-                        && let Some(kind) = view_kind(&view)
+                    if vram_cbv
+                        && let Some((address, size)) = crate::descriptor::inline_constant(words)
                     {
-                        BINDING_WRITES.set(STORES.get());
-                        read_view(handle, words, kind, &view);
+                        if let Some((shadow, addr, bytes)) =
+                            crate::descriptor::host::constant_vram_copy(address, size)
+                        {
+                            shadow.refresh(list, addr, bytes);
+                        }
+                        if let Some(title) = title_first
+                            && k < own_count
+                        {
+                            host.buffer_slot_tabled_at(title + k, frame);
+                        }
+                        continue;
+                    }
+                    if let Some(view) = crate::descriptor::view_from_record(words) {
+                        if let Some(kind) = view_kind(&view) {
+                            BINDING_WRITES.set(STORES.get());
+                            read_view(handle, words, kind, &view);
+                        } else if vram_cbv
+                            && let View::Constant(address, size) = view
+                        {
+                            if let Some((shadow, addr, bytes)) =
+                                crate::descriptor::host::constant_vram_copy(address, size)
+                            {
+                                shadow.refresh(list, addr, bytes);
+                            }
+                            if let Some(title) = title_first
+                                && k < own_count
+                            {
+                                host.buffer_slot_tabled_at(title + k, frame);
+                            }
+                        }
                     }
                 }
                 let depth = TESTED_DEPTH.get().1;
@@ -4641,6 +4740,10 @@ impl State {
                 }
             }
             let list_views = crate::descriptor::host::list_views();
+            let vram_cbv = crate::descriptor::host::vram_cbv();
+            if vram_cbv {
+                crate::descriptor::host::vram_cbv_maybe_log(frame);
+            }
             if self.recording == 0 {
                 static NEXT: AtomicU64 = AtomicU64::new(1);
                 self.recording = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -4650,6 +4753,79 @@ impl State {
             // used-resource list names (descriptor arrays).
             let mut copy_batch = crate::descriptor::host::CopyBatch::new();
             let retired = &mut self.retired;
+            let bind_cbv = |cache: &mut crate::descriptor::host::TableCache<'_>,
+                            copy_batch: &mut crate::descriptor::host::CopyBatch,
+                            retired: &mut Vec<ID3D12Resource>,
+                            index: u32,
+                            k: u32,
+                            words: [u32; 3],
+                            address: u64,
+                            size: u32| {
+                if let Some(title) = title_first
+                    && k < own_count
+                {
+                    host.buffer_slot_tabled_at(title + k, frame);
+                }
+                if vram_cbv {
+                    if size == 0 {
+                        host.make_null_buffer_batched(index, copy_batch, retired);
+                        return;
+                    }
+                    let fallback_unbacked = match if list_views {
+                        cache.make_listed_constant(
+                            host, words, address, size, index, copy_batch, retired,
+                        )
+                    } else {
+                        crate::descriptor::host::ListedConstant::Full
+                    } {
+                        crate::descriptor::host::ListedConstant::Hit(
+                            (shadow, addr, bytes),
+                            listed,
+                        ) => {
+                            if listed.ready.0 == 0 || listed.ready.0 != list.epoch() {
+                                shadow.refresh(list, *addr, *bytes);
+                                listed.ready = (list.epoch(), 0, false);
+                            }
+                            crate::descriptor::host::vram_cbv_note_direct(*bytes);
+                            return;
+                        }
+                        crate::descriptor::host::ListedConstant::Full => {
+                            match crate::descriptor::host::constant_vram_lookup(address, size) {
+                                Ok((shadow, addr, bytes)) => {
+                                    let offset = shadow.offset(addr);
+                                    cache.constant_raw_at(
+                                        host,
+                                        index,
+                                        &shadow.buffer,
+                                        offset,
+                                        bytes,
+                                        size,
+                                        copy_batch,
+                                        retired,
+                                    );
+                                    shadow.refresh(list, addr, bytes);
+                                    crate::descriptor::host::vram_cbv_note_direct(bytes);
+                                    return;
+                                }
+                                Err(unbacked) => unbacked,
+                            }
+                        }
+                        crate::descriptor::host::ListedConstant::Fallback(unbacked) => unbacked,
+                    };
+                    crate::descriptor::host::vram_cbv_note_fallback(fallback_unbacked);
+                }
+                let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
+                    if vram_cbv {
+                        host.make_null_buffer_batched(index, copy_batch, retired);
+                    } else {
+                        host.make_null_batched(index, copy_batch, retired);
+                    }
+                    return;
+                };
+                let slot_ref = (std::ptr::from_ref(heap) as usize, index);
+                list.defer_constants(to, address as *const u8, size as usize, slot_ref);
+                cache.constant_at(host, index, &buffer, gpu, size, copy_batch, retired);
+            };
             crate::descriptor::host::with_table_cache(
                 recording,
                 list_views,
@@ -4660,27 +4836,31 @@ impl State {
                         let words = records[k as usize];
                         let handle = table + u64::from(k) * 32;
                         if words[0] != crate::descriptor::VIEW_TAG {
-                            host.make_null_batched(index, &mut copy_batch, retired);
-                            if group.entry(k).is_some() {
+                            let used = group.entry(k);
+                            if vram_cbv
+                                && used.is_some_and(|u| u.kind == ResourceType::Cbv)
+                            {
+                                host.make_null_buffer_batched(index, &mut copy_batch, retired);
+                            } else {
+                                host.make_null_batched(index, &mut copy_batch, retired);
+                            }
+                            if used.is_some() {
                                 once!(slot, "a table entry without a view");
                             }
                             continue;
                         }
-                        // Inline CBVs decode directly from `words` with zero locks
-                        // and bypass `ListViews` completely.
+                        // Inline CBVs decode directly from `words` with zero locks.
                         if let Some((address, size)) = crate::descriptor::inline_constant(words) {
-                            if let Some(title) = title_first
-                                && k < own_count
-                            {
-                                host.buffer_slot_tabled_at(title + k, frame);
-                            }
-                            let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
-                                host.make_null_batched(index, &mut copy_batch, retired);
-                                continue;
-                            };
-                            let slot_ref = (std::ptr::from_ref(heap) as usize, index);
-                            list.defer_constants(to, address as *const u8, size as usize, slot_ref);
-                            cache.constant_at(host, index, &buffer, gpu, size, &mut copy_batch, retired);
+                            bind_cbv(
+                                cache,
+                                &mut copy_batch,
+                                retired,
+                                index,
+                                k,
+                                words,
+                                address,
+                                size,
+                            );
                             continue;
                         }
                         // A view this list has made before: its descriptor copied in one
@@ -4740,18 +4920,16 @@ impl State {
                         let used = group.entry(k);
                         match crate::descriptor::view_from_record(words) {
                             Some(View::Constant(address, size)) => {
-                                if let Some(title) = title_first
-                                    && k < own_count
-                                {
-                                    host.buffer_slot_tabled_at(title + k, frame);
-                                }
-                                let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
-                                    host.make_null_batched(index, &mut copy_batch, retired);
-                                    continue;
-                                };
-                                let slot_ref = (std::ptr::from_ref(heap) as usize, index);
-                                list.defer_constants(to, address as *const u8, size as usize, slot_ref);
-                                cache.constant_at(host, index, &buffer, gpu, size, &mut copy_batch, retired);
+                                bind_cbv(
+                                    cache,
+                                    &mut copy_batch,
+                                    retired,
+                                    index,
+                                    k,
+                                    words,
+                                    address,
+                                    size,
+                                );
                             }
                             Some(view) => {
                                 host.make_at_into(index, &view, retired);
@@ -6375,5 +6553,243 @@ void main() { output.Store(0, a); output.Store(4, b); }
         let mut spilled: Few<u32, 4> = Few::from_slice(&[9, 2, 7, 2, 5, 9, 1]);
         spilled.sort_dedup();
         assert_eq!(&*spilled, &[1, 2, 5, 7, 9]);
+    }
+
+    /// End-to-end GPU test for `VICTORY_VRAM_CBV=1` and `=0`:
+    /// - Under `=1`, 256B- and 16B-aligned shadow-backed CBVs bind directly as
+    ///   raw `ByteAddressBuffer` SRVs in GDDR7 VRAM (refreshed via `shadow.refresh`
+    ///   without scratch copies), 4B-aligned CBVs fall back to scratch as raw SRVs,
+    ///   and zero-size CBVs bind as typed null raw buffer SRVs reading `0`.
+    /// - Under `=0`, classic 256B-aligned CBV scratch copies continue to read
+    ///   exact values for both 256B- and 16B-aligned console CBVs.
+    #[test]
+    fn vram_cbv_table_reads_16b_aligned_shadow_without_scratch_fill() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+        let mut title: This = std::ptr::null();
+        let desc = [0u32, 64, 1, 0, 0, 0, 0, 0];
+        let iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        assert_eq!(
+            crate::descriptor::create_heap(std::ptr::null(), desc.as_ptr().cast(), &iid, &mut title),
+            0
+        );
+        struct Title(This);
+        impl Drop for Title {
+            fn drop(&mut self) {
+                crate::object::release(self.0);
+            }
+        }
+        let _title = Title(title);
+        let heap = crate::descriptor::heap(title);
+        let h = heap.host().unwrap();
+
+        let mut backing = vec![0u32; 2048];
+        let base_ptr = backing.as_mut_ptr() as usize;
+        let aligned = base_ptr.next_multiple_of(4096);
+        let start_word = (aligned - base_ptr) / 4;
+        let addr = aligned as u64;
+        backing[start_word] = 0x1111_2222; // offset 0 (256B aligned)
+        backing[start_word + 1] = 0x7788_99AA; // offset 4 (4B aligned -> scratch fallback)
+        backing[start_word + 4] = 0xCAFE_BABE; // offset 16 (16B aligned -> direct VRAM!)
+        backing[start_word + 5] = 0xDEAD_BEEF; // offset 20
+
+        for (slot, a, sz) in [
+            (0u64, addr, 256u32),
+            (1, addr + 16, 16),
+            (2, addr + 4, 16),
+            (3, addr + 16, 0),
+        ] {
+            crate::descriptor::create_cbv(
+                std::ptr::null(),
+                &[a as u32, (a >> 32) as u32, sz, 0],
+                heap.start + slot * 32,
+            );
+        }
+
+        let plan = TablePlan::new(&[cbv(0, 0), cbv(0, 1), cbv(0, 2), cbv(0, 3)], &[]);
+        let output = host.uav_buffer(256).unwrap();
+        let readback = host.read_back_buffer(256).unwrap();
+
+        // Part A: `VICTORY_VRAM_CBV=1` raw ByteAddressBuffer SRV path (direct VRAM + fallback + null).
+        victory_shader::emit::with_vram_cbv(true, || {
+            let mut state = State::default();
+            state.heaps = [title as usize, 0];
+            state.graphics = vec![Root::Table(heap.start)];
+            let extents = state.table_extents([&plan], false);
+            assert_eq!(&*extents, &[(0, 4)]);
+            let stats_before = crate::descriptor::host::vram_cbv_stats();
+            let list = host.new_list().unwrap();
+            let made = state.tables_with_extents(&list, &plan, (&[], true), false, &extents);
+            assert_ne!(made[0].1, u32::MAX);
+            let stats_after = crate::descriptor::host::vram_cbv_stats();
+            assert!(
+                stats_after[0] >= stats_before[0] + 2,
+                "slots 0 (256B) and 1 (16B) must bind directly into GDDR7 VRAM"
+            );
+            assert!(
+                stats_after[3] > stats_before[3],
+                "slot 2 (4B-aligned) must record alignment fallback to scratch"
+            );
+
+            // Mutate offset 16 AFTER recording to verify `shadow.refresh` uploads live title memory.
+            backing[start_word + 4] = 0x4242_1337;
+
+            if !h.has_raw_twins() {
+                const RAW_SRC: &str = r#"
+#define RS "DescriptorTable(SRV(t0, numDescriptors=4)), UAV(u0)"
+ByteAddressBuffer cb[4] : register(t0);
+RWByteAddressBuffer output : register(u0);
+[RootSignature(RS)] [numthreads(1,1,1)]
+void main() {
+    output.Store(0, cb[0].Load(0));
+    output.Store(4, cb[1].Load(0));
+    output.Store(8, cb[1].Load(4));
+    output.Store(12, cb[2].Load(0));
+    output.Store(16, cb[3].Load(0));
+}
+"#;
+                let code = crate::host::compile(RAW_SRC, s!("main"), s!("cs_5_1")).unwrap();
+                // SAFETY: compiled bytecode and live resources until synchronous completion.
+                let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
+                    let root = host.device.CreateRootSignature(0, &code).unwrap();
+                    let pso = host
+                        .device
+                        .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                            pRootSignature: std::mem::transmute_copy(&root),
+                            CS: D3D12_SHADER_BYTECODE {
+                                pShaderBytecode: code.as_ptr().cast(),
+                                BytecodeLength: code.len(),
+                            },
+                            ..Default::default()
+                        })
+                        .unwrap();
+                    (root, pso)
+                };
+                // SAFETY: open list with valid heap, root arguments, and resources.
+                unsafe {
+                    list.list.SetDescriptorHeaps(&[Some(h.heap.clone())]);
+                    list.list.SetComputeRootSignature(&root);
+                    list.list.SetPipelineState(&pso);
+                    list.list
+                        .SetComputeRootDescriptorTable(0, h.gpu_handle(made[0].1 / 32));
+                    list.list
+                        .SetComputeRootUnorderedAccessView(1, output.GetGPUVirtualAddress());
+                    list.list.ResourceBarrier(&[crate::host::transition(
+                        &output,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    )]);
+                    list.list.Dispatch(1, 1, 1);
+                    list.list.ResourceBarrier(&[crate::host::transition(
+                        &output,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
+                    list.list.CopyBufferRegion(&readback, 0, &output, 0, 20);
+                    list.list.Close().unwrap();
+                }
+                host.execute_sync_internal(&list);
+                let mut mapped = std::ptr::null_mut();
+                // SAFETY: completed readback; reading 5 dwords.
+                unsafe {
+                    readback
+                        .Map(0, Some(&D3D12_RANGE { Begin: 0, End: 20 }), Some(&mut mapped))
+                        .unwrap();
+                    assert_eq!(
+                        std::slice::from_raw_parts(mapped.cast::<u32>(), 5),
+                        &[0x1111_2222, 0x4242_1337, 0xDEAD_BEEF, 0x7788_99AA, 0]
+                    );
+                    readback.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+                    assert!(host.device.GetDeviceRemovedReason().is_ok());
+                }
+            }
+            state.tables_done();
+        });
+
+        // Part B: `VICTORY_VRAM_CBV=0` classic CBV path still reads both 256B and 16B CBVs.
+        victory_shader::emit::with_vram_cbv(false, || {
+            let mut state = State::default();
+            state.heaps = [title as usize, 0];
+            state.graphics = vec![Root::Table(heap.start)];
+            let plan_off = TablePlan::new(&[cbv(0, 0), cbv(0, 1)], &[]);
+            let extents = state.table_extents([&plan_off], false);
+            let list = host.new_list().unwrap();
+            let made = state.tables_with_extents(&list, &plan_off, (&[], true), false, &extents);
+            assert_ne!(made[0].1, u32::MAX);
+
+            const CLASSIC_SRC: &str = r#"
+#define RS "DescriptorTable(CBV(b0, numDescriptors=2)), UAV(u0)"
+cbuffer A : register(b0) { uint a; };
+cbuffer B : register(b1) { uint b; };
+RWByteAddressBuffer output : register(u0);
+[RootSignature(RS)] [numthreads(1,1,1)]
+void main() { output.Store(0, a); output.Store(4, b); }
+"#;
+            let code = crate::host::compile(CLASSIC_SRC, s!("main"), s!("cs_5_1")).unwrap();
+            // SAFETY: compiled bytecode and live resources until synchronous completion.
+            let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
+                let root = host.device.CreateRootSignature(0, &code).unwrap();
+                let pso = host
+                    .device
+                    .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::transmute_copy(&root),
+                        CS: D3D12_SHADER_BYTECODE {
+                            pShaderBytecode: code.as_ptr().cast(),
+                            BytecodeLength: code.len(),
+                        },
+                        ..Default::default()
+                    })
+                    .unwrap();
+                (root, pso)
+            };
+            // SAFETY: open list with valid heap, root arguments, and resources.
+            unsafe {
+                list.list.SetDescriptorHeaps(&[Some(h.heap.clone())]);
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetPipelineState(&pso);
+                list.list
+                    .SetComputeRootDescriptorTable(0, h.gpu_handle(made[0].1 / 32));
+                list.list
+                    .SetComputeRootUnorderedAccessView(1, output.GetGPUVirtualAddress());
+                list.list.ResourceBarrier(&[crate::host::transition(
+                    &output,
+                    if !h.has_raw_twins() {
+                        D3D12_RESOURCE_STATE_COPY_SOURCE
+                    } else {
+                        D3D12_RESOURCE_STATE_COMMON
+                    },
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+                list.list.Dispatch(1, 1, 1);
+                list.list.ResourceBarrier(&[crate::host::transition(
+                    &output,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                list.list.CopyBufferRegion(&readback, 0, &output, 0, 8);
+                list.list.Close().unwrap();
+            }
+            host.execute_sync_internal(&list);
+            let mut mapped = std::ptr::null_mut();
+            // SAFETY: completed readback; reading 2 dwords.
+            unsafe {
+                readback
+                    .Map(0, Some(&D3D12_RANGE { Begin: 0, End: 8 }), Some(&mut mapped))
+                    .unwrap();
+                assert_eq!(
+                    std::slice::from_raw_parts(mapped.cast::<u32>(), 2),
+                    &[0x1111_2222, 0x4242_1337]
+                );
+                readback.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+                assert!(host.device.GetDeviceRemovedReason().is_ok());
+            }
+            state.tables_done();
+        });
     }
 }

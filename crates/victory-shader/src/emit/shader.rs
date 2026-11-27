@@ -201,6 +201,41 @@ pub fn raw_views() -> u32 {
     RAW_VIEWS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+thread_local! {
+    /// Per-thread override for [`vram_cbv`], used by tests across crates.
+    static VRAM_CBV_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` with [`vram_cbv`] forced to `on` on the current thread, restoring
+/// the previous override on return or unwind.
+pub fn with_vram_cbv<T>(on: bool, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            VRAM_CBV_HERE.set(self.0);
+        }
+    }
+    let _restore = Restore(VRAM_CBV_HERE.replace(Some(on)));
+    f()
+}
+
+/// Wave 27 (`VICTORY_VRAM_CBV=1`; off by default): lowers constant buffer loads
+/// to DXIL `rawBufferLoad` on a 4-byte-aligned `ByteAddressBuffer` (`R32_TYPELESS`
+/// SRV) pointing directly into GDDR7 VRAM (`shadow.buffer`).
+///
+/// Works on NVIDIA's 1M-capped descriptor heap without AMD `raw_twins`
+/// (`raw_views() == 0`, reading the table/heap slot directly clamped to
+/// `view_heap_limit()`), and transparently uses `raw_twin` when `raw_views() != 0`.
+/// Root CBVs are lowered to root SRVs (`t<slot>`, space 1) with `USER_VIEW_BIAS`.
+/// Part of the translation: the shader cache keys on this switch when enabled.
+pub fn vram_cbv() -> bool {
+    if let Some(on) = VRAM_CBV_HERE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_VRAM_CBV").is_ok_and(|v| v.trim() == "1"))
+}
+
 pub(crate) struct Shader {
     pub m: Module,
     pub t: Types,

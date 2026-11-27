@@ -3841,6 +3841,27 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
 /// may write and that the title wrote since it was last copied. The
 /// refresh leaves ranges shaders are writing alone (`Shadow::update`), so
 /// the title's bytes there would reach the card a submission late.
+fn stale_under_flights_spans(
+    mut spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
+    if spans.is_empty() {
+        return spans;
+    }
+    if late_exact() {
+        // The title's bytes are put in beside the flights' writes; a
+        // settle is still due where that could not be done. At most this
+        // many changed runs go up to copies in the card's memory, each a
+        // copy of its own there. With [`card_steps`] the pages of the
+        // title's ring of constants come here too, which were waited for
+        // before: hundreds of short runs each, at about 1.5 us a run.
+        let mut runs_left = if card_steps::stage() > 0 { 4096 } else { 512 };
+        spans.retain(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
+        return spans;
+    }
+    spans.retain(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from));
+    spans
+}
+
 fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
     use std::sync::Arc;
     // Per copy, the span of what is refreshed (a flush brings that much
@@ -3865,19 +3886,7 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
             }
         }
     }
-    if late_exact() {
-        // The title's bytes are put in beside the flights' writes; a
-        // settle is still due where that could not be done. At most this
-        // many changed runs go up to copies in the card's memory, each a
-        // copy of its own there. With [`card_steps`] the pages of the
-        // title's ring of constants come here too, which were waited for
-        // before: hundreds of short runs each, at about 1.5 us a run.
-        let mut runs_left = if card_steps::stage() > 0 { 4096 } else { 512 };
-        spans.retain(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
-        return spans;
-    }
-    spans.retain(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from));
-    spans
+    stale_under_flights_spans(spans)
 }
 
 /// How many parts of submissions, and lists, the line's thread gives to the
@@ -5236,17 +5245,39 @@ impl Host {
                         let joins = rehash_runs() || own.is_some();
                         let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
                             vec![shadow.card_run(0, usize::MAX)]
-                        } else {
-                            // (In order: the next of the same piece, of the
-                            // tens of thousands there are, says nothing.)
+                        } else if joins {
+                            // Fast-path piece deduplication: `merge_under_writes` emits
+                            // tens of thousands of tiny sorted dword runs inside the same
+                            // 64 KiB piece; skip redundant `card_run` computations when a
+                            // run stays within the previous single piece.
+                            let start = shadow.span().0 as usize;
+                            let first_block = start >> 16;
                             let mut runs: Vec<crate::shadow::CardSpan> = Vec::new();
-                            for run in ranges.iter().map(|&(a, b)| shadow.card_run(a, b)) {
+                            let mut last_single_piece = usize::MAX;
+                            for &(a, b) in ranges {
+                                if a >= b {
+                                    continue;
+                                }
+                                let p_lo = ((start + a) >> 16) - first_block;
+                                let p_hi = ((start + b - 1) >> 16) - first_block;
+                                if p_lo == p_hi && p_lo == last_single_piece {
+                                    if let Some(last) = runs.last_mut() {
+                                        last.to = last.to.max(b as u32);
+                                    }
+                                    continue;
+                                }
+                                let run = shadow.card_run(a, b);
                                 match runs.last_mut() {
-                                    Some(last) if joins && (last.first, last.pieces) == (run.first, run.pieces) => last.to = last.to.max(run.to),
+                                    Some(last) if (last.first, last.pieces) == (run.first, run.pieces) => {
+                                        last.to = last.to.max(run.to);
+                                    }
                                     _ => runs.push(run),
                                 }
+                                last_single_piece = if p_lo == p_hi { p_lo } else { usize::MAX };
                             }
                             runs
+                        } else {
+                            ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
                         };
                         // The same pieces in fewer passes (`rehash_runs`).
                         let runs = if joins { crate::shadow::joined_piece_runs(runs) } else { runs };
@@ -5796,21 +5827,20 @@ impl Host {
                 for run in pieces[jobs[j].clone()].chunk_by(|a, b| std::sync::Arc::ptr_eq(&a.0, &b.0)) {
                     let addressed: Vec<(usize, usize, usize)> =
                         run.iter().map(|(_, lo, hi, at)| (*lo, *hi, data + *at as usize)).collect();
+                    let mut per_piece = gpu_only_on.then(|| Vec::with_capacity(run.len()));
                     // SAFETY: the mapping of the fetched bytes, `total` of
                     // them; the copy into it has run, and the next waits
                     // for this call.
-                    let merged = unsafe { run[0].0.land_card(&addressed, after, &mut notes) };
+                    let merged = unsafe { run[0].0.land_card_with_flags(&addressed, after, &mut notes, per_piece.as_mut()) };
                     put.fetch_add(merged, Ordering::Relaxed);
-                    if gpu_only_on && run[0].0.gpu_only_eligible() {
-                        after_land.push((
-                            &run[0].0,
-                            run.iter().map(|(_, lo, hi, _)| (*lo, *hi, merged > 0)).collect(),
-                        ));
+                    if let Some(flags) = per_piece
+                        && !flags.is_empty()
+                    {
+                        after_land.push((&run[0].0, flags));
                     }
                 }
                 notes.flush();
                 for (shadow, list) in after_land {
-                    shadow.gpu_only_ensure_tracked();
                     shadow.gpu_only_after_land(&list);
                 }
                 land::spent(land::stat::CARD_ALL, working);
@@ -6544,8 +6574,7 @@ impl Host {
         for p in crate::gpu_only::take_pending_demotions() {
             batch.push((p.shadow, p.pieces, p.reason, p.already_cleared));
         }
-        let tracked = crate::gpu_only::tracked_shadows();
-        if tracked.is_empty() {
+        if !crate::gpu_only::has_tracked_shadows() {
             if !batch.is_empty() {
                 self.demote_gpu_only_batch(submitted, batch);
             }
@@ -6560,8 +6589,8 @@ impl Host {
             raw_steps.clear();
             step_ranges.clear();
             // Coalesce all step title-memory ranges across `runs` into thread-local
-            // scratch so intersection with tracked shadows is zero-alloc and
-            // O(coalesced_ranges * tracked_shadows).
+            // scratch BEFORE upgrading tracked shadows, avoiding `Arc` clones on
+            // submissions with no CPU step ranges.
             let mut has_run = false;
             for list in runs {
                 for step in &list.deferred().copies {
@@ -6594,6 +6623,13 @@ impl Host {
                     }
                 }
             }
+            if raw_steps.is_empty() && !has_run {
+                return;
+            }
+            let tracked = crate::gpu_only::tracked_shadows();
+            if tracked.is_empty() {
+                return;
+            }
             if !raw_steps.is_empty() {
                 raw_steps.sort_unstable();
                 for &(from, to) in raw_steps.as_slice() {
@@ -6606,36 +6642,32 @@ impl Host {
                     }
                 }
             }
-            if !step_ranges.is_empty() || has_run {
-                let bounds = step_ranges.first().zip(step_ranges.last()).map(|(a, b)| (a.0, b.1));
-                for shadow in &tracked {
-                    if !shadow.gpu_only_eligible() {
-                        continue;
+            let bounds = step_ranges.first().zip(step_ranges.last()).map(|(a, b)| (a.0, b.1));
+            for shadow in &tracked {
+                if !shadow.gpu_only_eligible() {
+                    continue;
+                }
+                if has_run && shadow.any_gpu_only() {
+                    let all = shadow.gpu_only_all_pieces();
+                    if !all.is_empty() {
+                        batch.push((shadow.clone(), all, DemoteReason::Step, false));
                     }
-                    if has_run && shadow.any_gpu_only() {
-                        let all = shadow.gpu_only_all_pieces();
-                        if !all.is_empty() {
-                            batch.push((shadow.clone(), all, DemoteReason::Step, false));
-                        }
-                        continue;
-                    }
-                    let Some((min_step, max_step)) = bounds else {
-                        continue;
-                    };
-                    let (s_start, s_len) = shadow.span();
-                    let (s_start, s_end) = (s_start as usize, s_start.saturating_add(s_len) as usize);
-                    if s_end <= min_step || s_start >= max_step {
-                        continue;
-                    }
-                    let first = step_ranges.partition_point(|r| r.1 <= s_start);
-                    for &(a, b) in &step_ranges[first..] {
-                        if a >= s_end {
-                            break;
-                        }
-                        let hit = shadow.gpu_only_note_step(a, b, frame);
-                        if !hit.is_empty() {
-                            batch.push((shadow.clone(), hit, DemoteReason::Step, false));
-                        }
+                    continue;
+                }
+                let Some((min_step, max_step)) = bounds else {
+                    continue;
+                };
+                let (s_start, s_len) = shadow.span();
+                let (s_start, s_end) = (s_start as usize, s_start.saturating_add(s_len) as usize);
+                if s_end <= min_step || s_start >= max_step {
+                    continue;
+                }
+                let first = step_ranges.partition_point(|r| r.1 <= s_start);
+                let end = first + step_ranges[first..].partition_point(|r| r.0 < s_end);
+                if first < end {
+                    let hit = shadow.gpu_only_note_steps(&step_ranges[first..end], frame);
+                    if !hit.is_empty() {
+                        batch.push((shadow.clone(), hit, DemoteReason::Step, false));
                     }
                 }
             }
@@ -6979,6 +7011,8 @@ impl Host {
             let mut spans: ByCopy<(usize, usize)> = ByCopy::default();
             let mut gpu_only_spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
             let mut gpu_only_places: ByCopy<usize> = ByCopy::default();
+            let mut stale_spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+            let mut stale_places: ByCopy<Option<usize>> = ByCopy::default();
             for list in runs {
                 for step in &list.deferred().copies {
                     if let Step::Refresh(shadow, address, len) = step {
@@ -6998,6 +7032,18 @@ impl Host {
                                     gpu_only_places.insert(key, gpu_only_spans.len());
                                     gpu_only_spans.push((shadow.clone(), *address, end));
                                 }
+                            }
+                        }
+                        if behind {
+                            let place = stale_places.entry(key).or_insert_with(|| {
+                                shadow.writes_pending().then(|| {
+                                    stale_spans.push((shadow.clone(), *address, end));
+                                    stale_spans.len() - 1
+                                })
+                            });
+                            if let Some(i) = *place {
+                                let s = &mut stale_spans[i];
+                                (s.1, s.2) = (s.1.min(*address), s.2.max(end));
                             }
                         }
                     }
@@ -7032,7 +7078,11 @@ impl Host {
                     upcheck::reads(runs);
                 }
             }
-            let stale = if behind { stale_under_flights(runs) } else { Vec::new() };
+            let stale = if behind && (!demoted || flying()) {
+                stale_under_flights_spans(stale_spans)
+            } else {
+                Vec::new()
+            };
             if !stale.is_empty() {
                 let settling = std::time::Instant::now();
                 self.settle_stale(&mut submitted, runs, stale, &ranges);

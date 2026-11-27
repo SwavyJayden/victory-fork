@@ -844,17 +844,41 @@ pub(crate) fn carded_copies() -> Vec<Arc<Shadow>> {
 
 /// Ranges in order, those that overlap or touch as one.
 fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
-    // (The sort that finds what is in order already: they come as a few
-    // stretches of tens of thousands in order, put behind one another.)
-    ranges.sort();
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
-    for (from, to) in ranges {
-        match out.last_mut() {
-            Some(last) if from <= last.1 => last.1 = last.1.max(to),
-            _ => out.push((from, to)),
+    if ranges.len() <= 1 {
+        return ranges;
+    }
+    let mut sorted = true;
+    let mut disjoint = true;
+    for w in ranges.windows(2) {
+        if w[0] > w[1] {
+            sorted = false;
+            disjoint = false;
+            break;
+        }
+        if w[1].0 <= w[0].1 {
+            disjoint = false;
         }
     }
-    out
+    if sorted && disjoint {
+        return ranges;
+    }
+    if !sorted {
+        // (The sort that finds what is in order already: they come as a few
+        // stretches of tens of thousands in order, put behind one another.)
+        ranges.sort();
+    }
+    let mut write = 0usize;
+    for read in 1..ranges.len() {
+        let (from, to) = ranges[read];
+        if from <= ranges[write].1 {
+            ranges[write].1 = ranges[write].1.max(to);
+        } else {
+            write += 1;
+            ranges[write] = (from, to);
+        }
+    }
+    ranges.truncate(write + 1);
+    ranges
 }
 
 /// Runs of pieces to hash again (`Host::card_before`), those that overlap
@@ -3821,6 +3845,10 @@ impl Shadow {
                 note_stale(1);
                 return true;
             };
+            if self.watched.load(Ordering::Relaxed) == 0 {
+                let resolved = if crate::watch::guarded(a, e) { GUARDED } else { 1 };
+                let _ = self.watched.compare_exchange(0, resolved, Ordering::AcqRel, Ordering::Acquire);
+            }
             let stale: Vec<usize> = {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                 stale_pages_in(base, &copied, a, e, &written)
@@ -3851,20 +3879,55 @@ impl Shadow {
             // changed; none for a page that is not there (left as it is, and
             // looked at again next time) or that had too many.
             type Done = Option<Vec<(usize, usize)>>;
+            struct DoneSlots(Vec<std::cell::UnsafeCell<Done>>);
+            // SAFETY: each slot index `i` in `0..stale.len()` is written by at
+            // most one worker invocation `one(i)` and read only after all
+            // workers finish.
+            unsafe impl Sync for DoneSlots {}
+            impl DoneSlots {
+                /// # Safety
+                /// Caller has exclusive access to slot `i`.
+                #[inline]
+                unsafe fn set(&self, i: usize, value: Done) {
+                    // SAFETY: caller guarantees exclusive access to index `i`.
+                    unsafe { *self.0[i].get() = value };
+                }
+            }
             let left = std::sync::atomic::AtomicI64::new(*runs_left as i64);
             let over = std::sync::atomic::AtomicBool::new(false);
-            let done: Vec<Mutex<Done>> = stale.iter().map(|_| Mutex::new(None)).collect();
+            let done = DoneSlots((0..stale.len()).map(|_| std::cell::UnsafeCell::new(None)).collect());
+            let gpu_only_active = crate::gpu_only::enabled() && self.gpu_only_eligible();
+            let gpu_only_frame = if gpu_only_active { crate::frame::current() } else { 0 };
             let page_of = |i: usize| -> (usize, usize) { ((stale[i] * PAGE).max(a), ((stale[i] + 1) * PAGE).min(e)) };
             let one = |i: usize| {
                 let (lo, hi) = page_of(i);
                 if lo < hi && !over.load(Ordering::Relaxed) {
+                    let piece = stale[i] - base;
+                    // Probe working set (or clear same-frame trim) BEFORE
+                    // `merge_page_under_writes` reads title memory via `read_into`,
+                    // preventing false `pin_touch` on pure landing echoes.
+                    let should_retrim =
+                        gpu_only_active && self.gpu_only_probe_before_read_piece(piece, gpu_only_frame);
                     // SAFETY: the reference holds the copy's bytes at the
                     // copy's offsets, and these are in a declared range; the
                     // locks held above keep out what else writes them, and
                     // no two pages are the same.
                     let runs = unsafe { self.merge_page_under_writes(lo, hi - lo, held as *mut u8, &left) };
                     match runs {
-                        Ok(runs) => *done[i].lock().unwrap_or_else(|e| e.into_inner()) = runs,
+                        Ok(runs) => {
+                            if should_retrim
+                                && runs.as_ref().is_some_and(Vec::is_empty)
+                                && let Some(card) = &self.card
+                                && let Some(block) = card.gpu_only.piece_block_if_whole(piece)
+                                && card.gpu_only.needs_trim(piece, gpu_only_frame, false)
+                                && crate::inplace::pages_of(block).len() <= 1
+                                && crate::gpu_only::trim_block(block)
+                            {
+                                card.gpu_only.mark_trimmed(piece, gpu_only_frame, false);
+                            }
+                            // SAFETY: index `i` is exclusively owned by this invocation.
+                            unsafe { done.set(i, runs) };
+                        }
                         Err(()) => over.store(true, Ordering::Relaxed),
                     }
                 }
@@ -3879,17 +3942,22 @@ impl Shadow {
             *runs_left = left.into_inner().max(0) as usize;
             let mut taken = Vec::new();
             let mut all_runs: Vec<(usize, usize)> = Vec::new();
+            let mut dirty_pieces: Vec<usize> = Vec::new();
             let (mut merged_runs, mut merged_bytes) = (0u64, 0u64);
-            for (i, runs) in done.into_iter().enumerate() {
-                let Some(runs) = runs.into_inner().unwrap_or_else(|e| e.into_inner()) else {
+            for (i, slot) in done.0.into_iter().enumerate() {
+                let Some(runs) = slot.into_inner() else {
                     continue;
                 };
                 let (lo, hi) = ((stale[i] * PAGE).max(a), ((stale[i] + 1) * PAGE).min(e));
                 merged_runs += runs.len() as u64;
                 if self.card.is_some() {
-                    for (r, m) in runs {
-                        merged_bytes += m as u64;
-                        all_runs.push((lo - start + r, lo - start + r + m));
+                    if !runs.is_empty() {
+                        dirty_pieces.push(stale[i] - base);
+                        all_runs.reserve(runs.len());
+                        for (r, m) in runs {
+                            merged_bytes += m as u64;
+                            all_runs.push((lo - start + r, lo - start + r + m));
+                        }
                     }
                 } else {
                     merged_bytes += runs.iter().map(|r| r.1 as u64).sum::<u64>();
@@ -3906,7 +3974,7 @@ impl Shadow {
                 MERGED[2].fetch_add(merged_bytes, Ordering::Relaxed);
             }
             if !all_runs.is_empty() {
-                self.note_cpu_write_offsets(&all_runs);
+                self.note_cpu_write_pieces(&dirty_pieces);
                 self.card_changed_runs(all_runs.into_iter());
             }
             drop(before);
@@ -4498,12 +4566,19 @@ fn chunk_take_runs(
         };
         let whole = !known && card.before.get().is_none();
         let start = self.start as usize;
+        let first_block = start / PAGE;
+        let gpu_only_active = crate::gpu_only::enabled() && card.gpu_only.eligible();
+        let gpu_only_frame = if gpu_only_active { crate::frame::current() } else { 0 };
+        let mut dirty_pieces: Vec<usize> = Vec::new();
         TITLE.with_borrow_mut(|title| {
             title.resize(PAGE, 0);
             let mut at = from;
             while at < to {
                 let n = (PAGE - at % PAGE).min(to - at);
                 let title = &mut title[..n];
+                let piece = at / PAGE - first_block;
+                let should_retrim =
+                    gpu_only_active && self.gpu_only_probe_before_read_piece(piece, gpu_only_frame);
                 // (Pages that are not there read as zeros.)
                 crate::host::copy_mapped(title.as_mut_ptr(), at as *const u8, n, false);
                 // SAFETY: inside the mapping of the copy's CPU side, which
@@ -4518,7 +4593,16 @@ fn chunk_take_runs(
                     self.changed(at - start + a, at - start + a + len);
                 }
                 if !runs.is_empty() {
-                    self.note_cpu_write_title(at, at + n);
+                    if gpu_only_active && dirty_pieces.last() != Some(&piece) {
+                        dirty_pieces.push(piece);
+                    }
+                } else if should_retrim
+                    && let Some(block) = card.gpu_only.piece_block_if_whole(piece)
+                    && card.gpu_only.needs_trim(piece, gpu_only_frame, false)
+                    && crate::inplace::pages_of(block).len() <= 1
+                    && crate::gpu_only::trim_block(block)
+                {
+                    card.gpu_only.mark_trimmed(piece, gpu_only_frame, false);
                 }
                 self.card_changed_runs(runs.iter().map(|&(a, len)| (at - start + a, at - start + a + len)));
                 if let Some(was) = was {
@@ -4533,6 +4617,9 @@ fn chunk_take_runs(
                 at += n;
             }
         });
+        if !dirty_pieces.is_empty() {
+            self.note_cpu_write_pieces(&dirty_pieces);
+        }
         to - from
     }
 
@@ -4605,6 +4692,10 @@ fn chunk_take_runs(
         }
         let enqueue = {
             let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+            let (hint, _) = runs.size_hint();
+            if hint > 1 {
+                dirty.reserve(hint);
+            }
             for (from, to) in runs {
                 match dirty.last_mut() {
                     Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
@@ -4963,7 +5054,25 @@ impl Shadow {
     /// # Safety
     /// The third of each piece is the address of its bytes, which stay as
     /// they are during the call.
+    #[cfg(test)]
     pub(crate) unsafe fn land_card(&self, pieces: &[(usize, usize, usize)], fetched_after: u64, notes: &mut crate::land::Notes) -> u64 {
+        // SAFETY: caller's contract.
+        unsafe { self.land_card_with_flags(pieces, fetched_after, notes, None) }
+    }
+
+    /// As [`Self::land_card`], optionally recording per-piece `(lo, hi, wrote_title)`
+    /// into `out_flags` so `gpu_only_after_land` knows exactly which pieces wrote
+    /// title memory (instead of using the run-wide sum across sibling pieces).
+    ///
+    /// # Safety
+    /// Same as [`Self::land_card`].
+    pub(crate) unsafe fn land_card_with_flags(
+        &self,
+        pieces: &[(usize, usize, usize)],
+        fetched_after: u64,
+        notes: &mut crate::land::Notes,
+        mut out_flags: Option<&mut Vec<(usize, usize, bool)>>,
+    ) -> u64 {
         let Some(card) = &self.card else {
             return 0;
         };
@@ -4985,6 +5094,7 @@ impl Shadow {
             sent.near(fetched_after, from, to, &mut skip);
             skip
         };
+        let is_guarded = self.watched.load(Ordering::Relaxed) == GUARDED;
         let mut put = 0;
         for &(lo, hi, now) in pieces {
             if lo >= hi || hi > self.len as usize {
@@ -5001,8 +5111,15 @@ impl Shadow {
             let merged =
                 unsafe { crate::land::piece(self.start as usize + lo, now as *const u8, self.data.add(lo), &parts, true, notes, self) };
             self.walls_merged(hi - lo, merged as usize);
-            if merged > 0 {
+            // View memory (`GUARDED`) lands via `beside` and updates `copied` in
+            // `Shadow::landed` (never running `take_landed`), so only mark
+            // `self.landings` on non-guarded memory to keep `has_landing_in_piece`
+            // from staying stuck `true` forever on view memory.
+            if merged > 0 && !is_guarded {
                 self.note_landing(lo, hi);
+            }
+            if let Some(flags) = out_flags.as_deref_mut() {
+                flags.push((lo, hi, merged > 0));
             }
             put += merged;
         }
@@ -5059,6 +5176,12 @@ impl Shadow {
         if held {
             *at = (*at).max(now);
         }
+        drop(copied);
+        if held {
+            // Clear any leftover `landings` bits if `watched` was still `0` on
+            // an earlier landing of this view-memory block.
+            self.clear_landing_in_piece(page);
+        }
         held
     }
 
@@ -5108,12 +5231,12 @@ impl Shadow {
         self.piece(piece)
     }
 
-    /// Records a CPU step (`Copy`/`Placed`/`Fill`/`Texture`/`Plane`/`Host`)
-    /// overlapping `[from, to)` and atomically returns any overlapping `GpuOnly`
-    /// pieces that must be demoted first.
-    pub(crate) fn gpu_only_note_step(&self, from: usize, to: usize, frame: u64) -> Vec<usize> {
+    /// Records sorted CPU step ranges (`Copy`/`Placed`/`Fill`/`Texture`/
+    /// `Plane`/`Host`) overlapping this shadow in a single lock acquisition and
+    /// returns any overlapping `GpuOnly` pieces that must be demoted first.
+    pub(crate) fn gpu_only_note_steps(&self, ranges: &[(usize, usize)], frame: u64) -> Vec<usize> {
         match &self.card {
-            Some(c) if c.gpu_only.eligible() => c.gpu_only.note_step_and_collect_gpu_only(from, to, frame),
+            Some(c) if c.gpu_only.eligible() => c.gpu_only.note_steps_and_collect_gpu_only(ranges, frame),
             _ => Vec::new(),
         }
     }
@@ -5169,12 +5292,34 @@ impl Shadow {
         if !c.gpu_only.eligible() || runs.is_empty() {
             return;
         }
-        let start = self.start as usize;
-        let frame = crate::frame::current();
-        for &(lo, hi) in runs {
-            if lo < hi {
-                c.gpu_only.note_cpu_write(start + lo, start + hi, frame);
-            }
+        c.gpu_only.note_cpu_write_offsets(runs, crate::frame::current());
+    }
+
+    fn note_cpu_write_pieces(&self, pieces: &[usize]) {
+        let Some(c) = &self.card else {
+            return;
+        };
+        if !c.gpu_only.eligible() || pieces.is_empty() {
+            return;
+        }
+        c.gpu_only.note_cpu_write_pieces(pieces, crate::frame::current());
+    }
+
+    /// Lazily resolves `self.watched` when still `0` (e.g. pure shader-written
+    /// or always-pending buffers that have never gone through `update_free`).
+    fn ensure_watched(&self, block: usize) -> u8 {
+        let w = self.watched.load(Ordering::Relaxed);
+        if w != 0 {
+            return w;
+        }
+        let resolved = if crate::watch::writes(block, block + PIECE, true).is_some() {
+            if crate::watch::guarded(block, block + PIECE) { GUARDED } else { 1 }
+        } else {
+            NOT_WATCHED
+        };
+        match self.watched.compare_exchange(0, resolved, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => resolved,
+            Err(actual) => actual,
         }
     }
 
@@ -5245,7 +5390,7 @@ impl Shadow {
             BeforeReadAction::Probe => {
                 let touched = crate::gpu_only::query_working_set_block(block).map(|(t, _)| t);
                 let outcome = card.gpu_only.apply_probe_result(piece, frame, touched, true);
-                !matches!(outcome, ProbeOutcome::Pinned)
+                matches!(outcome, ProbeOutcome::Untouched(_))
             }
         }
     }
@@ -5262,19 +5407,52 @@ impl Shadow {
     }
 
     /// After landing completes (and `Notes::flush` has updated `copied` for
-    /// view memory): trims candidate pieces via `VirtualUnlock` and promotes
-    /// pieces satisfying all 5 rules to `GpuOnly`.
+    /// view memory): trims candidate pieces via `VirtualUnlock`, promotes
+    /// pieces satisfying all 5 rules to `GpuOnly`, and records compact
+    /// per-reason landing telemetry for periodic diagnostics.
     pub(crate) fn gpu_only_after_land(self: &Arc<Self>, pieces: &[(usize, usize, bool)]) {
-        if !crate::gpu_only::enabled() || !self.gpu_only_eligible() {
-            return;
-        }
-        let watched = self.watched.load(Ordering::Relaxed);
-        if !matches!(watched, 1 | GUARDED) {
+        use crate::gpu_only::{
+            AfterLandDecision, LAND_REASON_COUNT, LandBlockReason, bump_land_reason, record_land_summary,
+        };
+        if !crate::gpu_only::enabled() || pieces.is_empty() {
             return;
         }
         let Some(card) = &self.card else {
             return;
         };
+        let mut reasons = [0u64; LAND_REASON_COUNT];
+        if !card.gpu_only.eligible() {
+            let mut count = 0u64;
+            for &(lo, hi, _) in pieces {
+                if lo < hi {
+                    count += self.pieces(lo, hi).len() as u64;
+                }
+            }
+            bump_land_reason(&mut reasons, LandBlockReason::SmallBuf, count);
+            record_land_summary(self.id, self.start, self.len, self.watched.load(Ordering::Relaxed), &reasons);
+            return;
+        }
+        let mut watched = self.watched.load(Ordering::Relaxed);
+        if watched == 0
+            && let Some(block) = pieces
+                .iter()
+                .filter(|&&(lo, hi, _)| lo < hi)
+                .flat_map(|&(lo, hi, _)| self.pieces(lo, hi))
+                .find_map(|piece| card.gpu_only.piece_block_if_whole(piece))
+        {
+            watched = self.ensure_watched(block);
+        }
+        if !matches!(watched, 1 | GUARDED) {
+            let mut count = 0u64;
+            for &(lo, hi, _) in pieces {
+                if lo < hi {
+                    count += self.pieces(lo, hi).len() as u64;
+                }
+            }
+            bump_land_reason(&mut reasons, LandBlockReason::Unwatched, count);
+            record_land_summary(self.id, self.start, self.len, watched, &reasons);
+            return;
+        }
         self.gpu_only_ensure_tracked();
         let frame = crate::frame::current();
         for &(lo, hi, wrote_title) in pieces {
@@ -5283,34 +5461,56 @@ impl Shadow {
             }
             for piece in self.pieces(lo, hi) {
                 let Some(block) = card.gpu_only.piece_block_if_whole(piece) else {
+                    bump_land_reason(&mut reasons, LandBlockReason::PartialPiece, 1);
                     continue;
                 };
                 if !self.piece_is_copied(piece) {
+                    bump_land_reason(&mut reasons, LandBlockReason::NotCopied, 1);
                     continue;
                 }
-                // For private `MEM_WRITE_WATCH` memory (`watched == 1`) where
-                // landing just wrote title memory directly, defer promotion to
-                // `copy_stale` right after `take_landed` clears the echo and
-                // advances `copied`, so the next frame's write-watch sees clean.
-                let can_promote_here = watched == GUARDED || (!wrote_title && !self.has_landing_in_piece(piece));
-                if can_promote_here
-                    && card.gpu_only.ready_to_promote(piece, frame, false)
-                    && !self.has_dirty_in_piece(piece)
-                    && crate::inplace::pages_of(block).len() <= 1
-                    && !has_other_live_shadow_overlapping(self.id, block as u64, (block + PIECE) as u64)
-                    && crate::gpu_only::trim_block(block)
-                    && card.gpu_only.try_promote(piece, frame, false)
-                {
-                    continue;
-                }
-                if card.gpu_only.needs_trim(piece, frame, wrote_title)
-                    && crate::inplace::pages_of(block).len() <= 1
-                    && crate::gpu_only::trim_block(block)
-                {
-                    card.gpu_only.mark_trimmed(piece, frame, false);
+                match card.gpu_only.after_land_decision(piece, frame, wrote_title) {
+                    AfterLandDecision::ReadyToPromote { should_trim } => {
+                        // For private `MEM_WRITE_WATCH` memory (`watched == 1`) where
+                        // landing just wrote title memory directly, defer promotion to
+                        // `copy_stale` right after `take_landed` clears the echo and
+                        // advances `copied`, so the next frame's write-watch sees clean.
+                        let can_promote_here =
+                            watched == GUARDED || (!wrote_title && !self.has_landing_in_piece(piece));
+                        if !can_promote_here || self.has_dirty_in_piece(piece) {
+                            bump_land_reason(&mut reasons, LandBlockReason::DirtyOrLand, 1);
+                            if should_trim
+                                && crate::inplace::pages_of(block).len() <= 1
+                                && crate::gpu_only::trim_block(block)
+                            {
+                                card.gpu_only.mark_trimmed(piece, frame, false);
+                            }
+                            continue;
+                        }
+                        if crate::inplace::pages_of(block).len() > 1
+                            || has_other_live_shadow_overlapping(self.id, block as u64, (block + PIECE) as u64)
+                        {
+                            bump_land_reason(&mut reasons, LandBlockReason::Alias, 1);
+                            continue;
+                        }
+                        if crate::gpu_only::trim_block(block) && card.gpu_only.try_promote(piece, frame, false) {
+                            bump_land_reason(&mut reasons, LandBlockReason::Promoted, 1);
+                        } else {
+                            bump_land_reason(&mut reasons, LandBlockReason::Probing, 1);
+                        }
+                    }
+                    AfterLandDecision::NeedTrim(reason) => {
+                        bump_land_reason(&mut reasons, reason, 1);
+                        if crate::inplace::pages_of(block).len() <= 1 && crate::gpu_only::trim_block(block) {
+                            card.gpu_only.mark_trimmed(piece, frame, false);
+                        }
+                    }
+                    AfterLandDecision::Hold(reason) => {
+                        bump_land_reason(&mut reasons, reason, 1);
+                    }
                 }
             }
         }
+        record_land_summary(self.id, self.start, self.len, watched, &reasons);
     }
 
     /// Promotes private `MEM_WRITE_WATCH` pieces right after `copy_stale` +
@@ -5352,13 +5552,13 @@ impl Shadow {
         if !card.gpu_only.eligible() {
             return false;
         }
-        let watched = self.watched.load(Ordering::Relaxed);
-        if !matches!(watched, 1 | GUARDED) {
-            return false;
-        }
         let Some(block) = card.gpu_only.piece_block_if_whole(piece) else {
             return false;
         };
+        let watched = self.ensure_watched(block);
+        if !matches!(watched, 1 | GUARDED) {
+            return false;
+        }
         match card.gpu_only.unflagged_action(piece, frame) {
             UnflaggedAction::Skip => false,
             UnflaggedAction::NeedTrim => {
@@ -6887,6 +7087,47 @@ mod window_tests {
             prev_max_page = Some(chunk_max_page);
         }
         assert_eq!(total_after, total_before);
+    }
+
+    #[test]
+    fn joined_fast_paths_match_sort_and_coalesce() {
+        // Already sorted & strictly disjoint (zero-copy fast path).
+        let disjoint = vec![(0, 4), (8, 12), (20, 24)];
+        let ptr_before = disjoint.as_ptr();
+        let out = super::joined(disjoint);
+        assert_eq!(out, vec![(0, 4), (8, 12), (20, 24)]);
+        assert_eq!(out.as_ptr(), ptr_before, "disjoint sorted Vec should be returned in place");
+
+        // Already sorted with touching & overlapping runs (in-place coalesce).
+        let sorted_overlap = vec![(0, 4), (4, 8), (6, 12), (20, 24), (24, 30)];
+        let ptr_before = sorted_overlap.as_ptr();
+        let out = super::joined(sorted_overlap);
+        assert_eq!(out, vec![(0, 12), (20, 30)]);
+        assert_eq!(out.as_ptr(), ptr_before, "sorted overlapping Vec should coalesce in place");
+
+        // Unsorted with duplicates & overlaps.
+        let unsorted = vec![(20, 28), (0, 4), (10, 14), (2, 10), (24, 30)];
+        assert_eq!(super::joined(unsorted), vec![(0, 14), (20, 30)]);
+
+        // Empty and single element.
+        assert_eq!(super::joined(Vec::new()), Vec::<(usize, usize)>::new());
+        assert_eq!(super::joined(vec![(5, 9)]), vec![(5, 9)]);
+    }
+
+    #[test]
+    fn guarded_land_clears_leftover_landings_bits() {
+        use std::sync::atomic::Ordering;
+        let mut buf = vec![0u8; 2 * super::PIECE];
+        let shadow = super::Shadow::unbacked(0x4000_0000, buf.as_mut_ptr(), (2 * super::PIECE) as u64, true);
+        // Simulate leftover landing bit from before `watched` was known to be GUARDED.
+        shadow.note_landing(0, super::PIECE);
+        assert!(shadow.has_landing_in_piece(0));
+        // Clearing piece 0 leaves piece 1 unaffected and removes the stuck bit.
+        shadow.clear_landing_in_piece(0);
+        assert!(!shadow.has_landing_in_piece(0));
+        // When `watched == GUARDED`, `land_card_with_flags` must not re-set `landings` bits.
+        shadow.watched.store(super::GUARDED, Ordering::Relaxed);
+        assert_eq!(shadow.watched.load(Ordering::Relaxed), super::GUARDED);
     }
 }
 
